@@ -2,12 +2,17 @@
 //! 使用脚本化 MockProvider 驱动 AgentSession，无需真实 LLM。
 
 use async_trait::async_trait;
-use code_agent::{AgentEvent, AgentSession, ThinkStrategy};
-use code_tools::{write_file::WriteFileTool, Tool};
+use code_agent::{AgentEvent, AgentSession, FileChangeKind, ThinkStrategy};
+use code_tools::{
+    write_file::WriteFileTool, PermissionConfig, PermissionMode, Tool, ToolOutput, ToolRisk,
+};
 use futures::Stream;
 use hank_provider::{CompletionRequest, LlmProvider, StopReason, StreamEvent};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -44,6 +49,84 @@ impl LlmProvider for MockProvider {
         });
         let events: Vec<anyhow::Result<StreamEvent>> = script.into_iter().map(Ok).collect();
         Ok(Box::pin(futures::stream::iter(events)))
+    }
+}
+
+struct DangerousNoopTool {
+    executed: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl Tool for DangerousNoopTool {
+    fn name(&self) -> &str {
+        "dangerous_noop"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only dangerous tool."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    fn risk_level(&self) -> ToolRisk {
+        ToolRisk::Dangerous
+    }
+
+    async fn execute(&self, _input: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        self.executed.store(true, Ordering::SeqCst);
+        Ok(ToolOutput {
+            content: "executed".to_string(),
+            is_error: false,
+        })
+    }
+}
+
+struct StreamingEchoTool;
+
+#[async_trait]
+impl Tool for StreamingEchoTool {
+    fn name(&self) -> &str {
+        "streaming_echo"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only streaming tool."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    fn supports_streaming(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, _input: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        Ok(ToolOutput {
+            content: "fallback".to_string(),
+            is_error: false,
+        })
+    }
+
+    async fn execute_streaming(
+        &self,
+        _input: serde_json::Value,
+        stream_tx: mpsc::Sender<String>,
+    ) -> anyhow::Result<ToolOutput> {
+        let _ = stream_tx.send("chunk-a".to_string()).await;
+        let _ = stream_tx.send("chunk-b".to_string()).await;
+        Ok(ToolOutput {
+            content: "stream complete".to_string(),
+            is_error: false,
+        })
     }
 }
 
@@ -208,6 +291,53 @@ async fn test_file_changed_event_on_write() {
 }
 
 #[tokio::test]
+async fn test_file_changed_event_marks_existing_write_as_update() {
+    let dir = tempdir_path();
+    std::fs::write(format!("{dir}/existing.txt"), "old").unwrap();
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_use_script(
+            "t1",
+            "write_file",
+            r#"{"path":"existing.txt","content":"new"}"#,
+        ),
+        text_end_script("updated file"),
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(WriteFileTool::new(Some(dir.clone())))];
+    let mut session =
+        AgentSession::new(provider, tools, "mock-model".to_string(), "sys".to_string())
+            .with_permission(code_tools::PermissionMode::WorkspaceWrite, dir.clone());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "update a file".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+    let changes = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::FileChanged { changes, .. } => Some(changes.clone()),
+            _ => None,
+        })
+        .expect("missing file.changed event");
+
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].kind, FileChangeKind::Update);
+    assert_eq!(
+        std::fs::read_to_string(format!("{dir}/existing.txt")).unwrap(),
+        "new"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn test_permission_denied_outside_sandbox() {
     let dir = tempdir_path();
     let provider = Arc::new(MockProvider::new(vec![
@@ -289,6 +419,91 @@ async fn test_read_only_mode_denies_write() {
         .any(|e| matches!(e, AgentEvent::PermissionDenied { .. })));
     assert!(!std::path::Path::new(&format!("{dir}/a.txt")).exists());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_escalated_dangerous_tool_requests_and_denies_without_execution() {
+    let dir = tempdir_path();
+    let executed = Arc::new(AtomicBool::new(false));
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_use_script("t1", "dangerous_noop", r#"{}"#),
+        text_end_script("not executed"),
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(DangerousNoopTool {
+        executed: executed.clone(),
+    })];
+    let mut config = PermissionConfig::default();
+    config.mode = PermissionMode::Escalated;
+    config.sandbox_paths = vec![dir.clone()];
+    let mut session =
+        AgentSession::new(provider, tools, "mock-model".to_string(), "sys".to_string())
+            .with_permission_config(config, dir.clone());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "run dangerous tool".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::PermissionRequested { .. })));
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::PermissionDenied { .. })));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "dangerous_noop")));
+    assert!(!executed.load(Ordering::SeqCst));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_streaming_tool_output_delta_is_forwarded() {
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_use_script("t1", "streaming_echo", r#"{}"#),
+        text_end_script("streamed"),
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(StreamingEchoTool)];
+    let mut session =
+        AgentSession::new(provider, tools, "mock-model".to_string(), "sys".to_string());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "stream".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+    let chunks: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolOutputDelta { id, chunk } if id == "t1" => Some(chunk.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(chunks, vec!["chunk-a".to_string(), "chunk-b".to_string()]);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ToolResult {
+            id,
+            content,
+            is_error: false,
+        } if id == "t1" && content == "stream complete"
+    )));
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use crate::{Tool, ToolOutput, ToolRisk, LONG_TOOL_TIMEOUT};
+use crate::{Tool, ToolOutput, ToolRisk, LONG_TOOL_TIMEOUT, DEFAULT_BLOCKED_COMMANDS};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -11,17 +11,6 @@ use tracing::warn;
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_OUTPUT_BYTES: usize = 100_000;
 
-const BLOCKED_COMMANDS: &[&str] = &[
-    "rm -rf /",
-    "mkfs",
-    "dd if=/dev/zero",
-    ":(){ :|:& };:",
-    "shutdown",
-    "reboot",
-    "halt",
-    "poweroff",
-];
-
 pub struct ShellTool {
     work_dir: Option<String>,
 }
@@ -33,7 +22,7 @@ impl ShellTool {
 
     fn is_blocked(command: &str) -> bool {
         let lower = command.to_lowercase();
-        BLOCKED_COMMANDS.iter().any(|b| lower.contains(b))
+        DEFAULT_BLOCKED_COMMANDS.iter().any(|b| lower.contains(&b.to_lowercase()))
     }
 
     fn truncate_output(output: &str) -> String {

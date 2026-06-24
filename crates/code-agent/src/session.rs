@@ -1,16 +1,16 @@
 use crate::agent::orchestrator::{OrchestratorAgent, OrchestratorRuntime};
 use crate::agent::verifier::VerifierAgent;
 use crate::agent::{LoopDetector, ThinkStrategy, Verdict};
-use crate::context::summary::{estimate_tokens, truncate_tool_result_default};
+use crate::context::summary::estimate_tokens;
 use crate::context::ContextManager;
 use crate::retry::stream_with_retry;
-use crate::types::{FileChange, FileChangeKind, RunStatus};
+use crate::runtime::{
+    build_run_summary_from as runtime_build_run_summary_from, emit_run_terminal, now_ts, RunState,
+    ToolCallContext, ToolRuntime,
+};
 use crate::AgentEvent;
 use anyhow::Result;
-use code_tools::{
-    PermissionConfig, PermissionDecision, PermissionGuard, PermissionMode, Tool, ToolOutput,
-    ToolRisk,
-};
+use code_tools::{PermissionConfig, PermissionGuard, PermissionMode, Tool, ToolRisk};
 use hank_provider::{
     CompletionRequest, ContentBlock, LlmProvider, Message, Role, StopReason, StreamEvent,
     ToolDefinition,
@@ -24,33 +24,8 @@ use tracing::{debug, error, warn};
 
 const MAX_ITERATIONS: usize = 25;
 const LLM_STREAM_TIMEOUT_SECS: u64 = 120;
-const TOOL_TIMEOUT_SECS: u64 = 30;
 /// 验证后最多允许修订的轮数（FR-VERIFY-2）
 const MAX_REVISIONS: usize = 2;
-
-/// 当前 UTC 时间戳（RFC3339）
-pub(crate) fn now_ts() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
-/// 权限门控结果
-pub(crate) enum ToolGate {
-    /// 允许执行
-    Proceed,
-    /// 被拒绝，附带原因（写入 tool_result，loop 继续）
-    Denied(String),
-}
-
-/// 一次 run 内累积的执行状态（FR-LOOP-7, FR-PERM-6, FR-EVT-2）
-#[derive(Default)]
-pub(crate) struct RunState {
-    pub(crate) run_id: String,
-    pub(crate) permission_denials: Vec<String>,
-    pub(crate) verification_issues: Vec<String>,
-    pub(crate) file_changes: Vec<FileChange>,
-    pub(crate) input_tokens: u32,
-    pub(crate) output_tokens: u32,
-}
 
 /// Agent execution mode
 pub enum AgentMode {
@@ -192,6 +167,20 @@ impl AgentSession {
         self
     }
 
+    /// 配置上下文总预算与压缩阈值（FR-BUDGET）。
+    /// 默认 200K 预算 / 80K 阈值；换用更大上下文窗口的模型时可调高。
+    /// 压缩阈值取预算的 40%，与默认比例一致。
+    pub fn with_context_budget(mut self, total_budget: usize) -> Self {
+        let threshold = (total_budget as f64 * 0.4) as usize;
+        self.context_manager = ContextManager::with_budget(
+            threshold,
+            total_budget,
+            self.provider.clone(),
+            self.model.clone(),
+        );
+        self
+    }
+
     /// FR-TOOL-7: 将指定工具标记为延迟加载。
     /// 初始 tool_definitions 中只有 stub（name+description，无详细 schema），
     /// 首次被 LLM 调用时动态注入完整 schema。
@@ -311,8 +300,7 @@ impl AgentSession {
                     .await;
                 let paused = matches!(result, Ok(true));
                 let plain: Result<()> = result.map(|_| ());
-                self.emit_run_terminal(&run_id, &run_state, &plain, paused, &cancel, &event_tx)
-                    .await;
+                emit_run_terminal(&run_id, &run_state, &plain, paused, &cancel, &event_tx).await;
                 // 终态后统一发出 TurnComplete 关闭 SSE 流（在 RunCompleted 之后）
                 let _ = event_tx.send(AgentEvent::TurnComplete).await;
                 plain
@@ -333,97 +321,10 @@ impl AgentSession {
                     )
                     .await;
                 // Orchestrator 维护自身循环与 TurnComplete；这里只补 run 终态
-                self.emit_run_terminal(&run_id, &run_state, &result, false, &cancel, &event_tx)
-                    .await;
+                emit_run_terminal(&run_id, &run_state, &result, false, &cancel, &event_tx).await;
                 result
             }
         }
-    }
-
-    /// 发出 run 终态事件（completed/failed/cancelled）。
-    /// paused=true 表示因 ask_user 暂停，不发 RunCompleted。
-    async fn emit_run_terminal(
-        &self,
-        run_id: &str,
-        run_state: &RunState,
-        result: &Result<()>,
-        paused: bool,
-        cancel: &CancellationToken,
-        event_tx: &mpsc::Sender<AgentEvent>,
-    ) {
-        match result {
-            Err(e) => {
-                let _ = event_tx
-                    .send(AgentEvent::RunFailed {
-                        run_id: run_id.to_string(),
-                        timestamp: now_ts(),
-                        message: format!("{e:#}"),
-                    })
-                    .await;
-            }
-            Ok(()) if paused => {
-                // ask_user 暂停：run 未结束，不发终态事件
-            }
-            Ok(()) if cancel.is_cancelled() => {
-                // FR-SESSION-5: 取消后保留 partial file_changes/permission_denials
-                let _ = event_tx
-                    .send(AgentEvent::RunCancelled {
-                        run_id: run_id.to_string(),
-                        timestamp: now_ts(),
-                        file_changes: run_state.file_changes.clone(),
-                        permission_denials: run_state.permission_denials.clone(),
-                    })
-                    .await;
-            }
-            Ok(()) => {
-                let summary = self.build_run_summary(run_state);
-                let _ = event_tx
-                    .send(AgentEvent::RunCompleted {
-                        run_id: run_id.to_string(),
-                        timestamp: now_ts(),
-                        status: RunStatus::Success,
-                        input_tokens: run_state.input_tokens,
-                        output_tokens: run_state.output_tokens,
-                        summary,
-                        permission_denials: run_state.permission_denials.clone(),
-                        file_changes: run_state.file_changes.clone(),
-                    })
-                    .await;
-            }
-        }
-    }
-
-    /// 构造标准化最终汇报：改动文件 + 权限拒绝（FR-LOOP-4 验收 / 第8节）
-    pub(crate) fn build_run_summary_from(run_state: &RunState) -> String {
-        let mut parts: Vec<String> = Vec::new();
-        if run_state.file_changes.is_empty() {
-            parts.push("No file changes.".to_string());
-        } else {
-            let files: Vec<String> = run_state
-                .file_changes
-                .iter()
-                .map(|c| format!("{:?} {}", c.kind, c.path))
-                .collect();
-            parts.push(format!("Changed files: {}", files.join(", ")));
-        }
-        if !run_state.permission_denials.is_empty() {
-            parts.push(format!(
-                "Permission denials: {}",
-                run_state.permission_denials.join("; ")
-            ));
-        }
-        if !run_state.verification_issues.is_empty() {
-            parts.push(format!(
-                "Verification issues: {}",
-                run_state.verification_issues.join("; ")
-            ));
-        }
-        parts.join(" | ")
-    }
-
-    /// 构造标准化最终汇报：改动文件 + 权限拒绝（FR-LOOP-4 验收 / 第8节）
-    fn build_run_summary(&self, run_state: &RunState) -> String {
-        Self::build_run_summary_from(run_state)
     }
 
     /// Orchestrated mode: delegate to OrchestratorAgent
@@ -443,6 +344,9 @@ impl AgentSession {
             think_strategy,
         );
         orchestrator.set_messages(std::mem::take(&mut self.messages));
+        if !self.deferred_tool_names.is_empty() {
+            orchestrator.set_deferred_tools(self.deferred_tool_names.clone());
+        }
         let runtime = OrchestratorRuntime {
             run_id: run_state.run_id.clone(),
             work_dir: self.work_dir.clone(),
@@ -524,6 +428,11 @@ impl AgentSession {
         let mut consecutive_max_tokens = 0u32;
         let mut loop_detector = LoopDetector::new();
         let run_id = run_state.run_id.clone();
+        let tool_runtime = ToolRuntime::new(
+            self.permission.clone(),
+            self.tools.clone(),
+            self.work_dir.clone(),
+        );
 
         for iteration in 0..MAX_ITERATIONS {
             if cancel.is_cancelled() {
@@ -689,7 +598,7 @@ impl AgentSession {
                     let _ = event_tx
                         .send(AgentEvent::TokenWarning {
                             used_tokens: used,
-                            total_budget: 200_000,
+                            total_budget: self.context_manager.total_budget(),
                             percent: 95,
                             action: "forcing_compression".to_string(),
                         })
@@ -744,6 +653,7 @@ impl AgentSession {
                 consecutive_max_tokens = 0;
                 let mut tool_results: Vec<ContentBlock> = Vec::new();
                 let mut ask_user_triggered = false;
+                let mut pending_loop_nudge: Option<String> = None;
 
                 for block in &assistant_content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
@@ -810,108 +720,30 @@ impl AgentSession {
                                 break;
                             }
 
-                            // Inject nudge message after this tool result
+                            // 未达终止阈值：记录 nudge，稍后追加到 tool_results 消息末尾
+                            // （critical 级响应，强制换路）。不单独 push user 消息，
+                            // 以免插在 assistant(tool_use) 与 tool_results 之间破坏配对。
+                            pending_loop_nudge = Some(format!(
+                                "⚠️ Loop detected: {}. Vary your approach or use different tools.",
+                                pattern
+                            ));
                         }
 
-                        // ─── 权限检查 (FR-PERM-2/4/5/6) ───
-                        match self
-                            .gate_tool(name, input, id, &run_id, &turn_id, &event_tx, run_state)
-                            .await
-                        {
-                            ToolGate::Proceed => {}
-                            ToolGate::Denied(reason) => {
-                                tool_results.push(ContentBlock::ToolResult {
-                                    tool_use_id: id.clone(),
-                                    content: format!(
-                                        "Permission denied: {reason}. This action was not executed. \
-                                         If needed, the user can perform it manually."
-                                    ),
-                                    is_error: true,
-                                });
-                                continue;
-                            }
-                        }
-
-                        // 写工具：记录执行前文件是否存在，用于区分 add/update
-                        let pre_exists = if name == "write_file" || name == "str_replace" {
-                            input["path"]
-                                .as_str()
-                                .map(|p| std::path::Path::new(&self.resolve_path(p)).exists())
-                        } else {
-                            None
-                        };
-
-                        let input_str = serde_json::to_string(input).unwrap_or_default();
-                        debug!("Executing tool: name={name}, id={id}");
-                        let _ = event_tx
-                            .send(AgentEvent::ToolStart {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input_str,
-                            })
-                            .await;
-                        let tool_start = Instant::now();
-                        let output = match tokio::time::timeout(
-                            Duration::from_secs(TOOL_TIMEOUT_SECS),
-                            self.execute_tool(name, input.clone(), &event_tx, id),
-                        )
-                        .await
-                        {
-                            Ok(tool_output) => tool_output,
-                            Err(_) => {
-                                warn!("Tool {} timed out after {}s", name, TOOL_TIMEOUT_SECS);
-                                ToolOutput {
-                                    content: format!(
-                                        "Tool execution timed out after {}s",
-                                        TOOL_TIMEOUT_SECS
-                                    ),
-                                    is_error: true,
-                                }
-                            }
-                        };
-                        let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
-                        debug!("Tool result: id={id}, is_error={}", output.is_error);
-                        let _ = event_tx
-                            .send(AgentEvent::ToolResult {
-                                id: id.clone(),
-                                content: output.content.clone(),
-                                is_error: output.is_error,
-                            })
-                            .await;
-                        let _ = event_tx
-                            .send(AgentEvent::ToolMetrics {
-                                tool_name: name.clone(),
-                                duration_ms: tool_duration_ms,
-                                is_error: output.is_error,
-                            })
-                            .await;
-
-                        // ─── 文件变更事件 (FR-TOOL-6, FR-EVT-4) ───
-                        if !output.is_error {
-                            if let Some(change) = self.detect_file_change(name, input, pre_exists) {
-                                run_state.file_changes.push(change.clone());
-                                let _ = event_tx
-                                    .send(AgentEvent::FileChanged {
-                                        run_id: run_id.clone(),
-                                        turn_id: turn_id.clone(),
-                                        changes: vec![change],
-                                    })
-                                    .await;
-                            }
-                        }
-
-                        let content = truncate_tool_result_default(&output.content);
-                        // FR-ROBUST-4/5: 工具失败后结构化分类，附加语义提示辅助模型恢复
-                        let content = if output.is_error {
-                            classify_tool_error(&content, name)
-                        } else {
-                            content
-                        };
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content,
-                            is_error: output.is_error,
-                        });
+                        tool_results.push(
+                            tool_runtime
+                                .execute_tool_call(
+                                    ToolCallContext {
+                                        id: id.as_str(),
+                                        name: name.as_str(),
+                                        input,
+                                        run_id: &run_id,
+                                        turn_id: &turn_id,
+                                    },
+                                    &event_tx,
+                                    run_state,
+                                )
+                                .await,
+                        );
                     }
                 }
 
@@ -919,6 +751,11 @@ impl AgentSession {
                 // 返回 paused，由 run() 发出终态 TurnComplete 关闭 SSE 流。
                 if ask_user_triggered {
                     return Ok(true);
+                }
+
+                // 追加 loop nudge 到 tool_results 同一消息（critical 级响应，强制换路）
+                if let Some(nudge) = pending_loop_nudge {
+                    tool_results.push(ContentBlock::Text { text: nudge });
                 }
 
                 self.messages.push(Message {
@@ -986,7 +823,7 @@ impl AgentSession {
                     && revision_count < MAX_REVISIONS
                     && !cancel.is_cancelled()
                 {
-                    let summary = self.build_run_summary(run_state);
+                    let summary = runtime_build_run_summary_from(run_state);
                     let (verdict, issues) = self
                         .run_verify_phase(&run_id, &event_tx, cancel.clone(), &summary)
                         .await;
@@ -1032,244 +869,4 @@ impl AgentSession {
 
         Ok(false)
     }
-
-    /// 解析相对路径为绝对路径（与工具内逻辑保持一致）
-    pub(crate) fn resolve_path_for(path: &str, work_dir: &str) -> String {
-        if path.starts_with('/') || work_dir.is_empty() {
-            path.to_string()
-        } else {
-            format!("{}/{}", work_dir.trim_end_matches('/'), path)
-        }
-    }
-
-    fn resolve_path(&self, path: &str) -> String {
-        Self::resolve_path_for(path, &self.work_dir)
-    }
-
-    /// 查询工具声明的风险等级
-    pub(crate) fn tool_risk_for(tools: &[Arc<dyn Tool>], name: &str) -> ToolRisk {
-        tools
-            .iter()
-            .find(|t| t.name() == name)
-            .map(|t| t.risk_level())
-            .unwrap_or(ToolRisk::Safe)
-    }
-
-    /// 根据工具类型与执行前状态推断文件变更（FR-TOOL-6）
-    pub(crate) fn detect_file_change_for(
-        name: &str,
-        input: &serde_json::Value,
-        pre_exists: Option<bool>,
-    ) -> Option<FileChange> {
-        let path = input["path"].as_str()?.to_string();
-        match name {
-            "write_file" => {
-                let kind = if pre_exists == Some(true) {
-                    FileChangeKind::Update
-                } else {
-                    FileChangeKind::Add
-                };
-                Some(FileChange { path, kind })
-            }
-            "str_replace" => Some(FileChange {
-                path,
-                kind: FileChangeKind::Update,
-            }),
-            _ => None,
-        }
-    }
-
-    /// 根据工具类型与执行前状态推断文件变更（FR-TOOL-6）
-    fn detect_file_change(
-        &self,
-        name: &str,
-        input: &serde_json::Value,
-        pre_exists: Option<bool>,
-    ) -> Option<FileChange> {
-        Self::detect_file_change_for(name, input, pre_exists)
-    }
-
-    /// 工具执行前的权限门控（FR-PERM-2/5/6）。
-    /// - Allow → Proceed
-    /// - Deny → 发 permission.denied，记录 denial，返回 Denied
-    /// - NeedApproval → 非交互场景优雅降级为 Denied，发 permission.requested + permission.denied
-    pub(crate) async fn gate_tool_with(
-        permission: &PermissionGuard,
-        tools: &[Arc<dyn Tool>],
-        work_dir: &str,
-        name: &str,
-        input: &serde_json::Value,
-        tool_use_id: &str,
-        run_id: &str,
-        turn_id: &str,
-        event_tx: &mpsc::Sender<AgentEvent>,
-        run_state: &mut RunState,
-    ) -> ToolGate {
-        let risk = Self::tool_risk_for(tools, name);
-        let decision = permission.check(name, input, risk, work_dir);
-        match decision {
-            PermissionDecision::Allow => ToolGate::Proceed,
-            PermissionDecision::Deny(reason) => {
-                run_state
-                    .permission_denials
-                    .push(format!("{name}: {reason}"));
-                let _ = event_tx
-                    .send(AgentEvent::PermissionDenied {
-                        run_id: run_id.to_string(),
-                        turn_id: turn_id.to_string(),
-                        tool: name.to_string(),
-                        tool_use_id: tool_use_id.to_string(),
-                        reason: reason.clone(),
-                    })
-                    .await;
-                ToolGate::Denied(reason)
-            }
-            PermissionDecision::NeedApproval(reason) => {
-                // 先广播审批请求（前端可据此展示）
-                let _ = event_tx
-                    .send(AgentEvent::PermissionRequested {
-                        run_id: run_id.to_string(),
-                        turn_id: turn_id.to_string(),
-                        tool: name.to_string(),
-                        tool_use_id: tool_use_id.to_string(),
-                        risk: format!("{:?}", risk),
-                        reason: reason.clone(),
-                    })
-                    .await;
-                // 非交互场景优雅降级：拒绝执行但不阻塞（FR-PERM-5）
-                let denial = format!("requires approval: {reason}");
-                run_state
-                    .permission_denials
-                    .push(format!("{name}: {denial}"));
-                let _ = event_tx
-                    .send(AgentEvent::PermissionDenied {
-                        run_id: run_id.to_string(),
-                        turn_id: turn_id.to_string(),
-                        tool: name.to_string(),
-                        tool_use_id: tool_use_id.to_string(),
-                        reason: denial.clone(),
-                    })
-                    .await;
-                ToolGate::Denied(denial)
-            }
-        }
-    }
-
-    /// 工具执行前的权限门控（FR-PERM-2/5/6）。
-    /// - Allow → Proceed
-    /// - Deny → 发 permission.denied，记录 denial，返回 Denied
-    /// - NeedApproval → 非交互场景优雅降级为 Denied，发 permission.requested + permission.denied
-    async fn gate_tool(
-        &self,
-        name: &str,
-        input: &serde_json::Value,
-        tool_use_id: &str,
-        run_id: &str,
-        turn_id: &str,
-        event_tx: &mpsc::Sender<AgentEvent>,
-        run_state: &mut RunState,
-    ) -> ToolGate {
-        Self::gate_tool_with(
-            &self.permission,
-            &self.tools,
-            &self.work_dir,
-            name,
-            input,
-            tool_use_id,
-            run_id,
-            turn_id,
-            event_tx,
-            run_state,
-        )
-        .await
-    }
-
-    async fn execute_tool(
-        &self,
-        name: &str,
-        input: serde_json::Value,
-        event_tx: &mpsc::Sender<AgentEvent>,
-        tool_use_id: &str,
-    ) -> ToolOutput {
-        for tool in &self.tools {
-            if tool.name() == name {
-                if tool.supports_streaming() {
-                    // Streaming execution: forward chunks as ToolOutputDelta events
-                    let (stream_tx, mut stream_rx) = mpsc::channel::<String>(64);
-                    let event_tx_clone = event_tx.clone();
-                    let id_clone = tool_use_id.to_string();
-
-                    let forward_handle = tokio::spawn(async move {
-                        while let Some(chunk) = stream_rx.recv().await {
-                            let _ = event_tx_clone
-                                .send(AgentEvent::ToolOutputDelta {
-                                    id: id_clone.clone(),
-                                    chunk,
-                                })
-                                .await;
-                        }
-                    });
-
-                    let result = match tool.execute_streaming(input, stream_tx).await {
-                        Ok(output) => output,
-                        Err(e) => ToolOutput {
-                            content: format!("Tool execution error: {e}"),
-                            is_error: true,
-                        },
-                    };
-
-                    // Wait for forwarding to complete
-                    let _ = forward_handle.await;
-                    return result;
-                } else {
-                    return match tool.execute(input).await {
-                        Ok(output) => output,
-                        Err(e) => ToolOutput {
-                            content: format!("Tool execution error: {e}"),
-                            is_error: true,
-                        },
-                    };
-                }
-            }
-        }
-        ToolOutput {
-            content: format!("Unknown tool: {name}"),
-            is_error: true,
-        }
-    }
-}
-
-/// FR-ROBUST-4/5: 工具失败后错误分类，附加语义提示帮助模型选择恢复策略。
-pub(crate) fn classify_tool_error(content: &str, tool_name: &str) -> String {
-    let lower = content.to_lowercase();
-    let category = if lower.contains("command not found")
-        || lower.contains("no such file or directory") && tool_name == "shell"
-    {
-        "[error_type: command_not_found] The command is not installed. Try an alternative command or check if it needs to be installed first."
-    } else if lower.contains("permission denied")
-        || lower.contains("access denied")
-        || lower.contains("operation not permitted")
-    {
-        "[error_type: permission_denied] Insufficient permissions. This action requires elevated privileges or is outside the allowed workspace."
-    } else if lower.contains("network")
-        || lower.contains("dns")
-        || lower.contains("connection refused")
-        || lower.contains("could not resolve")
-    {
-        "[error_type: network_failure] Network or DNS failure. The resource may be unreachable; try a local fallback if available."
-    } else if lower.contains("not found")
-        || lower.contains("does not exist")
-        || lower.contains("no such file")
-    {
-        "[error_type: not_found] File or resource not found. Verify the path or create the missing resource first."
-    } else if lower.contains("timed out") || lower.contains("timeout") {
-        "[error_type: timeout] Operation timed out. Consider splitting the task or using a faster alternative."
-    } else if lower.contains("test")
-        && (lower.contains("failed") || lower.contains("error") || lower.contains("assert"))
-    {
-        "[error_type: test_failure] Tests failed. Read the failure output carefully and make targeted fixes."
-    } else {
-        "[error_type: tool_error]"
-    };
-    format!("{category}\n{content}")
 }

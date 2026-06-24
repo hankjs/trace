@@ -51,8 +51,18 @@ impl LoopDetector {
     }
 
     /// Check if the loop count has reached the termination threshold.
+    /// 同时检查窗口内独特调用比率，防止单次不同调用绕过连续计数（P2）。
     pub fn should_terminate(&self, threshold: usize) -> bool {
-        self.consecutive_loops >= threshold
+        if self.consecutive_loops >= threshold {
+            return true;
+        }
+        // 窗口足够大时，若独特调用比率 <30% 也触发终止
+        if self.window.len() >= 4 {
+            let unique_count = self.window.iter().collect::<std::collections::HashSet<_>>().len();
+            (unique_count as f64 / self.window.len() as f64) < 0.3
+        } else {
+            false
+        }
     }
 
     /// Get a string representation of the current detected loop pattern

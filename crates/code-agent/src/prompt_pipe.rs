@@ -188,8 +188,9 @@ pub async fn discover_project_context(work_dir: &str) -> Vec<PromptSegment> {
     for (filename, label) in &context_files {
         let path = format!("{}/{}", work_dir.trim_end_matches('/'), filename);
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            let truncated = if content.len() > max_chars {
-                format!("{}...\n[truncated at {} chars]", &content[..max_chars], max_chars)
+            let truncated = if content.chars().count() > max_chars {
+                let end = content.char_indices().nth(max_chars).map_or(content.len(), |(i, _)| i);
+                format!("{}...\n[truncated at {} chars]", &content[..end], max_chars)
             } else {
                 content
             };

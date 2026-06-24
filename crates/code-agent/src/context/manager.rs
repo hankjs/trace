@@ -107,6 +107,11 @@ impl ContextManager {
         self.actual_input_tokens = None;
     }
 
+    /// 总预算（用于事件上报，避免硬编码 200_000）
+    pub fn total_budget(&self) -> usize {
+        self.total_budget
+    }
+
     /// Check budget status based on current token usage.
     /// 优先使用 provider 报告的实际 token 数，否则使用估算值。
     pub fn check_budget(&self, messages: &[Message]) -> BudgetStatus {

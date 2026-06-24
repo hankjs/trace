@@ -5,7 +5,10 @@ use crate::agent::LoopDetector;
 use crate::context::summary::{estimate_tokens, truncate_tool_result_default};
 use crate::context::{BudgetStatus, ContextManager};
 use crate::retry::stream_with_retry;
-use crate::session::{classify_tool_error, now_ts, RunState, ToolGate};
+use crate::runtime::{
+    build_run_summary_from, classify_tool_error, now_ts, RunState, ToolCallContext, ToolGate,
+    ToolRuntime,
+};
 use crate::AgentEvent;
 use anyhow::Result;
 use code_tools::{PermissionGuard, Tool, ToolOutput, ToolRisk};
@@ -24,6 +27,9 @@ const ORCHESTRATOR_MAX_ITERATIONS: usize = 50;
 const DELEGATE_TASK_TOOL: &str = "delegate_task";
 const LLM_STREAM_TIMEOUT_SECS: u64 = 120;
 const LOOP_TERMINATE_COUNT: usize = 3;
+const MAX_REVISIONS: usize = 2;
+/// LlmRequest 事件中 system prompt 最大字符数，防止 SSE 流量过大
+const LLM_REQUEST_SYSTEM_PREVIEW_CHARS: usize = 500;
 
 #[derive(Clone)]
 pub(crate) struct OrchestratorRuntime {
@@ -45,6 +51,10 @@ pub struct OrchestratorAgent {
     loop_detector: LoopDetector,
     messages: Vec<Message>,
     consecutive_max_tokens: u32,
+    /// 当前 run 已进行的验证修订轮数（FR-VERIFY-1）
+    verify_revision_count: usize,
+    /// FR-TOOL-7: 延迟加载的工具名集合 — 初始只注册 stub，首次调用时注入完整 schema
+    deferred_tool_names: std::collections::HashSet<String>,
 }
 
 impl OrchestratorAgent {
@@ -110,6 +120,8 @@ impl OrchestratorAgent {
             loop_detector: LoopDetector::new(),
             messages: Vec::new(),
             consecutive_max_tokens: 0,
+            verify_revision_count: 0,
+            deferred_tool_names: std::collections::HashSet::new(),
         }
     }
 
@@ -119,6 +131,28 @@ impl OrchestratorAgent {
 
     pub fn set_messages(&mut self, messages: Vec<Message>) {
         self.messages = messages;
+    }
+
+    /// FR-TOOL-7: 将指定工具标记为延迟加载。初始 tool_definitions 中只有 stub
+    /// （name+description，空 schema），首次被 LLM 调用时动态注入完整 schema。
+    pub fn set_deferred_tools(&mut self, names: std::collections::HashSet<String>) {
+        for def in &mut self.tool_definitions {
+            if names.contains(&def.name) {
+                def.input_schema =
+                    serde_json::json!({ "type": "object", "properties": {}, "required": [] });
+            }
+        }
+        self.deferred_tool_names = names;
+    }
+
+    /// LlmRequest 事件中截断 system prompt，防止 SSE 流量过大
+    fn preview_system(system: &Option<String>) -> Option<String> {
+        system.as_deref().map(|s| {
+            match s.char_indices().nth(LLM_REQUEST_SYSTEM_PREVIEW_CHARS) {
+                Some((i, _)) => format!("{}...", &s[..i]),
+                None => s.to_string(),
+            }
+        })
     }
 
     /// Run the orchestrator loop with Think/Act/Observe phases.
@@ -188,7 +222,7 @@ impl OrchestratorAgent {
                     let _ = event_tx
                         .send(AgentEvent::TokenWarning {
                             used_tokens: used,
-                            total_budget: 200_000,
+                            total_budget: self.context_manager.total_budget(),
                             percent: 95,
                             action: "forcing_compression".to_string(),
                         })
@@ -198,6 +232,7 @@ impl OrchestratorAgent {
                         .compress_async(&mut self.messages)
                         .await
                     {
+                        self.context_manager.reset_actual_tokens(); // FR-BUDGET-6: 防止旧值误判
                         let after = estimate_tokens(&self.messages);
                         let _ = event_tx
                             .send(AgentEvent::CompressionTriggered {
@@ -214,7 +249,7 @@ impl OrchestratorAgent {
                     let _ = event_tx
                         .send(AgentEvent::TokenWarning {
                             used_tokens: used,
-                            total_budget: 200_000,
+                            total_budget: self.context_manager.total_budget(),
                             percent: 80,
                             action: "compress_if_needed".to_string(),
                         })
@@ -326,7 +361,7 @@ impl OrchestratorAgent {
         let _ = event_tx
             .send(AgentEvent::LlmRequest {
                 model: req.model.clone(),
-                system: req.system.clone(),
+                system: Self::preview_system(&req.system),
                 tools: req.tools.iter().map(|t| t.name.clone()).collect(),
                 max_tokens: req.max_tokens,
                 message_count: req.messages.len(),
@@ -442,7 +477,7 @@ impl OrchestratorAgent {
         let _ = event_tx
             .send(AgentEvent::LlmRequest {
                 model: req.model.clone(),
-                system: req.system.clone(),
+                system: Self::preview_system(&req.system),
                 tools: req.tools.iter().map(|t| t.name.clone()).collect(),
                 max_tokens: req.max_tokens,
                 message_count: req.messages.len(),
@@ -601,7 +636,7 @@ impl OrchestratorAgent {
                     .collect();
                 let verifier =
                     VerifierAgent::new(self.provider.clone(), readonly_tools, self.model.clone());
-                let summary = crate::session::AgentSession::build_run_summary_from(run_state);
+                let summary = build_run_summary_from(run_state);
                 let result = verifier
                     .verify(
                         &runtime.original_request,
@@ -617,20 +652,51 @@ impl OrchestratorAgent {
                             issues: vec![format!("Verification failed: {e}")],
                         }
                     });
-                if result.verdict != crate::agent::Verdict::Approved {
-                    for issue in &result.issues {
-                        run_state
-                            .verification_issues
-                            .push(format!("verification {:?}: {issue}", result.verdict));
-                    }
-                }
                 let _ = event_tx
                     .send(AgentEvent::VerificationCompleted {
                         run_id: runtime.run_id.clone(),
-                        verdict: result.verdict,
-                        issues: result.issues,
+                        verdict: result.verdict.clone(),
+                        issues: result.issues.clone(),
                     })
                     .await;
+                match result.verdict {
+                    crate::agent::Verdict::Approved => {
+                        self.verify_revision_count = 0;
+                    }
+                    crate::agent::Verdict::NeedsRevision
+                        if self.verify_revision_count < MAX_REVISIONS =>
+                    {
+                        // 注入修订请求，返回 Continue 让外层循环重新执行（FR-VERIFY-1/2）
+                        self.verify_revision_count += 1;
+                        let issue_text = result.issues.join("\n");
+                        self.messages.push(Message {
+                            role: Role::User,
+                            content: vec![ContentBlock::Text {
+                                text: format!(
+                                    "Verification issues found (revision {}/{MAX_REVISIONS}):\n{issue_text}\nPlease fix these issues.",
+                                    self.verify_revision_count
+                                ),
+                            }],
+                        });
+                        let _ = event_tx
+                            .send(AgentEvent::TurnCompleted {
+                                run_id: runtime.run_id.clone(),
+                                turn_id,
+                                timestamp: now_ts(),
+                            })
+                            .await;
+                        return Ok(ActResult::Continue);
+                    }
+                    _ => {
+                        // Rejected 或已达最大修订轮数
+                        for issue in &result.issues {
+                            run_state
+                                .verification_issues
+                                .push(format!("verification {:?}: {issue}", result.verdict));
+                        }
+                        self.verify_revision_count = 0;
+                    }
+                }
             }
             let _ = event_tx
                 .send(AgentEvent::TurnCompleted {
@@ -657,6 +723,22 @@ impl OrchestratorAgent {
                     delegate_tasks.push((id.as_str(), input));
                 } else {
                     regular_tools.push((id.as_str(), name.as_str(), input));
+                }
+            }
+        }
+
+        // FR-TOOL-7: 首次调用 deferred 工具时注入完整 schema（影响后续请求）
+        if !self.deferred_tool_names.is_empty() {
+            for (_, name, _) in &regular_tools {
+                if self.deferred_tool_names.remove(*name) {
+                    if let Some(tool) = self.tools.iter().find(|t| t.name() == *name) {
+                        let schema = tool.input_schema();
+                        if let Some(def) =
+                            self.tool_definitions.iter_mut().find(|d| d.name == *name)
+                        {
+                            def.input_schema = schema;
+                        }
+                    }
                 }
             }
         }
@@ -803,32 +885,9 @@ impl OrchestratorAgent {
                 })
             });
 
-            if has_write_workers {
-                for (id, task) in tasks_parsed {
-                    let reason = format!(
-                        "delegate_task with write tools is disabled until worker permissions and file-change tracking are wired; affected_paths={:?}",
-                        task.affected_paths
-                    );
-                    run_state
-                        .permission_denials
-                        .push(format!("delegate_task: {reason}"));
-                    let _ = event_tx
-                        .send(AgentEvent::PermissionDenied {
-                            run_id: runtime.run_id.clone(),
-                            turn_id: turn_id.clone(),
-                            tool: DELEGATE_TASK_TOOL.to_string(),
-                            tool_use_id: id.clone(),
-                            reason: reason.clone(),
-                        })
-                        .await;
-                    worker_success = false;
-                    tool_results.push(ContentBlock::ToolResult {
-                        tool_use_id: id,
-                        content: format!("Permission denied: {reason}"),
-                        is_error: true,
-                    });
-                }
-            } else if !has_path_conflict && tasks_parsed.len() > 1 {
+            // 并发条件：无写工具、无路径冲突、且多任务。写工具或路径冲突一律串行，
+            // 避免并行写竞争（FR-CTX-8）。Worker 经 ToolRuntime 受同一权限边界约束（FR-PERM-6）。
+            if !has_write_workers && !has_path_conflict && tasks_parsed.len() > 1 {
                 // Parallel: read-only tasks with no path conflicts
                 let futures: Vec<_> = tasks_parsed
                     .into_iter()
@@ -843,6 +902,8 @@ impl OrchestratorAgent {
                             self.provider.clone(),
                             worker_tools,
                             self.model.clone(),
+                            runtime.permission.clone(),
+                            runtime.work_dir.clone(),
                         );
                         let event_tx2 = event_tx.clone();
                         let cancel2 = cancel.clone();
@@ -863,6 +924,11 @@ impl OrchestratorAgent {
                 for (id, res) in results {
                     match res {
                         Ok(result) => {
+                            // 回填子任务的文件变更与权限拒绝到父 run_state（FR-PERM-6）
+                            run_state.file_changes.extend(result.file_changes.clone());
+                            run_state
+                                .permission_denials
+                                .extend(result.permission_denials.clone());
                             let _ = event_tx
                                 .send(AgentEvent::WorkerCompleted {
                                     task_id: result.task_id.clone(),
@@ -893,7 +959,7 @@ impl OrchestratorAgent {
                     }
                 }
             } else {
-                // Sequential: read-only path conflicts or single worker
+                // Sequential: write workers, path conflicts, or single worker
                 for (id, task) in tasks_parsed {
                     if cancel.is_cancelled() {
                         break;
@@ -904,8 +970,13 @@ impl OrchestratorAgent {
                         .filter(|t| task.tools_allowed.contains(&t.name().to_string()))
                         .cloned()
                         .collect();
-                    let worker =
-                        WorkerAgent::new(self.provider.clone(), worker_tools, self.model.clone());
+                    let worker = WorkerAgent::new(
+                        self.provider.clone(),
+                        worker_tools,
+                        self.model.clone(),
+                        runtime.permission.clone(),
+                        runtime.work_dir.clone(),
+                    );
                     let _ = event_tx
                         .send(AgentEvent::WorkerSpawned {
                             task_id: task.id.clone(),
@@ -917,6 +988,11 @@ impl OrchestratorAgent {
                         .await
                     {
                         Ok(result) => {
+                            // 回填子任务的文件变更与权限拒绝到父 run_state（FR-PERM-6）
+                            run_state.file_changes.extend(result.file_changes.clone());
+                            run_state
+                                .permission_denials
+                                .extend(result.permission_denials.clone());
                             let _ = event_tx
                                 .send(AgentEvent::WorkerCompleted {
                                     task_id: result.task_id.clone(),
@@ -974,6 +1050,7 @@ impl OrchestratorAgent {
                     .compress_async(&mut self.messages)
                     .await
                 {
+                    self.context_manager.reset_actual_tokens(); // FR-BUDGET-6: 防止旧值误判
                     let after = estimate_tokens(&self.messages);
                     let _ = event_tx
                         .send(AgentEvent::CompressionTriggered {
@@ -1004,58 +1081,6 @@ impl OrchestratorAgent {
         }
     }
 
-    async fn execute_tool(
-        &self,
-        name: &str,
-        input: serde_json::Value,
-        event_tx: &mpsc::Sender<AgentEvent>,
-        tool_use_id: &str,
-    ) -> ToolOutput {
-        for tool in &self.tools {
-            if tool.name() == name {
-                if tool.supports_streaming() {
-                    let (stream_tx, mut stream_rx) = mpsc::channel::<String>(64);
-                    let event_tx_clone = event_tx.clone();
-                    let id_clone = tool_use_id.to_string();
-
-                    let forward_handle = tokio::spawn(async move {
-                        while let Some(chunk) = stream_rx.recv().await {
-                            let _ = event_tx_clone
-                                .send(AgentEvent::ToolOutputDelta {
-                                    id: id_clone.clone(),
-                                    chunk,
-                                })
-                                .await;
-                        }
-                    });
-
-                    let result = match tool.execute_streaming(input, stream_tx).await {
-                        Ok(output) => output,
-                        Err(e) => ToolOutput {
-                            content: format!("Tool execution error: {e}"),
-                            is_error: true,
-                        },
-                    };
-
-                    let _ = forward_handle.await;
-                    return result;
-                } else {
-                    return match tool.execute(input).await {
-                        Ok(output) => output,
-                        Err(e) => ToolOutput {
-                            content: format!("Tool execution error: {e}"),
-                            is_error: true,
-                        },
-                    };
-                }
-            }
-        }
-        ToolOutput {
-            content: format!("Unknown tool: {name}"),
-            is_error: true,
-        }
-    }
-
     /// Execute a single tool with per-tool timeout and event emission.
     async fn execute_single_tool(
         &self,
@@ -1067,114 +1092,24 @@ impl OrchestratorAgent {
         runtime: &OrchestratorRuntime,
         turn_id: &str,
     ) -> ContentBlock {
-        match crate::session::AgentSession::gate_tool_with(
-            &runtime.permission,
-            &self.tools,
-            &runtime.work_dir,
-            name,
-            input,
-            id,
-            &runtime.run_id,
-            turn_id,
-            event_tx,
-            run_state,
-        )
-        .await
-        {
-            ToolGate::Proceed => {}
-            ToolGate::Denied(reason) => {
-                return ContentBlock::ToolResult {
-                    tool_use_id: id.to_string(),
-                    content: format!(
-                        "Permission denied: {reason}. This action was not executed. If needed, the user can perform it manually."
-                    ),
-                    is_error: true,
-                };
-            }
-        }
-
-        let pre_exists = if name == "write_file" || name == "str_replace" {
-            input["path"].as_str().map(|p| {
-                std::path::Path::new(&crate::session::AgentSession::resolve_path_for(
-                    p,
-                    &runtime.work_dir,
-                ))
-                .exists()
-            })
-        } else {
-            None
-        };
-
-        let input_str = serde_json::to_string(input).unwrap_or_default();
-        let _ = event_tx
-            .send(AgentEvent::ToolStart {
-                id: id.to_string(),
-                name: name.to_string(),
-                input: input_str,
-            })
-            .await;
-
-        let timeout = self.get_tool_timeout(name);
-        let tool_start = Instant::now();
-        let output = match tokio::time::timeout(
-            timeout,
-            self.execute_tool(name, input.clone(), event_tx, id),
-        )
-        .await
-        {
-            Ok(tool_output) => tool_output,
-            Err(_) => {
-                warn!("Tool {} timed out after {:?}", name, timeout);
-                ToolOutput {
-                    content: format!("Tool execution timed out after {}s", timeout.as_secs()),
-                    is_error: true,
-                }
-            }
-        };
-
-        let _ = event_tx
-            .send(AgentEvent::ToolResult {
-                id: id.to_string(),
-                content: output.content.clone(),
-                is_error: output.is_error,
-            })
-            .await;
-
-        let _ = event_tx
-            .send(AgentEvent::ToolMetrics {
-                tool_name: name.to_string(),
-                duration_ms: tool_start.elapsed().as_millis() as u64,
-                is_error: output.is_error,
-            })
-            .await;
-
-        if !output.is_error {
-            if let Some(change) =
-                crate::session::AgentSession::detect_file_change_for(name, input, pre_exists)
-            {
-                run_state.file_changes.push(change.clone());
-                let _ = event_tx
-                    .send(AgentEvent::FileChanged {
-                        run_id: runtime.run_id.clone(),
-                        turn_id: turn_id.to_string(),
-                        changes: vec![change],
-                    })
-                    .await;
-            }
-        }
-
-        let content = truncate_tool_result_default(&output.content);
-        let content = if output.is_error {
-            classify_tool_error(&content, name)
-        } else {
-            content
-        };
-
-        ContentBlock::ToolResult {
-            tool_use_id: id.to_string(),
-            content,
-            is_error: output.is_error,
-        }
+        let tool_runtime = ToolRuntime::new(
+            runtime.permission.clone(),
+            self.tools.clone(),
+            runtime.work_dir.clone(),
+        );
+        tool_runtime
+            .execute_tool_call(
+                ToolCallContext {
+                    id,
+                    name,
+                    input,
+                    run_id: &runtime.run_id,
+                    turn_id,
+                },
+                event_tx,
+                run_state,
+            )
+            .await
     }
 
     /// Execute multiple read-only tools in parallel.
@@ -1189,22 +1124,27 @@ impl OrchestratorAgent {
     ) -> Vec<ContentBlock> {
         use futures::future::join_all;
 
+        let tool_runtime = ToolRuntime::new(
+            runtime.permission.clone(),
+            self.tools.clone(),
+            runtime.work_dir.clone(),
+        );
         let mut allowed = Vec::new();
         let mut content_blocks = Vec::new();
         for (id, name, input) in tools {
-            match crate::session::AgentSession::gate_tool_with(
-                &runtime.permission,
-                &self.tools,
-                &runtime.work_dir,
-                name,
-                input,
-                id,
-                &runtime.run_id,
-                turn_id,
-                event_tx,
-                run_state,
-            )
-            .await
+            match tool_runtime
+                .gate_tool(
+                    &ToolCallContext {
+                        id: *id,
+                        name: *name,
+                        input: *input,
+                        run_id: &runtime.run_id,
+                        turn_id,
+                    },
+                    event_tx,
+                    run_state,
+                )
+                .await
             {
                 ToolGate::Proceed => allowed.push((*id, *name, *input)),
                 ToolGate::Denied(reason) => {
@@ -1238,13 +1178,14 @@ impl OrchestratorAgent {
                 let id = id.to_string();
                 let name = name.to_string();
                 let input = (*input).clone();
-                let timeout = self.get_tool_timeout(&name);
+                let tool_runtime = tool_runtime.clone();
+                let timeout = tool_runtime.timeout_for(&name);
                 let event_tx = event_tx.clone();
                 async move {
                     let start = Instant::now();
                     let output = match tokio::time::timeout(
                         timeout,
-                        self.execute_tool(&name, input, &event_tx, &id),
+                        tool_runtime.execute_tool(&name, input, &event_tx, &id),
                     )
                     .await
                     {
@@ -1293,16 +1234,6 @@ impl OrchestratorAgent {
         }
 
         content_blocks
-    }
-
-    /// Get the timeout for a specific tool based on its trait implementation.
-    fn get_tool_timeout(&self, name: &str) -> Duration {
-        for tool in &self.tools {
-            if tool.name() == name {
-                return tool.timeout();
-            }
-        }
-        Duration::from_secs(30)
     }
 }
 

@@ -5,35 +5,34 @@ use tracing::{debug, warn};
 /// 工具结果截断的默认上限（字符数）
 const TOOL_RESULT_MAX_CHARS: usize = 40_000;
 
+/// UTF-8 安全截断：按字符边界截断到最多 `max_chars` 个字符
+fn truncate_chars(s: &str, max_chars: usize) -> &str {
+    match s.char_indices().nth(max_chars) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
 /// 截断工具结果：保留 60% head + 40% tail，中间插入截断提示。
 /// 防止单次工具调用撑爆 context window。
+/// 全程以「字符数」为单位，避免字节/字符口径混用导致 CJK 内容提前截断。
 pub fn truncate_tool_result(content: &str, max_chars: usize) -> String {
-    if content.len() <= max_chars {
+    let total_chars = content.chars().count();
+    if total_chars <= max_chars {
         return content.to_string();
     }
-    let head_len = max_chars * 60 / 100;
-    let tail_len = max_chars * 40 / 100;
-    let original_len = content.len();
-    // 安全切分：在 char boundary 上截断
-    let head_end = content
-        .char_indices()
-        .take_while(|&(i, _)| i <= head_len)
-        .last()
-        .map(|(i, c)| i + c.len_utf8())
-        .unwrap_or(head_len.min(content.len()));
-    let tail_start = content
-        .char_indices()
-        .rev()
-        .take_while(|&(i, _)| content.len() - i <= tail_len)
-        .last()
-        .map(|(i, _)| i)
-        .unwrap_or(content.len().saturating_sub(tail_len));
+    let head_chars = max_chars * 60 / 100;
+    let tail_chars = max_chars * 40 / 100;
+    let omitted = total_chars - head_chars - tail_chars;
+
+    let head: String = content.chars().take(head_chars).collect();
+    let tail: String = content
+        .chars()
+        .skip(total_chars - tail_chars)
+        .collect::<String>();
     format!(
         "{}\n\n...[truncated {} of {} chars]...\n\n{}",
-        &content[..head_end],
-        original_len - head_end - (content.len() - tail_start),
-        original_len,
-        &content[tail_start..]
+        head, omitted, total_chars, tail
     )
 }
 
@@ -113,8 +112,8 @@ pub fn summarize_messages(messages: &[Message]) -> String {
             match block {
                 hank_provider::ContentBlock::Text { text } => {
                     // Take first 200 chars of each text block
-                    let truncated = if text.len() > 200 {
-                        format!("{}...", &text[..200])
+                    let truncated = if text.chars().count() > 200 {
+                        format!("{}...", truncate_chars(text, 200))
                     } else {
                         text.clone()
                     };
@@ -128,8 +127,8 @@ pub fn summarize_messages(messages: &[Message]) -> String {
                 }
                 hank_provider::ContentBlock::ToolResult { content, is_error, .. } => {
                     let status = if *is_error { "error" } else { "ok" };
-                    let truncated = if content.len() > 100 {
-                        format!("{}...", &content[..100])
+                    let truncated = if content.chars().count() > 100 {
+                        format!("{}...", truncate_chars(content, 100))
                     } else {
                         content.clone()
                     };
@@ -157,13 +156,9 @@ pub fn microcompact(messages: &mut Vec<Message>, preserve_recent: usize) -> usiz
     for msg in messages.iter_mut().take(cutoff) {
         for block in &mut msg.content {
             if let ContentBlock::ToolResult { content, tool_use_id: _, is_error: _ } = block {
-                if content.len() > 80 {
+                if content.chars().count() > 80 {
                     let original_len = content.len();
-                    let first_80 = if content.len() >= 80 {
-                        content[..80].to_string()
-                    } else {
-                        content.clone()
-                    };
+                    let first_80 = truncate_chars(content, 80).to_string();
                     *content = format!("{}...[truncated from {} chars]", first_80, original_len);
                 }
             }
@@ -190,6 +185,8 @@ pub async fn summarize_with_llm(
          - The original user request/goal\n\
          - Key decisions made\n\
          - Files modified or created\n\
+         - Errors encountered and approaches that failed (do NOT omit failures — \
+           the agent must avoid repeating dead-ends)\n\
          - Current progress and state\n\
          - What remains to be done\n\n\
          Keep the summary under 1000 words. Be factual and specific.\n\n\

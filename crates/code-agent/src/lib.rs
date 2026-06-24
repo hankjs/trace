@@ -2,6 +2,7 @@ pub mod agent;
 pub mod context;
 pub mod prompt_pipe;
 pub mod retry;
+pub(crate) mod runtime;
 pub mod session;
 pub mod types;
 

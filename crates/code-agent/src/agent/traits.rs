@@ -60,6 +60,12 @@ pub struct TaskResult {
     pub summary: String,
     /// Structured artifacts (file changes, outputs)
     pub artifacts: Vec<Artifact>,
+    /// 子任务执行期间产生的文件变更（FR-PERM-6，回填父 run_state）
+    #[serde(default)]
+    pub file_changes: Vec<crate::types::FileChange>,
+    /// 子任务执行期间的权限拒绝（FR-PERM-6，回填父 run_state）
+    #[serde(default)]
+    pub permission_denials: Vec<String>,
 }
 
 /// Verdict from the Verifier

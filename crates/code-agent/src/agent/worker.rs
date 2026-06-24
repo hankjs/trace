@@ -1,14 +1,14 @@
 use crate::agent::{Artifact, DelegatedTask, LoopDetector, TaskResult, TaskStatus};
-use crate::context::summary::truncate_tool_result_default;
 use crate::context::{BudgetStatus, ContextManager};
 use crate::retry::stream_with_retry;
+use crate::runtime::{RunState, ToolCallContext, ToolRuntime};
 use crate::AgentEvent;
 use anyhow::Result;
 use hank_provider::{
     CompletionRequest, ContentBlock, LlmProvider, Message, Role, StopReason, StreamEvent,
     ToolDefinition,
 };
-use code_tools::{Tool, ToolOutput};
+use code_tools::{PermissionGuard, Tool};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -24,19 +24,26 @@ const WORKER_CONTEXT_BUDGET: usize = 100_000;
 const WORKER_COMPRESS_THRESHOLD: usize = 60_000;
 
 /// WorkerAgent executes a delegated task using a flat stream-tools loop.
+/// 工具执行经 ToolRuntime 统一门控（权限/sandbox/超时/文件变更追踪），
+/// 不再绕过 PermissionGuard（FR-PERM-6）。
 pub struct WorkerAgent {
     provider: Arc<dyn LlmProvider>,
-    tools: Vec<Arc<dyn Tool>>,
     model: String,
     tool_definitions: Vec<ToolDefinition>,
     context_manager: ContextManager,
+    /// 工具执行运行时（继承父 Agent 的权限与工作目录）
+    tool_runtime: ToolRuntime,
 }
 
 impl WorkerAgent {
+    /// 创建 Worker。permission/work_dir 由 Orchestrator 透传，确保子任务
+    /// 的工具调用与父 Agent 受同一权限边界约束。
     pub fn new(
         provider: Arc<dyn LlmProvider>,
         tools: Vec<Arc<dyn Tool>>,
         model: String,
+        permission: Arc<PermissionGuard>,
+        work_dir: impl Into<String>,
     ) -> Self {
         let tool_definitions = tools
             .iter()
@@ -52,12 +59,14 @@ impl WorkerAgent {
             provider.clone(),
             model.clone(),
         );
+        let work_dir = work_dir.into();
+        let tool_runtime = ToolRuntime::new(permission, tools.clone(), work_dir);
         Self {
             provider,
-            tools,
             model,
             tool_definitions,
             context_manager,
+            tool_runtime,
         }
     }
 
@@ -87,6 +96,11 @@ impl WorkerAgent {
         let mut final_text = String::new();
         let mut consecutive_max_tokens = 0u32;
         let mut loop_detector = LoopDetector::new();
+        // 本地 run_state：收集子任务的文件变更与权限拒绝，结束后回填父 run_state
+        let mut run_state = RunState {
+            run_id: task.id.clone(),
+            ..Default::default()
+        };
 
         for iteration in 0..WORKER_MAX_ITERATIONS {
             if cancel.is_cancelled() {
@@ -176,6 +190,8 @@ impl WorkerAgent {
                             status: TaskStatus::Failed,
                             summary: format!("Stream error: {e}"),
                             artifacts: vec![],
+                            file_changes: run_state.file_changes.clone(),
+                            permission_denials: run_state.permission_denials.clone(),
                         });
                     }
                 }
@@ -232,6 +248,8 @@ impl WorkerAgent {
                                 status: TaskStatus::Failed,
                                 summary: "Cancelled".to_string(),
                                 artifacts: vec![],
+                                file_changes: run_state.file_changes.clone(),
+                                permission_denials: run_state.permission_denials.clone(),
                             });
                         }
 
@@ -255,6 +273,8 @@ impl WorkerAgent {
                                     status: TaskStatus::Failed,
                                     summary: format!("Loop detected: {}. Task terminated.", pattern),
                                     artifacts,
+                                    file_changes: run_state.file_changes.clone(),
+                                    permission_denials: run_state.permission_denials.clone(),
                                 });
                             }
 
@@ -270,55 +290,34 @@ impl WorkerAgent {
                             });
                         }
 
-                        let input_str = serde_json::to_string(input).unwrap_or_default();
-                        let _ = event_tx
-                            .send(AgentEvent::ToolStart {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: input_str,
-                            })
+                        // 经 ToolRuntime 统一执行：权限门控 + sandbox + 超时 +
+                        // 文件变更追踪 + 截断 + 错误分类（FR-PERM-6）
+                        let result_block = self
+                            .tool_runtime
+                            .execute_tool_call(
+                                ToolCallContext {
+                                    id: id.as_str(),
+                                    name: name.as_str(),
+                                    input,
+                                    run_id: &task.id,
+                                    turn_id: &task.id,
+                                },
+                                &event_tx,
+                                &mut run_state,
+                            )
                             .await;
 
-                        let tool_timeout = self.get_tool_timeout(name);
-                        let output = match tokio::time::timeout(
-                            tool_timeout,
-                            self.execute_tool(name, input.clone(), &event_tx, id),
-                        )
-                        .await
-                        {
-                            Ok(tool_output) => tool_output,
-                            Err(_) => {
-                                warn!("Worker tool {} timed out after {:?} for task {}", name, tool_timeout, task.id);
-                                ToolOutput {
-                                    content: format!("Tool execution timed out after {}s", tool_timeout.as_secs()),
-                                    is_error: true,
-                                }
+                        // 收集成功工具输出为 artifact（供 orchestrator 汇总）
+                        if let ContentBlock::ToolResult { content, is_error, .. } = &result_block {
+                            if !*is_error {
+                                artifacts.push(Artifact {
+                                    kind: name.clone(),
+                                    description: format!("Output from {name}"),
+                                    content: content.clone(),
+                                });
                             }
-                        };
-
-                        let _ = event_tx
-                            .send(AgentEvent::ToolResult {
-                                id: id.clone(),
-                                content: output.content.clone(),
-                                is_error: output.is_error,
-                            })
-                            .await;
-
-                        // Collect artifacts from tool outputs
-                        if !output.is_error {
-                            artifacts.push(Artifact {
-                                kind: name.clone(),
-                                description: format!("Output from {name}"),
-                                content: output.content.clone(),
-                            });
                         }
-
-                        let content = truncate_tool_result_default(&output.content);
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: id.clone(),
-                            content,
-                            is_error: output.is_error,
-                        });
+                        tool_results.push(result_block);
                     }
                 }
                 messages.push(Message {
@@ -348,9 +347,14 @@ impl WorkerAgent {
             }
         }
 
-        // Truncate summary to reasonable length
-        let summary = if final_text.len() > 500 {
-            format!("{}...", &final_text[..500])
+        // Truncate summary to reasonable length（按字符边界，避免多字节字符切片 panic）
+        let summary = if final_text.chars().count() > 500 {
+            let end = final_text
+                .char_indices()
+                .nth(500)
+                .map(|(i, _)| i)
+                .unwrap_or(final_text.len());
+            format!("{}...", &final_text[..end])
         } else if final_text.is_empty() {
             "Task completed without output.".to_string()
         } else {
@@ -369,59 +373,8 @@ impl WorkerAgent {
             status,
             summary,
             artifacts,
+            file_changes: run_state.file_changes,
+            permission_denials: run_state.permission_denials,
         })
-    }
-
-    async fn execute_tool(&self, name: &str, input: serde_json::Value, event_tx: &mpsc::Sender<AgentEvent>, tool_use_id: &str) -> ToolOutput {
-        for tool in &self.tools {
-            if tool.name() == name {
-                if tool.supports_streaming() {
-                    let (stream_tx, mut stream_rx) = mpsc::channel::<String>(64);
-                    let event_tx_clone = event_tx.clone();
-                    let id_clone = tool_use_id.to_string();
-
-                    let forward_handle = tokio::spawn(async move {
-                        while let Some(chunk) = stream_rx.recv().await {
-                            let _ = event_tx_clone.send(AgentEvent::ToolOutputDelta {
-                                id: id_clone.clone(),
-                                chunk,
-                            }).await;
-                        }
-                    });
-
-                    let result = match tool.execute_streaming(input, stream_tx).await {
-                        Ok(output) => output,
-                        Err(e) => ToolOutput {
-                            content: format!("Tool execution error: {e}"),
-                            is_error: true,
-                        },
-                    };
-
-                    let _ = forward_handle.await;
-                    return result;
-                } else {
-                    return match tool.execute(input).await {
-                        Ok(output) => output,
-                        Err(e) => ToolOutput {
-                            content: format!("Tool execution error: {e}"),
-                            is_error: true,
-                        },
-                    };
-                }
-            }
-        }
-        ToolOutput {
-            content: format!("Unknown tool: {name}"),
-            is_error: true,
-        }
-    }
-
-    fn get_tool_timeout(&self, name: &str) -> Duration {
-        for tool in &self.tools {
-            if tool.name() == name {
-                return tool.timeout();
-            }
-        }
-        Duration::from_secs(30)
     }
 }

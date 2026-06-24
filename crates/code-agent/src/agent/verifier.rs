@@ -15,6 +15,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 const VERIFIER_MAX_ITERATIONS: usize = 5;
+/// 验证器工具调用超时（秒）
+const VERIFIER_TOOL_TIMEOUT_SECS: u64 = 30;
 
 /// VerifierAgent checks whether a task result satisfies the original intent.
 /// It only has access to read-only tools.
@@ -47,7 +49,7 @@ impl VerifierAgent {
         &self,
         original_request: &str,
         task_summary: &str,
-        event_tx: mpsc::Sender<AgentEvent>,
+        _event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Result<VerificationResult> {
         let system_prompt = "You are a verification agent. Your job is to check whether \
@@ -173,12 +175,8 @@ impl VerifierAgent {
         // Parse the verification result from final text
         let result = self.parse_verification(&final_text);
 
-        let _ = event_tx
-            .send(AgentEvent::Verification {
-                verdict: result.verdict.clone(),
-                issues: result.issues.clone(),
-            })
-            .await;
+        // 注意：调用方（session.rs / orchestrator.rs）负责发 VerificationCompleted 事件
+        // 此处不重复发送，避免客户端收到双重事件
 
         Ok(result)
     }
@@ -239,10 +237,21 @@ impl VerifierAgent {
     async fn execute_tool(&self, name: &str, input: serde_json::Value) -> ToolOutput {
         for tool in &self.tools {
             if tool.name() == name {
-                return match tool.execute(input).await {
-                    Ok(output) => output,
-                    Err(e) => ToolOutput {
+                return match tokio::time::timeout(
+                    std::time::Duration::from_secs(VERIFIER_TOOL_TIMEOUT_SECS),
+                    tool.execute(input),
+                )
+                .await
+                {
+                    Ok(Ok(output)) => output,
+                    Ok(Err(e)) => ToolOutput {
                         content: format!("Tool execution error: {e}"),
+                        is_error: true,
+                    },
+                    Err(_) => ToolOutput {
+                        content: format!(
+                            "Verifier tool timed out after {VERIFIER_TOOL_TIMEOUT_SECS}s"
+                        ),
                         is_error: true,
                     },
                 };

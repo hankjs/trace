@@ -19,8 +19,10 @@ fn is_retryable(error: &anyhow::Error) -> bool {
     if msg.contains("429") || msg.contains("rate limit") || msg.contains("too many requests") {
         return true;
     }
-    // HTTP 5xx Server Errors
-    if msg.contains("500") || msg.contains("502") || msg.contains("503") || msg.contains("504") {
+    // HTTP 5xx Server Errors — 精确匹配（防止 5000/50000 等误命中）
+    if has_http_status(&msg, "500") || has_http_status(&msg, "502")
+        || has_http_status(&msg, "503") || has_http_status(&msg, "504")
+    {
         return true;
     }
     if msg.contains("internal server error") || msg.contains("bad gateway")
@@ -38,6 +40,25 @@ fn is_retryable(error: &anyhow::Error) -> bool {
     false
 }
 
+/// 检查 msg 中是否包含独立的 HTTP 状态码（不被其他数字包围）
+fn has_http_status(msg: &str, code: &str) -> bool {
+    let code_b = code.as_bytes();
+    let msg_b = msg.as_bytes();
+    let n = code_b.len();
+    let mut i = 0;
+    while i + n <= msg_b.len() {
+        if &msg_b[i..i + n] == code_b {
+            let before_ok = i == 0 || !msg_b[i - 1].is_ascii_digit();
+            let after_ok = i + n >= msg_b.len() || !msg_b[i + n].is_ascii_digit();
+            if before_ok && after_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
 /// 计算退避延迟（指数退避 + 抖动）
 fn retry_delay(attempt: u32) -> std::time::Duration {
     let exponential = BASE_DELAY_MS * 2u64.pow(attempt);
@@ -45,6 +66,25 @@ fn retry_delay(attempt: u32) -> std::time::Duration {
     let jitter = (rand_jitter() * exponential as f64 * 0.5) as u64;
     let delay = (exponential + jitter).min(MAX_DELAY_MS);
     std::time::Duration::from_millis(delay)
+}
+
+/// 尽力从错误信息中解析 Retry-After 提示（秒）。
+/// 优先采用服务端建议的等待时间，避免指数退避过于激进（loop.md:69）。
+/// 上限 60s，防止异常大值阻塞循环。
+fn retry_after_secs(error: &anyhow::Error) -> Option<u64> {
+    let msg = error.to_string().to_lowercase();
+    for marker in ["retry-after: ", "retry-after ", "retry after "] {
+        if let Some(pos) = msg.find(marker) {
+            let rest = &msg[pos + marker.len()..];
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(secs) = digits.parse::<u64>() {
+                if secs > 0 {
+                    return Some(secs.min(60));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// 简单的伪随机抖动 (0.0..1.0)，避免引入 rand crate
@@ -70,7 +110,10 @@ pub async fn stream_with_retry(
             Ok(stream) => return Ok(stream),
             Err(e) => {
                 if attempt < MAX_RETRIES && is_retryable(&e) {
-                    let delay = retry_delay(attempt);
+                    // 优先采用服务端 Retry-After 提示，否则指数退避 + 抖动
+                    let delay = retry_after_secs(&e)
+                        .map(std::time::Duration::from_secs)
+                        .unwrap_or_else(|| retry_delay(attempt));
                     warn!(
                         "LLM stream attempt {}/{} failed (retryable): {}. Retrying in {:?}",
                         attempt + 1,

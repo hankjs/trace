@@ -1,5 +1,22 @@
 use serde_json::Value;
 
+/// 危险命令黑名单的单一来源（FR-PERM-3）。
+/// shell.rs 与 PermissionGuard 共用此列表，避免两份黑名单漂移。
+/// 采用子串匹配（大小写无关）；这是粗粒度防线，不替代 sandbox 与权限模式。
+pub const DEFAULT_BLOCKED_COMMANDS: &[&str] = &[
+    "rm -rf /",
+    "mkfs",
+    "dd if=/dev",
+    ":(){ :|:& };:",
+    "chmod -R 777 /",
+    "curl | sh",
+    "wget | sh",
+    "shutdown",
+    "reboot",
+    "halt",
+    "poweroff",
+];
+
 /// 工具风险等级
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolRisk {
@@ -81,15 +98,10 @@ impl Default for PermissionConfig {
         Self {
             mode: PermissionMode::default(),
             sandbox_paths: Vec::new(),
-            blocked_commands: vec![
-                "rm -rf /".to_string(),
-                "mkfs".to_string(),
-                "dd if=/dev".to_string(),
-                ":(){ :|:& };:".to_string(),
-                "chmod -R 777 /".to_string(),
-                "curl | sh".to_string(),
-                "wget | sh".to_string(),
-            ],
+            blocked_commands: DEFAULT_BLOCKED_COMMANDS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             auto_approve_tools: vec![
                 "read_file".to_string(),
                 "search".to_string(),
@@ -125,18 +137,38 @@ impl PermissionGuard {
         self.config.mode
     }
 
+    /// 词法归一化路径：解析 `.`/`..`/重复分隔符，不触碰文件系统。
+    /// 用于 sandbox 前缀校验，防止 `a/../../etc` 这类穿越绕过子串检测。
+    fn normalize_path(path: &str) -> String {
+        let is_absolute = path.starts_with('/');
+        let mut parts: Vec<&str> = Vec::new();
+        for component in path.split('/') {
+            match component {
+                "" | "." => {}
+                ".." => {
+                    // 弹出上一级；绝对路径不能越过根
+                    parts.pop();
+                }
+                c => parts.push(c),
+            }
+        }
+        if is_absolute {
+            format!("/{}", parts.join("/"))
+        } else {
+            parts.join("/")
+        }
+    }
+
     /// 检查写路径是否落在 sandbox 内（FR-PERM-4）。
     /// sandbox_paths 为空时回退到 work_dir 前缀。
+    /// 先词法归一化再做前缀匹配，并要求边界对齐（避免 /workspace-evil 命中 /workspace）。
     fn path_in_sandbox(&self, path: &str, work_dir: &str) -> bool {
-        let resolved = if path.starts_with('/') {
+        let joined = if path.starts_with('/') {
             path.to_string()
         } else {
             format!("{}/{}", work_dir.trim_end_matches('/'), path)
         };
-        // 拒绝路径穿越
-        if resolved.contains("/../") || resolved.ends_with("/..") {
-            return false;
-        }
+        let resolved = Self::normalize_path(&joined);
         let roots: Vec<String> = if self.config.sandbox_paths.is_empty() {
             if work_dir.is_empty() {
                 return true; // 未配置 work_dir 时不做路径限制
@@ -145,7 +177,16 @@ impl PermissionGuard {
         } else {
             self.config.sandbox_paths.clone()
         };
-        roots.iter().any(|prefix| resolved.starts_with(prefix.trim_end_matches('/')))
+        roots.iter().any(|prefix| {
+            let norm_prefix = Self::normalize_path(prefix.trim_end_matches('/'));
+            if norm_prefix.is_empty() {
+                return true;
+            }
+            // 前缀匹配 + 边界对齐：完全相等，或紧跟 '/' 分隔
+            resolved.starts_with(&norm_prefix)
+                && (resolved.len() == norm_prefix.len()
+                    || resolved.as_bytes().get(norm_prefix.len()) == Some(&b'/'))
+        })
     }
 
     /// 检查命令是否命中预授权前缀（FR-PERM-8）
@@ -286,6 +327,48 @@ mod tests {
     fn test_path_traversal_denied() {
         let g = guard(PermissionMode::WorkspaceWrite);
         let d = g.check("write_file", &json!({"path": "../../etc/passwd"}), ToolRisk::Moderate, "/work");
+        assert!(matches!(d, PermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_path_traversal_midpath_denied() {
+        // 中段 .. 穿越（不以 /../ 结尾）应被归一化后拦截
+        let g = guard(PermissionMode::WorkspaceWrite);
+        let d = g.check(
+            "write_file",
+            &json!({"path": "sub/../../../etc/passwd"}),
+            ToolRisk::Moderate,
+            "/work",
+        );
+        assert!(matches!(d, PermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_path_traversal_back_into_sandbox_allowed() {
+        // 先出后回、最终仍落在 sandbox 内应放行
+        let g = guard(PermissionMode::WorkspaceWrite);
+        let d = g.check(
+            "write_file",
+            &json!({"path": "sub/../a.txt"}),
+            ToolRisk::Moderate,
+            "/work",
+        );
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn test_sibling_prefix_not_confused() {
+        // /work-evil 不应被 /work 前缀误匹配（边界对齐）
+        let mut cfg = PermissionConfig::default();
+        cfg.mode = PermissionMode::WorkspaceWrite;
+        cfg.sandbox_paths = vec!["/work".to_string()];
+        let g = PermissionGuard::new(cfg);
+        let d = g.check(
+            "write_file",
+            &json!({"path": "/work-evil/a.txt"}),
+            ToolRisk::Moderate,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::Deny(_)));
     }
 
