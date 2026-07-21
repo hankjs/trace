@@ -4,5 +4,5 @@ pub mod traits;
 pub mod verifier;
 pub mod worker;
 
-pub use loop_detector::LoopDetector;
+pub use loop_detector::{LoopDetector, LoopLevel};
 pub use traits::*;

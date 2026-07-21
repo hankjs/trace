@@ -130,14 +130,16 @@ pub struct NamedSegment {
     pub content: String,
 }
 
-/// 按 base/developer/environment/project/user 分层组装系统提示词（FR-CTX-1）。
+/// 按 base/developer/project/environment/user 分层组装系统提示词（FR-CTX-1）。
 ///
 /// - `base`: 稳定基础指令（缺省使用 BASE_CODING_PROMPT）
 /// - `runtime`: 权限 + 工具目录 + 技能索引
-/// - `environment`: 环境上下文块
+/// - `environment`: 环境上下文块（含 current_date）
 /// - `project`: 项目记忆文件（CLAUDE.md/AGENTS.md/.cursorrules）
 ///
-/// 注意：用户任务不在此拼接，作为独立 user message 发送（FR-CTX-7 / 第8节约束3）。
+/// 注意 1：顺序为"先静后动"（【SA 13】）——含日期的 environment 段放在静态的
+/// project 段之后，避免每天第一次运行击穿 project 段的 prompt cache。
+/// 注意 2：用户任务不在此拼接，作为独立 user message 发送（FR-CTX-7 / 第8节约束3）。
 /// 返回组装后的 system prompt 文本 + 命名分层（供 ContextAssembled debug 摘要使用）。
 pub fn build_layered_prompt(
     base: Option<&str>,
@@ -156,13 +158,14 @@ pub fn build_layered_prompt(
         named.push(NamedSegment { name: "developer", content: rt.render() });
     }
 
-    if let Some(env) = environment {
-        named.push(NamedSegment { name: "environment", content: env.render() });
-    }
-
     let project_text = build_system_prompt(project_segments);
     if !project_text.is_empty() {
         named.push(NamedSegment { name: "project", content: project_text });
+    }
+
+    // environment 含 current_date（动态），放在静态 project 段之后（先静后动）
+    if let Some(env) = environment {
+        named.push(NamedSegment { name: "environment", content: env.render() });
     }
 
     let assembled = named
@@ -287,11 +290,11 @@ mod tests {
         let project = [PromptSegment::Dynamic("# Project\nrules".to_string())];
 
         let (prompt, named) = build_layered_prompt(None, Some(&rt), Some(&env), &project);
-        // 分层顺序：base -> developer -> environment -> project
+        // 分层顺序（先静后动）：base -> developer -> project -> environment
         assert_eq!(named[0].name, "base");
         assert_eq!(named[1].name, "developer");
-        assert_eq!(named[2].name, "environment");
-        assert_eq!(named[3].name, "project");
+        assert_eq!(named[2].name, "project");
+        assert_eq!(named[3].name, "environment");
         assert!(prompt.contains("coding agent"));
         assert!(prompt.contains("permission mode: workspace-write"));
         assert!(prompt.contains("<environment_context>"));

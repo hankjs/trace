@@ -1,13 +1,22 @@
+use crate::AgentEvent;
 use anyhow::Result;
-use hank_provider::{CompletionRequest, LlmProvider, StreamEvent};
+use hank_provider::{CompletionRequest, ContentBlock, LlmProvider, StopReason, StreamEvent};
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio_stream::Stream;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tokio_stream::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-/// 最大重试次数
+/// 最大重试次数。
+/// 口径取舍（P3-#16）：书中教学值为 Claude Code 的 10 次，本实现取 3 次——
+/// agent loop 内每一步 LLM 调用已有外层 iteration 兜底，重试过多会拉长
+/// 失败反馈延迟；瞬态错误通常 1-2 次内恢复，3 次足够覆盖。
 const MAX_RETRIES: u32 = 3;
-/// 基础退避时间（毫秒）
+/// 基础退避时间（毫秒）。
+/// 口径取舍（P3-#16）：书中为 500ms，本实现取 1000ms——配合 Retry-After
+/// 优先策略（见下），自算退避只作兜底，稍保守的基数对限流端更友好。
 const BASE_DELAY_MS: u64 = 1000;
 /// 最大退避时间（毫秒）
 const MAX_DELAY_MS: u64 = 30_000;
@@ -59,7 +68,10 @@ fn has_http_status(msg: &str, code: &str) -> bool {
     false
 }
 
-/// 计算退避延迟（指数退避 + 抖动）
+/// 计算退避延迟（指数退避 + 抖动）。
+/// 口径取舍（P3-#16）：书中为 Equal Jitter（±25% 乘性），本实现用加性
+/// 0-50% 抖动（delay ∈ [base, 1.5×base]）——实现更简单且同样能打散
+/// 并发重试的同步效应；均值比 Equal Jitter 略高，与保守的 BASE_DELAY_MS 一致。
 fn retry_delay(attempt: u32) -> std::time::Duration {
     let exponential = BASE_DELAY_MS * 2u64.pow(attempt);
     // 50% 随机抖动
@@ -139,6 +151,146 @@ pub async fn stream_with_retry(
     }
 
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("LLM stream failed after retries")))
+}
+
+/// 一步 LLM 调用的流消费结果（本步累积状态）
+pub(crate) struct StreamOutcome {
+    pub assistant_content: Vec<ContentBlock>,
+    pub stop_reason: StopReason,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    /// 消费期间收到取消信号
+    pub cancelled: bool,
+    /// 流超时——非正常结束，调用方必须按失败/告警处理，
+    /// 不能落入 EndTurn 正常收尾路径（【SA 03】）
+    pub timed_out: bool,
+}
+
+/// 步骤级重试的流消费（【SA 03】）：把"发请求 + 消费流"包成一个可重试单元。
+/// 消费中遇到可重试错误（连接 reset 等）时丢弃本步累积状态重来，最多 MAX_RETRIES 次；
+/// 不可重试错误直接返回 Err。超时/取消只设置标志，由调用方决定如何收尾。
+pub(crate) async fn consume_stream_with_retry(
+    provider: &Arc<dyn LlmProvider>,
+    req: CompletionRequest,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<StreamOutcome> {
+    let mut attempt = 0u32;
+
+    'step: loop {
+        let mut stream = stream_with_retry(provider, req.clone()).await?;
+
+        let mut assistant_content: Vec<ContentBlock> = Vec::new();
+        let mut current_text = String::new();
+        let mut current_tool_id = String::new();
+        let mut current_tool_name = String::new();
+        let mut current_tool_input = String::new();
+        let mut stop_reason = StopReason::EndTurn;
+        let mut in_tool_block = false;
+        let mut cancelled = false;
+        let mut timed_out = false;
+        let mut input_tokens = 0u32;
+        let mut output_tokens = 0u32;
+
+        loop {
+            let event = tokio::select! {
+                event = stream.next() => event,
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    None
+                }
+                _ = tokio::time::sleep(timeout) => {
+                    warn!("LLM stream timeout after {timeout:?}");
+                    timed_out = true;
+                    None
+                }
+            };
+            let Some(event) = event else { break };
+            match event {
+                Ok(StreamEvent::TextDelta(text)) => {
+                    current_text.push_str(&text);
+                    let _ = event_tx.send(AgentEvent::TextDelta { text }).await;
+                }
+                Ok(StreamEvent::ToolUseStart { id, name }) => {
+                    if !current_text.is_empty() {
+                        assistant_content.push(ContentBlock::Text {
+                            text: std::mem::take(&mut current_text),
+                        });
+                    }
+                    current_tool_id = id;
+                    current_tool_name = name;
+                    current_tool_input.clear();
+                    in_tool_block = true;
+                }
+                Ok(StreamEvent::ToolUseInputDelta(json)) => {
+                    current_tool_input.push_str(&json);
+                }
+                Ok(StreamEvent::ToolUseEnd) => {
+                    if !in_tool_block {
+                        continue;
+                    }
+                    in_tool_block = false;
+                    let input: serde_json::Value =
+                        serde_json::from_str(&current_tool_input).unwrap_or_default();
+                    assistant_content.push(ContentBlock::ToolUse {
+                        id: std::mem::take(&mut current_tool_id),
+                        name: std::mem::take(&mut current_tool_name),
+                        input,
+                    });
+                    current_tool_input.clear();
+                }
+                Ok(StreamEvent::MessageEnd { stop_reason: sr }) => {
+                    stop_reason = sr;
+                }
+                Ok(StreamEvent::Usage {
+                    input_tokens: i,
+                    output_tokens: o,
+                    ..
+                }) => {
+                    input_tokens += i;
+                    output_tokens += o;
+                }
+                Ok(StreamEvent::Error(msg)) => {
+                    let _ = event_tx.send(AgentEvent::Error { message: msg }).await;
+                }
+                Err(e) => {
+                    if attempt < MAX_RETRIES && is_retryable(&e) {
+                        let delay = retry_after_secs(&e)
+                            .map(Duration::from_secs)
+                            .unwrap_or_else(|| retry_delay(attempt));
+                        warn!(
+                            "LLM stream consume attempt {}/{} failed (retryable): {}. \
+                             丢弃本步累积状态，{:?} 后重试",
+                            attempt + 1,
+                            MAX_RETRIES + 1,
+                            e,
+                            delay
+                        );
+                        tokio::time::sleep(delay).await;
+                        attempt += 1;
+                        continue 'step;
+                    }
+                    // 不可重试或已达最大重试次数
+                    return Err(e);
+                }
+            }
+        }
+
+        // Flush remaining text
+        if !current_text.is_empty() {
+            assistant_content.push(ContentBlock::Text { text: current_text });
+        }
+
+        return Ok(StreamOutcome {
+            assistant_content,
+            stop_reason,
+            input_tokens,
+            output_tokens,
+            cancelled,
+            timed_out,
+        });
+    }
 }
 
 #[cfg(test)]

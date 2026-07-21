@@ -2,9 +2,10 @@ use crate::agent::traits::{DelegatedTask, TaskStatus, ThinkStrategy};
 use crate::agent::verifier::VerifierAgent;
 use crate::agent::worker::WorkerAgent;
 use crate::agent::LoopDetector;
+use crate::agent::loop_detector::LoopLevel;
 use crate::context::summary::{estimate_tokens, truncate_tool_result_default};
 use crate::context::{BudgetStatus, ContextManager};
-use crate::retry::stream_with_retry;
+use crate::retry::{consume_stream_with_retry, stream_with_retry};
 use crate::runtime::{
     build_run_summary_from, classify_tool_error, now_ts, RunState, ToolCallContext, ToolGate,
     ToolRuntime,
@@ -26,7 +27,12 @@ use tracing::{debug, error, warn};
 const ORCHESTRATOR_MAX_ITERATIONS: usize = 50;
 const DELEGATE_TASK_TOOL: &str = "delegate_task";
 const LLM_STREAM_TIMEOUT_SECS: u64 = 120;
-const LOOP_TERMINATE_COUNT: usize = 3;
+/// MaxTokens 首次命中时静默提高的输出上限（【AF 08】8K→64K）
+const MAX_OUTPUT_TOKENS_UPPER: u32 = 64_000;
+/// 续写恢复消息最大注入次数（【AF 08】最多 3 次）
+const MAX_CONTINUATIONS: u32 = 3;
+/// 递减回报判停：续写增量低于该 token 数视为无进展（【AF 08】<500）
+const CONTINUATION_MIN_GAIN_TOKENS: u32 = 500;
 const MAX_REVISIONS: usize = 2;
 /// LlmRequest 事件中 system prompt 最大字符数，防止 SSE 流量过大
 const LLM_REQUEST_SYSTEM_PREVIEW_CHARS: usize = 500;
@@ -38,6 +44,8 @@ pub(crate) struct OrchestratorRuntime {
     pub(crate) permission: Arc<PermissionGuard>,
     pub(crate) verify_after_write: bool,
     pub(crate) original_request: String,
+    /// LLM 流超时（由 session 透传；超时按失败收尾）
+    pub(crate) stream_timeout: Duration,
 }
 
 pub struct OrchestratorAgent {
@@ -50,7 +58,10 @@ pub struct OrchestratorAgent {
     context_manager: ContextManager,
     loop_detector: LoopDetector,
     messages: Vec<Message>,
-    consecutive_max_tokens: u32,
+    /// MaxTokens 恢复状态（【AF 08】三步递进 + 递减回报检测）
+    max_tokens_escalated: bool,
+    max_tokens_continuations: u32,
+    small_output_streak: u32,
     /// 当前 run 已进行的验证修订轮数（FR-VERIFY-1）
     verify_revision_count: usize,
     /// FR-TOOL-7: 延迟加载的工具名集合 — 初始只注册 stub，首次调用时注入完整 schema
@@ -119,7 +130,9 @@ impl OrchestratorAgent {
             context_manager,
             loop_detector: LoopDetector::new(),
             messages: Vec::new(),
-            consecutive_max_tokens: 0,
+            max_tokens_escalated: false,
+            max_tokens_continuations: 0,
+            small_output_streak: 0,
             verify_revision_count: 0,
             deferred_tool_names: std::collections::HashSet::new(),
         }
@@ -182,6 +195,7 @@ impl OrchestratorAgent {
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
+            stream_timeout: Duration::from_secs(LLM_STREAM_TIMEOUT_SECS),
         };
         self.run_with_state(user_content, event_tx, cancel, &mut run_state, runtime)
             .await
@@ -195,10 +209,18 @@ impl OrchestratorAgent {
         run_state: &mut RunState,
         runtime: OrchestratorRuntime,
     ) -> Result<()> {
-        self.messages.push(Message {
+        let user_msg = Message {
             role: Role::User,
             content: user_content,
-        });
+        };
+        // 【SA 12】粗估增量：push 新消息后累加 pending，预算检查用 actual + pending
+        self.context_manager
+            .add_pending(estimate_tokens(std::slice::from_ref(&user_msg)));
+        self.messages.push(user_msg);
+
+        // 每轮新 user query 进入 loop 时重置循环检测器（detector 是成员变量，
+        // 跨 run 复用，【SA 03】要求新 query 清零 streak）
+        self.loop_detector.reset();
 
         let mut _iterations_without_progress = 0;
         let mut last_worker_failed = false;
@@ -311,7 +333,18 @@ impl OrchestratorAgent {
             }
 
             if iteration == ORCHESTRATOR_MAX_ITERATIONS - 1 {
+                // #15：达到迭代上限必须告知用户（【AF 08】停了、为什么停、下一步能做什么）
                 warn!("Orchestrator reached max iterations");
+                run_state.termination_note = Some(format!(
+                    "reached max iterations ({ORCHESTRATOR_MAX_ITERATIONS})"
+                ));
+                let _ = event_tx
+                    .send(AgentEvent::Error {
+                        message: format!(
+                            "Agent stopped: reached max iterations ({ORCHESTRATOR_MAX_ITERATIONS}). The task may be incomplete; consider rephrasing it or breaking it into smaller steps."
+                        ),
+                    })
+                    .await;
                 let _ = event_tx.send(AgentEvent::TurnComplete).await;
             }
         }
@@ -395,6 +428,7 @@ impl OrchestratorAgent {
                 Ok(StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
+                    ..
                 }) => {
                     total_input_tokens += input_tokens;
                     total_output_tokens += output_tokens;
@@ -413,10 +447,13 @@ impl OrchestratorAgent {
 
         // Add think output to messages as assistant turn
         if !think_text.is_empty() {
-            self.messages.push(Message {
+            let think_msg = Message {
                 role: Role::Assistant,
                 content: vec![ContentBlock::Text { text: think_text }],
-            });
+            };
+            self.context_manager
+                .add_pending(estimate_tokens(std::slice::from_ref(&think_msg)));
+            self.messages.push(think_msg);
         }
 
         let latency_ms = llm_start.elapsed().as_millis() as u64;
@@ -430,7 +467,7 @@ impl OrchestratorAgent {
                 phase: Some("think".to_string()),
             })
             .await;
-        run_state.input_tokens = run_state.input_tokens.max(total_input_tokens);
+        run_state.peak_input_tokens = run_state.peak_input_tokens.max(total_input_tokens);
         run_state.output_tokens += total_output_tokens;
         if total_input_tokens > 0 {
             self.context_manager
@@ -471,7 +508,11 @@ impl OrchestratorAgent {
             system: Some(self.system_prompt.clone()),
             messages: self.messages.clone(),
             tools: self.tool_definitions.clone(),
-            max_tokens: 16384,
+            max_tokens: if self.max_tokens_escalated {
+                MAX_OUTPUT_TOKENS_UPPER
+            } else {
+                16384
+            },
         };
 
         let _ = event_tx
@@ -487,91 +528,38 @@ impl OrchestratorAgent {
 
         debug!("Orchestrator ACT phase");
         let llm_start = Instant::now();
-        let mut stream = stream_with_retry(&self.provider, req).await?;
+        // 步骤级重试：发请求 + 消费流作为一个可重试单元（【SA 03】）
+        let outcome = consume_stream_with_retry(
+            &self.provider,
+            req,
+            event_tx,
+            cancel,
+            runtime.stream_timeout,
+        )
+        .await?;
+        let assistant_content = outcome.assistant_content;
+        let stop_reason = outcome.stop_reason;
+        let total_input_tokens = outcome.input_tokens;
+        let total_output_tokens = outcome.output_tokens;
 
-        let mut assistant_content: Vec<ContentBlock> = Vec::new();
-        let mut current_text = String::new();
-        let mut current_tool_id = String::new();
-        let mut current_tool_name = String::new();
-        let mut current_tool_input = String::new();
-        let mut stop_reason = StopReason::EndTurn;
-        let mut in_tool_block = false;
-        let mut total_input_tokens = 0u32;
-        let mut total_output_tokens = 0u32;
-
-        loop {
-            let event = tokio::select! {
-                event = stream.next() => event,
-                _ = cancel.cancelled() => { None }
-                _ = tokio::time::sleep(Duration::from_secs(LLM_STREAM_TIMEOUT_SECS)) => {
-                    warn!("Act phase LLM stream timeout after {}s", LLM_STREAM_TIMEOUT_SECS);
-                    None
-                }
-            };
-            let Some(event) = event else { break };
-            match event {
-                Ok(StreamEvent::TextDelta(text)) => {
-                    current_text.push_str(&text);
-                    let _ = event_tx.send(AgentEvent::TextDelta { text }).await;
-                }
-                Ok(StreamEvent::ToolUseStart { id, name }) => {
-                    if !current_text.is_empty() {
-                        assistant_content.push(ContentBlock::Text {
-                            text: std::mem::take(&mut current_text),
-                        });
-                    }
-                    current_tool_id = id;
-                    current_tool_name = name;
-                    current_tool_input.clear();
-                    in_tool_block = true;
-                }
-                Ok(StreamEvent::ToolUseInputDelta(json)) => {
-                    current_tool_input.push_str(&json);
-                }
-                Ok(StreamEvent::ToolUseEnd) => {
-                    if !in_tool_block {
-                        continue;
-                    }
-                    in_tool_block = false;
-                    let input: serde_json::Value =
-                        serde_json::from_str(&current_tool_input).unwrap_or_default();
-                    assistant_content.push(ContentBlock::ToolUse {
-                        id: std::mem::take(&mut current_tool_id),
-                        name: std::mem::take(&mut current_tool_name),
-                        input,
-                    });
-                    current_tool_input.clear();
-                }
-                Ok(StreamEvent::MessageEnd { stop_reason: sr }) => {
-                    stop_reason = sr;
-                }
-                Ok(StreamEvent::Usage {
-                    input_tokens,
-                    output_tokens,
-                }) => {
-                    total_input_tokens += input_tokens;
-                    total_output_tokens += output_tokens;
-                }
-                Ok(StreamEvent::Error(msg)) => {
-                    let _ = event_tx.send(AgentEvent::Error { message: msg }).await;
-                }
-                Err(e) => {
-                    error!("Act phase stream error: {e}");
-                    return Err(e);
-                }
-            }
+        // 超时是显式失败：终止 run，不能落入 EndTurn 正常收尾路径（【SA 03】）
+        if outcome.timed_out {
+            let message = format!(
+                "Act phase LLM stream timed out after {}s",
+                runtime.stream_timeout.as_secs()
+            );
+            error!("{message}");
+            let _ = event_tx.send(AgentEvent::Error {
+                message: message.clone(),
+            }).await;
+            return Err(anyhow::anyhow!(message));
         }
 
-        if !current_text.is_empty() {
-            assistant_content.push(ContentBlock::Text {
-                text: std::mem::take(&mut current_text),
-            });
-        }
-
-        self.messages.push(Message {
+        let assistant_msg = Message {
             role: Role::Assistant,
             content: assistant_content.clone(),
-        });
+        };
+        self.messages.push(assistant_msg);
 
         let latency_ms = llm_start.elapsed().as_millis() as u64;
         let _ = event_tx
@@ -584,29 +572,82 @@ impl OrchestratorAgent {
                 phase: Some("act".to_string()),
             })
             .await;
-        run_state.input_tokens = run_state.input_tokens.max(total_input_tokens);
+        run_state.peak_input_tokens = run_state.peak_input_tokens.max(total_input_tokens);
         run_state.output_tokens += total_output_tokens;
         if total_input_tokens > 0 {
             self.context_manager
                 .update_actual_tokens(total_input_tokens as usize);
         }
+        // 【SA 12】assistant 响应不在本次 actual 内，校准后累加粗估增量
+        self.context_manager
+            .add_pending(estimate_tokens(std::slice::from_ref(
+                self.messages.last().unwrap(),
+            )));
 
-        // Handle MaxTokens: continue generation instead of stopping
-        if stop_reason == StopReason::MaxTokens {
-            warn!("Orchestrator MaxTokens hit, continuing generation");
-            self.consecutive_max_tokens += 1;
-            if self.consecutive_max_tokens >= 3 {
-                warn!("3 consecutive MaxTokens without tool use, treating as done");
+        // Handle MaxTokens: continue generation instead of stopping.
+        // 方案 A（【AF 07】）：若截断前已有完整 tool_use 块，照常执行这些工具、
+        // push tool_results 后继续循环，保持配对，不注入续写提示。
+        let max_tokens_with_tools = stop_reason == StopReason::MaxTokens
+            && assistant_content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
+        if stop_reason == StopReason::MaxTokens && !max_tokens_with_tools {
+            // 【AF 08】① 首次命中：静默提高 max_output_tokens 重试，不注入消息
+            if !self.max_tokens_escalated {
+                warn!("Orchestrator MaxTokens hit, escalating max_tokens to {MAX_OUTPUT_TOKENS_UPPER} and retrying");
+                self.max_tokens_escalated = true;
+                let _ = event_tx
+                    .send(AgentEvent::TurnCompleted {
+                        run_id: runtime.run_id.clone(),
+                        turn_id,
+                        timestamp: now_ts(),
+                    })
+                    .await;
+                return Ok(ActResult::Continue);
+            }
+            self.max_tokens_continuations += 1;
+            // 递减回报检测：续写 ≥3 次且连续 2 次增量 <500 token → 直接停止
+            if total_output_tokens < CONTINUATION_MIN_GAIN_TOKENS {
+                self.small_output_streak += 1;
+            } else {
+                self.small_output_streak = 0;
+            }
+            if self.max_tokens_continuations > MAX_CONTINUATIONS
+                || (self.max_tokens_continuations >= MAX_CONTINUATIONS
+                    && self.small_output_streak >= 2)
+            {
+                // ③ 认栽：发事件告知输出被截断
+                warn!("Orchestrator MaxTokens recovery exhausted, output truncated");
+                let _ = event_tx
+                    .send(AgentEvent::Error {
+                        message: "Output truncated: the response hit the output token limit repeatedly and could not be completed. The partial output above is kept as-is.".to_string(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(AgentEvent::TurnCompleted {
+                        run_id: runtime.run_id.clone(),
+                        turn_id,
+                        timestamp: now_ts(),
+                    })
+                    .await;
                 return Ok(ActResult::Done);
             }
-            // Inject continuation prompt
-            self.messages.push(Message {
+            // ② 注入恢复消息（四要素：不要道歉、不要回顾、从断点直接继续、
+            // 拆成更小的块），第二次起更强硬，最多 3 次
+            let continuation_text = if self.max_tokens_continuations == 1 {
+                "[Your previous response was cut off by the output token limit. Do not apologize, do not recap. Continue directly from the exact point where you stopped, and break the remaining work into smaller chunks.]"
+            } else {
+                "[Your response was cut off AGAIN by the output token limit. Do NOT apologize, do NOT restart or recap. Resume immediately from the cutoff point, and use much smaller chunks.]"
+            };
+            let continuation_msg = Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text {
-                    text: "[Your previous response was cut off. Continue from where you left off.]"
-                        .to_string(),
+                    text: continuation_text.to_string(),
                 }],
-            });
+            };
+            self.context_manager
+                .add_pending(estimate_tokens(std::slice::from_ref(&continuation_msg)));
+            self.messages.push(continuation_msg);
             let _ = event_tx
                 .send(AgentEvent::TurnCompleted {
                     run_id: runtime.run_id.clone(),
@@ -617,10 +658,11 @@ impl OrchestratorAgent {
             return Ok(ActResult::Continue);
         }
 
-        // Reset counter on successful tool use
-        self.consecutive_max_tokens = 0;
+        // Reset counters on successful tool use
+        self.max_tokens_continuations = 0;
+        self.small_output_streak = 0;
 
-        if stop_reason != StopReason::ToolUse {
+        if stop_reason != StopReason::ToolUse && !max_tokens_with_tools {
             if runtime.verify_after_write && !run_state.file_changes.is_empty() {
                 let _ = event_tx
                     .send(AgentEvent::VerificationStarted {
@@ -669,7 +711,7 @@ impl OrchestratorAgent {
                         // 注入修订请求，返回 Continue 让外层循环重新执行（FR-VERIFY-1/2）
                         self.verify_revision_count += 1;
                         let issue_text = result.issues.join("\n");
-                        self.messages.push(Message {
+                        let revision_msg = Message {
                             role: Role::User,
                             content: vec![ContentBlock::Text {
                                 text: format!(
@@ -677,7 +719,10 @@ impl OrchestratorAgent {
                                     self.verify_revision_count
                                 ),
                             }],
-                        });
+                        };
+                        self.context_manager
+                            .add_pending(estimate_tokens(std::slice::from_ref(&revision_msg)));
+                        self.messages.push(revision_msg);
                         let _ = event_tx
                             .send(AgentEvent::TurnCompleted {
                                 run_id: runtime.run_id.clone(),
@@ -712,6 +757,7 @@ impl OrchestratorAgent {
         let mut tool_results: Vec<ContentBlock> = Vec::new();
         let mut had_worker = false;
         let mut worker_success = true;
+        let mut pending_loop_nudge: Option<String> = None;
 
         // Separate tool calls into delegate tasks and regular tools
         let mut regular_tools: Vec<(&str, &str, &serde_json::Value)> = Vec::new();
@@ -727,7 +773,11 @@ impl OrchestratorAgent {
             }
         }
 
-        // FR-TOOL-7: 首次调用 deferred 工具时注入完整 schema（影响后续请求）
+        // FR-TOOL-7: 首次调用 deferred 工具时注入完整 schema（影响后续请求）。
+        // 【AF 11】deferred loading 的意义是让模型拿到完整 schema 后再构造参数：
+        // 本轮用空 schema 盲猜的调用不执行，返回错误结果让模型重试。
+        let mut just_loaded_deferred: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         if !self.deferred_tool_names.is_empty() {
             for (_, name, _) in &regular_tools {
                 if self.deferred_tool_names.remove(*name) {
@@ -739,23 +789,27 @@ impl OrchestratorAgent {
                             def.input_schema = schema;
                         }
                     }
+                    just_loaded_deferred.insert(*name);
                 }
             }
         }
 
-        // Check for loops on regular tools
+        // Check for loops on regular tools（【SA 03】相同调用+相同结果才算无进展）
         for (id, name, input) in &regular_tools {
-            if self.loop_detector.record_and_check(name, input) {
+            let loop_level = self.loop_detector.record_and_check(name, input);
+            if loop_level != LoopLevel::None {
                 let pattern = self.loop_detector.loop_pattern();
                 let _ = event_tx
                     .send(AgentEvent::LoopDetected {
                         pattern: pattern.clone(),
-                        window_size: 6,
+                        window_size: self.loop_detector.window_size(),
                     })
                     .await;
 
-                if self.loop_detector.should_terminate(LOOP_TERMINATE_COUNT) {
+                if loop_level == LoopLevel::Breaker {
                     warn!("Loop detection: terminating after repeated loops");
+                    // 终止前给本条 assistant 消息中所有 tool_use 补全 tool_result
+                    // （含当前及未执行的 regular/delegate 调用），保持配对
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.to_string(),
                         content: format!(
@@ -764,34 +818,77 @@ impl OrchestratorAgent {
                         ),
                         is_error: true,
                     });
-                    // Add empty results for remaining tools
-                    break;
+                    for remaining in &assistant_content {
+                        if let ContentBlock::ToolUse { id: other_id, .. } = remaining {
+                            let has_result = tool_results.iter().any(|r| matches!(
+                                r,
+                                ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == other_id
+                            ));
+                            if !has_result {
+                                tool_results.push(ContentBlock::ToolResult {
+                                    tool_use_id: other_id.clone(),
+                                    content: "Loop detected, execution aborted".to_string(),
+                                    is_error: true,
+                                });
+                            }
+                        }
+                    }
+                    // push 完整 tool_results 消息后直接终止本轮 Act，
+                    // 不再执行剩余工具与 delegate_tasks
+                    let abort_msg = Message {
+                        role: Role::User,
+                        content: tool_results,
+                    };
+                    self.context_manager
+                        .add_pending(estimate_tokens(std::slice::from_ref(&abort_msg)));
+                    self.messages.push(abort_msg);
+                    let _ = event_tx
+                        .send(AgentEvent::TurnCompleted {
+                            run_id: runtime.run_id.clone(),
+                            turn_id,
+                            timestamp: now_ts(),
+                        })
+                        .await;
+                    return Ok(ActResult::Done);
                 }
 
-                // Inject nudge
-                self.messages.push(Message {
-                    role: Role::User,
-                    content: vec![ContentBlock::Text {
-                        text: format!(
-                            "⚠️ Loop detected: {}. Vary your approach or use different tools.",
-                            pattern
-                        ),
-                    }],
+                // 未达终止阈值：记录 nudge，稍后追加到 tool_results 消息末尾。
+                // 不单独 push user 消息，以免插在 assistant(tool_use) 与
+                // tool_results 之间破坏配对（参照 session.rs 的方案）。
+                pending_loop_nudge = Some(format!(
+                    "⚠️ Loop detected: {}. Vary your approach or use different tools.",
+                    pattern
+                ));
+            }
+        }
+
+        // 分区：本轮刚加载 schema 的 deferred 调用返回重试提示（不执行盲猜参数），
+        // 其余照常执行
+        let mut executable: Vec<(&str, &str, &serde_json::Value)> = Vec::new();
+        for (id, name, input) in regular_tools {
+            if just_loaded_deferred.contains(name) {
+                tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: id.to_string(),
+                    content: "Tool schema now loaded, please retry with correct parameters"
+                        .to_string(),
+                    is_error: true,
                 });
+            } else {
+                executable.push((id, name, input));
             }
         }
 
         // Execute regular tools — parallel if all are read-only, sequential otherwise
-        if !regular_tools.is_empty() && tool_results.is_empty() {
-            let has_writes = regular_tools
+        if !executable.is_empty() {
+            let has_writes = executable
                 .iter()
                 .any(|(_, name, _)| self.tools.iter().any(|t| t.name() == *name && t.is_write()));
 
-            if !has_writes && regular_tools.len() > 1 {
+            if !has_writes && executable.len() > 1 {
                 // Parallel execution for read-only tools
                 let results = self
                     .execute_tools_parallel(
-                        &regular_tools,
+                        &executable,
                         &event_tx,
                         cancel,
                         run_state,
@@ -799,10 +896,18 @@ impl OrchestratorAgent {
                         &turn_id,
                     )
                     .await;
+                // 回填结果指纹（【SA 03】：结果不同属正常探索，不计 streak）
+                for (id, name, input) in &executable {
+                    if let Some(ContentBlock::ToolResult { content, .. }) = results.iter().find(
+                        |r| matches!(r, ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id),
+                    ) {
+                        self.loop_detector.record_result(name, input, content);
+                    }
+                }
                 tool_results.extend(results);
             } else {
                 // Sequential execution for write tools
-                for (id, name, input) in &regular_tools {
+                for (id, name, input) in &executable {
                     if cancel.is_cancelled() {
                         break;
                     }
@@ -811,6 +916,10 @@ impl OrchestratorAgent {
                             id, name, input, &event_tx, run_state, runtime, &turn_id,
                         )
                         .await;
+                    // 回填结果指纹
+                    if let ContentBlock::ToolResult { content, .. } = &result {
+                        self.loop_detector.record_result(name, input, content);
+                    }
                     tool_results.push(result);
                 }
             }
@@ -1025,10 +1134,18 @@ impl OrchestratorAgent {
             }
         }
 
-        self.messages.push(Message {
+        // 追加 loop nudge 到 tool_results 同一消息，保持 tool_use/tool_result 配对
+        if let Some(nudge) = pending_loop_nudge {
+            tool_results.push(ContentBlock::Text { text: nudge });
+        }
+        let tool_results_msg = Message {
             role: Role::User,
             content: tool_results,
-        });
+        };
+        // 【SA 12】粗估增量：工具结果不等到下一次 LLM 调用才被预算察觉
+        self.context_manager
+            .add_pending(estimate_tokens(std::slice::from_ref(&tool_results_msg)));
+        self.messages.push(tool_results_msg);
 
         // Budget check after tool results to catch large tool outputs early
         match self.context_manager.check_budget(&self.messages) {

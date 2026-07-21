@@ -13,6 +13,12 @@ pub(crate) struct RunState {
     pub(crate) permission_denials: Vec<String>,
     pub(crate) verification_issues: Vec<String>,
     pub(crate) file_changes: Vec<FileChange>,
-    pub(crate) input_tokens: u32,
+    /// 峰值上下文 input tokens（单次 LLM 调用上报的最大值，非累计用量）。
+    /// 口径说明（P3-#17）：provider 上报的 input_tokens 是该次请求的整个上下文大小，
+    /// 累计无意义（会重复计算历史消息），故取 max() 记峰值；
+    /// RunCompleted.input_tokens 事件字段沿用此峰值语义。
+    pub(crate) peak_input_tokens: u32,
     pub(crate) output_tokens: u32,
+    /// 终止原因备注（如 reached max iterations），并入最终 summary（【AF 08】退出带原因）
+    pub(crate) termination_note: Option<String>,
 }

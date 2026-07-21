@@ -251,9 +251,16 @@ fn parse_chunk(chunk: &serde_json::Value, current_tool_id: &mut String) -> Optio
 
     // OpenAI sends usage in a final chunk with empty choices
     if let Some(usage) = chunk.get("usage") {
-        let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        events.push(StreamEvent::Usage { input_tokens, output_tokens });
+        // OpenAI 的 cached 已含在 prompt_tokens 里，归一化时从 input 扣除（【SA 13】）
+        let cache_read_tokens = usage
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let input_tokens = prompt_tokens.saturating_sub(cache_read_tokens);
+        events.push(StreamEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens: 0 });
     }
 
     let choices = chunk.get("choices")?.as_array()?;

@@ -53,7 +53,15 @@ pub enum StreamEvent {
     ToolUseInputDelta(String),
     ToolUseEnd,
     MessageEnd { stop_reason: StopReason },
-    Usage { input_tokens: u32, output_tokens: u32 },
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+        /// prompt cache 命中读取的 token（【SA 13】usage 归一化：
+        /// Anthropic 单列不用减；OpenAI cached 已含在 input 里，归一化时已扣除）
+        cache_read_tokens: u32,
+        /// prompt cache 写入的 token
+        cache_write_tokens: u32,
+    },
     Error(String),
 }
 

@@ -108,6 +108,19 @@ fn build_request_body(req: &CompletionRequest) -> serde_json::Value {
         }));
     }
 
+    // 【SA 13】prompt cache breakpoint 2：最后一条 user 消息末尾（滚动前缀）
+    if let Some(last_user) = messages
+        .iter_mut()
+        .rev()
+        .find(|m| m["role"] == serde_json::json!("user"))
+    {
+        if let Some(content) = last_user["content"].as_array_mut() {
+            if let Some(last_block) = content.last_mut() {
+                last_block["cache_control"] = serde_json::json!({"type": "ephemeral"});
+            }
+        }
+    }
+
     let mut body = serde_json::json!({
         "model": req.model,
         "max_tokens": req.max_tokens,
@@ -116,7 +129,12 @@ fn build_request_body(req: &CompletionRequest) -> serde_json::Value {
     });
 
     if let Some(system) = &req.system {
-        body["system"] = serde_json::json!(system);
+        // 【SA 13】prompt cache breakpoint 1：system 末尾（静态前缀，跨轮复用）
+        body["system"] = serde_json::json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": {"type": "ephemeral"},
+        }]);
     }
 
     if !req.tools.is_empty() {
@@ -192,7 +210,10 @@ fn parse_sse_event(raw: &str) -> Vec<StreamEvent> {
             if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
                 let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                vec![StreamEvent::Usage { input_tokens, output_tokens }]
+                // Anthropic 的 cache token 单列（不含在 input_tokens 内，不用减）
+                let cache_read_tokens = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let cache_write_tokens = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                vec![StreamEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens }]
             } else {
                 Vec::new()
             }
@@ -250,7 +271,7 @@ fn parse_sse_event(raw: &str) -> Vec<StreamEvent> {
             if let Some(usage) = parsed.get("usage") {
                 let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
                 if output_tokens > 0 {
-                    events.push(StreamEvent::Usage { input_tokens: 0, output_tokens });
+                    events.push(StreamEvent::Usage { input_tokens: 0, output_tokens, cache_read_tokens: 0, cache_write_tokens: 0 });
                 }
             }
             if let Some(delta) = parsed.get("delta") {

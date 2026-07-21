@@ -109,8 +109,8 @@ pub async fn completion_handler(
             Ok(StreamEvent::MessageEnd { stop_reason }) => {
                 serde_json::json!({"type": "message_end", "stop_reason": stop_reason}).to_string()
             }
-            Ok(StreamEvent::Usage { input_tokens, output_tokens }) => {
-                serde_json::json!({"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens}).to_string()
+            Ok(StreamEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens }) => {
+                serde_json::json!({"type": "usage", "input_tokens": input_tokens, "output_tokens": output_tokens, "cache_read_tokens": cache_read_tokens, "cache_write_tokens": cache_write_tokens}).to_string()
             }
             Ok(StreamEvent::Error(msg)) => {
                 serde_json::json!({"type": "error", "message": msg}).to_string()

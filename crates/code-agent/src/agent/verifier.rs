@@ -133,7 +133,13 @@ impl VerifierAgent {
                     Ok(StreamEvent::MessageEnd { stop_reason: sr }) => {
                         stop_reason = sr;
                     }
-                    Ok(_) | Err(_) => { break; }
+                    // 忽略未匹配的事件（如 Usage）——Anthropic 在 message_start
+                    // 阶段就会先发自 Usage，不能当作流结束
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!("Verifier stream error: {e}");
+                        break;
+                    }
                 }
             }
 

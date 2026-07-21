@@ -10,7 +10,7 @@ use futures::Stream;
 use hank_provider::{CompletionRequest, LlmProvider, StopReason, StreamEvent};
 use std::pin::Pin;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 use tokio::sync::mpsc;
@@ -20,15 +20,36 @@ use tokio_util::sync::CancellationToken;
 type Script = Vec<StreamEvent>;
 
 /// 按调用次数依次返回预设脚本的 mock provider。
+/// 约定：空脚本表示挂起的 stream（用于测试超时路径）。
 struct MockProvider {
-    scripts: Mutex<std::collections::VecDeque<Script>>,
+    scripts: Mutex<std::collections::VecDeque<Vec<anyhow::Result<StreamEvent>>>>,
+    /// stream() 被调用的次数（用于断言外层循环是否真正终止）
+    calls: Arc<AtomicUsize>,
 }
 
 impl MockProvider {
     fn new(scripts: Vec<Script>) -> Self {
         Self {
-            scripts: Mutex::new(scripts.into_iter().collect()),
+            scripts: Mutex::new(
+                scripts
+                    .into_iter()
+                    .map(|s| s.into_iter().map(Ok).collect())
+                    .collect(),
+            ),
+            calls: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// 支持脚本中混入 Err 事件（用于测试流消费中的重试）
+    fn new_raw(scripts: Vec<Vec<anyhow::Result<StreamEvent>>>) -> Self {
+        Self {
+            scripts: Mutex::new(scripts.into_iter().collect()),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 }
 
@@ -42,13 +63,17 @@ impl LlmProvider for MockProvider {
         &self,
         _req: CompletionRequest,
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<StreamEvent>> + Send>>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let script = self.scripts.lock().unwrap().pop_front().unwrap_or_else(|| {
-            vec![StreamEvent::MessageEnd {
+            vec![Ok(StreamEvent::MessageEnd {
                 stop_reason: StopReason::EndTurn,
-            }]
+            })]
         });
-        let events: Vec<anyhow::Result<StreamEvent>> = script.into_iter().map(Ok).collect();
-        Ok(Box::pin(futures::stream::iter(events)))
+        // 空脚本：挂起的 stream（既不产出事件也不结束），用于测试超时
+        if script.is_empty() {
+            return Ok(Box::pin(futures::stream::pending()));
+        }
+        Ok(Box::pin(futures::stream::iter(script)))
     }
 }
 
@@ -153,6 +178,8 @@ fn tool_use_script(id: &str, name: &str, input_json: &str) -> Script {
         StreamEvent::Usage {
             input_tokens: 100,
             output_tokens: 20,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         },
     ]
 }
@@ -166,6 +193,8 @@ fn text_end_script(text: &str) -> Script {
         StreamEvent::Usage {
             input_tokens: 120,
             output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         },
     ]
 }
@@ -605,4 +634,510 @@ fn tempdir_path() -> String {
     let path = base.join(unique);
     std::fs::create_dir_all(&path).unwrap();
     path.to_string_lossy().to_string()
+}
+
+/// 一次响应中携带多个 tool_use 块的脚本。
+fn multi_tool_use_script(ids: &[&str], name: &str, input_json: &str) -> Script {
+    let mut events = Vec::new();
+    for id in ids {
+        events.push(StreamEvent::ToolUseStart {
+            id: id.to_string(),
+            name: name.to_string(),
+        });
+        events.push(StreamEvent::ToolUseInputDelta(input_json.to_string()));
+        events.push(StreamEvent::ToolUseEnd);
+    }
+    events.push(StreamEvent::MessageEnd {
+        stop_reason: StopReason::ToolUse,
+    });
+    events
+}
+
+/// 循环检测 terminate：一条 assistant 消息含多个 tool_use 时，
+/// 每个 tool_use 都必须有配对 tool_result，且外层循环真正终止（不再发起 LLM 调用）。
+#[tokio::test]
+async fn test_loop_terminate_pairs_all_tool_results_and_stops() {
+    // 无进展 streak ≥10 触发全局熔断：第 1 轮 5 次相同调用 + 第 2 轮 6 次相同调用，
+    // 第 10 次（t10）触发 terminate，此时 t11 是同一条 assistant 消息中尚未执行的 tool_use。
+    let provider = Arc::new(MockProvider::new(vec![
+        multi_tool_use_script(&["t1", "t2", "t3", "t4", "t5"], "streaming_echo", r#"{}"#),
+        multi_tool_use_script(
+            &["t6", "t7", "t8", "t9", "t10", "t11"],
+            "streaming_echo",
+            r#"{}"#,
+        ),
+        text_end_script("should not reach here"),
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(StreamingEchoTool)];
+    let mut session =
+        AgentSession::new(provider.clone(), tools, "mock-model".to_string(), "sys".to_string());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "loop".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+
+    // 应发出 loop.detected
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::LoopDetected { .. })),
+        "missing loop.detected"
+    );
+
+    // terminate 后外层循环真正终止：只消费了 2 个脚本，第 3 个不应被请求
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "terminate 后不应再发起下一轮 LLM 调用"
+    );
+
+    // messages 中每个 tool_use 都有对应的 tool_result
+    let mut tool_use_ids: Vec<String> = Vec::new();
+    let mut tool_result_ids: Vec<String> = Vec::new();
+    for msg in session.messages() {
+        for block in &msg.content {
+            match block {
+                hank_provider::ContentBlock::ToolUse { id, .. } => tool_use_ids.push(id.clone()),
+                hank_provider::ContentBlock::ToolResult { tool_use_id, .. } => {
+                    tool_result_ids.push(tool_use_id.clone())
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(tool_use_ids.len(), 11, "tool_use_ids={tool_use_ids:?}");
+    for id in &tool_use_ids {
+        assert!(
+            tool_result_ids.contains(id),
+            "tool_use {id} 缺少配对的 tool_result"
+        );
+    }
+
+    // 未执行的 t11 收到的是 abort 错误结果
+    let t11_result = session.messages().iter().find_map(|msg| {
+        msg.content.iter().find_map(|block| match block {
+            hank_provider::ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } if tool_use_id == "t11" => Some((content.clone(), *is_error)),
+            _ => None,
+        })
+    });
+    let (content, is_error) = t11_result.expect("missing tool_result for t11");
+    assert!(is_error);
+    assert!(content.contains("Loop detected"), "content={content}");
+}
+
+/// MaxTokens 截断发生在完整 tool_use 块之后的脚本。
+fn tool_use_max_tokens_script(id: &str, name: &str, input_json: &str) -> Script {
+    vec![
+        StreamEvent::ToolUseStart {
+            id: id.to_string(),
+            name: name.to_string(),
+        },
+        StreamEvent::ToolUseInputDelta(input_json.to_string()),
+        StreamEvent::ToolUseEnd,
+        StreamEvent::MessageEnd {
+            stop_reason: StopReason::MaxTokens,
+        },
+    ]
+}
+
+/// #5 验收：MaxTokens 截断时 assistant_content 中含完整 tool_use 块，
+/// 照常执行工具并保持配对（方案 A），不注入续写提示。
+#[tokio::test]
+async fn test_max_tokens_executes_completed_tool_use() {
+    let provider = Arc::new(MockProvider::new(vec![
+        tool_use_max_tokens_script("t1", "streaming_echo", r#"{}"#),
+        text_end_script("done"),
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(StreamingEchoTool)];
+    let mut session =
+        AgentSession::new(provider.clone(), tools, "mock-model".to_string(), "sys".to_string());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+
+    // run 成功完成
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::RunCompleted {
+            status: code_agent::RunStatus::Success,
+            ..
+        }
+    )));
+    assert_eq!(provider.call_count(), 2);
+
+    // 每个 tool_use 都有配对 tool_result
+    let mut tool_use_ids: Vec<String> = Vec::new();
+    let mut tool_result_ids: Vec<String> = Vec::new();
+    for msg in session.messages() {
+        for block in &msg.content {
+            match block {
+                hank_provider::ContentBlock::ToolUse { id, .. } => tool_use_ids.push(id.clone()),
+                hank_provider::ContentBlock::ToolResult { tool_use_id, .. } => {
+                    tool_result_ids.push(tool_use_id.clone())
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(tool_use_ids, vec!["t1".to_string()]);
+    assert!(tool_result_ids.contains(&"t1".to_string()));
+
+    // 未注入续写提示
+    let has_continuation_prompt = session.messages().iter().any(|msg| {
+        msg.content.iter().any(|b| matches!(
+            b,
+            hank_provider::ContentBlock::Text { text } if text.contains("cut off")
+        ))
+    });
+    assert!(!has_continuation_prompt, "不应注入续写提示");
+}
+
+/// #8 验收：流消费中途发生可重试错误时，丢弃本步累积状态重试，
+/// 重试后成功且消息里无半截内容。
+#[tokio::test]
+async fn test_stream_error_step_retry_discards_partial_state() {
+    let provider = Arc::new(MockProvider::new_raw(vec![
+        // 第 1 次：半截文本后连接 reset（可重试）
+        vec![
+            Ok(StreamEvent::TextDelta("partial ".to_string())),
+            Err(anyhow::anyhow!("connection reset by peer")),
+        ],
+        // 第 2 次（重试）：正常完成
+        text_end_script("done").into_iter().map(Ok).collect(),
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = vec![];
+    let mut session =
+        AgentSession::new(provider.clone(), tools, "mock-model".to_string(), "sys".to_string());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+
+    // 重试后 run 成功
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::RunCompleted {
+            status: code_agent::RunStatus::Success,
+            ..
+        }
+    )));
+    assert_eq!(provider.call_count(), 2, "可重试错误应触发步骤级重试");
+
+    // assistant 消息无半截内容（本步累积状态已丢弃）
+    let assistant_text: String = session
+        .messages()
+        .iter()
+        .filter(|m| matches!(m.role, hank_provider::Role::Assistant))
+        .flat_map(|m| m.content.iter())
+        .filter_map(|b| match b {
+            hank_provider::ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(!assistant_text.contains("partial"), "assistant_text={assistant_text}");
+    assert!(assistant_text.contains("done"));
+}
+
+/// #8 验收：流超时（挂起的 stream）以失败/超时事件收尾，
+/// 不能静默落入 RunCompleted(Success)。
+#[tokio::test]
+async fn test_stream_timeout_fails_run() {
+    // 空脚本 = 挂起的 stream（既不产出事件也不结束）
+    let provider = Arc::new(MockProvider::new(vec![vec![]]));
+    let tools: Vec<Arc<dyn Tool>> = vec![];
+    let mut session =
+        AgentSession::new(provider, tools, "mock-model".to_string(), "sys".to_string())
+            .with_stream_timeout(std::time::Duration::from_millis(200));
+
+    let (tx, rx) = mpsc::channel(64);
+    let result = session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(result.is_err(), "超时应以失败收尾");
+
+    let events = collect_events(rx).await;
+
+    // 带原因的错误事件
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Error { message } if message.contains("timed out")
+        )),
+        "missing timeout error event"
+    );
+    // RunFailed 收尾，而非 RunCompleted(Success)
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::RunFailed { .. })),
+        "missing run.failed"
+    );
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentEvent::RunCompleted {
+            status: code_agent::RunStatus::Success,
+            ..
+        }
+    )));
+}
+
+/// 测试用工具：执行时取消 CancellationToken（模拟工具间取消路径）。
+struct CancellingTool {
+    cancel: CancellationToken,
+}
+
+#[async_trait]
+impl Tool for CancellingTool {
+    fn name(&self) -> &str {
+        "cancelling_tool"
+    }
+
+    fn description(&self) -> &str {
+        "Test-only tool that cancels the run."
+    }
+
+    fn input_schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {}
+        })
+    }
+
+    async fn execute(&self, _input: serde_json::Value) -> anyhow::Result<ToolOutput> {
+        self.cancel.cancel();
+        Ok(ToolOutput {
+            content: "cancelling".to_string(),
+            is_error: false,
+        })
+    }
+}
+
+/// #13 验收：工具间取消时，已执行的工具结果保留、未执行的补占位 result。
+#[tokio::test]
+async fn test_cancel_between_tools_preserves_pairing() {
+    let cancel = CancellationToken::new();
+    let provider = Arc::new(MockProvider::new(vec![multi_tool_use_script(
+        &["t1", "t2"],
+        "cancelling_tool",
+        r#"{}"#,
+    )]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(CancellingTool {
+        cancel: cancel.clone(),
+    })];
+    let mut session =
+        AgentSession::new(provider, tools, "mock-model".to_string(), "sys".to_string());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+            tx,
+            cancel,
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+
+    // 取消收尾
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::RunCancelled { .. })),
+        "missing run.cancelled"
+    );
+
+    // t1 已执行：保留真实结果；t2 未执行：补占位错误 result
+    let find_result = |id: &str| {
+        session.messages().iter().find_map(|msg| {
+            msg.content.iter().find_map(|b| match b {
+                hank_provider::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+        })
+    };
+    let (c1, e1) = find_result("t1").expect("missing tool_result for t1");
+    assert_eq!(c1, "cancelling");
+    assert!(!e1);
+    let (c2, e2) = find_result("t2").expect("missing placeholder tool_result for t2");
+    assert!(e2);
+    assert!(c2.contains("cancelled before execution"), "content={c2}");
+}
+
+/// #13 验收：ask_user 暂停时，已执行的工具结果保留、其余补占位，
+/// ask_user 的 tool_use 不预填结果（留给 server 端用用户答案回填）。
+#[tokio::test]
+async fn test_ask_user_pause_preserves_pairing() {
+    let script = vec![
+        StreamEvent::ToolUseStart {
+            id: "a1".to_string(),
+            name: "streaming_echo".to_string(),
+        },
+        StreamEvent::ToolUseInputDelta(r#"{}"#.to_string()),
+        StreamEvent::ToolUseEnd,
+        StreamEvent::ToolUseStart {
+            id: "ask1".to_string(),
+            name: "ask_user".to_string(),
+        },
+        StreamEvent::ToolUseInputDelta(r#"{"question":"继续吗？"}"#.to_string()),
+        StreamEvent::ToolUseEnd,
+        StreamEvent::ToolUseStart {
+            id: "a2".to_string(),
+            name: "streaming_echo".to_string(),
+        },
+        StreamEvent::ToolUseInputDelta(r#"{}"#.to_string()),
+        StreamEvent::ToolUseEnd,
+        StreamEvent::MessageEnd {
+            stop_reason: StopReason::ToolUse,
+        },
+    ];
+    let provider = Arc::new(MockProvider::new(vec![script]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(StreamingEchoTool)];
+    let mut session =
+        AgentSession::new(provider, tools, "mock-model".to_string(), "sys".to_string());
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "hi".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let events = collect_events(rx).await;
+
+    // ask_user 事件发出；paused 不发 run 终态
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::AskUser { tool_use_id, .. } if tool_use_id == "ask1")));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::RunCompleted { .. } | AgentEvent::RunFailed { .. })));
+
+    let find_result = |id: &str| {
+        session.messages().iter().find_map(|msg| {
+            msg.content.iter().find_map(|b| match b {
+                hank_provider::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+        })
+    };
+    // a1 已执行：保留真实结果
+    assert!(find_result("a1").is_some(), "a1 的结果应保留");
+    // ask_user：不预填结果（由 server 端用用户答案回填）
+    assert!(find_result("ask1").is_none(), "ask_user 不应预填结果");
+    // a2 未执行：补占位错误 result
+    let (c2, e2) = find_result("a2").expect("missing placeholder tool_result for a2");
+    assert!(e2);
+    assert!(c2.contains("ask_user interrupted"), "content={c2}");
+}
+
+/// #14 验收：首次调用 deferred 工具时不执行盲猜参数，
+/// 返回 "Tool schema now loaded" 错误结果让模型带完整 schema 重试。
+#[tokio::test]
+async fn test_deferred_tool_first_call_returns_retry_hint() {
+    let dir = tempdir_path();
+    let provider = Arc::new(MockProvider::new(vec![
+        // 第 1 次：空 schema 盲猜调用
+        tool_use_script("t1", "write_file", r#"{"path":"deferred.txt","content":"x"}"#),
+        // 第 2 次：拿到完整 schema 后重试
+        tool_use_script("t2", "write_file", r#"{"path":"deferred.txt","content":"x"}"#),
+        text_end_script("done"),
+    ]));
+    let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(WriteFileTool::new(Some(dir.clone())))];
+    let mut session =
+        AgentSession::new(provider, tools, "mock-model".to_string(), "sys".to_string())
+            .with_permission(code_tools::PermissionMode::WorkspaceWrite, dir.clone())
+            .with_deferred_tools(["write_file"]);
+
+    let (tx, rx) = mpsc::channel(64);
+    session
+        .run(
+            vec![hank_provider::ContentBlock::Text {
+                text: "write a file".to_string(),
+            }],
+            tx,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let _events = collect_events(rx).await;
+
+    let find_result = |id: &str| {
+        session.messages().iter().find_map(|msg| {
+            msg.content.iter().find_map(|b| match b {
+                hank_provider::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } if tool_use_id == id => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+        })
+    };
+    // 第 1 次盲猜：不执行，返回重试提示
+    let (c1, e1) = find_result("t1").expect("missing tool_result for t1");
+    assert!(e1);
+    assert!(c1.contains("Tool schema now loaded"), "content={c1}");
+    // 第 2 次重试：正常执行，文件写入
+    let (_c2, e2) = find_result("t2").expect("missing tool_result for t2");
+    assert!(!e2);
+    assert!(std::path::Path::new(&format!("{dir}/deferred.txt")).exists());
+    let _ = std::fs::remove_dir_all(&dir);
 }

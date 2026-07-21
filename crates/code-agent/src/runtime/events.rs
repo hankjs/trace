@@ -35,6 +35,9 @@ pub(crate) fn build_run_summary_from(run_state: &RunState) -> String {
             run_state.verification_issues.join("; ")
         ));
     }
+    if let Some(ref note) = run_state.termination_note {
+        parts.push(format!("Stopped: {note}"));
+    }
     parts.join(" | ")
 }
 
@@ -79,7 +82,8 @@ pub(crate) async fn emit_run_terminal(
                     run_id: run_id.to_string(),
                     timestamp: now_ts(),
                     status: RunStatus::Success,
-                    input_tokens: run_state.input_tokens,
+                    // 峰值上下文 input tokens（非累计，见 RunState 字段注释）
+                    input_tokens: run_state.peak_input_tokens,
                     output_tokens: run_state.output_tokens,
                     summary,
                     permission_denials: run_state.permission_denials.clone(),

@@ -7,8 +7,8 @@ pub mod session;
 pub mod types;
 
 pub use agent::{
-    ConcurrencyPolicy, DelegatedTask, LoopDetector, TaskResult, TaskStatus, ThinkStrategy, Verdict,
-    VerificationResult,
+    ConcurrencyPolicy, DelegatedTask, LoopDetector, LoopLevel, TaskResult, TaskStatus,
+    ThinkStrategy, Verdict, VerificationResult,
 };
 pub use context::{BudgetStatus, CompressionStrategy, ContextManager};
 pub use prompt_pipe::{

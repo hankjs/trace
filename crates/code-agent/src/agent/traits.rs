@@ -43,14 +43,6 @@ pub enum TaskStatus {
     NeedsHumanInput,
 }
 
-/// Artifact produced by a worker (file change, command output, etc.)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Artifact {
-    pub kind: String,
-    pub description: String,
-    pub content: String,
-}
-
 /// Result returned by a Worker to the Orchestrator
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskResult {
@@ -58,8 +50,6 @@ pub struct TaskResult {
     pub status: TaskStatus,
     /// Compressed summary injected into Orchestrator context
     pub summary: String,
-    /// Structured artifacts (file changes, outputs)
-    pub artifacts: Vec<Artifact>,
     /// 子任务执行期间产生的文件变更（FR-PERM-6，回填父 run_state）
     #[serde(default)]
     pub file_changes: Vec<crate::types::FileChange>,
