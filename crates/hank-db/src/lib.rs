@@ -498,7 +498,12 @@ impl Database {
             .fetch_one(&pool)
             .await?;
         if user_count.0 == 0 {
-            let hash = bcrypt::hash("admin", bcrypt::DEFAULT_COST).unwrap();
+            // 初始 admin 密码: 优先取环境变量, 否则生成随机密码并打印到日志(仅此一次)
+            let initial_password = std::env::var("HANK_ADMIN_INITIAL_PASSWORD")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
+            let hash = bcrypt::hash(&initial_password, bcrypt::DEFAULT_COST).unwrap();
             let id = Uuid::new_v4().to_string();
             let _ = sqlx::query(
                 "INSERT INTO users (id, username, password_hash, can_login_admin, can_login_client) VALUES (?, ?, ?, TRUE, TRUE)"
@@ -508,6 +513,9 @@ impl Database {
             .bind(&hash)
             .execute(&pool)
             .await;
+            tracing::warn!(
+                "seeded default admin user, initial password: {initial_password} (change it after first login)"
+            );
         }
 
         // Providers table
