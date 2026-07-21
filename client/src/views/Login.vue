@@ -33,7 +33,7 @@ async function handleLogin() {
 <template>
   <div class="login-page">
     <div class="login-form">
-      <span class="login-brand">Hank</span>
+      <span class="login-brand">Trace</span>
 
       <form @submit.prevent="handleLogin">
         <input

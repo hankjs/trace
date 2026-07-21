@@ -182,7 +182,7 @@ defineExpose({ rightPanelOpen, navCollapsed });
     <!-- Left Navigation -->
     <nav class="nav" :class="{ collapsed: navCollapsed }">
       <div class="nav-header">
-        <span v-if="!navCollapsed" class="nav-brand">Hank</span>
+        <span v-if="!navCollapsed" class="nav-brand">Trace</span>
         <button
           class="nav-toggle"
           @click="navCollapsed = !navCollapsed"

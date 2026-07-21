@@ -1,5 +1,5 @@
 ---
-name: Hank
+name: Trace
 description: AI agent desktop environment for developers
 colors:
   surface-deep: "#1f2124"
@@ -71,13 +71,13 @@ components:
     padding: "8px 12px"
 ---
 
-# Design System: Hank
+# Design System: Trace
 
 ## 1. Overview
 
 **Creative North Star: "The Quiet Instrument"**
 
-Hank's visual system is built on the principle that a developer tool should feel like a well-tuned instrument: responsive, predictable, and invisible when things are going well. The interface never competes with the content it displays. Every surface, every transition, every typographic choice serves a single purpose: keeping the developer in flow.
+Trace's visual system is built on the principle that a developer tool should feel like a well-tuned instrument: responsive, predictable, and invisible when things are going well. The interface never competes with the content it displays. Every surface, every transition, every typographic choice serves a single purpose: keeping the developer in flow.
 
 The system rejects chatbot aesthetics (bubbles, avatars, typing indicators), playful SaaS patterns (bouncy animations, gradient accents, rounded everything), and anything that signals "AI product" before "developer tool." The closest physical analogy is a precision measuring instrument: matte black housing, clear markings, no ornamentation.
 
@@ -122,7 +122,7 @@ A restrained palette of cool blue-slate neutrals with a single muted amber-gold 
 **Body Font:** System stack (-apple-system, BlinkMacSystemFont, Segoe UI, system-ui, sans-serif)
 **Mono Font:** SF Mono, Cascadia Code, JetBrains Mono, ui-monospace, monospace
 
-**Character:** Native, invisible, fast. The system font stack gives Hank a platform-native feel on every OS. No custom fonts to load, no FOUT, no personality competing with the developer's code.
+**Character:** Native, invisible, fast. The system font stack gives Trace a platform-native feel on every OS. No custom fonts to load, no FOUT, no personality competing with the developer's code.
 
 ### Hierarchy
 - **Title** (600, 13px, 1.3): Section headers, view titles, nav section labels. Same size as body; weight carries the hierarchy.
@@ -138,7 +138,7 @@ A restrained palette of cool blue-slate neutrals with a single muted amber-gold 
 
 ## 4. Elevation
 
-Hank uses flat tonal layering exclusively. No box-shadows anywhere in the system. Depth is communicated through surface lightness: darker surfaces recede, lighter surfaces advance.
+Trace uses flat tonal layering exclusively. No box-shadows anywhere in the system. Depth is communicated through surface lightness: darker surfaces recede, lighter surfaces advance.
 
 ### Tonal Layers
 - **Layer 0** (oklch 0.13): Root canvas. The void.
@@ -147,7 +147,7 @@ Hank uses flat tonal layering exclusively. No box-shadows anywhere in the system
 - **Layer 3** (oklch 0.25): Highest layer (pressed states, scrollbar thumbs).
 
 ### Named Rules
-**The No Shadow Rule.** Shadows are prohibited. If a surface needs to feel elevated, it gets a lighter tonal value. If a dropdown needs separation from its parent, it gets a border and a tonal step. Shadows imply physicality; Hank is a flat instrument.
+**The No Shadow Rule.** Shadows are prohibited. If a surface needs to feel elevated, it gets a lighter tonal value. If a dropdown needs separation from its parent, it gets a border and a tonal step. Shadows imply physicality; Trace is a flat instrument.
 
 ## 5. Components
 
@@ -200,7 +200,7 @@ Hank uses flat tonal layering exclusively. No box-shadows anywhere in the system
 
 ### Don't:
 - **Don't** use box-shadows anywhere. Not on dropdowns, not on modals, not on hover. Flat tonal layering only.
-- **Don't** use chat bubbles, avatars, or typing indicators. Hank is a development environment, not a chatbot.
+- **Don't** use chat bubbles, avatars, or typing indicators. Trace is a development environment, not a chatbot.
 - **Don't** use bouncy or elastic easing. Ease-out-expo only (cubic-bezier 0.16, 1, 0.3, 1).
 - **Don't** use border-left or border-right greater than 1px as colored accents on list items or cards.
 - **Don't** use gradient text (background-clip: text).

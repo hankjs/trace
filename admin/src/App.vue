@@ -40,7 +40,7 @@ function handleGenerate() {
   </div>
   <div v-else class="flex min-h-screen">
     <aside class="w-52 shrink-0 border-r border-border-subtle px-3 py-5 flex flex-col">
-      <div class="px-2 mb-5 text-sm font-medium text-text-secondary tracking-tight">Hank</div>
+      <div class="px-2 mb-5 text-sm font-medium text-text-secondary tracking-tight">Trace</div>
       <nav class="flex flex-col gap-1 flex-1">
         <RouterLink
           v-for="item in nav"

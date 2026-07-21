@@ -1,4 +1,4 @@
-# Hank Agent Web
+# Trace
 
 远程 AI Agent 服务 + Tauri 桌面客户端。Agent 运行在服务器上执行 shell 命令，客户端通过 SSE 实时展示工作状态。支持多 LLM 提供商、变更管理、Spec 系统、Checkpoint 回溯。
 

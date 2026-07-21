@@ -10,7 +10,7 @@ Solo developers using AI agents for code exploration, generation, and structured
 
 ## Product Purpose
 
-Hank is a desktop AI agent environment for developers who want structured, traceable AI-assisted coding. It connects to multiple LLM providers, executes shell commands and file operations, and tracks changes through specs, checkpoints, and conversation branches. Success looks like: a developer finishes a complex multi-step coding task faster and with more confidence than working alone, with a clear audit trail of what happened.
+Trace is a desktop AI agent environment for developers who want structured, traceable AI-assisted coding. It connects to multiple LLM providers, executes shell commands and file operations, and tracks changes through specs, checkpoints, and conversation branches. Success looks like: a developer finishes a complex multi-step coding task faster and with more confidence than working alone, with a clear audit trail of what happened.
 
 ## Brand Personality
 
@@ -18,7 +18,7 @@ Capable, calm, precise. An expert tool that stays out of the way. Confidence thr
 
 ## Anti-references
 
-- Generic chatbot UIs: no speech bubbles, no avatars, no typing indicators, no "AI is thinking" spinners with personality. Hank is not a chat companion — it's a development environment.
+- Generic chatbot UIs: no speech bubbles, no avatars, no typing indicators, no "AI is thinking" spinners with personality. Trace is not a chat companion — it's a development environment.
 - Rounded, playful SaaS aesthetics. No gratuitous gradients, no bouncy animations, no emoji-heavy copy.
 - Electron apps that feel sluggish or web-first. Should feel native and immediate.
 

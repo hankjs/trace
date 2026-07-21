@@ -1,5 +1,5 @@
 {
-  "productName": "Hank Agent",
+  "productName": "Trace",
   "version": "0.1.0",
   "identifier": "com.hank.agent",
   "build": {
@@ -11,7 +11,7 @@
   "app": {
     "windows": [
       {
-        "title": "Hank Agent",
+        "title": "Trace",
         "width": 900,
         "height": 700,
         "maximized": true
