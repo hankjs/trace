@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Hank server + admin 自动构建部署脚本
+#
+# 用法:
+#   ./deploy/deploy.sh             # 全量部署(依赖检查 -> 构建 -> 部署 -> 重启)
+#   ./deploy/deploy.sh --skip-deps # 跳过 apt/rustup 依赖安装(已装过时加速)
+#
+# 流程:
+#   1. 服务器安装构建依赖 (build-essential / pkg-config / libssl-dev / rustup)
+#   2. 本地构建 admin 前端 (pnpm build)
+#   3. rsync Rust 源码到服务器, cargo build --release
+#   4. 安装二进制 + admin/dist 到 /opt/hank, 注册 systemd 服务并重启
+#
+# 服务器上的 config.toml 只在缺失时从本地上传一次, 之后不会被覆盖.
+
+set -euo pipefail
+
+SSH_HOST="${SSH_HOST:-wananyun}"
+REMOTE_SRC="/root/hank-src"       # 服务器上的源码构建目录
+REMOTE_APP="/opt/hank"            # 部署目录
+SERVICE_NAME="hank-server"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+SKIP_DEPS=0
+[[ "${1:-}" == "--skip-deps" ]] && SKIP_DEPS=1
+
+log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+# ---------- 1. 服务器构建依赖 ----------
+# 国内服务器默认走 rsproxy.cn 镜像加速 rustup/crates; CARGO_MIRROR=none 可关闭
+CARGO_MIRROR="${CARGO_MIRROR:-rsproxy}"
+if [[ $SKIP_DEPS -eq 0 ]]; then
+  log "安装服务器构建依赖 (apt + rustup, 镜像: $CARGO_MIRROR)..."
+  ssh "$SSH_HOST" "CARGO_MIRROR='$CARGO_MIRROR'" bash -s <<'REMOTE'
+set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq build-essential pkg-config libssl-dev curl ca-certificates
+if [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
+  if [[ "$CARGO_MIRROR" == "rsproxy" ]]; then
+    export RUSTUP_DIST_SERVER="https://rsproxy.cn"
+    export RUSTUP_UPDATE_ROOT="https://rsproxy.cn/rustup"
+  fi
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+  sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal
+  rm -f /tmp/rustup-init.sh
+fi
+# crates.io 镜像, 加速 cargo build
+if [[ "$CARGO_MIRROR" == "rsproxy" && ! -f "$HOME/.cargo/config.toml" ]]; then
+  cat > "$HOME/.cargo/config.toml" <<'EOF'
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+[net]
+git-fetch-with-cli = true
+EOF
+fi
+"$HOME/.cargo/bin/cargo" --version
+REMOTE
+else
+  log "跳过依赖安装"
+fi
+
+# ---------- 2. 本地构建 admin ----------
+log "本地构建 admin 前端..."
+cd "$PROJECT_ROOT/admin"
+pnpm install --frozen-lockfile
+pnpm build
+cd "$PROJECT_ROOT"
+
+# ---------- 3. 同步源码并在服务器构建 ----------
+log "同步 Rust 源码到服务器..."
+ssh "$SSH_HOST" "mkdir -p $REMOTE_SRC"
+rsync -az \
+  -e ssh \
+  "$PROJECT_ROOT/Cargo.toml" "$PROJECT_ROOT/Cargo.lock" \
+  "$SSH_HOST:$REMOTE_SRC/"
+rsync -az --delete -e ssh \
+  "$PROJECT_ROOT/server" "$PROJECT_ROOT/crates" \
+  "$SSH_HOST:$REMOTE_SRC/"
+
+log "服务器上 cargo build --release (首次较慢)..."
+ssh "$SSH_HOST" "cd $REMOTE_SRC && \$HOME/.cargo/bin/cargo build --release -p hank-server"
+
+# ---------- 4. 部署产物 ----------
+log "部署到 $REMOTE_APP ..."
+ssh "$SSH_HOST" "mkdir -p $REMOTE_APP/admin $REMOTE_APP/logs"
+# 从服务器构建目录拷贝二进制到部署目录
+ssh "$SSH_HOST" "install -m 755 $REMOTE_SRC/target/release/hank-server $REMOTE_APP/hank-server"
+# admin 静态文件
+rsync -az --delete -e ssh \
+  "$PROJECT_ROOT/admin/dist/" "$SSH_HOST:$REMOTE_APP/admin/dist/"
+
+# config.toml: 只在服务器缺失时上传, 绝不覆盖
+if ssh "$SSH_HOST" "[[ ! -f $REMOTE_APP/config.toml ]]"; then
+  if [[ -f "$PROJECT_ROOT/config.toml" ]]; then
+    log "上传 config.toml (仅首次)..."
+    scp -q "$PROJECT_ROOT/config.toml" "$SSH_HOST:$REMOTE_APP/config.toml"
+    ssh "$SSH_HOST" "chmod 600 $REMOTE_APP/config.toml"
+  else
+    echo "ERROR: 服务器上没有 config.toml, 本地也没有, 请先从 config.example.toml 创建" >&2
+    exit 1
+  fi
+else
+  log "服务器已有 config.toml, 跳过 (如需更新请手动 scp)"
+fi
+
+# ---------- 5. systemd 服务 ----------
+log "注册并重启 systemd 服务..."
+scp -q "$PROJECT_ROOT/deploy/hank-server.service" "$SSH_HOST:/etc/systemd/system/$SERVICE_NAME.service"
+ssh "$SSH_HOST" bash -s <<REMOTE
+set -euo pipefail
+systemctl daemon-reload
+systemctl enable $SERVICE_NAME
+systemctl restart $SERVICE_NAME
+sleep 2
+systemctl is-active $SERVICE_NAME
+REMOTE
+
+# ---------- 6. 健康检查 (服务需先连数据库, 重试最多 30s) ----------
+log "健康检查..."
+ssh "$SSH_HOST" bash -s <<'REMOTE'
+set -euo pipefail
+for i in $(seq 1 10); do
+  if curl -fsS -m 3 http://127.0.0.1:3000/api/health; then
+    echo
+    exit 0
+  fi
+  sleep 3
+done
+echo "ERROR: 健康检查失败, 查看 journalctl -u hank-server" >&2
+exit 1
+REMOTE
+
+log "部署完成 ✔  (systemctl status $SERVICE_NAME / journalctl -u $SERVICE_NAME 查看状态)"

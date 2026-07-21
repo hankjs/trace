@@ -17,6 +17,9 @@ pub struct ServerConfig {
     pub database_url: String,
     #[serde(default)]
     pub allowed_dirs: Vec<String>,
+    /// 额外允许的 CORS origin（默认已含 Tauri 桌面端和本地开发端口）
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
 }
 
 impl Config {

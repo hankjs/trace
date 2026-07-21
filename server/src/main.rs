@@ -82,6 +82,54 @@ async fn auth_middleware(
     }
 }
 
+/// 在 auth_middleware 之后运行，要求 claims.can_admin == true
+async fn admin_required(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    match request.extensions().get::<auth::Claims>() {
+        Some(claims) if claims.can_admin => next.run(request).await,
+        _ => {
+            tracing::warn!("admin access denied: insufficient permissions");
+            response::forbidden("admin access required")
+        }
+    }
+}
+
+/// 构建 CORS 白名单：Tauri 桌面端 + 本地开发端口 + config 中额外配置的 origin
+fn cors_layer(extra_origins: &[String]) -> CorsLayer {
+    use axum::http::{header, HeaderValue, Method};
+
+    let mut origins: Vec<HeaderValue> = [
+        "tauri://localhost",       // Tauri webview (macOS/Linux)
+        "http://tauri.localhost",  // Tauri webview (Windows)
+        "http://localhost:1420",   // client dev server
+        "http://localhost:5173",   // admin dev server
+    ]
+    .iter()
+    .filter_map(|s| s.parse().ok())
+    .collect();
+
+    for o in extra_origins {
+        match o.parse() {
+            Ok(v) => origins.push(v),
+            Err(_) => tracing::warn!(origin = %o, "ignoring invalid cors_origins entry"),
+        }
+    }
+
+    CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::list(origins))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // 日志：同时输出到终端和文件（按天滚动，实时写入）
@@ -243,6 +291,7 @@ async fn main() -> Result<()> {
         .route("/api/admin/weixin/accounts/{id}", delete(weixin::routes::delete_account))
         .route("/api/admin/weixin/bindings", get(weixin::routes::list_bindings))
         .route("/api/admin/weixin/bindings/{id}", delete(weixin::routes::delete_binding_admin))
+        .layer(middleware::from_fn(admin_required))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Static file serving for admin SPA
@@ -253,7 +302,7 @@ async fn main() -> Result<()> {
         .merge(protected)
         .merge(admin_api)
         .nest_service("/admin", admin_static)
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer(&config.server.cors_origins))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &axum::http::Request<_>| {

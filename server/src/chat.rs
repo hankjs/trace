@@ -571,11 +571,14 @@ pub async fn chat_handler(
             let stream = make_sse_stream(handle.event_rx);
             Sse::new(stream).into_response()
         }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            e.to_string(),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, session_id = %session_id, "chat turn failed to start");
+            (
+                StatusCode::BAD_REQUEST,
+                "failed to start chat turn".to_string(),
+            )
+                .into_response()
+        }
     }
 }
 
