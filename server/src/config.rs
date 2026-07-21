@@ -20,6 +20,14 @@ pub struct ServerConfig {
     /// 额外允许的 CORS origin（默认已含 Tauri 桌面端和本地开发端口）
     #[serde(default)]
     pub cors_origins: Vec<String>,
+    /// 是否启动微信 getupdates 长轮询。多实例共库时只能有一个实例开启,
+    /// 本地 dev 应设为 false, 避免与线上实例争抢消息
+    #[serde(default = "default_true")]
+    pub weixin_monitor: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Config {

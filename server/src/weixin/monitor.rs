@@ -27,6 +27,10 @@ pub fn start_monitors(state: Arc<AppState>) {
 
 /// 启动（或重启）某账号的 monitor。已在跑的会先停掉。
 pub fn spawn_monitor(state: Arc<AppState>, account: WeixinAccount) {
+    if !state.config.server.weixin_monitor {
+        tracing::debug!(account_id = %account.id, "weixin monitor disabled by config, skip");
+        return;
+    }
     let account_id = account.id.clone();
     tokio::spawn(async move {
         stop_monitor(&state, &account_id).await;
