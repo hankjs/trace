@@ -85,16 +85,60 @@ pub struct ImagePayload {
     pub data: String,
 }
 
-// PLACEHOLDER_CHAT_HANDLER
+// --- Chat turn core (decoupled from HTTP) ---
 
-pub async fn chat_handler(
-    State(state): State<Arc<AppState>>,
-    Path(session_id): Path<String>,
-    headers: axum::http::HeaderMap,
-    axum::Json(body): axum::Json<ChatRequest>,
-) -> impl IntoResponse {
+/// Options for a single chat turn, supplied by the caller (HTTP handler,
+/// WeChat bot, ...).
+pub struct ChatTurnOpts {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub parent_id: Option<String>,
+    pub apply_change_id: Option<String>,
+    /// JWT carried by spec-family tools when they call back into this server.
+    pub auth_token: String,
+}
+
+/// Handle returned by [`run_chat_turn`]. The receiver is subscribed to the
+/// session's EventBuffer BEFORE the agent task starts, so the caller sees
+/// every event from the beginning. The stream ends when the buffer's
+/// broadcast channel closes after the turn completes.
+pub struct ChatTurnHandle {
+    pub event_rx: broadcast::Receiver<EventEntry>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ChatTurnError {
+    #[error("No enabled providers available")]
+    NoProviders,
+}
+
+/// Extract the plain text of a content-block list (used for checkpoint
+/// labels, session titles and ask_user tool_result payloads).
+fn text_from_blocks(blocks: &[hank_provider::ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            hank_provider::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Run one full chat turn for a session, independent of any HTTP request.
+///
+/// Persists agent events/metrics, updates the session's EventBuffer (the
+/// resume endpoint depends on it), and registers the cancellation token in
+/// `state.active_tasks` exactly like the HTTP chat endpoint does.
+pub async fn run_chat_turn(
+    state: &Arc<AppState>,
+    session_id: &str,
+    content: Vec<hank_provider::ContentBlock>,
+    opts: ChatTurnOpts,
+) -> Result<ChatTurnHandle, ChatTurnError> {
+    let session_id = session_id.to_string();
+
     // Resolve providers with fallback from DB
-    let fallback_list = match body.provider.as_deref() {
+    let fallback_list = match opts.provider.as_deref() {
         Some(name) => provider_registry::resolve_with_fallback(&state.db, name).await,
         None => {
             let all = state.db.list_providers_ordered().await.unwrap_or_default();
@@ -108,16 +152,12 @@ pub async fn chat_handler(
         }
     };
     if fallback_list.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            format!("No enabled providers available"),
-        )
-            .into_response();
+        return Err(ChatTurnError::NoProviders);
     }
 
     // Determine model from the first (preferred) provider record
     let first_record = &fallback_list[0].0;
-    let model = match &body.model {
+    let model = match &opts.model {
         Some(m) => provider_registry::resolve_model(first_record, m),
         None => provider_registry::resolve_default_model(first_record),
     };
@@ -132,7 +172,7 @@ pub async fn chat_handler(
     // Check if this session has a pending ask_user state
     let pending_ask_user = session_record.as_ref().and_then(|s| s.pending_ask_user.clone());
 
-    let parent_id_for_new_msg = match body.parent_id.as_deref() {
+    let parent_id_for_new_msg = match opts.parent_id.as_deref() {
         Some("root") => None,
         Some(id) => Some(id.to_string()),
         None => session_record.as_ref().and_then(|s| s.active_leaf_id.clone()),
@@ -140,11 +180,7 @@ pub async fn chat_handler(
 
     let tools: Vec<Arc<dyn Tool>> = {
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
-        let token = headers.get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .unwrap_or_default()
-            .to_string();
+        let token = opts.auth_token.clone();
         let checksum_store = new_checksum_store();
         let mut t: Vec<Arc<dyn Tool>> = vec![
             Arc::new(ShellTool::new(work_dir.clone())),
@@ -188,8 +224,8 @@ pub async fn chat_handler(
     let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(64);
     let db = state.db.clone();
     let sid = session_id.clone();
-    let content_text = body.content.clone();
-    let apply_change_id = body.apply_change_id.clone();
+    let content_text = text_from_blocks(&content);
+    let apply_change_id = opts.apply_change_id.clone();
 
     // If pending_ask_user, the user's reply becomes a tool_result
     let user_content: Vec<hank_provider::ContentBlock> = if let Some(ref pending_json) = pending_ask_user {
@@ -200,23 +236,11 @@ pub async fn chat_handler(
         let _ = state.db.clear_session_pending_ask_user(&session_id).await;
         vec![hank_provider::ContentBlock::ToolResult {
             tool_use_id,
-            content: body.content.clone(),
+            content: content_text.clone(),
             is_error: false,
         }]
     } else {
-        let mut blocks = vec![hank_provider::ContentBlock::Text { text: body.content }];
-        if let Some(images) = body.images {
-            for img in images {
-                blocks.push(hank_provider::ContentBlock::Image {
-                    source: hank_provider::ImageSource {
-                        source_type: "base64".to_string(),
-                        media_type: img.media_type,
-                        data: img.data,
-                    },
-                });
-            }
-        }
-        blocks
+        content
     };
     let is_first_message = {
         let msgs = if let Some(ref leaf) = parent_id_for_new_msg {
@@ -476,9 +500,57 @@ pub async fn chat_handler(
         }
     }.instrument(agent_span));
 
-    // Build SSE stream from broadcast receiver + heartbeat
-    let stream = make_sse_stream(rx);
-    Sse::new(stream).into_response()
+    Ok(ChatTurnHandle { event_rx: rx })
+}
+
+// PLACEHOLDER_CHAT_HANDLER
+
+pub async fn chat_handler(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<ChatRequest>,
+) -> impl IntoResponse {
+    // spec 类工具回调 server 自身时使用请求携带的 JWT
+    let auth_token = headers.get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or_default()
+        .to_string();
+
+    let mut blocks = vec![hank_provider::ContentBlock::Text { text: body.content }];
+    if let Some(images) = body.images {
+        for img in images {
+            blocks.push(hank_provider::ContentBlock::Image {
+                source: hank_provider::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: img.media_type,
+                    data: img.data,
+                },
+            });
+        }
+    }
+
+    let opts = ChatTurnOpts {
+        provider: body.provider,
+        model: body.model,
+        parent_id: body.parent_id,
+        apply_change_id: body.apply_change_id,
+        auth_token,
+    };
+
+    match run_chat_turn(&state, &session_id, blocks, opts).await {
+        Ok(handle) => {
+            // Build SSE stream from broadcast receiver + heartbeat
+            let stream = make_sse_stream(handle.event_rx);
+            Sse::new(stream).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            e.to_string(),
+        )
+            .into_response(),
+    }
 }
 
 /// Check if an error is retryable (network, rate limit, 5xx, auth issues).

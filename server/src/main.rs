@@ -12,6 +12,7 @@ mod requirement_docs;
 mod routes;
 mod skills;
 mod specs;
+mod weixin;
 
 use anyhow::Result;
 use axum::{
@@ -19,7 +20,7 @@ use axum::{
     http::{HeaderMap, Request},
     middleware::{self, Next},
     response::Response,
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use config::Config;
@@ -42,6 +43,10 @@ pub struct AppState {
     pub config: Config,
     pub active_tasks: RwLock<HashMap<String, CancellationToken>>,
     pub event_buffers: RwLock<HashMap<String, EventBuffer>>,
+    /// 微信 QR 登录状态机（login_id → 状态）
+    pub weixin_logins: weixin::login::LoginStates,
+    /// 微信账号 monitor 任务（account_id → 停止令牌）
+    pub weixin_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
 }
 
 async fn auth_middleware(
@@ -101,7 +106,12 @@ async fn main() -> Result<()> {
         config: config.clone(),
         active_tasks: RwLock::new(HashMap::new()),
         event_buffers: RwLock::new(HashMap::new()),
+        weixin_logins: RwLock::new(HashMap::new()),
+        weixin_monitors: RwLock::new(HashMap::new()),
     });
+
+    // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）
+    weixin::monitor::start_monitors(state.clone());
 
     // Public routes (no auth required)
     let public = Router::new()
@@ -179,6 +189,10 @@ async fn main() -> Result<()> {
         .route("/api/requirement-docs", post(requirement_docs::create_doc))
         .route("/api/requirement-docs/{id}", put(requirement_docs::update_doc))
         .route("/api/requirement-docs/by-change/{changeId}", get(requirement_docs::get_doc_by_change))
+        // Weixin routes (client)
+        .route("/api/weixin/bind-code", post(weixin::routes::create_bind_code))
+        .route("/api/weixin/binding", get(weixin::routes::get_binding))
+        .route("/api/weixin/binding", delete(weixin::routes::delete_binding))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Admin API routes (also protected)
@@ -210,6 +224,14 @@ async fn main() -> Result<()> {
         .route("/api/admin/requirement-docs", get(requirement_docs::admin_list_docs))
         .route("/api/admin/requirement-docs/{id}", get(requirement_docs::admin_get_doc))
         .route("/api/admin/tasks", get(requirement_docs::admin_list_tasks))
+        // Weixin bot admin
+        .route("/api/admin/weixin/login", post(weixin::routes::create_login))
+        .route("/api/admin/weixin/login/{login_id}", get(weixin::routes::get_login))
+        .route("/api/admin/weixin/accounts", get(weixin::routes::list_accounts))
+        .route("/api/admin/weixin/accounts/{id}", patch(weixin::routes::update_account))
+        .route("/api/admin/weixin/accounts/{id}", delete(weixin::routes::delete_account))
+        .route("/api/admin/weixin/bindings", get(weixin::routes::list_bindings))
+        .route("/api/admin/weixin/bindings/{id}", delete(weixin::routes::delete_binding_admin))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Static file serving for admin SPA

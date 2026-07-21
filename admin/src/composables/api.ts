@@ -121,6 +121,33 @@ export interface Provider {
   created_at: string
 }
 
+export interface WeixinLoginStart {
+  login_id: string
+  qrcode_url: string
+}
+
+export interface WeixinLoginStatus {
+  status: 'waiting' | 'scanned' | 'confirmed' | 'expired' | 'error'
+  account?: WeixinAccount | null
+  msg?: string
+}
+
+export interface WeixinAccount {
+  id: string
+  ilink_bot_id: string
+  base_url: string
+  bot_user_id: string
+  enabled: boolean
+  created_at: string
+}
+
+export interface WeixinBinding {
+  id: string
+  username: string
+  ilink_user_id: string
+  created_at: string
+}
+
 export interface AgentEventRecord {
   id: string
   session_id: string
@@ -254,6 +281,38 @@ export const api = {
 
   deleteImageProvider(id: string) {
     return request<void>(`/api/admin/image-providers/${id}`, { method: 'DELETE' })
+  },
+
+  // Weixin bot management
+  weixinLoginStart() {
+    return request<WeixinLoginStart>('/api/admin/weixin/login', { method: 'POST' })
+  },
+
+  weixinLoginStatus(loginId: string) {
+    return request<WeixinLoginStatus>(`/api/admin/weixin/login/${loginId}`)
+  },
+
+  listWeixinAccounts() {
+    return request<WeixinAccount[]>('/api/admin/weixin/accounts')
+  },
+
+  updateWeixinAccount(id: string, data: { enabled: boolean }) {
+    return request<{ status: string }>(`/api/admin/weixin/accounts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    })
+  },
+
+  deleteWeixinAccount(id: string) {
+    return request<void>(`/api/admin/weixin/accounts/${id}`, { method: 'DELETE' })
+  },
+
+  listWeixinBindings() {
+    return request<WeixinBinding[]>('/api/admin/weixin/bindings')
+  },
+
+  deleteWeixinBinding(id: string) {
+    return request<void>(`/api/admin/weixin/bindings/${id}`, { method: 'DELETE' })
   },
 
   chatGenerate(prompt: string, context?: string) {

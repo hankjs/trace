@@ -276,6 +276,56 @@ pub struct RequirementDocVersion {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WeixinAccount {
+    pub id: String,
+    pub ilink_bot_id: String,
+    #[serde(skip_serializing)]
+    pub bot_token: String,
+    pub base_url: String,
+    pub bot_user_id: Option<String>,
+    pub get_updates_buf: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WeixinBinding {
+    pub id: String,
+    pub account_id: String,
+    pub ilink_user_id: String,
+    pub user_id: String,
+    pub context_token: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WeixinBindingWithUsername {
+    pub id: String,
+    pub account_id: String,
+    pub ilink_user_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub context_token: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WeixinBindCode {
+    pub code: String,
+    pub user_id: String,
+    pub expires_at: i64,
+    pub used_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WeixinChat {
+    pub id: String,
+    pub binding_id: String,
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsOverview {
     pub total_input_tokens: u64,
@@ -644,6 +694,66 @@ impl Database {
                 created_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (doc_id) REFERENCES requirement_docs(id) ON DELETE CASCADE,
                 INDEX idx_rdv_doc (doc_id, version)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Weixin accounts table (wechat bot login accounts)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS weixin_accounts (
+                id VARCHAR(36) PRIMARY KEY,
+                ilink_bot_id VARCHAR(128) NOT NULL,
+                bot_token TEXT NOT NULL,
+                base_url VARCHAR(255) NOT NULL,
+                bot_user_id VARCHAR(128) DEFAULT NULL,
+                get_updates_buf MEDIUMTEXT DEFAULT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at DATETIME NOT NULL DEFAULT NOW()
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Weixin bindings table (wechat user <-> trace user)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS weixin_bindings (
+                id VARCHAR(36) PRIMARY KEY,
+                account_id VARCHAR(36) NOT NULL,
+                ilink_user_id VARCHAR(128) NOT NULL,
+                user_id VARCHAR(36) NOT NULL,
+                context_token MEDIUMTEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                FOREIGN KEY (account_id) REFERENCES weixin_accounts(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY uk_weixin_binding (account_id, ilink_user_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Weixin bind codes table (one-time binding codes)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS weixin_bind_codes (
+                code VARCHAR(8) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL,
+                expires_at BIGINT NOT NULL,
+                used_at BIGINT DEFAULT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Weixin chats table (current session mapped to a binding)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS weixin_chats (
+                id VARCHAR(36) PRIMARY KEY,
+                binding_id VARCHAR(36) NOT NULL,
+                session_id VARCHAR(36) NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                FOREIGN KEY (binding_id) REFERENCES weixin_bindings(id) ON DELETE CASCADE,
+                UNIQUE KEY uk_weixin_chat_binding (binding_id)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -1149,6 +1259,17 @@ impl Database {
                 "SELECT id, username, password_hash, can_login_admin, can_login_client, created_at FROM users WHERE username = ?"
             )
             .bind(username)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn get_user_by_id(&self, id: &str) -> Result<Option<User>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, User>(
+                "SELECT id, username, password_hash, can_login_admin, can_login_client, created_at FROM users WHERE id = ?"
+            )
+            .bind(id)
             .fetch_optional(&self.pool)
         )?;
         Ok(row)
@@ -2256,6 +2377,225 @@ impl Database {
         let tasks = list_q.fetch_all(&self.pool).await?;
 
         Ok((tasks, total as u64))
+    }
+
+    // Weixin accounts
+    pub async fn create_weixin_account(&self, ilink_bot_id: &str, bot_token: &str, base_url: &str, bot_user_id: Option<&str>) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO weixin_accounts (id, ilink_bot_id, bot_token, base_url, bot_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+            )
+            .bind(&id)
+            .bind(ilink_bot_id)
+            .bind(bot_token)
+            .bind(base_url)
+            .bind(bot_user_id)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(id)
+    }
+
+    pub async fn list_weixin_accounts(&self) -> Result<Vec<WeixinAccount>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, WeixinAccount>(
+                "SELECT id, ilink_bot_id, bot_token, base_url, bot_user_id, get_updates_buf, enabled, created_at FROM weixin_accounts ORDER BY created_at ASC"
+            )
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    pub async fn get_weixin_account(&self, id: &str) -> Result<Option<WeixinAccount>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, WeixinAccount>(
+                "SELECT id, ilink_bot_id, bot_token, base_url, bot_user_id, get_updates_buf, enabled, created_at FROM weixin_accounts WHERE id = ?"
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn update_weixin_token(&self, id: &str, bot_token: &str, base_url: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE weixin_accounts SET bot_token = ?, base_url = ? WHERE id = ?")
+                .bind(bot_token)
+                .bind(base_url)
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn update_weixin_bot_user_id(&self, id: &str, bot_user_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE weixin_accounts SET bot_user_id = ? WHERE id = ?")
+                .bind(bot_user_id)
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn update_weixin_cursor(&self, id: &str, buf: Option<&str>) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE weixin_accounts SET get_updates_buf = ? WHERE id = ?")
+                .bind(buf)
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn set_weixin_account_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE weixin_accounts SET enabled = ? WHERE id = ?")
+                .bind(enabled)
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn delete_weixin_account(&self, id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("DELETE FROM weixin_accounts WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    // Weixin bindings
+    pub async fn create_weixin_binding(&self, account_id: &str, ilink_user_id: &str, user_id: &str) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO weixin_bindings (id, account_id, ilink_user_id, user_id, created_at) VALUES (?, ?, ?, ?, ?)"
+            )
+            .bind(&id)
+            .bind(account_id)
+            .bind(ilink_user_id)
+            .bind(user_id)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(id)
+    }
+
+    pub async fn get_weixin_binding(&self, account_id: &str, ilink_user_id: &str) -> Result<Option<WeixinBinding>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, WeixinBinding>(
+                "SELECT id, account_id, ilink_user_id, user_id, context_token, created_at FROM weixin_bindings WHERE account_id = ? AND ilink_user_id = ?"
+            )
+            .bind(account_id)
+            .bind(ilink_user_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn get_weixin_binding_by_user(&self, user_id: &str) -> Result<Option<WeixinBinding>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, WeixinBinding>(
+                "SELECT id, account_id, ilink_user_id, user_id, context_token, created_at FROM weixin_bindings WHERE user_id = ?"
+            )
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn list_weixin_bindings(&self) -> Result<Vec<WeixinBindingWithUsername>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, WeixinBindingWithUsername>(
+                "SELECT b.id, b.account_id, b.ilink_user_id, b.user_id, u.username, b.context_token, b.created_at FROM weixin_bindings b JOIN users u ON u.id = b.user_id ORDER BY b.created_at ASC"
+            )
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    pub async fn update_weixin_binding_context(&self, id: &str, context_token: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE weixin_bindings SET context_token = ? WHERE id = ?")
+                .bind(context_token)
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn delete_weixin_binding(&self, id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("DELETE FROM weixin_bindings WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    // Weixin bind codes
+    pub async fn create_weixin_bind_code(&self, code: &str, user_id: &str, expires_at: i64) -> Result<()> {
+        db_retry!(
+            sqlx::query("INSERT INTO weixin_bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)")
+                .bind(code)
+                .bind(user_id)
+                .bind(expires_at)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 校验并消费绑定码：未过期且未使用时原子标记 used，返回 user_id。
+    pub async fn consume_weixin_bind_code(&self, code: &str) -> Result<Option<String>> {
+        let now_ms = Utc::now().timestamp_millis();
+        let res = db_retry!(
+            sqlx::query("UPDATE weixin_bind_codes SET used_at = ? WHERE code = ? AND used_at IS NULL AND expires_at > ?")
+                .bind(now_ms)
+                .bind(code)
+                .bind(now_ms)
+                .execute(&self.pool)
+        )?;
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let row: Option<(String,)> = db_retry!(
+            sqlx::query_as("SELECT user_id FROM weixin_bind_codes WHERE code = ?")
+                .bind(code)
+                .fetch_optional(&self.pool)
+        )?;
+        Ok(row.map(|r| r.0))
+    }
+
+    // Weixin chats
+    pub async fn get_weixin_chat(&self, binding_id: &str) -> Result<Option<String>> {
+        let row: Option<(String,)> = db_retry!(
+            sqlx::query_as("SELECT session_id FROM weixin_chats WHERE binding_id = ?")
+                .bind(binding_id)
+                .fetch_optional(&self.pool)
+        )?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn set_weixin_chat(&self, binding_id: &str, session_id: &str) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO weixin_chats (id, binding_id, session_id, created_at) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE session_id = VALUES(session_id)"
+            )
+            .bind(&id)
+            .bind(binding_id)
+            .bind(session_id)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(())
     }
 }
 

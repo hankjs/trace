@@ -19,6 +19,7 @@ const router = createRouter({
     { path: '/users', component: () => import('./views/Users.vue') },
     { path: '/providers', component: () => import('./views/Providers.vue') },
     { path: '/image-providers', component: () => import('./views/ImageProviders.vue') },
+    { path: '/weixin', component: () => import('./views/WeixinBot.vue') },
   ],
 })
 

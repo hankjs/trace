@@ -1,8 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useRouter } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { createBindCode, getBinding, unbind, type WeixinBinding } from "../api/weixin";
 
 interface AgentConfig {
   name: string;
@@ -78,7 +79,104 @@ async function browsePath() {
   }
 }
 
-onMounted(loadAgents);
+onMounted(() => {
+  loadAgents();
+  loadBinding();
+});
+
+// ---------- 微信绑定 ----------
+
+const binding = ref<WeixinBinding | null>(null);
+const bindCode = ref("");
+const bindExpiresAt = ref(0);
+const now = ref(Date.now());
+const generatingCode = ref(false);
+const unbinding = ref(false);
+let countdownTimer: ReturnType<typeof setInterval> | undefined;
+let pollTimer: ReturnType<typeof setInterval> | undefined;
+
+const codeExpired = computed(() => !bindCode.value || now.value >= bindExpiresAt.value);
+const countdownText = computed(() => {
+  const remain = Math.max(0, bindExpiresAt.value - now.value);
+  const m = Math.floor(remain / 60000);
+  const s = Math.floor((remain % 60000) / 1000);
+  return `${m}:${String(s).padStart(2, "0")}`;
+});
+
+async function loadBinding() {
+  const result = await getBinding();
+  if (result.ok) binding.value = result.data ?? null;
+}
+
+function stopPolling() {
+  clearInterval(pollTimer);
+  pollTimer = undefined;
+}
+
+function startPolling() {
+  stopPolling();
+  pollTimer = setInterval(async () => {
+    const result = await getBinding();
+    if (result.ok && result.data) binding.value = result.data;
+  }, 5000);
+}
+
+// 未绑定期间每 5 秒轮询一次绑定状态，拿到绑定后自动切到已绑定态并停止轮询
+watch(
+  binding,
+  (value) => {
+    if (value) stopPolling();
+    else startPolling();
+  },
+  { immediate: true }
+);
+
+function startCountdown() {
+  clearInterval(countdownTimer);
+  now.value = Date.now();
+  countdownTimer = setInterval(() => {
+    now.value = Date.now();
+    if (now.value >= bindExpiresAt.value) clearInterval(countdownTimer);
+  }, 1000);
+}
+
+async function generateCode() {
+  generatingCode.value = true;
+  try {
+    const result = await createBindCode();
+    if (result.ok && result.data) {
+      bindCode.value = result.data.code;
+      bindExpiresAt.value = result.data.expires_at;
+      startCountdown();
+    }
+  } finally {
+    generatingCode.value = false;
+  }
+}
+
+async function confirmUnbind() {
+  if (!confirm("确定解绑微信？解绑后将无法通过微信机器人驱动会话。")) return;
+  unbinding.value = true;
+  try {
+    const result = await unbind();
+    if (result.ok) {
+      binding.value = null;
+      bindCode.value = "";
+    }
+  } finally {
+    unbinding.value = false;
+  }
+}
+
+function formatTime(iso: string) {
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
+
+onUnmounted(() => {
+  clearInterval(countdownTimer);
+  stopPolling();
+});
 </script>
 
 <template>
@@ -86,9 +184,10 @@ onMounted(loadAgents);
     <div class="settings-panel">
       <div class="settings-header">
         <button class="back-btn" @click="goBack()">&larr;</button>
-        <h2>Local Agent Settings</h2>
+        <h2>设置</h2>
       </div>
 
+      <h3 class="section-title">Local Agents</h3>
       <div class="agent-list">
         <div v-for="agent in agents" :key="agent.name" class="agent-item">
           <div class="agent-info">
@@ -126,6 +225,38 @@ onMounted(loadAgents);
         </div>
       </div>
       <button v-else class="btn-primary" @click="isAdding = true">+ Add Agent</button>
+
+      <h3 class="section-title weixin-title">微信绑定</h3>
+      <div class="weixin-section">
+        <p class="weixin-desc">绑定后可在微信中通过机器人远程驱动会话。</p>
+
+        <!-- 已绑定 -->
+        <div v-if="binding" class="weixin-bound">
+          <div class="weixin-bound-info">
+            <span class="weixin-label">微信用户</span>
+            <span class="weixin-value">{{ binding.ilink_user_id }}</span>
+          </div>
+          <div class="weixin-bound-info">
+            <span class="weixin-label">绑定时间</span>
+            <span class="weixin-value">{{ formatTime(binding.created_at) }}</span>
+          </div>
+          <button class="btn-sm btn-danger" :disabled="unbinding" @click="confirmUnbind">
+            {{ unbinding ? "解绑中..." : "解绑" }}
+          </button>
+        </div>
+
+        <!-- 未绑定 -->
+        <div v-else class="weixin-unbound">
+          <template v-if="bindCode && !codeExpired">
+            <div class="bind-code">{{ bindCode }}</div>
+            <p class="weixin-hint">有效期剩余 {{ countdownText }}</p>
+            <p class="weixin-hint">打开微信，向机器人发送：<code>bind {{ bindCode }}</code></p>
+          </template>
+          <button class="btn-primary" :disabled="generatingCode" @click="generateCode">
+            {{ generatingCode ? "生成中..." : bindCode ? "重新生成绑定码" : "生成绑定码" }}
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -183,4 +314,17 @@ onMounted(loadAgents);
 .btn-danger { color: var(--color-error, #f44); border-color: var(--color-error, #f44); }
 .btn-primary { padding: 0.5rem 1rem; border-radius: 0.375rem; border: none; background: var(--color-accent, #6366f1); color: white; cursor: pointer; font-size: 0.875rem; }
 .btn-primary:hover { opacity: 0.9; }
+.btn-primary:disabled { opacity: 0.5; cursor: default; }
+.section-title { font-size: 0.8rem; font-weight: 600; color: var(--color-text-secondary); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.75rem; }
+.weixin-title { margin-top: 2rem; }
+.weixin-section { padding: 1rem; border: 1px solid var(--color-border, #333); border-radius: 0.5rem; }
+.weixin-desc { font-size: 0.85rem; color: var(--color-text-secondary); margin-bottom: 0.75rem; }
+.weixin-unbound { display: flex; flex-direction: column; align-items: flex-start; gap: 0.5rem; }
+.bind-code { font-size: 2rem; font-weight: 700; font-family: monospace; letter-spacing: 0.3em; color: var(--color-text-primary); }
+.weixin-hint { font-size: 0.8rem; color: var(--color-text-secondary); }
+.weixin-hint code { font-family: monospace; background: var(--color-surface-1, #1a1a1a); padding: 0.1rem 0.4rem; border-radius: 0.25rem; color: var(--color-text-primary); }
+.weixin-bound { display: flex; flex-direction: column; gap: 0.5rem; align-items: flex-start; }
+.weixin-bound-info { display: flex; gap: 0.75rem; font-size: 0.85rem; }
+.weixin-label { color: var(--color-text-secondary); min-width: 4rem; }
+.weixin-value { font-family: monospace; color: var(--color-text-primary); }
 </style>
