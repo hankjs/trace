@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, onMounted, onUnmounted, onDeactivated, watch, toRef } from "vue";
 import { useSession, apiRequest } from "../composables/useSession";
+import { useRemoteExec } from "../composables/useRemoteExec";
+import { setSessionExecClient } from "../api/remoteExec";
 import { useMessageTree } from "../composables/useMessageTree";
 import { useMessage } from "../composables/useMessage";
 import { useSidebarPanels } from "../composables/useSidebarPanels";
@@ -79,6 +81,27 @@ const sessionTitle = computed(() => currentSession.value?.title || "");
 const sessionWorkDir = computed(() => currentSession.value?.work_dir || "");
 const displayDir = computed(() => currentSession.value?.work_dir || "");
 const isEmpty = computed(() => blocks.value.length === 0 && !isStreaming.value);
+
+// 在本地执行（远程会话的 fs/shell 工具下发到本机 client）
+const remoteExec = useRemoteExec();
+const execLocalOn = ref(false);
+const execLocalBusy = ref(false);
+// 会话当前绑定的 exec client（server 在 GET /api/sessions/{id} 返回的 exec_client_id 字段）
+const boundExecClientId = computed(() => currentSession.value?.exec_client_id ?? undefined);
+const boundToOtherClient = computed(() => !!boundExecClientId.value && boundExecClientId.value !== remoteExec.clientId);
+
+watch(boundExecClientId, (id) => { execLocalOn.value = id === remoteExec.clientId; }, { immediate: true });
+
+async function toggleExecLocal() {
+  if (execLocalBusy.value) return;
+  if (boundToOtherClient.value) { showWarning("该会话已绑定其他 client，请先在那台设备上关闭"); return; }
+  execLocalBusy.value = true;
+  try {
+    const result = await setSessionExecClient(props.sessionId, execLocalOn.value ? null : remoteExec.clientId);
+    if (result.ok) execLocalOn.value = !execLocalOn.value;
+    else showWarning(result.msg || "设置失败");
+  } finally { execLocalBusy.value = false; }
+}
 
 // Checkpoint functions
 async function fetchCheckpoints() {
@@ -258,6 +281,17 @@ watch(scrollTargetId, (id) => { if (id) { clearScrollTarget(); nextTick(() => { 
           {{ local.localAgentStatus.value === 'running' ? 'Running' : local.localAgentStatus.value === 'stopped' ? 'Stopped' : 'Not Configured' }}
         </span>
         <span v-if="actions.activeApplyChangeId.value" class="apply-indicator">Applying Change</span>
+        <template v-if="local.sessionEnvironment.value === 'remote' && remoteExec.acceptRemote.value">
+          <button
+            class="exec-local-toggle"
+            :class="{ on: execLocalOn, conflict: boundToOtherClient }"
+            :disabled="execLocalBusy"
+            :title="boundToOtherClient ? '该会话已绑定其他 client' : execLocalOn ? '点击切回 server 执行' : '点击后 fs/shell 工具在本机执行'"
+            @click="toggleExecLocal"
+          >
+            {{ execLocalBusy ? '设置中…' : boundToOtherClient ? '已在其他设备执行' : execLocalOn ? '本地执行中' : '在本地执行' }}
+          </button>
+        </template>
       </template>
       <template #actions>
         <button class="new-session-btn" :disabled="isCreatingSession" @click="startSessionFromCurrentDir" title="使用当前目录新建会话" aria-label="使用当前目录新建会话">
@@ -365,5 +399,10 @@ watch(scrollTargetId, (id) => { if (id) { clearScrollTarget(); nextTick(() => { 
 .new-session-btn svg { flex-shrink: 0; }
 .settings-icon-btn { background: none; border: none; color: var(--color-text-muted); cursor: pointer; padding: 4px; border-radius: 4px; display: flex; align-items: center; }
 .settings-icon-btn:hover { color: var(--color-text-primary); background: var(--color-surface-1); }
+.exec-local-toggle { font-size: 11px; padding: 2px 8px; border-radius: var(--radius-sm); font-weight: 500; border: 1px solid var(--color-border-subtle); background: var(--color-surface-1); color: var(--color-text-secondary); cursor: pointer; transition: color 0.12s, border-color 0.12s; }
+.exec-local-toggle:hover:not(:disabled) { color: var(--color-text-primary); border-color: var(--color-border); }
+.exec-local-toggle.on { color: var(--color-success); border-color: var(--color-success); background: var(--color-success-surface); }
+.exec-local-toggle.conflict { color: var(--color-text-muted); cursor: not-allowed; }
+.exec-local-toggle:disabled { opacity: 0.55; cursor: not-allowed; }
 </style>
 

@@ -10,6 +10,7 @@ code-tools = { path = "../crates/code-tools" }
 hank-db = { path = "../crates/hank-db" }
 tokio = { workspace = true }
 serde = { workspace = true }
+async-trait = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

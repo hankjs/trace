@@ -4,6 +4,9 @@ import { useRouter } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { createBindCode, getBinding, unbind, type WeixinBinding } from "../api/weixin";
+import { useRemoteExec } from "../composables/useRemoteExec";
+
+const remoteExec = useRemoteExec();
 
 interface AgentConfig {
   name: string;
@@ -173,6 +176,33 @@ function formatTime(iso: string) {
   return isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
+// ---------- 远程执行 ----------
+
+const remoteAccept = ref(remoteExec.acceptRemote.value);
+const remoteWorkDir = ref(remoteExec.workDir.value);
+const remoteSaving = ref(false);
+
+async function toggleRemoteAccept() {
+  remoteSaving.value = true;
+  try {
+    await remoteExec.setAcceptRemote(remoteAccept.value);
+  } finally {
+    remoteSaving.value = false;
+  }
+}
+
+async function chooseRemoteWorkDir() {
+  const selected = await open({ multiple: false, directory: true, title: "选择远程执行工作目录" });
+  if (selected) {
+    remoteWorkDir.value = selected as string;
+    await remoteExec.setWorkDir(remoteWorkDir.value);
+  }
+}
+
+async function saveRemoteWorkDir() {
+  await remoteExec.setWorkDir(remoteWorkDir.value.trim());
+}
+
 onUnmounted(() => {
   clearInterval(countdownTimer);
   stopPolling();
@@ -225,6 +255,23 @@ onUnmounted(() => {
         </div>
       </div>
       <button v-else class="btn-primary" @click="isAdding = true">+ Add Agent</button>
+
+      <h3 class="section-title weixin-title">远程执行</h3>
+      <div class="weixin-section">
+        <p class="weixin-desc">开启后，server 端会话的 fs/shell 工具调用可下发到本机，在下方工作目录中执行。</p>
+        <label class="remote-toggle-row">
+          <input type="checkbox" v-model="remoteAccept" :disabled="remoteSaving" @change="toggleRemoteAccept" />
+          <span>接受远程执行任务</span>
+        </label>
+        <div class="remote-status" :class="{ on: remoteExec.isPolling.value }">
+          {{ remoteExec.isPolling.value ? "已连接，等待任务" : remoteAccept ? "未连接" : "未开启" }}
+        </div>
+        <div class="remote-workdir-row">
+          <input v-model="remoteWorkDir" class="input flex-1" placeholder="工作目录（远程任务在此目录执行）" @change="saveRemoteWorkDir" />
+          <button class="btn-sm" @click="chooseRemoteWorkDir">选择目录</button>
+        </div>
+        <p class="weixin-hint">client_id：<code>{{ remoteExec.clientId }}</code></p>
+      </div>
 
       <h3 class="section-title weixin-title">微信绑定</h3>
       <div class="weixin-section">
@@ -327,4 +374,8 @@ onUnmounted(() => {
 .weixin-bound-info { display: flex; gap: 0.75rem; font-size: 0.85rem; }
 .weixin-label { color: var(--color-text-secondary); min-width: 4rem; }
 .weixin-value { font-family: monospace; color: var(--color-text-primary); }
+.remote-toggle-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: var(--color-text-primary); cursor: pointer; margin-bottom: 0.5rem; }
+.remote-status { font-size: 0.8rem; color: var(--color-text-secondary); margin-bottom: 0.75rem; }
+.remote-status.on { color: var(--color-success, #4f4); }
+.remote-workdir-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
 </style>

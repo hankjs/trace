@@ -168,17 +168,32 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
             let msg = match &session_id {
                 Some(sid) => {
                     let running = state.active_tasks.read().await.contains_key(sid);
-                    let title = state
-                        .db
-                        .get_session(sid)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|s| s.title)
-                        .unwrap_or_default();
+                    let session = state.db.get_session(sid).await.ok().flatten();
+                    let title = session.as_ref().map(|s| s.title.clone()).unwrap_or_default();
                     let title = if title.is_empty() { "(无标题)" } else { title.as_str() };
+                    // 执行位置：绑定的桌面 client（含在线状态）或 server 本地
+                    let exec_at = match session.as_ref().and_then(|s| s.exec_client_id.clone()) {
+                        Some(cid) => {
+                            let hostname = state
+                                .db
+                                .get_client_agent(&binding.user_id, &cid)
+                                .await
+                                .ok()
+                                .flatten()
+                                .and_then(|c| c.hostname)
+                                .unwrap_or_else(|| cid.clone());
+                            let online =
+                                crate::remote_exec::is_client_online(state, &binding.user_id, &cid)
+                                    .await;
+                            format!(
+                                "client 端 {hostname}{}",
+                                if online { "" } else { "（当前离线）" }
+                            )
+                        }
+                        None => "server 端".to_string(),
+                    };
                     format!(
-                        "会话：{title}\nID：{sid}\n状态：{}",
+                        "会话：{title}\nID：{sid}\n状态：{}\n执行位置：{exec_at}",
                         if running { "执行中" } else { "空闲" }
                     )
                 }
@@ -209,7 +224,7 @@ const MENU_TEXT: &str = "\
 /菜单 — 显示本说明
 
 【小贴士】
-· 任务在服务器端执行，操作的是服务器上的项目目录
+· 桌面 client 在线时任务在你本地机器执行，离线时在服务器端执行、仅支持查询类对话
 · 同一时间只能跑一个任务，执行中新消息会排队提醒
 · 暂只支持文字，图片/语音还在开发中";
 
@@ -293,6 +308,16 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
         return;
     }
 
+    // 会话绑定的桌面 client 已离线时解除绑定，退化为 server 本地执行
+    if let Ok(Some(session)) = state.db.get_session(&session_id).await {
+        if let Some(ref cid) = session.exec_client_id {
+            if !crate::remote_exec::is_client_online(state, &binding.user_id, cid).await {
+                tracing::info!(session_id = %session_id, client_id = %cid, "exec client offline, unbind session");
+                let _ = state.db.set_session_exec_client(&session_id, None, None).await;
+            }
+        }
+    }
+
     let username = state
         .db
         .get_user_by_id(&binding.user_id)
@@ -338,19 +363,36 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
 
 async fn create_weixin_session(state: &Arc<AppState>, binding: &WeixinBinding) -> Result<hank_db::Session> {
     let metadata = serde_json::json!({ "source": "weixin" }).to_string();
-    state
+    // 有在线且接受远程任务的桌面 client 时，会话绑定到该 client 本地执行
+    let client = crate::remote_exec::pick_online_client(state, &binding.user_id).await;
+    let work_dir = client.as_ref().and_then(|c| c.work_dir.clone());
+    let mut session = state
         .db
         .create_session(
             "",
             "",
-            None,
+            work_dir.as_deref(),
             Some(&binding.user_id),
             Some("remote"),
             Some("chat"),
             Some(&metadata),
         )
         .await
-        .map_err(|e| anyhow!("create session: {e:#}"))
+        .map_err(|e| anyhow!("create session: {e:#}"))?;
+    if let Some(c) = client {
+        if let Err(e) = state
+            .db
+            .set_session_exec_client(&session.id, Some(&c.id), c.work_dir.as_deref())
+            .await
+        {
+            tracing::warn!("weixin: bind exec client failed: {e:#}");
+        } else {
+            tracing::info!(session_id = %session.id, client_id = %c.id, "weixin session bound to desktop client");
+            session.exec_client_id = Some(c.id);
+            session.work_dir = c.work_dir;
+        }
+    }
+    Ok(session)
 }
 
 /// 创建新会话并绑定到当前微信聊天。

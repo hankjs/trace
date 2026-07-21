@@ -13,6 +13,7 @@ export interface Session {
   change_id: string | null;
   active_leaf_id: string | null;
   metadata: Record<string, any> | null;
+  exec_client_id: string | null;
   created_at: string;
   updated_at: string;
 }

@@ -168,6 +168,9 @@ pub async fn run_chat_turn(
     let work_dir_for_agent = work_dir.clone();
     let session_change_id = session_record.as_ref().and_then(|s| s.change_id.clone());
     let session_type = session_record.as_ref().map(|s| s.session_type.clone()).unwrap_or_else(|| "chat".to_string());
+    // 远程执行：会话绑定的桌面 client（None = server 本地执行）
+    let exec_client_id = session_record.as_ref().and_then(|s| s.exec_client_id.clone());
+    let session_user_id = session_record.as_ref().and_then(|s| s.user_id.clone());
 
     // Check if this session has a pending ask_user state
     let pending_ask_user = session_record.as_ref().and_then(|s| s.pending_ask_user.clone());
@@ -182,21 +185,35 @@ pub async fn run_chat_turn(
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
         let token = opts.auth_token.clone();
         let checksum_store = new_checksum_store();
-        let mut t: Vec<Arc<dyn Tool>> = vec![
-            Arc::new(ShellTool::new(work_dir.clone())),
-            Arc::new(ReadFileTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
-            Arc::new(WriteFileTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
-            Arc::new(StrReplaceTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
-            Arc::new(ListDirectoryTool::new(work_dir.clone())),
-            Arc::new(SearchTool::new(work_dir.clone())),
-            Arc::new(GitTool::new(work_dir.clone())),
-            Arc::new(WebFetchTool::new()),
-            Arc::new(TestRunnerTool::new(work_dir.clone())),
-            Arc::new(UpdateSpecTool::new(base_url.clone(), token.clone(), session_id.clone())),
-            Arc::new(UpdateTaskStatusTool::new(base_url.clone(), token.clone(), session_id.clone())),
-            Arc::new(UpdateArtifactTool::new(base_url.clone(), token.clone(), session_id.clone())),
-            Arc::new(AskUserTool::new()),
-        ];
+        // fs/shell 类工具：绑定 exec_client_id 的会话改用远程代理工具，
+        // 在桌面 client 本地执行；test_runner 远程会话不提供（可用 shell 跑测试）
+        let mut t: Vec<Arc<dyn Tool>> = match (&exec_client_id, &session_user_id) {
+            (Some(client_id), Some(user_id)) => {
+                let mut remote = crate::remote_tools::remote_tool_set(
+                    state.clone(),
+                    user_id,
+                    client_id,
+                    work_dir.clone(),
+                );
+                remote.push(Arc::new(WebFetchTool::new()));
+                remote
+            }
+            _ => vec![
+                Arc::new(ShellTool::new(work_dir.clone())),
+                Arc::new(ReadFileTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
+                Arc::new(WriteFileTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
+                Arc::new(StrReplaceTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
+                Arc::new(ListDirectoryTool::new(work_dir.clone())),
+                Arc::new(SearchTool::new(work_dir.clone())),
+                Arc::new(GitTool::new(work_dir.clone())),
+                Arc::new(WebFetchTool::new()),
+                Arc::new(TestRunnerTool::new(work_dir.clone())),
+            ],
+        };
+        t.push(Arc::new(UpdateSpecTool::new(base_url.clone(), token.clone(), session_id.clone())));
+        t.push(Arc::new(UpdateTaskStatusTool::new(base_url.clone(), token.clone(), session_id.clone())));
+        t.push(Arc::new(UpdateArtifactTool::new(base_url.clone(), token.clone(), session_id.clone())));
+        t.push(Arc::new(AskUserTool::new()));
         // Add explore/generate tools if session is bound to a change or is explore type
         if let Some(ref cid) = session_change_id {
             t.push(Arc::new(FinalizeExploreTool::new(base_url.clone(), token.clone(), cid.clone(), session_id.clone())));
@@ -418,11 +435,20 @@ pub async fn run_chat_turn(
                     sandbox_mode: "workspace-write".to_string(),
                     network_policy: "restricted".to_string(),
                 };
+                // 远程执行会话：向 agent 说明工作目录在用户本地桌面机器上
+                let mut project_segments: Vec<code_agent::PromptSegment> = vec![];
+                if exec_client_id.is_some() {
+                    project_segments.push(code_agent::PromptSegment::Dynamic(
+                        "执行环境说明：工作目录在用户的本地桌面机器上，文件与 shell 类工具\
+                        通过远程执行通道在该机器上运行，所有路径均为该机器的本地路径。"
+                            .to_string(),
+                    ));
+                }
                 let (_assembled, named) = code_agent::build_layered_prompt(
                     Some(&system_prompt),
                     Some(&runtime),
                     Some(&env),
-                    &[],
+                    &project_segments,
                 );
                 session = session.with_layered_prompt(named);
             }

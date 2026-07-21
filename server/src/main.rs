@@ -7,6 +7,8 @@ mod config;
 mod image_gen;
 mod llm;
 pub mod provider_registry;
+pub mod remote_exec;
+pub mod remote_tools;
 pub mod response;
 mod requirement_docs;
 mod routes;
@@ -47,6 +49,8 @@ pub struct AppState {
     pub weixin_logins: weixin::login::LoginStates,
     /// 微信账号 monitor 任务（account_id → 停止令牌）
     pub weixin_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
+    /// 桌面 client 远程执行通道（user_id → 长轮询/派发状态）
+    pub client_hubs: RwLock<HashMap<String, remote_exec::UserHub>>,
 }
 
 async fn auth_middleware(
@@ -108,6 +112,7 @@ async fn main() -> Result<()> {
         event_buffers: RwLock::new(HashMap::new()),
         weixin_logins: RwLock::new(HashMap::new()),
         weixin_monitors: RwLock::new(HashMap::new()),
+        client_hubs: RwLock::new(HashMap::new()),
     });
 
     // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）
@@ -193,6 +198,12 @@ async fn main() -> Result<()> {
         .route("/api/weixin/bind-code", post(weixin::routes::create_bind_code))
         .route("/api/weixin/binding", get(weixin::routes::get_binding))
         .route("/api/weixin/binding", delete(weixin::routes::delete_binding))
+        // Remote execution: desktop client long-poll channel
+        .route("/api/client/registration", put(remote_exec::register_client))
+        .route("/api/client/poll", get(remote_exec::poll_requests))
+        .route("/api/client/tool-result", post(remote_exec::post_tool_result))
+        .route("/api/client/online", get(remote_exec::list_online))
+        .route("/api/sessions/{id}/exec-client", put(remote_exec::set_session_exec_client))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Admin API routes (also protected)

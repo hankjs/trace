@@ -64,6 +64,8 @@ pub struct Session {
     pub pending_ask_user: Option<String>,
     pub active_leaf_id: Option<String>,
     pub metadata: Option<String>,
+    /// 远程执行会话的桌面 client id，NULL 表示 server 本地执行
+    pub exec_client_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -326,6 +328,17 @@ pub struct WeixinChat {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ClientAgent {
+    pub id: String,
+    pub user_id: String,
+    pub hostname: Option<String>,
+    pub work_dir: Option<String>,
+    pub accept_remote: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsOverview {
     pub total_input_tokens: u64,
@@ -365,6 +378,7 @@ impl Database {
                 pending_ask_user JSON DEFAULT NULL,
                 active_leaf_id VARCHAR(36) DEFAULT NULL,
                 metadata TEXT DEFAULT NULL,
+                exec_client_id VARCHAR(36) DEFAULT NULL,
                 created_at DATETIME NOT NULL DEFAULT NOW(),
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 INDEX idx_sessions_user (user_id),
@@ -759,6 +773,23 @@ impl Database {
         .execute(&pool)
         .await?;
 
+        // Client agents table (desktop client registration for remote tool execution)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS client_agents (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL,
+                hostname VARCHAR(255) DEFAULT NULL,
+                work_dir TEXT DEFAULT NULL,
+                accept_remote BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                INDEX idx_client_agents_user (user_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
         // Migrations for existing databases
         // Add category column to prompt_templates if not exists
         let _ = sqlx::query(
@@ -774,8 +805,31 @@ impl Database {
         let _ = sqlx::query(
             "ALTER TABLE changes ADD COLUMN tasks_path VARCHAR(512) DEFAULT NULL AFTER requirement_path"
         ).execute(&pool).await;
+        // Add exec_client_id to sessions if not exists (remote tool execution target)
+        Self::ensure_column(
+            &pool,
+            "sessions",
+            "exec_client_id",
+            "ALTER TABLE sessions ADD COLUMN exec_client_id VARCHAR(36) DEFAULT NULL",
+        )
+        .await?;
 
         Ok(Self { pool })
+    }
+
+    // Check-then-alter: add a column only when it does not exist yet
+    async fn ensure_column(pool: &MySqlPool, table: &str, column: &str, ddl: &str) -> Result<()> {
+        let exists: Option<(String,)> = sqlx::query_as(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_optional(pool)
+        .await?;
+        if exists.is_none() {
+            sqlx::query(ddl).execute(pool).await?;
+        }
+        Ok(())
     }
 
     // Sessions
@@ -816,6 +870,7 @@ impl Database {
             pending_ask_user: None,
             active_leaf_id: None,
             metadata: metadata.map(|s| s.to_string()),
+            exec_client_id: None,
             created_at: now,
             updated_at: now,
         })
@@ -824,7 +879,7 @@ impl Database {
     pub async fn list_sessions(&self) -> Result<Vec<Session>> {
         let sessions = db_retry!(
             sqlx::query_as::<_, Session>(
-                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, created_at, updated_at FROM sessions ORDER BY updated_at DESC"
+                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, exec_client_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC"
             )
             .fetch_all(&self.pool)
         )?;
@@ -834,7 +889,7 @@ impl Database {
     pub async fn list_sessions_by_user(&self, user_id: &str) -> Result<Vec<Session>> {
         let sessions = db_retry!(
             sqlx::query_as::<_, Session>(
-                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC"
+                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, exec_client_id, created_at, updated_at FROM sessions WHERE user_id = ? ORDER BY updated_at DESC"
             )
             .bind(user_id)
             .fetch_all(&self.pool)
@@ -845,7 +900,7 @@ impl Database {
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let session = db_retry!(
             sqlx::query_as::<_, Session>(
-                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, created_at, updated_at FROM sessions WHERE id = ?"
+                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, exec_client_id, created_at, updated_at FROM sessions WHERE id = ?"
             )
             .bind(id)
             .fetch_optional(&self.pool)
@@ -1938,7 +1993,7 @@ impl Database {
     pub async fn get_session_by_change_id(&self, change_id: &str) -> Result<Option<Session>> {
         let session = db_retry!(
             sqlx::query_as::<_, Session>(
-                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, created_at, updated_at FROM sessions WHERE change_id = ? ORDER BY updated_at DESC LIMIT 1"
+                "SELECT id, user_id, title, provider, model, work_dir, local_agent, local_work_dir, environment, session_type, change_id, pending_ask_user, active_leaf_id, metadata, exec_client_id, created_at, updated_at FROM sessions WHERE change_id = ? ORDER BY updated_at DESC LIMIT 1"
             )
             .bind(change_id)
             .fetch_optional(&self.pool)
@@ -2594,6 +2649,58 @@ impl Database {
             .bind(session_id)
             .bind(now)
             .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    // Client agents
+    pub async fn upsert_client_agent(&self, id: &str, user_id: &str, hostname: Option<&str>, work_dir: Option<&str>, accept_remote: bool) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO client_agents (id, user_id, hostname, work_dir, accept_remote) VALUES (?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), hostname = VALUES(hostname), work_dir = VALUES(work_dir), accept_remote = VALUES(accept_remote), updated_at = NOW()"
+            )
+            .bind(id)
+            .bind(user_id)
+            .bind(hostname)
+            .bind(work_dir)
+            .bind(accept_remote)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_client_agent(&self, user_id: &str, client_id: &str) -> Result<Option<ClientAgent>> {
+        let agent = db_retry!(
+            sqlx::query_as::<_, ClientAgent>(
+                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents WHERE user_id = ? AND id = ?"
+            )
+            .bind(user_id)
+            .bind(client_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(agent)
+    }
+
+    pub async fn list_client_agents(&self, user_id: &str) -> Result<Vec<ClientAgent>> {
+        let agents = db_retry!(
+            sqlx::query_as::<_, ClientAgent>(
+                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents WHERE user_id = ? ORDER BY created_at ASC"
+            )
+            .bind(user_id)
+            .fetch_all(&self.pool)
+        )?;
+        Ok(agents)
+    }
+
+    // Switch a session between server-local execution (None) and a remote client
+    pub async fn set_session_exec_client(&self, session_id: &str, exec_client_id: Option<&str>, work_dir: Option<&str>) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE sessions SET exec_client_id = ?, work_dir = ?, updated_at = NOW() WHERE id = ?")
+                .bind(exec_client_id)
+                .bind(work_dir)
+                .bind(session_id)
+                .execute(&self.pool)
         )?;
         Ok(())
     }
