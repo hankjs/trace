@@ -1,4 +1,5 @@
 import { ref, readonly } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { execToolLocal } from "../agents/ExploreAgent/localTools";
 import {
   pollToolRequests,
@@ -102,6 +103,24 @@ async function executeRemoteTool(req: RemoteToolRequest): Promise<{ content: str
           };
         }
         return await execToolLocal("bash", { command: cmd }, dir);
+      }
+      case "terminal_list": {
+        const list = await invoke("term_list");
+        return { content: JSON.stringify(list), is_error: false };
+      }
+      case "terminal_read": {
+        const lines = Number(input.lines) || 200;
+        // 未指定 lines 时按字节兜底，避免返回过大；指定 lines 时读全量再按行截尾
+        const text = await invoke<string>("term_read", {
+          id: input.id,
+          maxBytes: input.lines ? null : 40000,
+        });
+        const tail = text.split("\n").slice(-lines).join("\n");
+        return { content: tail, is_error: false };
+      }
+      case "terminal_write": {
+        await invoke("term_write", { id: input.id, data: String(input.data ?? "") });
+        return { content: "ok", is_error: false };
       }
       default:
         return { content: `Unknown tool: ${req.tool}`, is_error: true };

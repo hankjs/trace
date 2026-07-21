@@ -25,3 +25,5 @@ libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures = "0.3"
 url = "2"
+portable-pty = "0.8"
+strip-ansi-escapes = "0.2"

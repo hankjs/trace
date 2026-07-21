@@ -1,6 +1,7 @@
 mod acp;
 mod commands;
 mod llm_stream;
+mod terminal;
 mod tools;
 
 use std::sync::Arc;
@@ -28,6 +29,7 @@ pub fn run() {
             });
 
             app.manage(state);
+            app.manage(terminal::TermManager::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -47,6 +49,12 @@ pub fn run() {
             tools::tool_bash,
             llm_stream::llm_stream,
             llm_stream::llm_stream_test,
+            terminal::term_create,
+            terminal::term_write,
+            terminal::term_resize,
+            terminal::term_close,
+            terminal::term_read,
+            terminal::term_list,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

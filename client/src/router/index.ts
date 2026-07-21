@@ -76,6 +76,11 @@ const router = createRouter({
           component: () => import("../views/AdminImageProviders.vue"),
         },
         {
+          path: "terminal",
+          name: "terminal",
+          component: () => import("../views/TerminalView.vue"),
+        },
+        {
           path: "image-gen",
           name: "image-gen",
           component: () => import("../views/ImageGen.vue"),

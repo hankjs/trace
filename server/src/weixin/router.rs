@@ -201,10 +201,161 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
             };
             reply(&msg).await;
         }
+        "/terms" => {
+            let msg = terminal_list(state, binding).await;
+            reply(&msg).await;
+        }
+        "/term" => {
+            let msg = terminal_read(state, binding, text).await;
+            reply(&msg).await;
+        }
+        "/send" => {
+            let msg = terminal_write(state, binding, text).await;
+            reply(&msg).await;
+        }
         "/菜单" | "/menu" | "/help" | "/帮助" => reply(MENU_TEXT).await,
         _ => reply("未知命令，发送 /菜单 查看全部能力").await,
     }
 }
+
+// ─── 终端远程命令（/terms /term /send）─────────────────────────────────────
+
+const TERM_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// 微信单条消息长度上限（留余量）
+const WECHAT_MSG_MAX: usize = 1800;
+
+/// 向当前在线 client 派发一条 terminal_* 工具调用，返回文本结果或错误文案。
+async fn dispatch_terminal(
+    state: &Arc<AppState>,
+    binding: &WeixinBinding,
+    tool: &str,
+    input: serde_json::Value,
+) -> Result<String> {
+    let client = crate::remote_exec::pick_online_client(state, &binding.user_id)
+        .await
+        .ok_or_else(|| anyhow!("桌面 client 不在线或未开启远程执行"))?;
+    let result =
+        crate::remote_exec::dispatch_tool_call(state, &binding.user_id, &client.id, tool, input, TERM_CMD_TIMEOUT)
+            .await?;
+    if result.is_error {
+        Err(anyhow!(result.content))
+    } else {
+        Ok(result.content)
+    }
+}
+
+/// /terms — 列出 client 上全部终端会话
+async fn terminal_list(state: &Arc<AppState>, binding: &WeixinBinding) -> String {
+    match dispatch_terminal(state, binding, "terminal_list", serde_json::json!({})).await {
+        Ok(content) => {
+            let terms: Vec<serde_json::Value> = match serde_json::from_str(&content) {
+                Ok(v) => v,
+                Err(_) => return format!("解析终端列表失败：{content}"),
+            };
+            if terms.is_empty() {
+                return "当前没有终端会话，在 client 的「终端」页新建一个即可".to_string();
+            }
+            let mut lines = vec!["终端会话（/term <id> 看输出，/send <id> <文本> 发输入）：".to_string()];
+            for t in terms {
+                let id = t["id"].as_str().unwrap_or("?");
+                let short = &id[..id.len().min(8)];
+                let fg = t["foreground_cmd"].as_str().unwrap_or("?");
+                let cwd = t["cwd"].as_str().unwrap_or("");
+                let alive = if t["alive"].as_bool().unwrap_or(false) { "运行中" } else { "已退出" };
+                lines.push(format!("[{short}] {fg} · {alive}\n    {cwd}"));
+            }
+            lines.join("\n")
+        }
+        Err(e) => format!("获取终端列表失败：{e:#}"),
+    }
+}
+
+/// 按 id 前缀解析完整 term_id（前缀需唯一）
+async fn resolve_term_id(state: &Arc<AppState>, binding: &WeixinBinding, prefix: &str) -> Result<String> {
+    let content = dispatch_terminal(state, binding, "terminal_list", serde_json::json!({})).await?;
+    let terms: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+    let matches: Vec<&str> = terms
+        .iter()
+        .filter_map(|t| t["id"].as_str())
+        .filter(|id| id.starts_with(prefix))
+        .collect();
+    match matches.len() {
+        0 => Err(anyhow!("没有找到 id 以 {prefix} 开头的终端会话")),
+        1 => Ok(matches[0].to_string()),
+        _ => Err(anyhow!("id 前缀 {prefix} 匹配到多个会话，请多输几位")),
+    }
+}
+
+/// 保留字符串尾部不超过 max 个字符（按 char 边界）
+fn tail_chars(s: &str, max: usize) -> &str {
+    if s.chars().count() <= max {
+        return s;
+    }
+    let start = s.char_indices().nth(s.chars().count() - max).map(|(i, _)| i).unwrap_or(0);
+    &s[start..]
+}
+
+/// /term <id前缀> [行数] — 查看终端输出尾部
+async fn terminal_read(state: &Arc<AppState>, binding: &WeixinBinding, text: &str) -> String {
+    let mut parts = text.split_whitespace();
+    let _ = parts.next(); // "/term"
+    let Some(prefix) = parts.next() else {
+        return "用法：/term <id> [行数]，id 用 /terms 查看".to_string();
+    };
+    let lines: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(80);
+    match resolve_term_id(state, binding, prefix).await {
+        Ok(id) => {
+            match dispatch_terminal(
+                state,
+                binding,
+                "terminal_read",
+                serde_json::json!({ "id": id, "lines": lines }),
+            )
+            .await
+            {
+                Ok(content) => {
+                    let tail = tail_chars(content.trim_end(), WECHAT_MSG_MAX);
+                    if tail.is_empty() {
+                        "（该终端暂无输出）".to_string()
+                    } else {
+                        tail.to_string()
+                    }
+                }
+                Err(e) => format!("读取终端输出失败：{e:#}"),
+            }
+        }
+        Err(e) => format!("{e:#}"),
+    }
+}
+
+/// /send <id前缀> <文本> — 向终端发送输入（末尾自动补回车）
+async fn terminal_write(state: &Arc<AppState>, binding: &WeixinBinding, text: &str) -> String {
+    let mut parts = text.splitn(3, ' ');
+    let _ = parts.next(); // "/send"
+    let Some(prefix) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
+        return "用法：/send <id> <文本>，id 用 /terms 查看".to_string();
+    };
+    let Some(data) = parts.next() else {
+        return "用法：/send <id> <文本>，文本不能为空".to_string();
+    };
+    match resolve_term_id(state, binding, prefix).await {
+        Ok(id) => {
+            match dispatch_terminal(
+                state,
+                binding,
+                "terminal_write",
+                serde_json::json!({ "id": id, "data": format!("{data}\n") }),
+            )
+            .await
+            {
+                Ok(_) => format!("已发送到 [{prefix}]，稍后用 /term {prefix} 查看输出"),
+                Err(e) => format!("发送失败：{e:#}"),
+            }
+        }
+        Err(e) => format!("{e:#}"),
+    }
+}
+
 
 /// /菜单 命令的能力说明文案。
 const MENU_TEXT: &str = "\
@@ -222,6 +373,11 @@ const MENU_TEXT: &str = "\
 /status — 查看当前会话和执行状态
 /ai <任务> — 跳过智能判断，直接派任务给 agent
 /菜单 — 显示本说明
+
+【终端（桌面 client 在线时可用）】
+/terms — 列出 client 上的终端会话
+/term <id> [行数] — 查看终端输出（如 /term a1b2 100）
+/send <id> <文本> — 向终端发送输入（如 /send a1b2 ls -la）
 
 【小贴士】
 · 桌面 client 在线时任务在你本地机器执行，离线时在服务器端执行、仅支持查询类对话

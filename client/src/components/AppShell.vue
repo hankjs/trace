@@ -80,6 +80,7 @@ const activeSection = computed(() => {
   if (name === "agent-settings") return "settings";
   if (name === "debug-stream") return "debug";
   if (name === "image-gen") return "image-gen";
+  if (name === "terminal") return "terminal";
   return "sessions";
 });
 
@@ -360,6 +361,30 @@ defineExpose({ rightPanelOpen, navCollapsed });
               <rect x="2" y="2" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.3"/>
               <circle cx="5.5" cy="5.5" r="1.2" stroke="currentColor" stroke-width="1.1"/>
               <path d="M2 10.5l3.5-3.5 2.5 2.5 2-2 3.5 3.5" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- 终端 -->
+        <div class="nav-section">
+          <button
+            v-if="!navCollapsed"
+            class="nav-section-header"
+            :class="{ active: activeSection === 'terminal' }"
+            @click="navigateTo('terminal')"
+          >
+            终端
+          </button>
+          <button
+            v-else
+            class="nav-icon-btn"
+            :class="{ active: activeSection === 'terminal' }"
+            @click="navigateTo('terminal')"
+            aria-label="终端"
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" stroke="currentColor" stroke-width="1.3"/>
+              <path d="M4.5 6l2.5 2.5L4.5 11M8 11h3.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round"/>
             </svg>
           </button>
         </div>

@@ -1,5 +1,14 @@
 @import "tailwindcss";
 
+/* 内置 Nerd Font 符号字体：终端 powerline/图标字形兜底（系统未装 Nerd Font 时用） */
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/fonts/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
 @theme {
   /* Restrained palette: cool-neutral dark with green-gold accent */
   /* Surfaces: hue 220 (blue-slate), very low chroma */
