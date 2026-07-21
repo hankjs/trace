@@ -69,6 +69,9 @@ function cancelRename() {
 const navCollapsed = ref(false);
 const lastPanelId = ref<string | null>(null);
 
+// 终端是主模式：终端页完全隐藏左侧导航（由终端 tab 栏的悬浮菜单替代）
+const isTerminalRoute = computed(() => route.name === "terminal");
+
 const rightPanelOpen = computed(() => activePanelId.value !== null);
 
 const activeSection = computed(() => {
@@ -180,8 +183,8 @@ defineExpose({ rightPanelOpen, navCollapsed });
 
 <template>
   <div class="shell" ref="shellEl" :class="{ resizing: isResizing }">
-    <!-- Left Navigation -->
-    <nav class="nav" :class="{ collapsed: navCollapsed }">
+    <!-- Left Navigation（终端页隐藏，走悬浮菜单） -->
+    <nav v-if="!isTerminalRoute" class="nav" :class="{ collapsed: navCollapsed }">
       <div class="nav-header">
         <span v-if="!navCollapsed" class="nav-brand">Trace</span>
         <button

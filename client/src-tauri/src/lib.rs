@@ -30,6 +30,30 @@ pub fn run() {
 
             app.manage(state);
             app.manage(terminal::TermManager::default());
+
+            // macOS 默认菜单的 Close Window (⌘W) 会抢走快捷键关闭整个窗口,
+            // 移除它让 ⌘W 透传到前端用于关闭终端 pane
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::menu::MenuItemKind;
+                if let Some(menu) = app.menu() {
+                    if let Ok(items) = menu.items() {
+                        for item in items {
+                            if let MenuItemKind::Submenu(sub) = item {
+                                if let Ok(sub_items) = sub.items() {
+                                    for si in sub_items {
+                                        if let MenuItemKind::Predefined(p) = &si {
+                                            if p.text().is_ok_and(|t| t == "Close Window") {
+                                                let _ = sub.remove(&si);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -55,6 +79,7 @@ pub fn run() {
             terminal::term_close,
             terminal::term_read,
             terminal::term_list,
+            terminal::term_foreground_cwd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

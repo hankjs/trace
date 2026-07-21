@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, nextTick, provide } from "vue";
+import { ref, reactive, computed, onMounted, onUnmounted, nextTick, provide } from "vue";
+import { useRouter } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
@@ -8,6 +9,8 @@ import { SearchAddon } from "@xterm/addon-search";
 import { CanvasAddon } from "@xterm/addon-canvas";
 import "@xterm/xterm/css/xterm.css";
 import PaneNode from "../components/terminal/PaneNode.vue";
+import ContextMenu from "../components/ContextMenu.vue";
+import { useContextMenu, type ContextMenuItem } from "../composables/useContextMenu";
 import {
   type LayoutNode,
   createLeaf,
@@ -29,6 +32,9 @@ interface TermInfo {
 interface Tab {
   id: string;
   title: string;
+  /** 用户重命名后的固定标题（不再被前台进程名覆盖） */
+  customTitle?: string;
+  pinned?: boolean;
   alive: boolean;
   root: LayoutNode;
   activePaneId: string;
@@ -48,6 +54,14 @@ const containers = new Map<string, HTMLElement>();
 const instances = new Map<string, TermInstance>();
 /** 每个 pane 的启动 cwd，用于分屏时继承 */
 const paneCwds = new Map<string, string>();
+/** pane id -> 实时信息（标题栏显示用，5s 轮询更新） */
+const paneInfos = reactive<Record<string, { foreground_cmd: string; cwd: string; alive: boolean }>>({});
+provide("paneInfos", paneInfos);
+/** pane 自定义标题 + 进行中的重命名请求（PaneNode 双击标题栏或右键菜单触发） */
+const paneTitles = reactive<Record<string, string>>({});
+const paneRename = reactive<{ id: string | null }>({ id: null });
+provide("paneTitles", paneTitles);
+provide("paneRename", paneRename);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 // 搜索框状态
@@ -72,20 +86,38 @@ function reattachInstance(id: string, el: HTMLElement) {
   const inst = instances.get(id);
   if (!inst) return;
   nextTick(() => {
-    const termEl = inst.term.element;
-    if (termEl && termEl.parentElement !== el) {
-      el.appendChild(termEl);
-    }
-    inst.observer?.disconnect();
-    const observer = new ResizeObserver(() => {
-      if (el.clientWidth === 0 || el.clientHeight === 0) return;
+    try {
+      const termEl = inst.term.element;
+      if (termEl && termEl.parentElement !== el) {
+        el.appendChild(termEl);
+      }
+      inst.observer?.disconnect();
+      const observer = new ResizeObserver(() => {
+        if (el.clientWidth === 0 || el.clientHeight === 0) return;
+        inst.fit.fit();
+        invoke("term_resize", { id, cols: inst.term.cols, rows: inst.term.rows }).catch(() => {});
+      });
+      observer.observe(el);
+      inst.observer = observer;
       inst.fit.fit();
-      invoke("term_resize", { id, cols: inst.term.cols, rows: inst.term.rows }).catch(() => {});
-    });
-    observer.observe(el);
-    inst.observer = observer;
-    inst.fit.fit();
+    } catch (e) {
+      // 搬家失败（如 canvas 状态损坏）：销毁重建 + 回放 scrollback 兜底
+      console.warn("[Terminal] reattach failed, recreating:", e);
+      disposeInstance(id);
+      attachWithReplay(id);
+    }
   });
+}
+
+/** 从 PTY scrollback 回放重建一个 pane（reattach 兜底） */
+async function attachWithReplay(id: string) {
+  let replay = "";
+  try {
+    replay = await invoke<string>("term_read", { id, maxBytes: null });
+  } catch {
+    /* 读取失败则空白重建 */
+  }
+  await attachInstance(id, replay);
 }
 
 function basename(p: string): string {
@@ -96,12 +128,127 @@ function activeTab(): Tab | undefined {
   return tabs.value.find((t) => t.id === activeTabId.value);
 }
 
+// ---------- 悬浮菜单（终端为主模式，替代左侧导航） ----------
+
+const router = useRouter();
+const menuOpen = ref(false);
+const menuItems: { label: string; name: string }[] = [
+  { label: "会话", name: "sessions" },
+  { label: "规格", name: "specs" },
+  { label: "变更", name: "changes" },
+  { label: "Skills", name: "skills" },
+  { label: "AI生图", name: "image-gen" },
+  { label: "Debug", name: "debug-stream" },
+  { label: "设置", name: "agent-settings" },
+];
+
+function toggleMenu() {
+  menuOpen.value = !menuOpen.value;
+}
+
+function closeMenu() {
+  menuOpen.value = false;
+}
+
+function goMenuItem(name: string) {
+  menuOpen.value = false;
+  router.push({ name });
+}
+
+function onGlobalPointerDown(e: PointerEvent) {
+  if (!(e.target instanceof HTMLElement)) return;
+  if (!e.target.closest(".menu-wrap")) closeMenu();
+}
+
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (e.key === "Escape") closeMenu();
+}
+
+// ---------- 右键菜单（tab / pane） ----------
+
+const {
+  visible: ctxVisible,
+  position: ctxPosition,
+  items: ctxItems,
+  open: ctxOpen,
+  close: ctxClose,
+} = useContextMenu();
+
+/** pin 的 tab 排在前面（稳定排序） */
+const sortedTabs = computed(() => {
+  return tabs.value
+    .map((t, i) => ({ t, i }))
+    .sort((a, b) => Number(b.t.pinned ?? false) - Number(a.t.pinned ?? false) || a.i - b.i)
+    .map(({ t }) => t);
+});
+
+// tab 重命名状态
+const renamingTabId = ref<string | null>(null);
+const renameValue = ref("");
+const renameInputEl = ref<HTMLInputElement | null>(null);
+
+function startRenameTab(tab: Tab) {
+  renamingTabId.value = tab.id;
+  renameValue.value = tab.customTitle || tab.title;
+  nextTick(() => {
+    renameInputEl.value?.focus();
+    renameInputEl.value?.select();
+  });
+}
+
+function commitRenameTab() {
+  const tab = tabs.value.find((t) => t.id === renamingTabId.value);
+  if (tab) {
+    const v = renameValue.value.trim();
+    tab.customTitle = v || undefined;
+    if (v) tab.title = v;
+  }
+  renamingTabId.value = null;
+}
+
+function onTabContextMenu(e: MouseEvent, tab: Tab) {
+  const items: ContextMenuItem[] = [
+    { label: "重命名", action: () => startRenameTab(tab) },
+    {
+      label: tab.pinned ? "取消固定" : "固定",
+      action: () => {
+        tab.pinned = !tab.pinned;
+      },
+    },
+    { label: "", action: () => {}, separator: true },
+    { label: "关闭", destructive: true, action: () => closeTab(tab.id) },
+  ];
+  ctxOpen(e, items);
+}
+
+function onPaneContextMenu(tab: Tab, payload: { id: string; x: number; y: number }) {
+  tab.activePaneId = payload.id;
+  instances.get(payload.id)?.term.focus();
+  const items: ContextMenuItem[] = [
+    { label: "重命名", action: () => { paneRename.id = payload.id; } },
+    { label: "向右分屏", action: () => splitPane("row") },
+    { label: "向下分屏", action: () => splitPane("col") },
+    { label: "搜索", action: () => openSearch() },
+    { label: "", action: () => {}, separator: true },
+    { label: "关闭面板", destructive: true, action: () => closePane(payload.id) },
+  ];
+  // 构造一个合成的 MouseEvent 位置（ContextMenu.open 需要事件）
+  ctxOpen(new MouseEvent("contextmenu", { clientX: payload.x, clientY: payload.y }), items);
+}
+
 // ---------- xterm 实例管理（按 pane） ----------
 
-async function attachInstance(id: string, replay?: string) {
+async function attachInstance(id: string, replay?: string, retries = 3) {
   await nextTick();
   const el = containers.get(id);
-  if (!el || instances.has(id)) return;
+  if (!el) {
+    // ref 注册晚于 nextTick 时重试，避免 pane 永远空白
+    if (retries > 0 && !instances.has(id)) {
+      setTimeout(() => attachInstance(id, replay, retries - 1), 50);
+    }
+    return;
+  }
+  if (instances.has(id)) return;
 
   const term = new Terminal({
     fontSize: 15,
@@ -242,7 +389,10 @@ function estimateSize(dir?: "row" | "col"): { cols: number; rows: number } {
 async function splitPane(dir: "row" | "col") {
   const tab = activeTab();
   if (!tab) return;
-  const cwd = paneCwds.get(tab.activePaneId) || null;
+  // 继承分割前 pane 前台进程的实时工作目录（cd 过也能跟上），失败退回创建时的 cwd
+  const cwd = await invoke<string>("term_foreground_cwd", { id: tab.activePaneId }).catch(
+    () => paneCwds.get(tab.activePaneId) || null,
+  );
   const { cols, rows } = estimateSize(dir);
   const info = await invoke<TermInfo>("term_create", { cols, rows, cwd });
   paneCwds.set(info.id, info.cwd);
@@ -261,9 +411,18 @@ async function closePane(paneId: string | undefined) {
   const tab = tabs.value.find((t) => allLeaves(t.root).includes(paneId));
   if (!tab) return;
   invoke("term_close", { id: paneId }).catch(() => {});
-  disposeInstance(paneId);
+  // dispose 失败不能阻断树更新，否则会留下空框
+  try {
+    disposeInstance(paneId);
+  } catch (e) {
+    console.warn("[Terminal] dispose failed during closePane:", e);
+    instances.delete(paneId);
+  }
   paneCwds.delete(paneId);
   containers.delete(paneId);
+  delete paneInfos[paneId];
+  delete paneTitles[paneId];
+  if (paneRename.id === paneId) paneRename.id = null;
   const newRoot = removeNode(tab.root, paneId);
   if (!newRoot) {
     // 最后一个 pane：关闭整个 tab
@@ -310,6 +469,9 @@ function closeTab(id: string) {
     disposeInstance(leafId);
     paneCwds.delete(leafId);
     containers.delete(leafId);
+    delete paneInfos[leafId];
+    delete paneTitles[leafId];
+    if (paneRename.id === leafId) paneRename.id = null;
   }
   tabs.value.splice(idx, 1);
   if (activeTabId.value === id) {
@@ -370,13 +532,20 @@ async function refreshTitles() {
   try {
     const list = await invoke<TermInfo[]>("term_list");
     const byId = new Map(list.map((t) => [t.id, t]));
+    for (const info of list) {
+      paneInfos[info.id] = {
+        foreground_cmd: info.foreground_cmd,
+        cwd: info.cwd,
+        alive: info.alive,
+      };
+    }
     for (const tab of tabs.value) {
       const leaves = allLeaves(tab.root);
       const infos = leaves
         .map((id) => byId.get(id))
         .filter((i): i is TermInfo => !!i);
       const activeInfo = byId.get(tab.activePaneId);
-      if (activeInfo) tab.title = activeInfo.foreground_cmd;
+      if (activeInfo && !tab.customTitle) tab.title = activeInfo.foreground_cmd;
       tab.alive = infos.some((i) => i.alive);
     }
   } catch {
@@ -416,29 +585,75 @@ onMounted(async () => {
     /* term_list 失败则直接新建 */
   }
   if (tabs.value.length === 0) await newTerminal();
+  await refreshTitles();
   pollTimer = setInterval(refreshTitles, 5000);
+  document.addEventListener("pointerdown", onGlobalPointerDown);
+  document.addEventListener("keydown", onGlobalKeydown);
 });
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
+  document.removeEventListener("pointerdown", onGlobalPointerDown);
+  document.removeEventListener("keydown", onGlobalKeydown);
   // 只销毁前端实例，PTY 会话保留，回到页面时可重连
   for (const id of [...instances.keys()]) disposeInstance(id);
 });
 </script>
 
 <template>
-  <div class="terminal-view">
+  <div class="terminal-view" @contextmenu.prevent>
     <!-- Tab Bar -->
     <div class="tab-bar">
+      <!-- 悬浮菜单（替代左侧导航） -->
+      <div class="menu-wrap">
+        <button
+          class="tab-action-btn menu-btn"
+          :class="{ open: menuOpen }"
+          @click="toggleMenu"
+          aria-label="菜单"
+          title="菜单"
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path d="M2 3.5h10M2 7h10M2 10.5h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+          </svg>
+        </button>
+        <div v-if="menuOpen" class="menu-dropdown">
+          <button
+            v-for="item in menuItems"
+            :key="item.name"
+            class="menu-item"
+            @click="goMenuItem(item.name)"
+          >
+            {{ item.label }}
+          </button>
+        </div>
+      </div>
+
       <div
-        v-for="tab in tabs"
+        v-for="tab in sortedTabs"
         :key="tab.id"
         class="tab"
-        :class="{ active: tab.id === activeTabId, dead: !tab.alive }"
+        :class="{ active: tab.id === activeTabId, dead: !tab.alive, pinned: tab.pinned }"
         @click="activateTab(tab.id)"
+        @dblclick="startRenameTab(tab)"
+        @contextmenu="onTabContextMenu($event, tab)"
       >
         <span class="tab-dot" :class="{ alive: tab.alive }"></span>
-        <span class="tab-title">{{ tab.title }}</span>
+        <svg v-if="tab.pinned" class="tab-pin" width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M9.5 1.5l5 5-1.8 1.8-1-.4L9 10.6V13l-1.5 1.5L5 12l-2.5 2.5-1-1L4 11 1.5 8.5 3 7h2.4l2.7-2.7-.4-1 1.8-1.8z"/>
+        </svg>
+        <input
+          v-if="renamingTabId === tab.id"
+          ref="renameInputEl"
+          v-model="renameValue"
+          class="tab-rename"
+          @click.stop
+          @dblclick.stop
+          @keydown.enter="commitRenameTab"
+          @keydown.escape="renamingTabId = null"
+          @blur="commitRenameTab"
+        />
+        <span v-else class="tab-title">{{ tab.title }}</span>
         <button class="tab-close" @click.stop="closeTab(tab.id)" aria-label="关闭终端">
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
             <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
@@ -503,6 +718,7 @@ onUnmounted(() => {
           :node="tab.root"
           :active-pane-id="tab.activePaneId"
           @focus="onPaneFocus(tab, $event)"
+          @ctx="onPaneContextMenu(tab, $event)"
         />
       </div>
 
@@ -537,6 +753,8 @@ onUnmounted(() => {
         <p>没有打开的终端</p>
         <button class="term-empty-btn" @click="newTerminal">新建终端</button>
       </div>
+
+      <ContextMenu :visible="ctxVisible" :position="ctxPosition" :items="ctxItems" @close="ctxClose" />
     </div>
   </div>
 </template>
@@ -607,6 +825,23 @@ onUnmounted(() => {
   text-overflow: ellipsis;
 }
 
+.tab-pin {
+  color: var(--color-accent);
+  flex-shrink: 0;
+}
+
+.tab-rename {
+  width: 110px;
+  padding: 0 var(--space-1);
+  font-size: 12px;
+  font-family: inherit;
+  color: var(--color-text-primary);
+  background: var(--color-surface-0);
+  border: 1px solid var(--color-accent);
+  border-radius: var(--radius-sm);
+  outline: none;
+}
+
 .tab-close {
   display: flex;
   align-items: center;
@@ -654,6 +889,52 @@ onUnmounted(() => {
   align-items: center;
   gap: 2px;
   flex-shrink: 0;
+}
+
+/* 悬浮菜单 */
+.menu-wrap {
+  position: relative;
+  flex-shrink: 0;
+  margin-right: var(--space-1);
+}
+
+.menu-btn.open {
+  color: var(--color-text-primary);
+  background: var(--color-surface-hover);
+}
+
+.menu-dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  min-width: 120px;
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 8px);
+  box-shadow: 0 8px 24px oklch(0 0 0 / 0.45);
+}
+
+.menu-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: var(--space-1) var(--space-2);
+  font-size: 12px;
+  border: none;
+  background: none;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: color var(--duration-fast), background var(--duration-fast);
+}
+
+.menu-item:hover {
+  color: var(--color-text-primary);
+  background: var(--color-surface-hover);
 }
 
 .tab-action-btn {

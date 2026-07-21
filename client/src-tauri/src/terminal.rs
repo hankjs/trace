@@ -40,23 +40,15 @@ pub struct TermInfo {
     pub created_at: String,
 }
 
-/// macOS 下用 `ps -Ao pid=,ppid=,comm=` 找到 child_pid 后代链最深进程的 comm。
+/// macOS 下沿 `ps` 树找 child_pid 后代链最深的进程，返回 (pid, comm)。
 #[cfg(target_os = "macos")]
-fn foreground_cmd(child_pid: u32, shell: &str) -> String {
-    let fallback = || {
-        std::path::Path::new(shell)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| shell.to_string())
-    };
-    let output = match std::process::Command::new("ps")
+fn deepest_descendant(child_pid: u32) -> Option<(u32, String)> {
+    let output = std::process::Command::new("ps")
         .args(["-Ao", "pid=,ppid=,comm="])
         .output()
-    {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return fallback(),
-    };
-    let text = String::from_utf8_lossy(&output);
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&output.stdout);
     // ppid -> Vec<(pid, comm)>
     let mut children: HashMap<u32, Vec<(u32, String)>> = HashMap::new();
     for line in text.lines() {
@@ -72,21 +64,59 @@ fn foreground_cmd(child_pid: u32, shell: &str) -> String {
     }
     // 沿后代链走到最深：每层取第一个子进程
     let mut cur = child_pid;
-    let mut deepest = fallback();
+    let mut deepest = (child_pid, String::new());
     let mut guard = 0;
     while let Some(kids) = children.get(&cur) {
         if kids.is_empty() || guard > 64 {
             break;
         }
         guard += 1;
-        let (pid, comm) = &kids[0];
-        deepest = std::path::Path::new(comm)
+        deepest = kids[0].clone();
+        cur = deepest.0;
+    }
+    Some(deepest)
+}
+
+/// macOS 下用 `ps -Ao pid=,ppid=,comm=` 找到 child_pid 后代链最深进程的 comm。
+#[cfg(target_os = "macos")]
+fn foreground_cmd(child_pid: u32, shell: &str) -> String {
+    let fallback = || {
+        std::path::Path::new(shell)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| comm.clone());
-        cur = *pid;
+            .unwrap_or_else(|| shell.to_string())
+    };
+    match deepest_descendant(child_pid) {
+        Some((_, comm)) if !comm.is_empty() => std::path::Path::new(&comm)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or(comm),
+        _ => fallback(),
     }
-    deepest
+}
+
+/// macOS 下取前台进程（后代链最深）的当前工作目录：`lsof -a -p <pid> -d cwd -Fn`。
+#[cfg(target_os = "macos")]
+fn foreground_cwd(s: &TermSession) -> String {
+    if let Some((pid, _)) = deepest_descendant(s.child_pid) {
+        if let Ok(o) = std::process::Command::new("lsof")
+            .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+            .output()
+        {
+            if o.status.success() {
+                let text = String::from_utf8_lossy(&o.stdout);
+                // 输出形如 "p<pid>\nn</path>"，取 n 行
+                for line in text.lines() {
+                    if let Some(path) = line.strip_prefix('n') {
+                        if !path.is_empty() {
+                            return path.to_string();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    s.cwd.clone()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -101,7 +131,8 @@ fn session_info(s: &TermSession) -> TermInfo {
     TermInfo {
         id: s.id.clone(),
         shell: s.shell.clone(),
-        cwd: s.cwd.clone(),
+        // 展示用实时 cwd（前台进程 cd 过也能跟上），代价是每次一次 lsof，量级可忽略
+        cwd: foreground_cwd(s),
         foreground_cmd: foreground_cmd(s.child_pid, &s.shell),
         alive: s.alive.load(Ordering::SeqCst),
         created_at: s.created_at.clone(),
@@ -288,6 +319,18 @@ pub fn term_read(
     drop(buf);
     let stripped = strip_ansi_escapes::strip(&tail);
     Ok(String::from_utf8_lossy(&stripped).to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn foreground_cwd(s: &TermSession) -> String {
+    s.cwd.clone()
+}
+
+#[tauri::command]
+pub fn term_foreground_cwd(state: State<'_, TermManager>, id: String) -> Result<String, String> {
+    let sessions = state.sessions.lock().unwrap();
+    let session = sessions.get(&id).ok_or("terminal not found")?;
+    Ok(foreground_cwd(session))
 }
 
 #[tauri::command]

@@ -14,6 +14,10 @@ const router = createRouter({
       children: [
         {
           path: "",
+          redirect: { name: "terminal" },
+        },
+        {
+          path: "sessions",
           name: "sessions",
           component: () => import("../views/SessionList.vue"),
         },
@@ -93,7 +97,7 @@ const router = createRouter({
 router.beforeEach((to) => {
   const token = localStorage.getItem("hank_client_token");
   if (!token && to.name !== "login") return { name: "login" };
-  if (token && to.name === "login") return { name: "sessions" };
+  if (token && to.name === "login") return { name: "terminal" };
 });
 
 export default router;
