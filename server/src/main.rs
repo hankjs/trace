@@ -15,6 +15,8 @@ mod requirement_docs;
 mod routes;
 mod skills;
 mod specs;
+mod termshot;
+mod websnap;
 mod weixin;
 
 use anyhow::Result;

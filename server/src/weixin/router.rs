@@ -92,7 +92,7 @@ pub async fn handle_message(state: Arc<AppState>, account: WeixinAccount, msg: I
 
     // 斜杠命令
     if text.starts_with('/') {
-        handle_command(&state, &binding, &text, reply).await;
+        handle_command(&state, &account, &binding, &from, &context_token, &text, reply).await;
         return Ok(());
     }
 
@@ -140,10 +140,14 @@ async fn handle_unbound<Fut: std::future::Future<Output = ()>>(
     }
 }
 
-/// 斜杠命令：/new /stop /status。
+/// 斜杠命令：/new /stop /status /terms /term /send /shot /snap。
+/// account/from/context_token 用于截图类命令直接发图（send_media）。
 async fn handle_command<Fut: std::future::Future<Output = ()>>(
     state: &Arc<AppState>,
+    account: &WeixinAccount,
     binding: &WeixinBinding,
+    from: &str,
+    context_token: &str,
     text: &str,
     reply: impl FnOnce(&str) -> Fut,
 ) {
@@ -211,6 +215,14 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
         }
         "/send" => {
             let msg = terminal_write(state, binding, text).await;
+            reply(&msg).await;
+        }
+        "/shot" => {
+            let msg = terminal_shot(state, account, binding, from, context_token, text).await;
+            reply(&msg).await;
+        }
+        "/snap" => {
+            let msg = web_snap(state, account, from, context_token, text).await;
             reply(&msg).await;
         }
         "/菜单" | "/menu" | "/help" | "/帮助" => reply(MENU_TEXT).await,
@@ -355,7 +367,92 @@ async fn terminal_write(state: &Arc<AppState>, binding: &WeixinBinding, text: &s
         Err(e) => format!("{e:#}"),
     }
 }
+/// /shot <id前缀> — 终端屏幕截图：拉 SGR 快照渲染成 PNG 发图，失败降级为文本输出
+async fn terminal_shot(
+    state: &Arc<AppState>,
+    account: &WeixinAccount,
+    binding: &WeixinBinding,
+    from: &str,
+    context_token: &str,
+    text: &str,
+) -> String {
+    let mut parts = text.split_whitespace();
+    let _ = parts.next(); // "/shot"
+    let Some(prefix) = parts.next() else {
+        return "用法：/shot <id>，id 用 /terms 查看".to_string();
+    };
+    let id = match resolve_term_id(state, binding, prefix).await {
+        Ok(id) => id,
+        Err(e) => return format!("{e:#}"),
+    };
+    // raw=true：client 返回带 SGR 转义码的当前屏幕快照
+    let snap = match dispatch_terminal(
+        state,
+        binding,
+        "terminal_read",
+        serde_json::json!({ "id": id, "raw": true }),
+    )
+    .await
+    {
+        Ok(content) => content,
+        Err(e) => return format!("读取终端屏幕失败：{e:#}"),
+    };
+    let fallback = |reason: &str| {
+        // 渲染/发图失败时降级为纯文本输出（复用 /term 的截尾逻辑）
+        let plain = crate::termshot::strip_ansi(&snap);
+        let tail = tail_chars(plain.trim_end(), WECHAT_MSG_MAX);
+        if tail.is_empty() {
+            reason.to_string()
+        } else {
+            format!("{reason}，以下为终端文本：\n{tail}")
+        }
+    };
+    let png = match crate::termshot::render_png(&snap) {
+        Ok(png) => png,
+        Err(e) => {
+            tracing::warn!("weixin: render term shot failed: {e:#}");
+            return fallback(&format!("截图渲染失败：{e:#}"));
+        }
+    };
+    let client = IlinkClient::new();
+    match client.send_media(account, from, context_token, "term.png", &png).await {
+        Ok(()) => format!("终端 [{prefix}] 截图已发送"),
+        Err(e) => {
+            tracing::warn!("weixin: send term shot failed: {e:#}");
+            fallback(&format!("截图发送失败：{e:#}"))
+        }
+    }
+}
 
+/// /snap <url> — 网页截图：server 本机 headless Chrome 截全页 PNG 发图。
+/// 耗时可达 30s；monitor 对每条消息单独 spawn（monitor.rs），这里直接 await 不会阻塞轮询。
+async fn web_snap(
+    state: &Arc<AppState>,
+    account: &WeixinAccount,
+    from: &str,
+    context_token: &str,
+    text: &str,
+) -> String {
+    let url = text.split_whitespace().nth(1);
+    let Some(url) = url else {
+        return "用法：/snap <url>（仅支持 http/https）".to_string();
+    };
+    let client = IlinkClient::new();
+    if let Err(e) = client.send_text(account, from, context_token, "网页截图中，请稍候…").await {
+        tracing::warn!("weixin: snap ack reply failed: {e:#}");
+    }
+    let png = match crate::websnap::snap_url(state.config.server.chrome_path.as_deref(), url).await {
+        Ok(png) => png,
+        Err(e) => return format!("网页截图失败：{e:#}"),
+    };
+    match client.send_media(account, from, context_token, "snap.png", &png).await {
+        Ok(()) => format!("网页截图已发送：{url}"),
+        Err(e) => {
+            tracing::warn!("weixin: send web snap failed: {e:#}");
+            format!("截图发送失败：{e:#}")
+        }
+    }
+}
 
 /// 派发任务时注入的渠道提示：告知 agent 媒体文件回传约定。
 const WEIXIN_FILE_HINT: &str = "\n\n（渠道提示：本任务来自微信。如需把生成的文件（图片、图表、文档等）发给用户，\
@@ -383,6 +480,8 @@ const MENU_TEXT: &str = "\
 /terms — 列出 client 上的终端会话
 /term <id> [行数] — 查看终端输出（如 /term a1b2 100）
 /send <id> <文本> — 向终端发送输入（如 /send a1b2 ls -la）
+/shot <id> — 终端屏幕截图（图片）
+/snap <url> — 网页截图（图片）
 
 【小贴士】
 · 桌面 client 在线时任务在你本地机器执行，离线时在服务器端执行、仅支持查询类对话

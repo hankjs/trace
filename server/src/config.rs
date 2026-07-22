@@ -24,6 +24,9 @@ pub struct ServerConfig {
     /// 本地 dev 应设为 false, 避免与线上实例争抢消息
     #[serde(default = "default_true")]
     pub weixin_monitor: bool,
+    /// Chrome/Chromium 可执行文件路径（/snap 网页截图用）。留空则自动探测常见路径
+    #[serde(default)]
+    pub chrome_path: Option<String>,
 }
 
 fn default_true() -> bool {

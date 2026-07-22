@@ -6,3 +6,7 @@ host = "0.0.0.0"
 port = 3000
 jwt_secret = "change-me-to-a-random-string"
 database_url = "mysql://user:password@host:3306/dbname"
+
+# Chrome/Chromium 可执行文件路径（微信 /snap 网页截图用，服务器需先安装 chromium）
+# 留空时自动探测常见路径，也可用 CHROME_PATH 环境变量指定
+# chrome_path = "/usr/bin/chromium"

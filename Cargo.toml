@@ -32,3 +32,11 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 async-stream = "0.3"
 bcrypt = "0.16"
+# 终端截图(需求 A):SGR 快照 -> SVG -> PNG
+resvg = "0.45"
+usvg = "0.45"
+tiny-skia = "0.11"
+fontdb = "0.23"
+unicode-width = "0.2"
+# 网页截图(需求 B):headless Chrome DevTools 协议
+chromiumoxide = "0.7"

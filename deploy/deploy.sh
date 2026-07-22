@@ -12,6 +12,10 @@
 #   4. 安装二进制 + admin/dist 到 /opt/hank, 注册 systemd 服务并重启
 #
 # 服务器上的 config.toml 只在缺失时从本地上传一次, 之后不会被覆盖.
+#
+# 运行期可选依赖(脚本不自动安装, 按需手动装):
+#   - /snap 网页截图: apt install -y chromium, 并在 config.toml 配置 chrome_path
+#   - /shot 终端截图: 服务器需等宽 CJK 字体(如 apt install -y fonts-noto-cjk), 否则中文缺字形
 
 set -euo pipefail
 
