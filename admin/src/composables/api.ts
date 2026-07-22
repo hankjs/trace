@@ -311,6 +311,29 @@ export const api = {
     return request<WeixinBinding[]>('/api/admin/weixin/bindings')
   },
 
+  // ---- 终端代理 ----
+
+  listClients() {
+    return request<ClientAgentInfo[]>('/api/admin/clients')
+  },
+
+  listClientTerminals(clientId: string) {
+    return request<TermInfo[]>(`/api/admin/clients/${clientId}/terminals`)
+  },
+
+  terminalOutput(clientId: string, termId: string, lines = 200) {
+    return request<{ output: string }>(
+      `/api/admin/clients/${clientId}/terminals/${termId}/output?lines=${lines}`
+    )
+  },
+
+  terminalInput(clientId: string, termId: string, data: string) {
+    return request<{ sent: boolean }>(
+      `/api/admin/clients/${clientId}/terminals/${termId}/input`,
+      { method: 'POST', body: JSON.stringify({ data }) }
+    )
+  },
+
   deleteWeixinBinding(id: string) {
     return request<void>(`/api/admin/weixin/bindings/${id}`, { method: 'DELETE' })
   },
@@ -325,4 +348,22 @@ export const api = {
       body: JSON.stringify({ prompt, context }),
     })
   },
+}
+
+export interface ClientAgentInfo {
+  id: string
+  user_id: string
+  hostname: string | null
+  work_dir: string | null
+  accept_remote: boolean
+  online: boolean
+}
+
+export interface TermInfo {
+  id: string
+  shell: string
+  cwd: string
+  foreground_cmd: string
+  alive: boolean
+  created_at: string
 }

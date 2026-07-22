@@ -2701,6 +2701,29 @@ impl Database {
         Ok(agents)
     }
 
+    /// admin 用：不按用户过滤，列出全部 client agent
+    pub async fn list_all_client_agents(&self) -> Result<Vec<ClientAgent>> {
+        let agents = db_retry!(
+            sqlx::query_as::<_, ClientAgent>(
+                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents ORDER BY created_at ASC"
+            )
+            .fetch_all(&self.pool)
+        )?;
+        Ok(agents)
+    }
+
+    /// admin 用：仅按 client_id 查询（dispatch 需要取出 user_id）
+    pub async fn get_client_agent_by_id(&self, client_id: &str) -> Result<Option<ClientAgent>> {
+        let agent = db_retry!(
+            sqlx::query_as::<_, ClientAgent>(
+                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents WHERE id = ?"
+            )
+            .bind(client_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(agent)
+    }
+
     // Switch a session between server-local execution (None) and a remote client
     pub async fn set_session_exec_client(&self, session_id: &str, exec_client_id: Option<&str>, work_dir: Option<&str>) -> Result<()> {
         db_retry!(

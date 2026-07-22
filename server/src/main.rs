@@ -1,4 +1,5 @@
 mod admin;
+mod admin_terminal;
 mod auth;
 mod changes;
 mod chat;
@@ -291,12 +292,18 @@ async fn main() -> Result<()> {
         .route("/api/admin/weixin/accounts/{id}", delete(weixin::routes::delete_account))
         .route("/api/admin/weixin/bindings", get(weixin::routes::list_bindings))
         .route("/api/admin/weixin/bindings/{id}", delete(weixin::routes::delete_binding_admin))
+        // Admin terminal proxy
+        .route("/api/admin/clients", get(admin_terminal::list_clients))
+        .route("/api/admin/clients/{cid}/terminals", get(admin_terminal::list_terminals))
+        .route("/api/admin/clients/{cid}/terminals/{tid}/output", get(admin_terminal::terminal_output))
+        .route("/api/admin/clients/{cid}/terminals/{tid}/input", post(admin_terminal::terminal_input))
         .layer(middleware::from_fn(admin_required))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 
     // Static file serving for admin SPA
+    // 注意用 fallback（保留 200 状态），not_found_service 会把 SPA 路由也标成 404
     let admin_static = ServeDir::new("admin/dist")
-        .not_found_service(ServeFile::new("admin/dist/index.html"));
+        .fallback(ServeFile::new("admin/dist/index.html"));
 
     let app = public
         .merge(protected)
