@@ -384,6 +384,8 @@ export interface TermInfo {
   foreground_cmd: string
   alive: boolean
   created_at: string
+  cols: number
+  rows: number
 }
 
 export interface ClientNotification {

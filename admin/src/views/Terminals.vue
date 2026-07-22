@@ -2,7 +2,6 @@
 import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { api, type ClientAgentInfo, type TermInfo } from '../composables/api'
 import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 
 const clients = ref<ClientAgentInfo[]>([])
@@ -13,15 +12,21 @@ const input = ref('')
 const autoRefresh = ref(true)
 const error = ref('')
 
-// xterm 输出视图（raw ANSI 回放渲染）
+// xterm 输出视图（raw ANSI 回放渲染）；宽高与 client 端实际终端一致，超出部分滚动查看
 const termEl = ref<HTMLElement | null>(null)
 let xterm: Terminal | null = null
-let fitAddon: FitAddon | null = null
-let resizeObserver: ResizeObserver | null = null
+
+function selectedTermSize() {
+  const t = terminals.value.find((t) => t.id === selectedTermId.value)
+  return { cols: t?.cols || 80, rows: t?.rows || 24 }
+}
 
 function ensureXterm() {
   if (xterm || !termEl.value) return
+  const { cols, rows } = selectedTermSize()
   xterm = new Terminal({
+    cols,
+    rows,
     fontSize: 15,
     lineHeight: 1.15,
     fontFamily: "'Fira Code', Menlo, 'Symbols Nerd Font Mono', Monaco, monospace",
@@ -30,12 +35,16 @@ function ensureXterm() {
     scrollback: 10000,
     theme: { background: '#0d1117', foreground: '#e6edf3' },
   })
-  fitAddon = new FitAddon()
-  xterm.loadAddon(fitAddon)
   xterm.open(termEl.value)
-  fitAddon.fit()
-  resizeObserver = new ResizeObserver(() => fitAddon?.fit())
-  resizeObserver.observe(termEl.value)
+}
+
+/** client 端终端尺寸变化时同步，保证换行位置一致 */
+function syncXtermSize() {
+  if (!xterm) return
+  const { cols, rows } = selectedTermSize()
+  if (xterm.cols !== cols || xterm.rows !== rows) {
+    xterm.resize(cols, rows)
+  }
 }
 
 let outputTimer: ReturnType<typeof setInterval> | null = null
@@ -58,6 +67,7 @@ async function loadTerminals() {
   try {
     terminals.value = await api.listClientTerminals(selectedClientId.value)
     error.value = ''
+    syncXtermSize()
   } catch (e: any) {
     terminals.value = []
     error.value = e.message
@@ -106,7 +116,7 @@ watch(selectedTermId, async (id) => {
   if (id) {
     await nextTick()
     ensureXterm()
-    fitAddon?.fit()
+    syncXtermSize()
   }
   loadOutput()
   if (outputTimer) clearInterval(outputTimer)
@@ -154,7 +164,6 @@ onMounted(async () => {
 onUnmounted(() => {
   if (outputTimer) clearInterval(outputTimer)
   if (listTimer) clearInterval(listTimer)
-  resizeObserver?.disconnect()
   xterm?.dispose()
   xterm = null
 })
@@ -224,7 +233,7 @@ onUnmounted(() => {
       <div v-if="selectedTermId" class="flex flex-col min-h-0">
         <div
           ref="termEl"
-          class="flex-1 min-h-0 bg-[#0d1117] border border-border-subtle rounded-md overflow-hidden p-1"
+          class="flex-1 min-h-0 bg-[#0d1117] border border-border-subtle rounded-md overflow-auto p-1"
         ></div>
         <div class="flex gap-2 mt-3">
           <input

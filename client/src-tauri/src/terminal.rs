@@ -23,6 +23,9 @@ pub struct TermSession {
     pub created_at: String,
     pub scrollback: Arc<Mutex<VecDeque<u8>>>,
     pub alive: Arc<AtomicBool>,
+    /// PTY 当前尺寸，随 term_create/term_resize 更新
+    pub cols: u16,
+    pub rows: u16,
 }
 
 #[derive(Default)]
@@ -38,6 +41,8 @@ pub struct TermInfo {
     pub foreground_cmd: String,
     pub alive: bool,
     pub created_at: String,
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// macOS 下沿 `ps` 树找 child_pid 后代链最深的进程，返回 (pid, comm)。
@@ -135,6 +140,8 @@ fn session_info(s: &TermSession) -> TermInfo {    TermInfo {
         foreground_cmd: foreground_cmd(s.child_pid, &s.shell),
         alive: s.alive.load(Ordering::SeqCst),
         created_at: s.created_at.clone(),
+        cols: s.cols,
+        rows: s.rows,
     }
 }
 
@@ -191,11 +198,13 @@ pub fn term_create(
         .or_else(|| std::env::var("HOME").ok())
         .unwrap_or_else(|| ".".to_string());
 
+    let cols = if cols == 0 { 80 } else { cols };
+    let rows = if rows == 0 { 24 } else { rows };
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: if rows == 0 { 24 } else { rows },
-            cols: if cols == 0 { 80 } else { cols },
+            rows,
+            cols,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -297,6 +306,8 @@ pub fn term_create(
         created_at: chrono::Utc::now().to_rfc3339(),
         scrollback,
         alive,
+        cols,
+        rows,
     };
     let info = session_info(&session);
     state.sessions.lock().unwrap().insert(id, session);
@@ -321,8 +332,8 @@ pub fn term_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let sessions = state.sessions.lock().unwrap();
-    let session = sessions.get(&id).ok_or("terminal not found")?;
+    let mut sessions = state.sessions.lock().unwrap();
+    let session = sessions.get_mut(&id).ok_or("terminal not found")?;
     session
         .master
         .resize(PtySize {
@@ -331,7 +342,10 @@ pub fn term_resize(
             pixel_width: 0,
             pixel_height: 0,
         })
-        .map_err(|e| format!("resize failed: {e}"))
+        .map_err(|e| format!("resize failed: {e}"))?;
+    session.cols = cols;
+    session.rows = rows;
+    Ok(())
 }
 
 #[tauri::command]
