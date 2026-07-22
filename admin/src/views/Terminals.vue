@@ -122,6 +122,14 @@ watch(autoRefresh, (on) => {
   if (on && selectedTermId.value) {
     outputTimer = setInterval(loadOutput, 3000)
   }
+  if (listTimer) clearInterval(listTimer)
+  listTimer = null
+  if (on) {
+    listTimer = setInterval(() => {
+      loadClients()
+      loadTerminals()
+    }, 5000)
+  }
 })
 
 function shortId(id: string) {
@@ -135,10 +143,12 @@ function homeCwd(cwd: string) {
 onMounted(async () => {
   await loadClients()
   await loadTerminals()
-  listTimer = setInterval(() => {
-    loadClients()
-    loadTerminals()
-  }, 5000)
+  if (autoRefresh.value) {
+    listTimer = setInterval(() => {
+      loadClients()
+      loadTerminals()
+    }, 5000)
+  }
 })
 
 onUnmounted(() => {
@@ -156,7 +166,7 @@ onUnmounted(() => {
       <h1 class="text-lg font-semibold text-text-primary">终端</h1>
       <label class="flex items-center gap-1.5 text-[13px] text-text-secondary cursor-pointer">
         <input v-model="autoRefresh" type="checkbox" class="rounded" />
-        自动刷新输出
+        自动刷新
       </label>
     </div>
 
