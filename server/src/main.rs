@@ -14,6 +14,7 @@ pub mod response;
 mod requirement_docs;
 mod routes;
 mod skills;
+mod snap_tools;
 mod specs;
 mod termshot;
 mod websnap;

@@ -206,6 +206,8 @@ async fn build_system_prompt(
         - 桌面 client 离线时：纯查询、闲聊、查会话状态等不需要操作用户本地文件的消息，正常 reply 或 dispatch\
         （在服务器端执行）；涉及本地文件、代码修改、本地命令的任务不要 dispatch，用 reply 告知\
         \"你的桌面 client 不在线，请打开 Trace 客户端后重试\"。\n\
+        - 截图/网页快照类请求（如\"截图 kimi 官网\"、\"截图给我看看\"）属于任务，正常 dispatch 即可，\
+        server 端自带截图能力，不要求桌面 client 在线；改写 task 时把\"kimi 官网\"这类口语补全成完整 URL 更好。\n\
         - 拿不准时选 dispatch，task 直接使用用户原文。"
     )
 }

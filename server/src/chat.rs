@@ -214,6 +214,17 @@ pub async fn run_chat_turn(
         t.push(Arc::new(UpdateTaskStatusTool::new(base_url.clone(), token.clone(), session_id.clone())));
         t.push(Arc::new(UpdateArtifactTool::new(base_url.clone(), token.clone(), session_id.clone())));
         t.push(Arc::new(AskUserTool::new()));
+        // 截图类工具永远 server 本地执行：网页快照用 server 本机 Chrome，
+        // 终端截图由 server 拉 client 快照后本地渲染（无 user_id 的会话无法定位 client，不注册）
+        t.push(Arc::new(crate::snap_tools::WebSnapshotTool::new(
+            state.config.server.chrome_path.clone(),
+        )));
+        if let Some(ref uid) = session_user_id {
+            t.push(Arc::new(crate::snap_tools::TerminalSnapshotTool::new(
+                state.clone(),
+                uid.clone(),
+            )));
+        }
         // Add explore/generate tools if session is bound to a change or is explore type
         if let Some(ref cid) = session_change_id {
             t.push(Arc::new(FinalizeExploreTool::new(base_url.clone(), token.clone(), cid.clone(), session_id.clone())));

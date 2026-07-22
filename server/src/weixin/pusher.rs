@@ -299,7 +299,7 @@ async fn load_media_bytes(
         .and_then(|s| s.exec_client_id);
     match client_id {
         Some(cid) => {
-            let result = crate::remote_exec::dispatch_tool_call(
+            let remote = crate::remote_exec::dispatch_tool_call(
                 state,
                 user_id,
                 &cid,
@@ -307,11 +307,20 @@ async fn load_media_bytes(
                 serde_json::json!({ "path": path }),
                 REMOTE_READ_TIMEOUT,
             )
-            .await?;
-            if result.is_error {
-                return Err(anyhow!(result.content));
+            .await;
+            match remote {
+                Ok(result) if !result.is_error => base64_decode(result.content.trim()),
+                // 远程读不到（超时/断线/client 上不存在该路径）时降级读 server 本地：
+                // server 渲染的截图 PNG（snap_tools）就写在 server 磁盘上
+                other => {
+                    let reason = match other {
+                        Ok(r) => r.content,
+                        Err(e) => format!("{e:#}"),
+                    };
+                    tracing::info!(path, %reason, "weixin: remote read failed, fallback to local file");
+                    Ok(tokio::fs::read(path).await?)
+                }
             }
-            base64_decode(result.content.trim())
         }
         None => Ok(tokio::fs::read(path).await?),
     }
