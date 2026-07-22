@@ -104,6 +104,13 @@ async function executeRemoteTool(req: RemoteToolRequest): Promise<{ content: str
         }
         return await execToolLocal("bash", { command: cmd }, dir);
       }
+      case "read_file_base64": {
+        // 微信渠道媒体回传：读取本地文件并以 base64 返回（二进制安全）
+        const r = await invoke<{ content: string; is_error: boolean }>("tool_read_file_base64", {
+          path: String(input.path ?? ""),
+        });
+        return { content: r.content, is_error: r.is_error };
+      }
       case "terminal_list": {
         const list = await invoke("term_list");
         return { content: JSON.stringify(list), is_error: false };

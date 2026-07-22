@@ -219,5 +219,33 @@ onUnmounted(stopPolling)
         </tr>
       </tbody>
     </table>
+
+    <!-- 主动发送 -->
+    <template v-if="!bindingsLoading && bindings.length > 0">
+      <h2 class="text-sm font-semibold text-text-primary mt-10 mb-3">主动发送</h2>
+      <div class="p-4 border border-border-subtle rounded-lg space-y-3">
+        <select v-model="sendBindingId" class="w-full px-3 py-1.5 text-sm bg-transparent border border-border-subtle rounded-md text-text-primary">
+          <option value="" disabled>选择接收用户</option>
+          <option v-for="b in bindings" :key="b.id" :value="b.id">{{ b.username }}（{{ b.ilink_user_id }}）</option>
+        </select>
+        <textarea
+          v-model="sendText"
+          rows="3"
+          placeholder="要发送的消息内容"
+          class="w-full px-3 py-1.5 text-sm bg-transparent border border-border-subtle rounded-md text-text-primary resize-y"
+          @keydown.meta.enter="sendMessage"
+          @keydown.ctrl.enter="sendMessage"
+        ></textarea>
+        <div class="flex items-center gap-3">
+          <button
+            @click="sendMessage"
+            :disabled="!sendBindingId || !sendText.trim() || sending"
+            class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
+          >{{ sending ? '发送中...' : '发送' }}</button>
+          <span v-if="sendResult" class="text-xs" :class="sendResult.ok ? 'text-green-500' : 'text-red-400'">{{ sendResult.msg }}</span>
+        </div>
+        <p class="text-xs text-text-tertiary">仅支持给最近与机器人有过对话的绑定用户发送（依赖微信会话凭证）。</p>
+      </div>
+    </template>
   </div>
 </template>

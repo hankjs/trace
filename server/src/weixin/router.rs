@@ -357,6 +357,10 @@ async fn terminal_write(state: &Arc<AppState>, binding: &WeixinBinding, text: &s
 }
 
 
+/// 派发任务时注入的渠道提示：告知 agent 媒体文件回传约定。
+const WEIXIN_FILE_HINT: &str = "\n\n（渠道提示：本任务来自微信。如需把生成的文件（图片、图表、文档等）发给用户，\
+在最终回复中单独写 [file:/绝对/路径]，每个文件一条，系统会自动把文件发到微信。不要虚构路径，只标记真实存在的文件。）";
+
 /// /菜单 命令的能力说明文案。
 const MENU_TEXT: &str = "\
 我是 Trace 微信助手，可以帮你远程驱动 AI 编程会话：
@@ -366,6 +370,7 @@ const MENU_TEXT: &str = "\
 · 执行中会推送进度摘要，完成后发回完整结果
 · 接着发消息 = 在同一会话里追问、补充要求
 · agent 向你提问时，直接回复即可作答
+· agent 生成的图片/文件可直接发回微信
 
 【命令】
 /new — 开一个新会话（旧话题结束）
@@ -382,7 +387,7 @@ const MENU_TEXT: &str = "\
 【小贴士】
 · 桌面 client 在线时任务在你本地机器执行，离线时在服务器端执行、仅支持查询类对话
 · 同一时间只能跑一个任务，执行中新消息会排队提醒
-· 暂只支持文字，图片/语音还在开发中";
+· 暂只支持文字输入，语音还在开发中";
 
 /// 普通文本：先由渠道 agent 决策，再按 action 分发。
 /// 渠道 agent 失败时降级为直接 dispatch 原文（保持原有行为）。
@@ -499,14 +504,17 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
         auth_token: jwt,
     };
     let content = vec![hank_provider::ContentBlock::Text {
-        text: text.to_string(),
+        text: format!("{text}{WEIXIN_FILE_HINT}"),
     }];
     match run_chat_turn(state, &session_id, content, opts).await {
         Ok(handle) => {
             pusher::spawn(
+                state.clone(),
                 account.clone(),
                 from.to_string(),
                 context_token.to_string(),
+                session_id.clone(),
+                binding.user_id.clone(),
                 handle.event_rx,
             );
         }

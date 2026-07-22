@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Result};
 use hank_db::WeixinAccount;
+use md5::Digest;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -18,6 +19,22 @@ const NORMAL_TIMEOUT: Duration = Duration::from_secs(15);
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(40);
 /// 微信单条文本过长时的切片长度（字符数）
 const TEXT_CHUNK_CHARS: usize = 1800;
+/// 微信 CDN 基础地址：getuploadurl 未返回 upload_full_url 时回退拼接上传地址
+const CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
+/// CDN 上传超时（媒体文件较大，给足时间）
+const CDN_UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// CDN 上传失败重试次数（仅 5xx/网络错误重试，4xx 直接失败）
+const CDN_UPLOAD_RETRIES: u32 = 3;
+
+/// proto: UploadMediaType
+const MEDIA_TYPE_IMAGE: u32 = 1;
+const MEDIA_TYPE_VIDEO: u32 = 2;
+const MEDIA_TYPE_FILE: u32 = 3;
+
+/// proto: MessageItemType（媒体）
+const ITEM_TYPE_IMAGE: u32 = 2;
+const ITEM_TYPE_FILE: u32 = 4;
+const ITEM_TYPE_VIDEO: u32 = 5;
 
 #[derive(Clone)]
 pub struct IlinkClient {
@@ -32,7 +49,7 @@ fn random_wechat_uin() -> String {
 }
 
 /// 极简 base64（标准字符集，带 padding），避免新增依赖。
-fn base64_encode(input: &[u8]) -> String {
+pub(crate) fn base64_encode(input: &[u8]) -> String {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in input.chunks(3) {
@@ -58,6 +75,35 @@ fn base_info() -> Value {
         "channel_version": "1.0.0",
         "bot_agent": "Trace/1.0",
     })
+}
+
+/// 极简 hex（小写），避免新增依赖。
+fn hex_encode(input: &[u8]) -> String {
+    input.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// AES-128-ECB 密文长度（PKCS7 补齐到 16 字节边界，整块时额外加一块）
+fn aes_ecb_padded_size(plaintext_size: usize) -> usize {
+    (plaintext_size + 1).div_ceil(16) * 16
+}
+
+/// AES-128-ECB 加密（PKCS7 padding），与参考实现 aes-ecb.js 一致。
+fn aes128_ecb_encrypt(key: &[u8; 16], plaintext: &[u8]) -> Vec<u8> {
+    use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyInit};
+    ecb::Encryptor::<aes::Aes128>::new(key.into()).encrypt_padded_vec_mut::<Pkcs7>(plaintext)
+}
+
+/// 按扩展名推断 proto: UploadMediaType
+fn media_type_of(file_name: &str) -> u32 {
+    let ext = file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "heic" | "heif" => MEDIA_TYPE_IMAGE,
+        "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm" => MEDIA_TYPE_VIDEO,
+        _ => MEDIA_TYPE_FILE,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,6 +370,160 @@ impl IlinkClient {
             tracing::info!(to = to_user_id, client_id, len = part.chars().count(), "weixin: message sent");
         }
         Ok(())
+    }
+
+    /// 发送媒体文件：按扩展名路由到图片/视频/文件附件。
+    /// 流程与官方参考实现一致：getuploadurl 换取上传地址 → AES-128-ECB 加密后 POST 到 CDN
+    /// → sendmessage 发送引用 CDN 的媒体 item。
+    pub async fn send_media(
+        &self,
+        account: &WeixinAccount,
+        to_user_id: &str,
+        context_token: &str,
+        file_name: &str,
+        data: &[u8],
+    ) -> Result<()> {
+        let rawsize = data.len();
+        let rawfilemd5 = format!("{:x}", md5::Md5::digest(data));
+        let filesize = aes_ecb_padded_size(rawsize);
+        let filekey = hex_encode(uuid::Uuid::new_v4().as_bytes());
+        let aeskey = *uuid::Uuid::new_v4().as_bytes();
+        let aeskey_hex = hex_encode(&aeskey);
+
+        let body = json!({
+            "filekey": filekey,
+            "media_type": media_type_of(file_name),
+            "to_user_id": to_user_id,
+            "rawsize": rawsize,
+            "rawfilemd5": rawfilemd5,
+            "filesize": filesize,
+            "no_need_thumb": true,
+            "aeskey": aeskey_hex,
+            "base_info": base_info(),
+        });
+        let text = self
+            .post(
+                &account.base_url,
+                "ilink/bot/getuploadurl",
+                &body,
+                Some(&account.bot_token),
+                NORMAL_TIMEOUT,
+            )
+            .await?;
+        let resp: Value = serde_json::from_str(&text)?;
+        let ret = resp["ret"].as_i64().unwrap_or(0);
+        if ret != 0 {
+            let errmsg = resp["errmsg"].as_str().unwrap_or("(none)");
+            return Err(anyhow!("getuploadurl ret={ret} errmsg={errmsg}"));
+        }
+        let upload_full_url = resp["upload_full_url"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let upload_param = resp["upload_param"].as_str().filter(|s| !s.is_empty());
+        let cdn_url = match (upload_full_url, upload_param) {
+            (Some(u), _) => u.to_string(),
+            (None, Some(p)) => format!(
+                "{CDN_BASE_URL}/upload?encrypted_query_param={}&filekey={}",
+                urlencoding_encode(p),
+                urlencoding_encode(&filekey)
+            ),
+            (None, None) => return Err(anyhow!("getuploadurl 未返回上传地址: {}", text.chars().take(200).collect::<String>())),
+        };
+
+        let ciphertext = aes128_ecb_encrypt(&aeskey, data);
+        let download_param = self.upload_to_cdn(&cdn_url, &ciphertext).await?;
+
+        // 与参考实现一致：aes_key 为 hex 字符串（ASCII）再 base64
+        let media = json!({
+            "encrypt_query_param": download_param,
+            "aes_key": base64_encode(aeskey_hex.as_bytes()),
+            "encrypt_type": 1,
+        });
+        let item = match media_type_of(file_name) {
+            MEDIA_TYPE_IMAGE => json!({
+                "type": ITEM_TYPE_IMAGE,
+                "image_item": { "media": media, "mid_size": filesize },
+            }),
+            MEDIA_TYPE_VIDEO => json!({
+                "type": ITEM_TYPE_VIDEO,
+                "video_item": { "media": media, "video_size": filesize },
+            }),
+            _ => json!({
+                "type": ITEM_TYPE_FILE,
+                "file_item": { "media": media, "file_name": file_name, "len": rawsize.to_string() },
+            }),
+        };
+        let client_id = format!("trace-weixin-{}", uuid::Uuid::new_v4());
+        let body = json!({
+            "msg": {
+                "from_user_id": "",
+                "to_user_id": to_user_id,
+                "client_id": client_id,
+                "message_type": 2,
+                "message_state": 2,
+                "context_token": context_token,
+                "item_list": [item],
+            },
+            "base_info": base_info(),
+        });
+        let text_resp = self
+            .post(
+                &account.base_url,
+                "ilink/bot/sendmessage",
+                &body,
+                Some(&account.bot_token),
+                NORMAL_TIMEOUT,
+            )
+            .await?;
+        let resp: Value = serde_json::from_str(&text_resp)?;
+        let ret = resp["ret"].as_i64().unwrap_or(0);
+        if ret != 0 {
+            let errmsg = resp["errmsg"].as_str().unwrap_or("(none)");
+            return Err(anyhow!("sendmessage ret={ret} errmsg={errmsg}"));
+        }
+        tracing::info!(to = to_user_id, client_id, file_name, rawsize, "weixin: media sent");
+        Ok(())
+    }
+
+    /// POST 密文到 CDN，返回 x-encrypted-param 下载凭证。5xx/网络错误重试，4xx 直接失败。
+    async fn upload_to_cdn(&self, url: &str, ciphertext: &[u8]) -> Result<String> {
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 1..=CDN_UPLOAD_RETRIES {
+            let result = self
+                .http
+                .post(url)
+                .header("Content-Type", "application/octet-stream")
+                .body(ciphertext.to_vec())
+                .timeout(CDN_UPLOAD_TIMEOUT)
+                .send()
+                .await;
+            match result {
+                Ok(res) => {
+                    let status = res.status();
+                    if status.is_success() {
+                        return res
+                            .headers()
+                            .get("x-encrypted-param")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string())
+                            .ok_or_else(|| anyhow!("CDN 上传响应缺少 x-encrypted-param 头"));
+                    }
+                    let err_msg = res
+                        .headers()
+                        .get("x-error-message")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string());
+                    let err = anyhow!("CDN 上传失败 {status}: {}", err_msg.unwrap_or_default());
+                    if status.is_client_error() {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+                Err(e) => last_err = Some(e.into()),
+            }
+            if attempt < CDN_UPLOAD_RETRIES {
+                tracing::warn!(attempt, "weixin: CDN upload failed, retrying");
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("CDN 上传失败")))
     }
 }
 

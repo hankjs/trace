@@ -31,3 +31,6 @@ toml = "0.8"
 dirs = "5"
 bcrypt = { workspace = true }
 reqwest = { workspace = true }
+aes = "0.8"
+ecb = { version = "0.1", features = ["alloc"] }
+md-5 = "0.10"

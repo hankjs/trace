@@ -72,6 +72,7 @@ pub fn run() {
             tools::tool_write_file,
             tools::tool_edit,
             tools::tool_bash,
+            tools::tool_read_file_base64,
             llm_stream::llm_stream,
             llm_stream::llm_stream_test,
             terminal::term_create,

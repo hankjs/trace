@@ -295,3 +295,53 @@ pub async fn tool_bash(
         Err(_) => ToolResult { content: format!("Command timed out after {}ms", timeout.as_millis()), is_error: true, duration_ms },
     }
 }
+/// 远程文件回传大小上限（与 server 端 MAX_MEDIA_BYTES 对齐）
+const MAX_READ_FILE_BASE64_BYTES: u64 = 20 * 1024 * 1024;
+
+/// 读取本地文件并以 base64 返回，供微信渠道回传媒体文件。
+#[tauri::command]
+pub async fn tool_read_file_base64(path: String) -> ToolResult {
+    let start = Instant::now();
+    let result = async {
+        let meta = fs::metadata(&path).await.map_err(|e| format!("Error reading file: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("Not a regular file: {path}"));
+        }
+        if meta.len() > MAX_READ_FILE_BASE64_BYTES {
+            return Err(format!(
+                "File too large: {} bytes (limit {})",
+                meta.len(),
+                MAX_READ_FILE_BASE64_BYTES
+            ));
+        }
+        let data = fs::read(&path).await.map_err(|e| format!("Error reading file: {e}"))?;
+        Ok(base64_encode(&data))
+    }
+    .await;
+    match result {
+        Ok(content) => ToolResult { content, is_error: false, duration_ms: start.elapsed().as_millis() as u64 },
+        Err(e) => ToolResult { content: e, is_error: true, duration_ms: start.elapsed().as_millis() as u64 },
+    }
+}
+
+/// 极简 base64（标准字符集，带 padding），避免新增依赖。
+fn base64_encode(input: &[u8]) -> String {
+    const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        out.push(CHARS[(b[0] >> 2) as usize] as char);
+        out.push(CHARS[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[(((b[1] & 0x0f) << 2) | (b[2] >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(b[2] & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}

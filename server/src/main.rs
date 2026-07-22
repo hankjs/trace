@@ -19,7 +19,7 @@ mod weixin;
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{HeaderMap, Request},
     middleware::{self, Next},
     response::Response,
@@ -251,7 +251,11 @@ async fn main() -> Result<()> {
         .route("/api/client/registration", put(remote_exec::register_client))
         .route("/api/client/notify", post(remote_exec::post_notification))
         .route("/api/client/poll", get(remote_exec::poll_requests))
-        .route("/api/client/tool-result", post(remote_exec::post_tool_result))
+        // tool-result 可能携带媒体文件 base64 回传（20MB 文件约 27MB），放宽 body 上限
+        .route(
+            "/api/client/tool-result",
+            post(remote_exec::post_tool_result).route_layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+        )
         .route("/api/client/online", get(remote_exec::list_online))
         .route("/api/sessions/{id}/exec-client", put(remote_exec::set_session_exec_client))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
