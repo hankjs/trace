@@ -153,7 +153,7 @@ fn append_scrollback(buf: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
     }
 }
 
-/// zsh shell integration 脚本：包装用户 .zshrc，追加 OSC 133（命令生命周期）
+/// zsh shell integration 脚本：包装用户 .zshrc/.zprofile，追加 OSC 133（命令生命周期）
 /// 和 OSC 7（cwd 上报）钩子。每次启动覆写，返回 ZDOTDIR 目录。
 fn write_zsh_integration(app: &AppHandle) -> Option<String> {
     let base = app.path().app_data_dir().ok()?;
@@ -181,6 +181,20 @@ add-zsh-hook precmd __trace_precmd
 add-zsh-hook preexec __trace_preexec
 "##;
     std::fs::write(dir.join(".zshrc"), content).ok()?;
+    // login shell(-l)下 zsh 在 .zshrc 之前还会读 $ZDOTDIR/.zprofile；
+    // ZDOTDIR 被我们改到了 integration 目录，这里包一层转 source 用户自己的
+    // ~/.zprofile(brew shellenv / pyenv init 通常都在这里)，否则 PATH 补不上。
+    // 注意此处不能恢复 ZDOTDIR：zsh 读取每个启动文件时按当时的 ZDOTDIR 查找，
+    // 若提前恢复，后面的包装 .zshrc(注入 OSC 钩子) 就会被跳过
+    let profile = r##"# Trace terminal shell integration (auto-generated, 勿手改)
+if [[ -n "$TRACE_ORIG_ZDOTDIR" ]]; then
+  __TRACE_REAL_ZDOTDIR="$TRACE_ORIG_ZDOTDIR"
+else
+  __TRACE_REAL_ZDOTDIR="$HOME"
+fi
+[[ -f "$__TRACE_REAL_ZDOTDIR/.zprofile" ]] && source "$__TRACE_REAL_ZDOTDIR/.zprofile"
+"##;
+    std::fs::write(dir.join(".zprofile"), profile).ok()?;
     Some(dir.to_string_lossy().to_string())
 }
 
@@ -211,6 +225,9 @@ pub fn term_create(
         .map_err(|e| format!("openpty failed: {e}"))?;
 
     let mut cmd = CommandBuilder::new(&shell);
+    // 以 login shell 启动：GUI 应用从 Finder 启动时环境干净，login shell 才会走
+    // /etc/zprofile(path_helper) 和 ~/.zprofile(brew shellenv 等) 把 PATH 补齐
+    cmd.arg("-l");
     cmd.cwd(&cwd);
     cmd.env("TERM", "xterm-256color");
     // 声明为 iTerm2 兼容终端：kimi 等 CLI 按 TERM_PROGRAM 探测通知能力,

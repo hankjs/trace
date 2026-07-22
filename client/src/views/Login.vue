@@ -20,7 +20,7 @@ async function handleLogin() {
     if (!result.ok) {
       error.value = result.error || "用户名或密码错误";
     } else {
-      router.push({ name: "sessions" });
+      router.push({ name: "terminal" });
     }
   } catch {
     error.value = "网络错误";
