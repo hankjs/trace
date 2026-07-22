@@ -339,6 +339,18 @@ pub struct ClientAgent {
     pub updated_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ClientNotification {
+    pub id: String,
+    pub user_id: String,
+    pub client_id: String,
+    pub term_id: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub body: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsOverview {
     pub total_input_tokens: u64,
@@ -793,6 +805,24 @@ impl Database {
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
                 INDEX idx_client_agents_user (user_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Client notifications table (终端通知上报：kimi task complete / approval 等)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS client_notifications (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL,
+                client_id VARCHAR(36) NOT NULL,
+                term_id VARCHAR(64) DEFAULT NULL,
+                kind VARCHAR(32) NOT NULL DEFAULT 'notification',
+                title VARCHAR(255) NOT NULL DEFAULT '',
+                body TEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                INDEX idx_client_notifications_user (user_id),
+                INDEX idx_client_notifications_created (created_at)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -2562,6 +2592,17 @@ impl Database {
         Ok(row)
     }
 
+    pub async fn get_weixin_binding_by_id(&self, id: &str) -> Result<Option<WeixinBinding>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, WeixinBinding>(
+                "SELECT id, account_id, ilink_user_id, user_id, context_token, created_at FROM weixin_bindings WHERE id = ?"
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
     pub async fn get_weixin_binding_by_user(&self, user_id: &str) -> Result<Option<WeixinBinding>> {
         let row = db_retry!(
             sqlx::query_as::<_, WeixinBinding>(
@@ -2722,6 +2763,46 @@ impl Database {
             .fetch_optional(&self.pool)
         )?;
         Ok(agent)
+    }
+
+    /// 上报一条终端通知（kimi task complete / approval 等）
+    pub async fn create_client_notification(
+        &self,
+        user_id: &str,
+        client_id: &str,
+        term_id: Option<&str>,
+        kind: &str,
+        title: &str,
+        body: Option<&str>,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO client_notifications (id, user_id, client_id, term_id, kind, title, body) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+            .bind(&id)
+            .bind(user_id)
+            .bind(client_id)
+            .bind(term_id)
+            .bind(kind)
+            .bind(title)
+            .bind(body)
+            .execute(&self.pool)
+        )?;
+        Ok(id)
+    }
+
+    /// 列出某用户最近的终端通知（后续 admin/微信消费用）
+    pub async fn list_client_notifications(&self, user_id: &str, limit: u32) -> Result<Vec<ClientNotification>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, ClientNotification>(
+                "SELECT id, user_id, client_id, term_id, kind, title, body, created_at FROM client_notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"
+            )
+            .bind(user_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
     }
 
     // Switch a session between server-local execution (None) and a remote client

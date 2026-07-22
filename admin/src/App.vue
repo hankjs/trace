@@ -18,6 +18,7 @@ const nav = [
   { to: '/image-providers', label: '生图供应商', icon: '🖼' },
   { to: '/weixin', label: '微信机器人', icon: '✆' },
   { to: '/terminals', label: '终端', icon: '▸' },
+  { to: '/notifications', label: '通知', icon: '◉' },
   { to: '/users', label: '用户', icon: '⚇' },
 ]
 
@@ -60,7 +61,10 @@ function handleGenerate() {
         class="px-2 py-1.5 text-[12px] text-text-tertiary hover:text-text-secondary transition-colors text-left"
       >退出登录</button>
     </aside>
-    <main class="flex-1 min-w-0 px-10 py-8 max-w-4xl">
+    <main
+      class="flex-1 min-w-0 px-10 py-8"
+      :class="route.path === '/terminals' ? 'flex flex-col h-screen overflow-hidden' : 'max-w-4xl'"
+    >
       <RouterView />
     </main>
   </div>

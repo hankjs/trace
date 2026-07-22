@@ -2,7 +2,7 @@
 
 use crate::auth::Claims;
 use crate::response::{self as R};
-use crate::weixin::{login, monitor, router};
+use crate::weixin::{api, login, monitor, router};
 use crate::AppState;
 use axum::{
     extract::{Path, State},
@@ -92,6 +92,46 @@ pub async fn delete_account(
 pub async fn list_bindings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.list_weixin_bindings().await {
         Ok(bindings) => R::ok(bindings),
+        Err(e) => R::internal_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SendMessageRequest {
+    pub binding_id: String,
+    pub text: String,
+}
+
+/// POST /api/admin/weixin/send — 主动给已绑定用户发微信消息。
+/// 依赖 binding 里最近一次入站消息刷新的 context_token；没有则无法发送。
+pub async fn send_message(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SendMessageRequest>,
+) -> impl IntoResponse {
+    let text = body.text.trim();
+    if text.is_empty() {
+        return R::bad_request("text is empty");
+    }
+    let binding = match state.db.get_weixin_binding_by_id(&body.binding_id).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return R::not_found("binding not found"),
+        Err(e) => return R::internal_error(e),
+    };
+    let context_token = match binding.context_token.as_deref() {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => return R::bad_request("该用户还没有给机器人发过消息，无法主动发送"),
+    };
+    let account = match state.db.get_weixin_account(&binding.account_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return R::not_found("account not found"),
+        Err(e) => return R::internal_error(e),
+    };
+    let client = api::IlinkClient::new();
+    match client
+        .send_text(&account, &binding.ilink_user_id, &context_token, text)
+        .await
+    {
+        Ok(()) => R::no_content(),
         Err(e) => R::internal_error(e),
     }
 }

@@ -184,6 +184,54 @@ pub async fn register_client(
     }
 }
 
+// ─── 终端通知上报 ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct NotifyRequest {
+    pub client_id: String,
+    pub term_id: Option<String>,
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub body: Option<String>,
+}
+
+/// client 上报终端通知（OSC 9/777 捕获：kimi task complete / approval 等）。
+/// 落库即可，后续推微信/其他渠道由消费方决定。
+pub async fn post_notification(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<NotifyRequest>,
+) -> impl IntoResponse {
+    if body.client_id.trim().is_empty() {
+        return R::bad_request("client_id is required");
+    }
+    let kind = body.kind.as_deref().unwrap_or("notification");
+    let title = body.title.as_deref().unwrap_or("");
+    match state
+        .db
+        .create_client_notification(
+            &claims.sub,
+            &body.client_id,
+            body.term_id.as_deref(),
+            kind,
+            title,
+            body.body.as_deref(),
+        )
+        .await
+    {
+        Ok(id) => {
+            tracing::info!(
+                client_id = %body.client_id,
+                term_id = ?body.term_id,
+                title,
+                "client terminal notification reported"
+            );
+            R::ok(serde_json::json!({"id": id}))
+        }
+        Err(e) => R::internal_error(e),
+    }
+}
+
 #[derive(Deserialize)]
 pub struct PollQuery {
     pub client_id: String,

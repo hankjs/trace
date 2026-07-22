@@ -311,6 +311,13 @@ export const api = {
     return request<WeixinBinding[]>('/api/admin/weixin/bindings')
   },
 
+  weixinSend(bindingId: string, text: string) {
+    return request<void>('/api/admin/weixin/send', {
+      method: 'POST',
+      body: JSON.stringify({ binding_id: bindingId, text }),
+    })
+  },
+
   // ---- 终端代理 ----
 
   listClients() {
@@ -327,11 +334,22 @@ export const api = {
     )
   },
 
+  /** 保留 ANSI 的原始输出，供 xterm 回放渲染 */
+  terminalOutputRaw(clientId: string, termId: string) {
+    return request<{ output: string }>(
+      `/api/admin/clients/${clientId}/terminals/${termId}/output?raw=true`
+    )
+  },
+
   terminalInput(clientId: string, termId: string, data: string) {
     return request<{ sent: boolean }>(
       `/api/admin/clients/${clientId}/terminals/${termId}/input`,
       { method: 'POST', body: JSON.stringify({ data }) }
     )
+  },
+
+  listNotifications(limit = 100) {
+    return request<ClientNotification[]>(`/api/admin/notifications?limit=${limit}`)
   },
 
   deleteWeixinBinding(id: string) {
@@ -365,5 +383,16 @@ export interface TermInfo {
   cwd: string
   foreground_cmd: string
   alive: boolean
+  created_at: string
+}
+
+export interface ClientNotification {
+  id: string
+  user_id: string
+  client_id: string
+  term_id: string | null
+  kind: string
+  title: string
+  body: string | null
   created_at: string
 }

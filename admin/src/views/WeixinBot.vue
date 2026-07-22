@@ -104,6 +104,26 @@ async function unbind(id: string) {
   await loadBindings()
 }
 
+// 主动发送
+const sendBindingId = ref('')
+const sendText = ref('')
+const sending = ref(false)
+const sendResult = ref<{ ok: boolean; msg: string } | null>(null)
+
+async function sendMessage() {
+  if (!sendBindingId.value || !sendText.value.trim() || sending.value) return
+  sending.value = true
+  sendResult.value = null
+  try {
+    await api.weixinSend(sendBindingId.value, sendText.value.trim())
+    sendResult.value = { ok: true, msg: '已发送' }
+    sendText.value = ''
+  } catch (e: any) {
+    sendResult.value = { ok: false, msg: e?.message || '发送失败' }
+  }
+  sending.value = false
+}
+
 onMounted(() => {
   load()
   loadBindings()

@@ -1,15 +1,42 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch } from 'vue'
+import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { api, type ClientAgentInfo, type TermInfo } from '../composables/api'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import '@xterm/xterm/css/xterm.css'
 
 const clients = ref<ClientAgentInfo[]>([])
 const selectedClientId = ref('')
 const terminals = ref<TermInfo[]>([])
 const selectedTermId = ref('')
-const output = ref('')
 const input = ref('')
 const autoRefresh = ref(true)
 const error = ref('')
+
+// xterm 输出视图（raw ANSI 回放渲染）
+const termEl = ref<HTMLElement | null>(null)
+let xterm: Terminal | null = null
+let fitAddon: FitAddon | null = null
+let resizeObserver: ResizeObserver | null = null
+
+function ensureXterm() {
+  if (xterm || !termEl.value) return
+  xterm = new Terminal({
+    fontSize: 15,
+    lineHeight: 1.15,
+    fontFamily: "'Fira Code', Menlo, 'Symbols Nerd Font Mono', Monaco, monospace",
+    cursorBlink: false,
+    disableStdin: true,
+    scrollback: 10000,
+    theme: { background: '#0d1117', foreground: '#e6edf3' },
+  })
+  fitAddon = new FitAddon()
+  xterm.loadAddon(fitAddon)
+  xterm.open(termEl.value)
+  fitAddon.fit()
+  resizeObserver = new ResizeObserver(() => fitAddon?.fit())
+  resizeObserver.observe(termEl.value)
+}
 
 let outputTimer: ReturnType<typeof setInterval> | null = null
 let listTimer: ReturnType<typeof setInterval> | null = null
@@ -37,12 +64,19 @@ async function loadTerminals() {
   }
 }
 
+let lastSnapshot = ''
+
 async function loadOutput() {
   if (!selectedClientId.value || !selectedTermId.value) return
   try {
-    const res = await api.terminalOutput(selectedClientId.value, selectedTermId.value, 200)
-    output.value = res.output
+    const res = await api.terminalOutputRaw(selectedClientId.value, selectedTermId.value)
     error.value = ''
+    // 快照未变化时跳过重写，避免无谓的重绘闪烁
+    if (xterm && res.output !== lastSnapshot) {
+      lastSnapshot = res.output
+      xterm.reset()
+      xterm.write(res.output)
+    }
   } catch (e: any) {
     error.value = e.message
   }
@@ -52,7 +86,8 @@ async function send() {
   const data = input.value
   if (!selectedClientId.value || !selectedTermId.value || !data) return
   try {
-    await api.terminalInput(selectedClientId.value, selectedTermId.value, data + '\n')
+    // TUI 应用（raw 模式）把回车识别为 \r 而非 \n
+    await api.terminalInput(selectedClientId.value, selectedTermId.value, data + '\r')
     input.value = ''
     setTimeout(loadOutput, 300)
   } catch (e: any) {
@@ -62,12 +97,17 @@ async function send() {
 
 watch(selectedClientId, () => {
   selectedTermId.value = ''
-  output.value = ''
+  xterm?.reset()
   loadTerminals()
 })
 
-watch(selectedTermId, (id) => {
-  output.value = ''
+watch(selectedTermId, async (id) => {
+  xterm?.reset()
+  if (id) {
+    await nextTick()
+    ensureXterm()
+    fitAddon?.fit()
+  }
   loadOutput()
   if (outputTimer) clearInterval(outputTimer)
   outputTimer = null
@@ -104,12 +144,15 @@ onMounted(async () => {
 onUnmounted(() => {
   if (outputTimer) clearInterval(outputTimer)
   if (listTimer) clearInterval(listTimer)
+  resizeObserver?.disconnect()
+  xterm?.dispose()
+  xterm = null
 })
 </script>
 
 <template>
-  <div>
-    <div class="flex items-center justify-between mb-6">
+  <div class="flex flex-col h-full min-h-0">
+    <div class="flex items-center justify-between mb-6 shrink-0">
       <h1 class="text-lg font-semibold text-text-primary">终端</h1>
       <label class="flex items-center gap-1.5 text-[13px] text-text-secondary cursor-pointer">
         <input v-model="autoRefresh" type="checkbox" class="rounded" />
@@ -117,11 +160,11 @@ onUnmounted(() => {
       </label>
     </div>
 
-    <p v-if="error" class="mb-4 text-[13px] text-red-400">{{ error }}</p>
+    <p v-if="error" class="mb-4 text-[13px] text-red-400 shrink-0">{{ error }}</p>
 
-    <div class="grid grid-cols-[220px_1fr] gap-6">
+    <div class="grid grid-cols-[220px_1fr] gap-6 flex-1 min-h-0">
       <!-- 左：client 列表 + 终端列表 -->
-      <div class="space-y-6">
+      <div class="space-y-6 overflow-y-auto min-h-0">
         <div>
           <div class="text-[12px] text-text-tertiary font-medium mb-2 px-1">桌面 CLIENT</div>
           <div
@@ -167,11 +210,12 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- 右：输出 + 输入 -->
-      <div v-if="selectedTermId" class="flex flex-col min-h-[480px]">
-        <div class="flex-1 bg-[#0d1117] border border-border-subtle rounded-md p-3 overflow-auto max-h-[60vh]">
-          <pre class="text-[12px] leading-relaxed text-gray-200 font-mono whitespace-pre-wrap break-all">{{ output || '（暂无输出）' }}</pre>
-        </div>
+      <!-- 右：xterm 输出 + 输入 -->
+      <div v-if="selectedTermId" class="flex flex-col min-h-0">
+        <div
+          ref="termEl"
+          class="flex-1 min-h-0 bg-[#0d1117] border border-border-subtle rounded-md overflow-hidden p-1"
+        ></div>
         <div class="flex gap-2 mt-3">
           <input
             v-model="input"
@@ -194,7 +238,7 @@ onUnmounted(() => {
           </button>
         </div>
       </div>
-      <div v-else class="flex items-center justify-center min-h-[480px] text-[13px] text-text-tertiary border border-dashed border-border-subtle rounded-md">
+      <div v-else class="flex items-center justify-center min-h-0 h-full text-[13px] text-text-tertiary border border-dashed border-border-subtle rounded-md">
         选择一个终端会话查看输出
       </div>
     </div>

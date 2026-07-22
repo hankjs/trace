@@ -30,7 +30,10 @@ const h = vi.hoisted(() => {
     }
     write() {}
     focus() {}
+    blur() {}
     onData() {}
+    onBell() {}
+    parser = { registerOscHandler: () => {} };
     attachCustomKeyEventHandler(cb: (e: any) => boolean) {
       keyHandlers.set(this.id, cb);
     }
@@ -71,6 +74,11 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async () => () => {}),
+}));
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => ({
+    onFocusChanged: vi.fn(async () => () => {}),
+  }),
 }));
 
 // vue-router 也需要 mock（TerminalView 里 useRouter）

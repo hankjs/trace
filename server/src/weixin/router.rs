@@ -344,7 +344,7 @@ async fn terminal_write(state: &Arc<AppState>, binding: &WeixinBinding, text: &s
                 state,
                 binding,
                 "terminal_write",
-                serde_json::json!({ "id": id, "data": format!("{data}\n") }),
+                serde_json::json!({ "id": id, "data": format!("{data}\r") }),
             )
             .await
             {

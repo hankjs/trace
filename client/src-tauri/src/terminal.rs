@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
 
@@ -127,8 +127,7 @@ fn foreground_cmd(_child_pid: u32, shell: &str) -> String {
         .unwrap_or_else(|| shell.to_string())
 }
 
-fn session_info(s: &TermSession) -> TermInfo {
-    TermInfo {
+fn session_info(s: &TermSession) -> TermInfo {    TermInfo {
         id: s.id.clone(),
         shell: s.shell.clone(),
         // 展示用实时 cwd（前台进程 cd 过也能跟上），代价是每次一次 lsof，量级可忽略
@@ -145,6 +144,37 @@ fn append_scrollback(buf: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
     while b.len() > SCROLLBACK_CAP {
         b.pop_front();
     }
+}
+
+/// zsh shell integration 脚本：包装用户 .zshrc，追加 OSC 133（命令生命周期）
+/// 和 OSC 7（cwd 上报）钩子。每次启动覆写，返回 ZDOTDIR 目录。
+fn write_zsh_integration(app: &AppHandle) -> Option<String> {
+    let base = app.path().app_data_dir().ok()?;
+    let dir = base.join("shell-integration").join("zsh");
+    std::fs::create_dir_all(&dir).ok()?;
+    let content = r##"# Trace terminal shell integration (auto-generated, 勿手改)
+# 先恢复真实 ZDOTDIR 并加载用户自己的配置
+if [[ -n "$TRACE_ORIG_ZDOTDIR" ]]; then
+  ZDOTDIR="$TRACE_ORIG_ZDOTDIR"
+else
+  ZDOTDIR="$HOME"
+fi
+[[ -f "$ZDOTDIR/.zshrc" ]] && source "$ZDOTDIR/.zshrc"
+
+# OSC 133: A=prompt 开始, C=命令执行, D=命令结束(带退出码); OSC 7: 上报 cwd
+__trace_precmd() {
+  local __code=$?
+  printf '\e]133;D;%d\a' $__code
+  printf '\e]7;file://%s%s\a' "${HOST:-localhost}" "$PWD"
+  printf '\e]133;A\a'
+}
+__trace_preexec() { printf '\e]133;C\a' }
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __trace_precmd
+add-zsh-hook preexec __trace_preexec
+"##;
+    std::fs::write(dir.join(".zshrc"), content).ok()?;
+    Some(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -174,6 +204,22 @@ pub fn term_create(
     let mut cmd = CommandBuilder::new(&shell);
     cmd.cwd(&cwd);
     cmd.env("TERM", "xterm-256color");
+    // 声明为 iTerm2 兼容终端：kimi 等 CLI 按 TERM_PROGRAM 探测通知能力,
+    // 不设置时 kimi 降级为裸 BEL(丢失通知标题/正文)
+    cmd.env("TERM_PROGRAM", "iTerm.app");
+    cmd.env("TERM_PROGRAM_VERSION", "3.5.0");
+
+    // zsh：注入 shell integration（OSC 133 命令生命周期 + OSC 7 cwd 上报），
+    // 通过 ZDOTDIR 包装用户的 .zshrc，对任意命令生效
+    if std::path::Path::new(&shell).file_name().is_some_and(|n| n == "zsh") {
+        if let Some(dir) = write_zsh_integration(&app) {
+            if let Ok(orig) = std::env::var("ZDOTDIR") {
+                cmd.env("TRACE_ORIG_ZDOTDIR", orig);
+            }
+            cmd.env("ZDOTDIR", dir);
+        }
+    }
+
     let mut child = pair
         .slave
         .spawn_command(cmd)
@@ -306,6 +352,7 @@ pub fn term_read(
     state: State<'_, TermManager>,
     id: String,
     max_bytes: Option<usize>,
+    raw: Option<bool>,
 ) -> Result<String, String> {
     let sessions = state.sessions.lock().unwrap();
     let session = sessions.get(&id).ok_or("terminal not found")?;
@@ -317,6 +364,10 @@ pub fn term_read(
     };
     let tail: Vec<u8> = buf.iter().skip(start).copied().collect();
     drop(buf);
+    // raw=true 保留 ANSI（供 xterm 回放渲染）；默认剥离供纯文本消费
+    if raw.unwrap_or(false) {
+        return Ok(String::from_utf8_lossy(&tail).to_string());
+    }
     let stripped = strip_ansi_escapes::strip(&tail);
     Ok(String::from_utf8_lossy(&stripped).to_string())
 }

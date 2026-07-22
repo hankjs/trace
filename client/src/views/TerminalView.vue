@@ -11,6 +11,10 @@ import "@xterm/xterm/css/xterm.css";
 import PaneNode from "../components/terminal/PaneNode.vue";
 import ContextMenu from "../components/ContextMenu.vue";
 import { useContextMenu, type ContextMenuItem } from "../composables/useContextMenu";
+import { useRemoteExec } from "../composables/useRemoteExec";
+import { reportTermNotification } from "../api/termNotify";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { registerTerm, unregisterTerm } from "../terminal/screenRegistry";
 import {
   type LayoutNode,
   createLeaf,
@@ -63,6 +67,7 @@ const paneRename = reactive<{ id: string | null }>({ id: null });
 provide("paneTitles", paneTitles);
 provide("paneRename", paneRename);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let unlistenFocus: (() => void) | null = null;
 
 // 搜索框状态
 const searchOpen = ref(false);
@@ -236,6 +241,72 @@ function onPaneContextMenu(tab: Tab, payload: { id: string; x: number; y: number
   ctxOpen(new MouseEvent("contextmenu", { clientX: payload.x, clientY: payload.y }), items);
 }
 
+// ---------- 终端通知捕获（OSC 9 / 777 / 133 / 7 / BEL） ----------
+
+const { clientId } = useRemoteExec();
+
+/** pane 收到通知序列：带上前台进程上下文后统一处理 */
+function notifyPane(id: string, title: string, body: string, kind?: string) {
+  if (!body.trim()) return;
+  const fg = paneTitles[id] || paneInfos[id]?.foreground_cmd || "shell";
+  reportTermNotification({
+    clientId,
+    termId: id,
+    title: `${fg} · ${title}`,
+    body: body.trim(),
+    kind,
+  });
+}
+
+/** 命令执行追踪：OSC 133 C 记录开始时间，D 结算耗时/退出码 */
+const paneCmdStart = new Map<string, number>();
+/** BEL 响铃按 pane 10s 去重 */
+const paneLastBell = new Map<string, number>();
+/** 命令耗时超过该值才通知（失败命令不受限） */
+const CMD_NOTIFY_MIN_MS = 30_000;
+const BELL_DEDUPE_MS = 10_000;
+
+function onOsc133(id: string, data: string) {
+  if (data === "C") {
+    paneCmdStart.set(id, Date.now());
+    return;
+  }
+  if (data.startsWith("D")) {
+    const exitCode = parseInt(data.split(";")[1] || "0", 10);
+    const start = paneCmdStart.get(id);
+    paneCmdStart.delete(id);
+    if (start === undefined) return; // 没有配对的 C（如会话中途接入），跳过
+    const secs = Math.round((Date.now() - start) / 1000);
+    const failed = exitCode !== 0;
+    if (!failed && secs * 1000 < CMD_NOTIFY_MIN_MS) return; // 短命令不打扰
+    const dur = secs >= 60 ? `${Math.floor(secs / 60)}m${secs % 60}s` : `${secs}s`;
+    notifyPane(
+      id,
+      failed ? "命令失败" : "命令完成",
+      `退出码 ${exitCode} · 耗时 ${dur}`,
+      "command",
+    );
+  }
+}
+
+function onOsc7(id: string, data: string) {
+  // file://host/path → 取 path，实时更新标题栏 cwd
+  try {
+    const url = new URL(data);
+    const path = decodeURIComponent(url.pathname);
+    if (path && paneInfos[id]) paneInfos[id].cwd = path;
+  } catch {
+    /* 非法 URL 忽略 */
+  }
+}
+
+function onBell(id: string) {
+  const now = Date.now();
+  if (now - (paneLastBell.get(id) || 0) < BELL_DEDUPE_MS) return;
+  paneLastBell.set(id, now);
+  notifyPane(id, "响铃提醒", "终端发出响铃（可能有任务等待处理）", "bell");
+}
+
 // ---------- xterm 实例管理（按 pane） ----------
 
 async function attachInstance(id: string, replay?: string, retries = 3) {
@@ -284,6 +355,34 @@ async function attachInstance(id: string, replay?: string, retries = 3) {
     invoke("term_write", { id, data }).catch(() => {});
   });
 
+  // 捕获通知转义序列：OSC 9（iTerm2/kitty 通知）、OSC 777（notify;title;body）
+  // kimi CLI 的 task complete / approval required 就是通过这些序列发出的
+  term.parser.registerOscHandler(9, (data) => {
+    // OSC 9;4;… 是 ConEmu 进度序列，不是通知文本，过滤
+    if (data.startsWith("4;")) return true;
+    notifyPane(id, "任务通知", data);
+    return true;
+  });
+  term.parser.registerOscHandler(777, (data) => {
+    const parts = data.split(";");
+    const title = parts.length > 2 ? parts[1] : "任务通知";
+    const body = parts.length > 2 ? parts.slice(2).join(";") : data;
+    notifyPane(id, title, body);
+    return true;
+  });
+  // OSC 133 命令生命周期（shell integration 注入后对任意命令生效）
+  term.parser.registerOscHandler(133, (data) => {
+    onOsc133(id, data);
+    return true;
+  });
+  // OSC 7 实时 cwd 上报
+  term.parser.registerOscHandler(7, (data) => {
+    onOsc7(id, data);
+    return true;
+  });
+  // BEL 响铃（claude code 等的通用通知信号）
+  term.onBell(() => onBell(id));
+
   term.attachCustomKeyEventHandler((e) => handleKey(e, id));
 
   const inst: TermInstance = { term, fit, search, unlisten, observer: null };
@@ -295,6 +394,7 @@ async function attachInstance(id: string, replay?: string, retries = 3) {
   observer.observe(el);
   inst.observer = observer;
   instances.set(id, inst);
+  registerTerm(id, term);
 
   // 初始同步一次真实尺寸
   invoke("term_resize", { id, cols: term.cols, rows: term.rows }).catch(() => {});
@@ -308,6 +408,7 @@ function disposeInstance(id: string) {
   inst.unlisten();
   inst.term.dispose();
   instances.delete(id);
+  unregisterTerm(id);
 }
 
 function fitPane(id: string) {
@@ -422,6 +523,8 @@ async function closePane(paneId: string | undefined) {
   containers.delete(paneId);
   delete paneInfos[paneId];
   delete paneTitles[paneId];
+  paneCmdStart.delete(paneId);
+  paneLastBell.delete(paneId);
   if (paneRename.id === paneId) paneRename.id = null;
   const newRoot = removeNode(tab.root, paneId);
   if (!newRoot) {
@@ -589,10 +692,22 @@ onMounted(async () => {
   pollTimer = setInterval(refreshTitles, 5000);
   document.addEventListener("pointerdown", onGlobalPointerDown);
   document.addEventListener("keydown", onGlobalKeydown);
+  // 窗口焦点映射到 xterm textarea 焦点：kimi 等 TUI 靠 CSI I/O 焦点追踪
+  // 决定是否发"失焦通知"，webview 里窗口切走不会自动 blur，需要显式同步
+  unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+    if (focused) {
+      const tab = activeTab();
+      if (tab) instances.get(tab.activePaneId)?.term.focus();
+    } else {
+      for (const inst of instances.values()) inst.term.blur();
+    }
+  });
 });
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
+  unlistenFocus?.();
+  unlistenFocus = null;
   document.removeEventListener("pointerdown", onGlobalPointerDown);
   document.removeEventListener("keydown", onGlobalKeydown);
   // 只销毁前端实例，PTY 会话保留，回到页面时可重连

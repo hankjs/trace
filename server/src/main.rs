@@ -249,6 +249,7 @@ async fn main() -> Result<()> {
         .route("/api/weixin/binding", delete(weixin::routes::delete_binding))
         // Remote execution: desktop client long-poll channel
         .route("/api/client/registration", put(remote_exec::register_client))
+        .route("/api/client/notify", post(remote_exec::post_notification))
         .route("/api/client/poll", get(remote_exec::poll_requests))
         .route("/api/client/tool-result", post(remote_exec::post_tool_result))
         .route("/api/client/online", get(remote_exec::list_online))
@@ -292,11 +293,13 @@ async fn main() -> Result<()> {
         .route("/api/admin/weixin/accounts/{id}", delete(weixin::routes::delete_account))
         .route("/api/admin/weixin/bindings", get(weixin::routes::list_bindings))
         .route("/api/admin/weixin/bindings/{id}", delete(weixin::routes::delete_binding_admin))
+        .route("/api/admin/weixin/send", post(weixin::routes::send_message))
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
         .route("/api/admin/clients/{cid}/terminals", get(admin_terminal::list_terminals))
         .route("/api/admin/clients/{cid}/terminals/{tid}/output", get(admin_terminal::terminal_output))
         .route("/api/admin/clients/{cid}/terminals/{tid}/input", post(admin_terminal::terminal_input))
+        .route("/api/admin/notifications", get(admin_terminal::list_notifications))
         .layer(middleware::from_fn(admin_required))
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
 

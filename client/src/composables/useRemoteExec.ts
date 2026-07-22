@@ -109,6 +109,19 @@ async function executeRemoteTool(req: RemoteToolRequest): Promise<{ content: str
         return { content: JSON.stringify(list), is_error: false };
       }
       case "terminal_read": {
+        // raw 模式：优先返回 xterm 当前屏幕快照（带 SGR，和桌面端一致）；
+        // pane 未在本视图附着时降级为 PTY 原始流
+        if (input.raw) {
+          const { serializeScreen } = await import("../terminal/screenRegistry");
+          const snap = serializeScreen(input.id);
+          if (snap !== null) return { content: snap, is_error: false };
+          const text = await invoke<string>("term_read", {
+            id: input.id,
+            maxBytes: input.maxBytes ?? 65536,
+            raw: true,
+          });
+          return { content: text, is_error: false };
+        }
         const lines = Number(input.lines) || 200;
         // 未指定 lines 时按字节兜底，避免返回过大；指定 lines 时读全量再按行截尾
         const text = await invoke<string>("term_read", {

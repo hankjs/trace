@@ -78,25 +78,41 @@ pub async fn list_terminals(
 #[derive(Deserialize)]
 pub struct OutputQuery {
     lines: Option<usize>,
+    raw: Option<bool>,
 }
 
-/// GET /api/admin/clients/{cid}/terminals/{tid}/output?lines=N — 终端输出尾部
+/// GET /api/admin/clients/{cid}/terminals/{tid}/output?lines=N&raw=1 — 终端输出尾部
 pub async fn terminal_output(
     State(state): State<Arc<AppState>>,
     Path((cid, tid)): Path<(String, String)>,
     Query(q): Query<OutputQuery>,
 ) -> impl IntoResponse {
-    let lines = q.lines.unwrap_or(200);
-    match dispatch(
-        &state,
-        &cid,
-        "terminal_read",
-        serde_json::json!({ "id": tid, "lines": lines }),
-    )
-    .await
-    {
+    let input = if q.raw.unwrap_or(false) {
+        serde_json::json!({ "id": tid, "raw": true })
+    } else {
+        serde_json::json!({ "id": tid, "lines": q.lines.unwrap_or(200) })
+    };
+    match dispatch(&state, &cid, "terminal_read", input).await {
         Ok(content) => R::ok(serde_json::json!({ "output": content })),
         Err(resp) => resp,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct NotifyQuery {
+    limit: Option<u32>,
+}
+
+/// GET /api/admin/notifications?limit=N — 当前 admin 用户的终端通知（新到旧）
+pub async fn list_notifications(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Query(q): Query<NotifyQuery>,
+) -> impl IntoResponse {
+    let limit = q.limit.unwrap_or(100).min(500);
+    match state.db.list_client_notifications(&claims.sub, limit).await {
+        Ok(rows) => R::ok(rows),
+        Err(e) => R::internal_error(e),
     }
 }
 
