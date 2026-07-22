@@ -68,6 +68,7 @@ provide("paneTitles", paneTitles);
 provide("paneRename", paneRename);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let unlistenFocus: (() => void) | null = null;
+let unlistenDrag: (() => void) | null = null;
 
 // 搜索框状态
 const searchOpen = ref(false);
@@ -545,6 +546,42 @@ function onPaneFocus(tab: Tab, paneId: string) {
   instances.get(paneId)?.term.focus();
 }
 
+// ---------- 文件拖拽（拖入文件 → 插入本地路径） ----------
+
+/** shell 安全转义：安全字符原样保留，其余单引号包裹（iTerm2 拖放同款行为） */
+function shellQuote(p: string): string {
+  if (/^[A-Za-z0-9_@%+=:,./~^-]+$/.test(p)) return p;
+  return `'${p.replace(/'/g, `'\\''`)}'`;
+}
+
+/** 拖放落点定位 pane：物理像素转 CSS 像素后命中测试，未命中退回当前激活 pane */
+function paneAtPosition(pos: { x: number; y: number }): string | null {
+  const scale = window.devicePixelRatio || 1;
+  const x = pos.x / scale;
+  const y = pos.y / scale;
+  for (const [id, el] of containers) {
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return id;
+  }
+  return activeTab()?.activePaneId || null;
+}
+
+function onFileDrop(paths: string[], position: { x: number; y: number }) {
+  if (paths.length === 0) return;
+  const paneId = paneAtPosition(position);
+  const inst = paneId ? instances.get(paneId) : undefined;
+  if (!paneId || !inst) return;
+  let data = paths.map(shellQuote).join(" ");
+  // 与 iTerm2 一致：应用开启 bracketed paste 时按"粘贴"投递，
+  // CLI（kimi/claude code 等）靠这个标记把粘贴的图片路径识别为附件
+  if (inst.term.modes.bracketedPasteMode) {
+    data = `\x1b[200~${data}\x1b[201~`;
+  }
+  invoke("term_write", { id: paneId, data }).catch(() => {});
+  inst.term.focus();
+}
+
 // ---------- tab 操作 ----------
 
 async function newTerminal() {
@@ -702,12 +739,21 @@ onMounted(async () => {
       for (const inst of instances.values()) inst.term.blur();
     }
   });
+  // 拖文件进终端：插入 shell 转义后的本地路径（Tauri 原生拖放事件，
+  // webview 的 HTML5 drop 在 dragDropEnabled 下收不到文件路径）
+  unlistenDrag = await getCurrentWindow().onDragDropEvent((event) => {
+    if (event.payload.type === "drop") {
+      onFileDrop(event.payload.paths, event.payload.position);
+    }
+  });
 });
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer);
   unlistenFocus?.();
   unlistenFocus = null;
+  unlistenDrag?.();
+  unlistenDrag = null;
   document.removeEventListener("pointerdown", onGlobalPointerDown);
   document.removeEventListener("keydown", onGlobalKeydown);
   // 只销毁前端实例，PTY 会话保留，回到页面时可重连
