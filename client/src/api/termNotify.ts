@@ -3,6 +3,7 @@ import {
   requestPermission,
   sendNotification,
 } from "@tauri-apps/plugin-notification";
+import { listen } from "@tauri-apps/api/event";
 import { apiRequest } from "../composables/useSession";
 
 /**
@@ -57,4 +58,33 @@ export function reportTermNotification(p: TermNotifyPayload) {
       body: p.body,
     }),
   }).catch((e) => console.warn("[TermNotify] report to server failed:", e));
+}
+
+/** Rust 侧 term-notify 事件负载（terminal.rs reader 线程统一捕获） */
+interface TermNotifyEvent {
+  id: string;
+  kind: string;
+  title: string;
+  body: string;
+}
+
+let listening = false;
+
+/**
+ * 注册全局 term-notify 监听：OSC 9/777/133/BEL 由 Rust reader 线程统一捕获，
+ * 与视图是否附着无关（无头终端如微信托管的 kimi CLI 也能上报）。
+ * 幂等：重复调用只注册一次。
+ */
+export function initTermNotifyListener(getClientId: () => string) {
+  if (listening) return;
+  listening = true;
+  listen<TermNotifyEvent>("term-notify", (e) => {
+    reportTermNotification({
+      clientId: getClientId(),
+      termId: e.payload.id,
+      title: e.payload.title,
+      body: e.payload.body,
+      kind: e.payload.kind,
+    });
+  }).catch((e) => console.warn("[TermNotify] listen term-notify failed:", e));
 }

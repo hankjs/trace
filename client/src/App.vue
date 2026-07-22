@@ -3,11 +3,15 @@ import { watch } from "vue";
 import { useRouter } from "vue-router";
 import { useSession } from "./composables/useSession";
 import { useRemoteExec } from "./composables/useRemoteExec";
+import { initTermNotifyListener } from "./api/termNotify";
 import MessageToast from "./components/MessageToast.vue";
 
 const { isAuthenticated } = useSession();
 const remoteExec = useRemoteExec();
 const router = useRouter();
+
+// 终端通知全局监听（Rust 侧统一捕获，含无头终端），App 生命周期内注册一次
+initTermNotifyListener(() => remoteExec.clientId);
 
 watch(isAuthenticated, (authed) => {
   if (!authed) {

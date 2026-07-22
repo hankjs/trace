@@ -329,6 +329,16 @@ pub struct WeixinChat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct WeixinKimi {
+    pub binding_id: String,
+    pub client_id: Option<String>,
+    pub term_id: Option<String>,
+    pub work_dir: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ClientAgent {
     pub id: String,
     pub user_id: String,
@@ -793,6 +803,21 @@ impl Database {
         .execute(&pool)
         .await?;
 
+        // Weixin kimi managed sessions table (binding → client 上托管的 Kimi CLI 终端)
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS weixin_kimi (
+                binding_id VARCHAR(36) PRIMARY KEY,
+                client_id VARCHAR(36) DEFAULT NULL,
+                term_id VARCHAR(64) DEFAULT NULL,
+                work_dir VARCHAR(512) DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                FOREIGN KEY (binding_id) REFERENCES weixin_bindings(id) ON DELETE CASCADE
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
         // Client agents table (desktop client registration for remote tool execution)
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS client_agents (
@@ -829,6 +854,10 @@ impl Database {
         .await?;
 
         // Migrations for existing databases
+        // Add pushed_at to client_notifications (微信推送消费标记)
+        let _ = sqlx::query(
+            "ALTER TABLE client_notifications ADD COLUMN pushed_at DATETIME DEFAULT NULL AFTER created_at"
+        ).execute(&pool).await;
         // Add category column to prompt_templates if not exists
         let _ = sqlx::query(
             "ALTER TABLE prompt_templates ADD COLUMN category VARCHAR(32) NOT NULL DEFAULT 'prompt' AFTER content"
@@ -2803,6 +2832,77 @@ impl Database {
             .fetch_all(&self.pool)
         )?;
         Ok(rows)
+    }
+
+    /// 列出尚未被微信消费方处理的终端通知（全用户，按时间正序）
+    pub async fn list_unpushed_client_notifications(&self, limit: u32) -> Result<Vec<ClientNotification>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, ClientNotification>(
+                "SELECT id, user_id, client_id, term_id, kind, title, body, created_at FROM client_notifications WHERE pushed_at IS NULL ORDER BY created_at LIMIT ?"
+            )
+            .bind(limit)
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    /// 标记一条终端通知已被微信消费方处理（已推送或不需推送）
+    pub async fn mark_client_notification_pushed(&self, id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE client_notifications SET pushed_at = NOW() WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 查询 binding 的 kimi 托管会话
+    pub async fn get_weixin_kimi(&self, binding_id: &str) -> Result<Option<WeixinKimi>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, WeixinKimi>(
+                "SELECT binding_id, client_id, term_id, work_dir, created_at, updated_at FROM weixin_kimi WHERE binding_id = ?"
+            )
+            .bind(binding_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    /// 记录托管终端的工作目录（对下一次 /kimi 生效），保留已有映射
+    pub async fn upsert_weixin_kimi_work_dir(&self, binding_id: &str, work_dir: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO weixin_kimi (binding_id, work_dir, created_at, updated_at) VALUES (?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE work_dir = VALUES(work_dir), updated_at = NOW()"
+            )
+            .bind(binding_id)
+            .bind(work_dir)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 建立/更新 binding → 托管终端映射
+    pub async fn set_weixin_kimi(&self, binding_id: &str, client_id: &str, term_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO weixin_kimi (binding_id, client_id, term_id, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE client_id = VALUES(client_id), term_id = VALUES(term_id), updated_at = NOW()"
+            )
+            .bind(binding_id)
+            .bind(client_id)
+            .bind(term_id)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 清除托管终端映射（保留 work_dir 供下次 /kimi 使用）
+    pub async fn clear_weixin_kimi(&self, binding_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE weixin_kimi SET client_id = NULL, term_id = NULL, updated_at = NOW() WHERE binding_id = ?")
+                .bind(binding_id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
     }
 
     // Switch a session between server-local execution (None) and a remote client

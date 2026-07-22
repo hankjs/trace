@@ -170,6 +170,9 @@ async fn main() -> Result<()> {
     // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）
     weixin::monitor::start_monitors(state.clone());
 
+    // 启动 kimi 托管通知消费循环（client 通知 → 微信推送）
+    tokio::spawn(weixin::kimi::run_notification_consumer(state.clone()));
+
     // Public routes (no auth required)
     let public = Router::new()
         .route("/api/health", get(routes::health))

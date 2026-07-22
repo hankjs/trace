@@ -153,6 +153,158 @@ fn append_scrollback(buf: &Arc<Mutex<VecDeque<u8>>>, data: &[u8]) {
     }
 }
 
+// ─── 终端通知捕获（OSC 9 / 777 / 133 与 BEL）───────────────────────────────
+//
+// 在 reader 线程的 PTY 字节流上增量扫描，与视图是否附着无关——无头终端（如微信
+// 托管的 kimi CLI）也能捕获通知。结果经全局 `term-notify` 事件发给前端统一上报。
+
+/// 命令耗时超过该值才通知（失败命令不受限）
+const CMD_NOTIFY_MIN_MS: u128 = 30_000;
+/// BEL 响铃去重窗口
+const BELL_DEDUPE_MS: u128 = 10_000;
+
+/// 全局 `term-notify` 事件负载
+#[derive(Serialize, Clone)]
+struct TermNotifyEvent {
+    id: String,
+    kind: String,
+    title: String,
+    body: String,
+}
+
+/// PTY 字节流上的增量 OSC/BEL 扫描器（每个终端会话一个实例）。
+/// 只匹配 ASCII 控制字节（ESC/BEL/]/\），多字节 UTF-8 内容不会误触发。
+#[derive(Default)]
+struct NotifyScanner {
+    /// 0=普通 1=见到 ESC 2=OSC 中 3=OSC 中见到 ESC（期待 ST）
+    state: u8,
+    buf: Vec<u8>,
+    /// OSC 133 C 记录的命令开始时间，D 结算耗时
+    cmd_start: Option<std::time::Instant>,
+    last_bell: Option<std::time::Instant>,
+}
+
+impl NotifyScanner {
+    /// 喂入一个输出块，返回捕获到的 (kind, title, body)
+    fn feed(&mut self, chunk: &[u8]) -> Vec<(String, String, String)> {
+        let mut out = Vec::new();
+        for &b in chunk {
+            match self.state {
+                0 => match b {
+                    0x07 => self.bell(&mut out),
+                    0x1b => self.state = 1,
+                    _ => {}
+                },
+                1 => match b {
+                    b']' => {
+                        self.state = 2;
+                        self.buf.clear();
+                    }
+                    0x1b => {}
+                    0x07 => {
+                        self.state = 0;
+                        self.bell(&mut out);
+                    }
+                    _ => self.state = 0,
+                },
+                2 => match b {
+                    0x07 => {
+                        self.state = 0;
+                        self.finish_osc(&mut out);
+                    }
+                    0x1b => self.state = 3,
+                    _ => {
+                        // 超长 OSC 视为异常序列，丢弃防内存膨胀
+                        if self.buf.len() < 4096 {
+                            self.buf.push(b);
+                        } else {
+                            self.state = 0;
+                            self.buf.clear();
+                        }
+                    }
+                },
+                _ => match b {
+                    b'\\' => {
+                        self.state = 0;
+                        self.finish_osc(&mut out);
+                    }
+                    0x1b => self.state = 1,
+                    _ => self.state = 0,
+                },
+            }
+        }
+        out
+    }
+
+    fn bell(&mut self, out: &mut Vec<(String, String, String)>) {
+        let now = std::time::Instant::now();
+        if let Some(t) = self.last_bell {
+            if now.duration_since(t) < std::time::Duration::from_millis(BELL_DEDUPE_MS as u64) {
+                return;
+            }
+        }
+        self.last_bell = Some(now);
+        out.push((
+            "bell".into(),
+            "响铃提醒".into(),
+            "终端发出响铃（可能有任务等待处理）".into(),
+        ));
+    }
+
+    fn finish_osc(&mut self, out: &mut Vec<(String, String, String)>) {
+        let content = String::from_utf8_lossy(&self.buf).to_string();
+        self.buf.clear();
+        let Some((ps, pt)) = content.split_once(';') else { return };
+        match ps {
+            // iTerm2/kitty 通知；9;4;… 是 ConEmu 进度序列，不是通知文本，过滤
+            "9" => {
+                if pt.starts_with("4;") {
+                    return;
+                }
+                let body = pt.trim();
+                if !body.is_empty() {
+                    out.push(("notification".into(), "任务通知".into(), body.into()));
+                }
+            }
+            // OSC 777 ; notify ; title ; body
+            "777" => {
+                let rest = pt.strip_prefix("notify;").unwrap_or(pt);
+                let (title, body) = rest.split_once(';').unwrap_or(("任务通知", rest));
+                let body = body.trim();
+                if !body.is_empty() {
+                    out.push(("notification".into(), title.to_string(), body.into()));
+                }
+            }
+            // OSC 133 命令生命周期（shell integration 注入后对任意命令生效）
+            "133" => {
+                if pt == "C" {
+                    self.cmd_start = Some(std::time::Instant::now());
+                } else if let Some(code) = pt.strip_prefix("D;") {
+                    let exit_code: i32 = code.parse().unwrap_or(0);
+                    // 没有配对的 C（如会话中途接入）时跳过
+                    if let Some(start) = self.cmd_start.take() {
+                        let secs = start.elapsed().as_secs();
+                        let failed = exit_code != 0;
+                        if failed || secs as u128 * 1000 >= CMD_NOTIFY_MIN_MS {
+                            let dur = if secs >= 60 {
+                                format!("{}m{}s", secs / 60, secs % 60)
+                            } else {
+                                format!("{secs}s")
+                            };
+                            out.push((
+                                "command".into(),
+                                if failed { "命令失败".into() } else { "命令完成".into() },
+                                format!("退出码 {exit_code} · 耗时 {dur}"),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// zsh shell integration 脚本：包装用户 .zshrc/.zprofile，追加 OSC 133（命令生命周期）
 /// 和 OSC 7（cwd 上报）钩子。每次启动覆写，返回 ZDOTDIR 目录。
 fn write_zsh_integration(app: &AppHandle) -> Option<String> {
@@ -257,7 +409,7 @@ pub fn term_create(
     let scrollback: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
     let alive = Arc::new(AtomicBool::new(true));
 
-    // reader 线程：PTY 输出 → scrollback + 事件推送
+    // reader 线程：PTY 输出 → scrollback + 事件推送 + 通知捕获（OSC 9/777/133/BEL）
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -266,17 +418,33 @@ pub fn term_create(
         let scrollback = scrollback.clone();
         let event = format!("term-output/{id}");
         let app = app.clone();
+        let term_id = id.clone();
+        let shell_for_notify = shell.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             // 跨块增量解码：多字节 UTF-8 字符/转义序列被 read 边界切断时,
             // 不完整尾部留到下一块再解码, 避免 from_utf8_lossy 产生 U+FFFD 乱码
             let mut pending: Vec<u8> = Vec::new();
+            let mut scanner = NotifyScanner::default();
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         let chunk = &buf[..n];
                         append_scrollback(&scrollback, chunk);
+                        for (kind, title, body) in scanner.feed(chunk) {
+                            // 带上前台进程名（如 "kimi · 任务通知"），与原视图侧行为一致
+                            let fg = foreground_cmd(child_pid, &shell_for_notify);
+                            let _ = app.emit(
+                                "term-notify",
+                                TermNotifyEvent {
+                                    id: term_id.clone(),
+                                    kind,
+                                    title: format!("{fg} · {title}"),
+                                    body,
+                                },
+                            );
+                        }
                         pending.extend_from_slice(chunk);
                         let valid_up_to = match std::str::from_utf8(&pending) {
                             Ok(_) => pending.len(),

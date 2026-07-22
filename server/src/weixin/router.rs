@@ -81,6 +81,18 @@ pub async fn handle_message(state: Arc<AppState>, account: WeixinAccount, msg: I
         }
     };
 
+    // kimi <text>：转发给托管的 Kimi CLI 终端（含 kimi /yolo 这类 CLI 自身命令）
+    // 必须放在 /ai 与斜杠命令检查之前，避免内容以 / 开头时被命令分支拦截
+    if let Some(input) = text.strip_prefix("kimi ").or_else(|| text.strip_prefix("Kimi ")) {
+        let input = input.trim();
+        if !input.is_empty() {
+            if let Some(msg) = crate::weixin::kimi::send_input(&state, &binding, input).await {
+                reply(&msg).await;
+            }
+            return Ok(());
+        }
+    }
+
     // /ai <text>：跳过渠道 agent，直接派发给 coding agent
     if let Some(task) = text.strip_prefix("/ai") {
         let task = task.trim();
@@ -169,7 +181,7 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
             }
         }
         "/status" => {
-            let msg = match &session_id {
+            let mut msg = match &session_id {
                 Some(sid) => {
                     let running = state.active_tasks.read().await.contains_key(sid);
                     let session = state.db.get_session(sid).await.ok().flatten();
@@ -203,6 +215,10 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
                 }
                 None => "当前没有会话，直接发送消息即可开始".to_string(),
             };
+            if let Some(line) = crate::weixin::kimi::status_line(state, binding).await {
+                msg.push_str("\n");
+                msg.push_str(&line);
+            }
             reply(&msg).await;
         }
         "/terms" => {
@@ -223,6 +239,78 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
         }
         "/snap" => {
             let msg = web_snap(state, account, from, context_token, text).await;
+            reply(&msg).await;
+        }
+        "/cd" => {
+            let dir = text.splitn(2, ' ').nth(1).map(str::trim).unwrap_or("");
+            if dir.is_empty() {
+                let current = state
+                    .db
+                    .get_weixin_kimi(&binding.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|m| m.work_dir);
+                match current {
+                    Some(d) => {
+                        reply(&format!("当前工作目录：{d}\n/cd <路径> 修改，/ls [路径] 浏览目录")).await
+                    }
+                    None => reply("还没有设置工作目录，/ls [路径] 先看看有哪些目录").await,
+                }
+            } else {
+                // 在 client 上真实校验目录存在，并解析为绝对路径（支持 ~）
+                match client_shell(state, binding, &format!("cd {} && pwd", sh_quote(dir))).await {
+                    Ok(out) => {
+                        let resolved = out
+                            .lines()
+                            .last()
+                            .map(str::trim)
+                            .filter(|s| s.starts_with('/'))
+                            .unwrap_or(dir);
+                        match state.db.upsert_weixin_kimi_work_dir(&binding.id, resolved).await {
+                            Ok(()) => {
+                                // 已有存活托管会话时提示不即时生效
+                                let note = match crate::weixin::kimi::status_line(state, binding).await {
+                                    Some(line) if line.contains("运行中") => {
+                                        "\n（当前 kimi 会话不受影响，/kstop 后重开才会切换）"
+                                    }
+                                    _ => "",
+                                };
+                                reply(&format!("已记录工作目录：{resolved}{note}")).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!("weixin: set kimi work dir failed: {e:#}");
+                                reply("设置失败，请稍后重试").await;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if msg.contains("不在线") {
+                            reply(&msg).await;
+                        } else {
+                            reply(&format!(
+                                "目录不存在或不可进入：{dir}\n用 /ls [路径] 看看 client 上有哪些目录"
+                            ))
+                            .await;
+                        }
+                    }
+                }
+            }
+        }
+        "/ls" => {
+            let msg = kimi_list_dir(state, binding, text).await;
+            reply(&msg).await;
+        }
+        "/kimi" => match crate::weixin::kimi::start_session(state, binding).await {
+            Ok(msg) => reply(&msg).await,
+            Err(e) => {
+                tracing::warn!("weixin: start kimi session failed: {e:#}");
+                reply(&format!("开启失败：{e:#}")).await;
+            }
+        },
+        "/kstop" => {
+            let msg = crate::weixin::kimi::stop_session(state, binding).await;
             reply(&msg).await;
         }
         "/菜单" | "/menu" | "/help" | "/帮助" => reply(MENU_TEXT).await,
@@ -256,9 +344,70 @@ async fn dispatch_terminal(
     }
 }
 
+/// shell 路径转义：单引号包裹，~ 前缀展开为 $HOME
+fn sh_quote(path: &str) -> String {
+    if path == "~" {
+        "$HOME".to_string()
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        format!("$HOME/'{}'", rest.replace('\'', "'\\''"))
+    } else {
+        format!("'{}'", path.replace('\'', "'\\''"))
+    }
+}
+
+/// 在在线 client 上执行一条 shell 命令（/ls、/cd 校验用）
+async fn client_shell(state: &Arc<AppState>, binding: &WeixinBinding, command: &str) -> Result<String> {
+    dispatch_terminal(
+        state,
+        binding,
+        "shell",
+        serde_json::json!({ "command": command, "timeout_ms": 10000 }),
+    )
+    .await
+}
+
+/// /ls [路径] — 列出 client 上的目录内容，方便挑选 /cd 目标。
+/// 默认路径：/cd 已记录的目录 → client 注册的工作目录 → home。
+async fn kimi_list_dir(state: &Arc<AppState>, binding: &WeixinBinding, text: &str) -> String {
+    let arg = text.splitn(2, ' ').nth(1).map(str::trim).filter(|s| !s.is_empty());
+    let path = match arg {
+        Some(p) => p.to_string(),
+        None => {
+            let recorded = state
+                .db
+                .get_weixin_kimi(&binding.id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|m| m.work_dir);
+            match recorded {
+                Some(d) => d,
+                None => crate::remote_exec::pick_online_client(state, &binding.user_id)
+                    .await
+                    .and_then(|c| c.work_dir)
+                    .unwrap_or_else(|| "~".to_string()),
+            }
+        }
+    };
+    match client_shell(state, binding, &format!("ls -la {}", sh_quote(&path))).await {
+        Ok(out) => {
+            let out = out.trim_end();
+            if out.is_empty() {
+                return format!("{path}：空目录");
+            }
+            if out.chars().count() > WECHAT_MSG_MAX {
+                let head: String = out.chars().take(WECHAT_MSG_MAX - 40).collect();
+                format!("{path}：\n{head}\n…（过长已截断，/ls <子目录> 细化）")
+            } else {
+                format!("{path}：\n{out}")
+            }
+        }
+        Err(e) => format!("ls 失败：{e:#}"),
+    }
+}
+
 /// /terms — 列出 client 上全部终端会话
-async fn terminal_list(state: &Arc<AppState>, binding: &WeixinBinding) -> String {
-    match dispatch_terminal(state, binding, "terminal_list", serde_json::json!({})).await {
+async fn terminal_list(state: &Arc<AppState>, binding: &WeixinBinding) -> String {    match dispatch_terminal(state, binding, "terminal_list", serde_json::json!({})).await {
         Ok(content) => {
             let terms: Vec<serde_json::Value> = match serde_json::from_str(&content) {
                 Ok(v) => v,
@@ -482,6 +631,14 @@ const MENU_TEXT: &str = "\
 /send <id> <文本> — 向终端发送输入（如 /send a1b2 ls -la）
 /shot <id> — 终端屏幕截图（图片）
 /snap <url> — 网页截图（图片）
+
+【kimi 托管（桌面 client 在线时可用）】
+/ls [路径] — 浏览 client 上的目录（挑 /cd 目标）
+/cd <路径> — 设置托管终端的工作目录（会在 client 上校验）
+/kimi — 在 client 上开一个托管的 Kimi CLI 会话
+kimi <文本> — 与托管 kimi 交互（如 kimi /yolo、kimi y）
+· 运行期间不推送进度；需要决策或完成任务时才通知你
+/kstop — 结束托管会话
 
 【小贴士】
 · 桌面 client 在线时任务在你本地机器执行，离线时在服务器端执行、仅支持查询类对话

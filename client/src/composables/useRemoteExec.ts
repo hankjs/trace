@@ -142,6 +142,19 @@ async function executeRemoteTool(req: RemoteToolRequest): Promise<{ content: str
         await invoke("term_write", { id: input.id, data: String(input.data ?? "") });
         return { content: "ok", is_error: false };
       }
+      case "terminal_create": {
+        // 远程开终端（微信 /kimi 托管会话用），cwd 为空时走 client 默认目录
+        const info = await invoke("term_create", {
+          cols: Number(input.cols) || 120,
+          rows: Number(input.rows) || 30,
+          cwd: input.cwd ?? null,
+        });
+        return { content: JSON.stringify(info), is_error: false };
+      }
+      case "terminal_close": {
+        await invoke("term_close", { id: String(input.id ?? "") });
+        return { content: "ok", is_error: false };
+      }
       default:
         return { content: `Unknown tool: ${req.tool}`, is_error: true };
     }
