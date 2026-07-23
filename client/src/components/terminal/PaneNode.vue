@@ -113,6 +113,14 @@ function onTitlebarDown(e: PointerEvent) {
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
 }
+
+/** 标题栏右侧设置按钮：点击效果等同右键该 pane（菜单定位在按钮下方） */
+function openPaneMenu(e: MouseEvent) {
+  const id = node_id();
+  if (!id) return;
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  emit("ctx", { id, x: rect.right, y: rect.bottom + 4 });
+}
 </script>
 
 <template>
@@ -166,6 +174,19 @@ function onTitlebarDown(e: PointerEvent) {
         <span class="pane-title-cmd">{{ paneTitles[node.id] || paneInfos[node.id]?.foreground_cmd || "shell" }}</span>
         <span class="pane-title-cwd">{{ homeCwd(paneInfos[node.id]?.cwd || "") }}</span>
       </template>
+      <!-- 设置按钮：点击效果等同 pane 右键菜单 -->
+      <button
+        class="pane-menu-btn"
+        @pointerdown.stop
+        @click.stop="openPaneMenu"
+        aria-label="面板菜单"
+        title="面板菜单"
+      >
+        <svg width="12" height="12" viewBox="0 0 16 16" fill="none">
+          <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3"/>
+          <path d="M8 1v2M8 13v2M1 8h2M13 8h2M3 3l1.5 1.5M11.5 11.5L13 13M13 3l-1.5 1.5M4.5 11.5L3 13" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/>
+        </svg>
+      </button>
     </div>
     <div class="term-container" :ref="(el) => registerTermEl?.(node.id, el)"></div>
     <!-- 拖拽落点高亮（iTerm2 风格：边缘 = split，中央 = 交换） -->
@@ -337,6 +358,34 @@ function onTitlebarDown(e: PointerEvent) {
   border: 1px solid var(--color-accent);
   border-radius: var(--radius-sm);
   outline: none;
+}
+
+/* 标题栏右侧设置按钮：默认隐藏，悬停标题栏时显现（opacity 保持布局不抖动） */
+.pane-menu-btn {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border: none;
+  background: none;
+  border-radius: var(--radius-sm);
+  color: var(--color-text-muted);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  opacity: 0;
+  transition: opacity var(--duration-fast), color var(--duration-fast), background var(--duration-fast);
+}
+
+.pane-titlebar:hover .pane-menu-btn {
+  opacity: 1;
+}
+
+.pane-menu-btn:hover {
+  color: var(--color-text-primary);
+  background: var(--color-surface-hover);
 }
 
 .term-container :deep(.xterm) {
