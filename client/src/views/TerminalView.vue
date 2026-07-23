@@ -779,6 +779,8 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- 滚动只作用于 tab 列表，避免 tab-bar 的 overflow 裁剪悬浮菜单 -->
+      <div class="tabs-scroll">
       <div
         v-for="tab in sortedTabs"
         :key="tab.id"
@@ -816,6 +818,7 @@ onUnmounted(() => {
           <path d="M7 2v10M2 7h10" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
         </svg>
       </button>
+      </div>
 
       <div class="tab-actions">
         <button
@@ -925,8 +928,17 @@ onUnmounted(() => {
   padding: var(--space-1) var(--space-2);
   background: var(--color-surface-1);
   border-bottom: 1px solid var(--color-border-subtle);
-  overflow-x: auto;
   flex-shrink: 0;
+}
+
+/* tab 列表单独滚动：若 overflow 放在 .tab-bar 上，悬浮菜单 dropdown 会被裁剪 */
+.tabs-scroll {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  overflow-x: auto;
 }
 
 .tab {
