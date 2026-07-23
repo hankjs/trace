@@ -4,6 +4,24 @@
 //! 还是需要派发给 coding agent 的任务（改写后 dispatch），
 //! 亦或等价于 /stop /new 的控制意图。
 //! 调用失败或输出无法解析时返回 None，由调用方降级为直接 dispatch。
+//!
+//! 对话记忆规范（哪些进上下文、哪些不进、何时清空）：
+//!
+//! 【记录 —— 有上下文价值】用户之后的指代/追问依赖这些：
+//! - 普通文本消息及其渠道回复（reply/dispatch/stop 决策），见 router::handle_chat
+//! - /ai 直派任务（记录任务原文 + "已派发"，用户可能追问任务进展）
+//!
+//! 【不记录 —— 无上下文价值】瞬时信息或固定文案，录进去只会占名额、误导后续决策：
+//! - 全部斜杠命令及其输出：/菜单 /help（固定长文案）、/status（瞬时状态，很快过期）、
+//!   /terms /term /send /shot /snap（终端/截图的瞬时输出）、/ls /cd（目录浏览设置）、
+//!   /kimi /kstop /stop（会话控制）——见 router::handle_command，刻意不碰 history
+//! - kimi <文本> 托管 CLI 交互（托管会话自己有终端上下文）
+//! - pusher 推送的执行进度/最终结果（任务上下文在 coding agent 会话里，追问会 dispatch 回去）
+//!
+//! 【清空 —— 仅 /new】斜杠 /new 或自然语言 New 决策成功开新会话时 clear_history；
+//! 其他一切情况（包括 /stop、任务完成、server 报错）都保持记忆。
+//! 记忆随 server 重启丢失；单绑定上限 MAX_HISTORY_TURNS 轮，旧轮次自动淘汰，
+//! 因此偶尔录入的过期状态类回复会自然滚出，无需专门清理。
 
 use crate::provider_registry;
 use crate::AppState;

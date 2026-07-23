@@ -155,6 +155,8 @@ async fn handle_unbound<Fut: std::future::Future<Output = ()>>(
 
 /// 斜杠命令：/new /stop /status /terms /term /send /shot /snap。
 /// account/from/context_token 用于截图类命令直接发图（send_media）。
+/// 注意：命令及其输出一律不进渠道对话记忆（规范见 channel.rs 模块文档）；
+/// 唯一例外是 /new 成功时清空记忆。
 async fn handle_command<Fut: std::future::Future<Output = ()>>(
     state: &Arc<AppState>,
     account: &WeixinAccount,
