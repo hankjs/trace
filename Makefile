@@ -6,7 +6,7 @@ server-dev:
 
 # 客户端前端开发 (Vite)
 client-dev:
-	cd client && pnpm dev
+	cd client && pnpm tauri dev
 
 # 管理后台前端开发 (Vite)
 admin-dev:
