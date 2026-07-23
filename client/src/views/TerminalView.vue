@@ -257,8 +257,15 @@ function onOsc7(id: string, data: string) {
 
 // ---------- xterm 实例管理（按 pane） ----------
 
+// Canvas 渲染器不会主动触发 webfont 加载，创建终端前显式加载 Nerd Font 符号字体，
+// 否则 PUA 图标（如 U+E0A0 分支符号）回退不到该字体而显示为方框
+const nerdFontReady: Promise<unknown> = document.fonts
+  .load('15px "Symbols Nerd Font Mono"', "\uE0A0\uE0B0\uE0B4\uF126")
+  .catch(() => {});
+
 async function attachInstance(id: string, replay?: string, retries = 3) {
   await nextTick();
+  await nerdFontReady;
   const el = containers.get(id);
   if (!el) {
     // ref 注册晚于 nextTick 时重试，避免 pane 永远空白
