@@ -78,19 +78,19 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     onFocusChanged: vi.fn(async () => () => {}),
+    onDragDropEvent: vi.fn(async () => () => {}),
   }),
 }));
 
-// vue-router 也需要 mock（TerminalView 里 useRouter）
-vi.mock("vue-router", () => ({
-  useRouter: () => ({ push: vi.fn() }),
-}));
-
 import TerminalView from "../src/views/TerminalView.vue";
+import { termTabs, activeTermTabId } from "../src/terminal/termTabs";
 
 describe("TerminalView 分屏/关闭流程", () => {
   beforeEach(() => {
     keyHandlers.clear();
+    // tab 状态是模块级的，用例间需手动清理
+    termTabs.value = [];
+    activeTermTabId.value = "";
   });
 
   it("新建 -> 分屏 -> ⌘W 关闭后 DOM 不残留 pane", async () => {
@@ -100,18 +100,16 @@ describe("TerminalView 分屏/关闭流程", () => {
     // 初始：1 个 tab 1 个 pane
     expect(wrapper.findAll(".pane").length).toBe(1);
 
-    // 点击「向右分屏」按钮
-    const splitBtn = wrapper.find('[aria-label="向右分屏"]');
-    expect(splitBtn.exists()).toBe(true);
-    await splitBtn.trigger("click");
+    // 模拟在焦点 pane 上按 ⌘D 向右分屏
+    const handlers = [...keyHandlers.values()];
+    expect(handlers.length).toBeGreaterThan(0);
+    handlers[handlers.length - 1]({ type: "keydown", metaKey: true, key: "d", shiftKey: false, ctrlKey: false, altKey: false });
     await flushPromises();
     expect(wrapper.findAll(".pane").length).toBe(2);
 
     // 模拟在焦点 pane 上按 ⌘W：找到新 pane 的 key handler
     // keyHandlers 按 FakeTerminal 实例 id 存，取最后一个（新 attach 的）
-    const handlers = [...keyHandlers.values()];
-    expect(handlers.length).toBeGreaterThan(0);
-    const last = handlers[handlers.length - 1];
+    const last = [...keyHandlers.values()].at(-1)!;
     last({ type: "keydown", metaKey: true, key: "w", ctrlKey: false, altKey: false });
     await flushPromises();
 

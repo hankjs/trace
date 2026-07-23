@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted, watch } from "vue";
 import { useRoute } from "vue-router";
 import { useSidebarPanels } from "../composables/useSidebarPanels";
-import FloatingMenu from "./FloatingMenu.vue";
+import GlobalTabBar from "./GlobalTabBar.vue";
 
 const route = useRoute();
 const { panels: sidebarPanels, activePanelId, togglePanel, closePanel, reset: resetPanels } = useSidebarPanels();
@@ -17,9 +17,6 @@ const panelWidthPercent = ref(50);
 const isResizing = ref(false);
 
 const lastPanelId = ref<string | null>(null);
-
-// 终端是主模式：终端页自带 tab 栏悬浮菜单，隐藏全局顶栏
-const isTerminalRoute = computed(() => route.name === "terminal");
 
 const rightPanelOpen = computed(() => activePanelId.value !== null);
 
@@ -93,11 +90,8 @@ defineExpose({ rightPanelOpen });
 
 <template>
   <div class="shell" ref="shellEl" :class="{ resizing: isResizing }">
-    <!-- 顶栏：左上角悬浮菜单（终端页隐藏，终端 tab 栏自带菜单） -->
-    <header v-if="!isTerminalRoute" class="topbar">
-      <FloatingMenu />
-      <span class="topbar-brand">Trace</span>
-    </header>
+    <!-- 全局 tab 栏：页面 tab 与终端 tab 共用，左上角「+」新增 tab -->
+    <GlobalTabBar />
 
     <div class="shell-body">
       <!-- Content + Panel wrapper (flex percentages apply within this area) -->
@@ -161,24 +155,6 @@ defineExpose({ rightPanelOpen });
   flex-direction: column;
   height: 100vh;
   overflow: hidden;
-}
-
-/* Top Bar */
-.topbar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-1) var(--space-3);
-  height: var(--header-height);
-  flex-shrink: 0;
-  background: var(--color-surface-1);
-  border-bottom: 1px solid var(--color-border-subtle);
-}
-
-.topbar-brand {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--color-text-primary);
 }
 
 .shell-body {
