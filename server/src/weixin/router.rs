@@ -103,6 +103,13 @@ pub async fn handle_message(state: Arc<AppState>, account: WeixinAccount, msg: I
         }
     }
 
+    // 不带斜杠的菜单请求：直接回固定文案，避免渠道 agent 凭印象编功能清单
+    let trimmed = text.trim();
+    if trimmed == "菜单" || trimmed == "帮助" || trimmed.eq_ignore_ascii_case("menu") || trimmed.eq_ignore_ascii_case("help") {
+        reply(MENU_TEXT).await;
+        return Ok(());
+    }
+
     // 斜杠命令
     if text.starts_with('/') {
         handle_command(&state, &account, &binding, &from, &context_token, &text, reply).await;
