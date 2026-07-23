@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, inject } from "vue";
-import type { LayoutNode } from "../../terminal/layout";
+import type { LayoutNode, PaneDragState } from "../../terminal/layout";
 
 interface PaneInfo {
   foreground_cmd: string;
@@ -25,6 +25,10 @@ const paneInfos = inject<Record<string, PaneInfo>>("paneInfos", {});
 // 由 TerminalView provide：pane 自定义标题 + 重命名请求
 const paneTitles = inject<Record<string, string>>("paneTitles", {});
 const paneRename = inject<{ id: string | null }>("paneRename", { id: null });
+// 由 TerminalView provide：拖拽移动 pane 的实时状态与回调
+const paneDrag = inject<PaneDragState>("paneDrag", { dragId: null, targetId: null, zone: null });
+const paneDragMove = inject<(x: number, y: number) => void>("paneDragMove", () => {});
+const paneDragDrop = inject<(x: number, y: number) => void>("paneDragDrop", () => {});
 
 const renameValue = ref("");
 
@@ -80,6 +84,35 @@ function onDividerDown(e: PointerEvent) {
   window.addEventListener("pointermove", onMove);
   window.addEventListener("pointerup", onUp);
 }
+
+/** 拖标题栏移动 pane（iTerm2 风格）：超过阈值进入拖拽，落点由 TerminalView 命中计算 */
+function onTitlebarDown(e: PointerEvent) {
+  if (e.button !== 0) return;
+  const id = node_id();
+  if (!id || paneRename.id === id) return; // 重命名输入框交互优先
+  const startX = e.clientX;
+  const startY = e.clientY;
+  let dragging = false;
+  const onMove = (ev: PointerEvent) => {
+    if (!dragging) {
+      if (Math.abs(ev.clientX - startX) + Math.abs(ev.clientY - startY) < 6) return;
+      dragging = true;
+      paneDrag.dragId = id;
+      document.body.style.cursor = "grabbing";
+    }
+    paneDragMove(ev.clientX, ev.clientY);
+  };
+  const onUp = (ev: PointerEvent) => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    if (dragging) {
+      document.body.style.cursor = "";
+      paneDragDrop(ev.clientX, ev.clientY);
+    }
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+}
 </script>
 
 <template>
@@ -104,11 +137,20 @@ function onDividerDown(e: PointerEvent) {
   <div
     v-else
     class="pane"
-    :class="{ active: node.id === activePaneId }"
+    :class="{
+      active: node.id === activePaneId,
+      'drag-source': paneDrag.dragId === node.id,
+      'drag-target': paneDrag.targetId === node.id && paneDrag.zone,
+    }"
     @mousedown="emit('focus', node.id)"
     @contextmenu.stop.prevent="emit('ctx', { id: node.id, x: $event.clientX, y: $event.clientY })"
   >
-    <div class="pane-titlebar" @dblclick.stop="startRename">
+    <div
+      class="pane-titlebar"
+      :class="{ draggable: paneRename.id !== node.id }"
+      @dblclick.stop="startRename"
+      @pointerdown="onTitlebarDown"
+    >
       <span class="pane-title-dot" :class="{ alive: paneInfos[node.id]?.alive !== false }"></span>
       <input
         v-if="paneRename.id === node.id"
@@ -126,6 +168,12 @@ function onDividerDown(e: PointerEvent) {
       </template>
     </div>
     <div class="term-container" :ref="(el) => registerTermEl?.(node.id, el)"></div>
+    <!-- 拖拽落点高亮（iTerm2 风格：边缘 = split，中央 = 交换） -->
+    <div
+      v-if="paneDrag.targetId === node.id && paneDrag.zone"
+      class="drop-highlight"
+      :class="`drop-${paneDrag.zone}`"
+    ></div>
   </div>
 </template>
 
@@ -210,6 +258,40 @@ function onDividerDown(e: PointerEvent) {
   background: var(--color-surface-1);
   border-bottom: 1px solid var(--color-border-subtle);
   user-select: none;
+}
+
+.pane-titlebar.draggable {
+  cursor: grab;
+}
+
+.pane.drag-source {
+  opacity: 0.45;
+}
+
+.drop-highlight {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--color-accent) 12%, transparent);
+  box-shadow: inset 0 0 0 2px var(--color-accent);
+}
+
+/* 边缘落点：只高亮目标 pane 被 split 的那一半 */
+.drop-left {
+  right: 50%;
+}
+
+.drop-right {
+  left: 50%;
+}
+
+.drop-top {
+  bottom: 50%;
+}
+
+.drop-bottom {
+  top: 50%;
 }
 
 .pane-title-dot {

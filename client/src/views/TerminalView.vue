@@ -15,9 +15,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { registerTerm, unregisterTerm } from "../terminal/screenRegistry";
 import {
   type LayoutNode,
+  type DropZone,
+  type PaneDragState,
   createLeaf,
   splitNode,
   removeNode,
+  swapLeaves,
   firstLeaf,
   allLeaves,
 } from "../terminal/layout";
@@ -475,6 +478,62 @@ function onPaneFocus(tab: Tab, paneId: string) {
   tab.activePaneId = paneId;
   instances.get(paneId)?.term.focus();
 }
+
+// ---------- pane 拖拽移动 / 分屏（iTerm2 风格：拖标题栏到边缘 split，到中央交换） ----------
+
+const paneDrag = reactive<PaneDragState>({ dragId: null, targetId: null, zone: null });
+provide("paneDrag", paneDrag);
+
+/** 命中测试：指针落在当前 tab 哪个 pane 的哪个落点区域（边缘 25% = split 方向，中央 = 交换） */
+function dropTargetAt(x: number, y: number): { id: string; zone: DropZone } | null {
+  const tab = activeTab();
+  if (!tab) return null;
+  const leaves = new Set(allLeaves(tab.root));
+  for (const [id, el] of containers) {
+    if (!leaves.has(id) || id === paneDrag.dragId) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
+    const fx = (x - r.left) / r.width;
+    const fy = (y - r.top) / r.height;
+    let zone: DropZone = "center";
+    if (fx < 0.25) zone = "left";
+    else if (fx > 0.75) zone = "right";
+    else if (fy < 0.25) zone = "top";
+    else if (fy > 0.75) zone = "bottom";
+    return { id, zone };
+  }
+  return null;
+}
+
+provide("paneDragMove", (x: number, y: number) => {
+  const hit = dropTargetAt(x, y);
+  paneDrag.targetId = hit?.id ?? null;
+  paneDrag.zone = hit?.zone ?? null;
+});
+
+provide("paneDragDrop", (x: number, y: number) => {
+  const dragId = paneDrag.dragId;
+  const hit = dropTargetAt(x, y);
+  paneDrag.dragId = null;
+  paneDrag.targetId = null;
+  paneDrag.zone = null;
+  if (!dragId || !hit) return;
+  const tab = activeTab();
+  if (!tab) return;
+  if (hit.zone === "center") {
+    tab.root = swapLeaves(tab.root, dragId, hit.id);
+  } else {
+    const dir = hit.zone === "left" || hit.zone === "right" ? "row" : "col";
+    const side = hit.zone === "left" || hit.zone === "top" ? "a" : "b";
+    const removed = removeNode(tab.root, dragId);
+    if (!removed) return;
+    tab.root = splitNode(removed, hit.id, dir, dragId, side);
+  }
+  // 树结构变化后 reattachInstance 会自动把 xterm DOM 搬进新容器并 refit
+  tab.activePaneId = dragId;
+  nextTick(() => instances.get(dragId)?.term.focus());
+});
 
 // ---------- 文件拖拽（拖入文件 → 插入本地路径） ----------
 
