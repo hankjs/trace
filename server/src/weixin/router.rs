@@ -97,6 +97,7 @@ pub async fn handle_message(state: Arc<AppState>, account: WeixinAccount, msg: I
     if let Some(task) = text.strip_prefix("/ai") {
         let task = task.trim();
         if !task.is_empty() {
+            channel::push_history(&state, &binding.id, task, "收到，任务已派发").await;
             dispatch_task(&state, &account, &binding, &from, &context_token, task, &reply).await;
             return Ok(());
         }
@@ -167,7 +168,10 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
     let session_id = state.db.get_weixin_chat(&binding.id).await.ok().flatten();
     match cmd {
         "/new" => match new_weixin_session(state, binding).await {
-            Ok(()) => reply("已开启新会话").await,
+            Ok(()) => {
+                channel::clear_history(state, &binding.id).await;
+                reply("已开启新会话").await
+            }
             Err(e) => {
                 tracing::warn!("weixin: create session failed: {e:#}");
                 reply("创建会话失败，请稍后重试").await;
@@ -658,12 +662,18 @@ async fn handle_chat<'a, Fut: std::future::Future<Output = ()>>(
     reply: &'a (impl Fn(&str) -> Fut + 'a),
 ) {
     let session_id = state.db.get_weixin_chat(&binding.id).await.ok().flatten();
-    match channel::decide(state, binding, session_id.as_deref(), text).await {
-        Some(ChannelAction::Reply { text: t }) => reply(&t).await,
+    let history = channel::history(state, &binding.id).await;
+    match channel::decide(state, binding, session_id.as_deref(), text, &history).await {
+        Some(ChannelAction::Reply { text: t }) => {
+            channel::push_history(state, &binding.id, text, &t).await;
+            reply(&t).await
+        }
         Some(ChannelAction::Dispatch { ack, task }) => {
             if !ack.trim().is_empty() {
                 reply(&ack).await;
             }
+            let ack_text = if ack.trim().is_empty() { "收到，任务已派发" } else { ack.trim() };
+            channel::push_history(state, &binding.id, text, ack_text).await;
             let task = if task.trim().is_empty() { text } else { task.trim() };
             dispatch_task(state, account, binding, from, context_token, task, reply).await;
         }
@@ -676,10 +686,12 @@ async fn handle_chat<'a, Fut: std::future::Future<Output = ()>>(
             } else {
                 "当前没有正在执行的任务".to_string()
             };
+            channel::push_history(state, &binding.id, text, &msg).await;
             reply(&msg).await;
         }
         Some(ChannelAction::New { text: t }) => match new_weixin_session(state, binding).await {
             Ok(()) => {
+                channel::clear_history(state, &binding.id).await;
                 let msg = if t.trim().is_empty() { "已开启新会话" } else { t.trim() };
                 reply(msg).await;
             }
@@ -688,7 +700,10 @@ async fn handle_chat<'a, Fut: std::future::Future<Output = ()>>(
                 reply("创建会话失败，请稍后重试").await;
             }
         },
-        None => dispatch_task(state, account, binding, from, context_token, text, reply).await,
+        None => {
+            channel::push_history(state, &binding.id, text, "收到，任务已派发").await;
+            dispatch_task(state, account, binding, from, context_token, text, reply).await;
+        }
     }
 }
 

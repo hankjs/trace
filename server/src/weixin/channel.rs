@@ -12,6 +12,49 @@ use futures::StreamExt;
 use hank_db::WeixinBinding;
 use hank_provider::{CompletionRequest, ContentBlock, Message, Role, StreamEvent};
 use serde::Deserialize;
+use std::collections::VecDeque;
+
+/// 一轮渠道对话（用户消息 + 机器人回复），作为渠道 agent 的短期记忆。
+#[derive(Clone, Debug)]
+pub struct ChannelTurn {
+    pub user: String,
+    pub assistant: String,
+}
+
+/// 每个绑定最多保留的对话轮数
+const MAX_HISTORY_TURNS: usize = 12;
+/// 单条历史消息截断长度，避免 prompt 膨胀
+const HISTORY_MSG_MAX: usize = 800;
+
+/// 读取某绑定的渠道对话记忆。
+pub async fn history(state: &AppState, binding_id: &str) -> Vec<ChannelTurn> {
+    state
+        .weixin_channel_history
+        .read()
+        .await
+        .get(binding_id)
+        .map(|h| h.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// 追加一轮对话到渠道记忆（超出上限丢弃最旧的）。
+pub async fn push_history(state: &AppState, binding_id: &str, user: &str, assistant: &str) {
+    let turn = ChannelTurn {
+        user: truncate(user, HISTORY_MSG_MAX),
+        assistant: truncate(assistant, HISTORY_MSG_MAX),
+    };
+    let mut map = state.weixin_channel_history.write().await;
+    let h = map.entry(binding_id.to_string()).or_insert_with(VecDeque::new);
+    h.push_back(turn);
+    while h.len() > MAX_HISTORY_TURNS {
+        h.pop_front();
+    }
+}
+
+/// 清空渠道记忆（/new 开新会话时调用）。
+pub async fn clear_history(state: &AppState, binding_id: &str) {
+    state.weixin_channel_history.write().await.remove(binding_id);
+}
 
 /// 渠道 agent 的路由决策。
 #[derive(Debug, Deserialize)]
@@ -48,13 +91,15 @@ impl ChannelAction {
 }
 
 /// 让渠道 agent 决策一条消息。失败（无 provider / LLM 错误 / JSON 解析失败）返回 None。
+/// history 为该绑定的近期渠道对话，用于理解「这个」「上面第 1 条」这类指代。
 pub async fn decide(
     state: &AppState,
     binding: &WeixinBinding,
     session_id: Option<&str>,
     text: &str,
+    history: &[ChannelTurn],
 ) -> Option<ChannelAction> {
-    match try_decide(state, binding, session_id, text).await {
+    match try_decide(state, binding, session_id, text, history).await {
         Ok(action) => {
             tracing::info!(
                 action = action.action_name(),
@@ -75,21 +120,39 @@ async fn try_decide(
     binding: &WeixinBinding,
     session_id: Option<&str>,
     text: &str,
+    history: &[ChannelTurn],
 ) -> Result<ChannelAction> {
     let system = build_system_prompt(state, binding, session_id).await;
 
     let (record, provider) = provider_registry::resolve_default(&state.db)
         .await
         .ok_or_else(|| anyhow!("no enabled provider"))?;
+    // 近期对话作为多轮上下文，当前消息放最后
+    let mut messages: Vec<Message> = history
+        .iter()
+        .flat_map(|t| {
+            [
+                Message {
+                    role: Role::User,
+                    content: vec![ContentBlock::Text { text: t.user.clone() }],
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text { text: t.assistant.clone() }],
+                },
+            ]
+        })
+        .collect();
+    messages.push(Message {
+        role: Role::User,
+        content: vec![ContentBlock::Text {
+            text: text.to_string(),
+        }],
+    });
     let req = CompletionRequest {
         model: provider_registry::resolve_default_model(&record),
         system: Some(system),
-        messages: vec![Message {
-            role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: text.to_string(),
-            }],
-        }],
+        messages,
         tools: vec![],
         max_tokens: 512,
     };
@@ -201,6 +264,8 @@ async fn build_system_prompt(
         - 最近会话：\n{recent}\n\
         \n\
         要求：\n\
+        - 对话中会附带最近的聊天记录（含你之前的回复），\
+        用户说「这个」「上面第 1 条」「我是问」这类指代或追问时，结合记录理解，不要重复回答已经答过的内容。\n\
         - text/ack 用中文，简短口语化；不要用 markdown 表格、代码块（微信里显示不好看）。\n\
         - 桌面 client 在线时，派发的任务在用户本地机器执行，按现有逻辑决策即可。\n\
         - 桌面 client 离线时：纯查询、闲聊、查会话状态等不需要操作用户本地文件的消息，正常 reply 或 dispatch\

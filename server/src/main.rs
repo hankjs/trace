@@ -53,6 +53,8 @@ pub struct AppState {
     pub weixin_logins: weixin::login::LoginStates,
     /// 微信账号 monitor 任务（account_id → 停止令牌）
     pub weixin_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
+    /// 微信渠道 agent 的短期对话记忆（binding_id → 最近若干轮问答）
+    pub weixin_channel_history: RwLock<HashMap<String, std::collections::VecDeque<weixin::channel::ChannelTurn>>>,
     /// 桌面 client 远程执行通道（user_id → 长轮询/派发状态）
     pub client_hubs: RwLock<HashMap<String, remote_exec::UserHub>>,
 }
@@ -164,6 +166,7 @@ async fn main() -> Result<()> {
         event_buffers: RwLock::new(HashMap::new()),
         weixin_logins: RwLock::new(HashMap::new()),
         weixin_monitors: RwLock::new(HashMap::new()),
+        weixin_channel_history: RwLock::new(HashMap::new()),
         client_hubs: RwLock::new(HashMap::new()),
     });
 
