@@ -322,6 +322,8 @@ impl IlinkClient {
         context_token: &str,
         text: &str,
     ) -> Result<()> {
+        // 微信会把 \n / \r\n 渲染成空格（实测），U+2028 才能显示为换行
+        let text = text.replace("\r\n", "\u{2028}").replace('\n', "\u{2028}");
         let mut chunk = String::new();
         let mut chunks: Vec<String> = Vec::new();
         for c in text.chars() {
