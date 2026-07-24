@@ -1,0 +1,19 @@
+[Unit]
+Description=Hank CLI (headless 远程终端节点)
+After=network.target hank-server.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hank
+ExecStart=/opt/hank/hank-cli --config /opt/hank/hank-cli.toml
+Restart=always
+RestartSec=3
+# 日志直接进 journal (journalctl -u hank-cli)
+StandardOutput=journal
+StandardError=journal
+# 基础加固; PTY shell 需要写 $HOME(shell-integration) 和配置文件(client_id 写回), 不做只读根
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

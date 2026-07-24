@@ -6,7 +6,7 @@ members = [
     "crates/code-tools",
     "crates/hank-db",
 ]
-exclude = ["client/src-tauri"]
+exclude = ["client/src-tauri", "cli"]
 resolver = "2"
 
 [workspace.dependencies]

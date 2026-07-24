@@ -1,0 +1,13 @@
+# hank-cli 配置示例
+# 默认路径 ~/.hank-cli/config.toml，也可用 --config 指定其他路径。
+# server / username / password 可分别被 --server / --username / --password 覆盖。
+
+server = "http://127.0.0.1:3000"
+username = "your-username"
+password = "your-password"
+
+# 可选：注册用工作目录（server 侧记录，远程工具默认上下文）
+# work_dir = "/Users/xxx"
+
+# 可选：本节点 ID。缺省时首次运行自动生成 uuid 并写回本文件。
+# client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"

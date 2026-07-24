@@ -1,0 +1,90 @@
+"""持仓计算:由 quant_trade 实时推导(均价法成本),不落表。
+
+浮动盈亏取价优先级:当日最新盘中快照 > 最近收盘价。
+"""
+from __future__ import annotations
+
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from ..models import DailyBar, Snapshot, Trade
+
+
+def _latest_prices(db: Session, codes: list[str]) -> dict[str, tuple[float, str]]:
+    """每只股票的最新参考价:(价格, 来源)"""
+    prices: dict[str, tuple[float, str]] = {}
+    for code in codes:
+        # 盘中最新快照
+        snap = db.execute(
+            select(Snapshot).where(Snapshot.code == code)
+            .order_by(Snapshot.ts.desc()).limit(1)
+        ).scalar_one_or_none()
+        bar = db.execute(
+            select(DailyBar).where(DailyBar.code == code)
+            .order_by(DailyBar.date.desc()).limit(1)
+        ).scalar_one_or_none()
+        if snap is not None and (bar is None or snap.ts.date() >= bar.date):
+            prices[code] = (snap.price, "snapshot")
+        elif bar is not None:
+            prices[code] = (bar.close, "close")
+    return prices
+
+
+def compute_positions(db: Session) -> list[dict]:
+    """按 code 聚合所有成交,均价法推导持仓。
+
+    买入:总成本 += price*qty + fee
+    卖出:已实现盈亏 += (price - 均价)*qty - fee;数量与成本按比例扣减
+    """
+    trades = db.execute(
+        select(Trade).order_by(Trade.trade_date, Trade.id)
+    ).scalars().all()
+
+    book: dict[str, dict] = {}
+    for t in trades:
+        p = book.setdefault(t.code, {"qty": 0.0, "cost": 0.0, "realized": 0.0})
+        if t.side == "buy":
+            p["cost"] += t.price * t.qty + t.fee
+            p["qty"] += t.qty
+        else:  # sell
+            avg = p["cost"] / p["qty"] if p["qty"] > 0 else 0.0
+            sell_qty = min(t.qty, p["qty"])
+            p["realized"] += (t.price - avg) * sell_qty - t.fee
+            p["qty"] -= sell_qty
+            p["cost"] -= avg * sell_qty
+
+    holding_codes = [c for c, p in book.items() if p["qty"] > 1e-9]
+    prices = _latest_prices(db, holding_codes)
+
+    positions = []
+    for code in holding_codes:
+        p = book[code]
+        avg_cost = p["cost"] / p["qty"]
+        last_price, price_src = prices.get(code, (None, None))
+        item = {
+            "code": code,
+            "qty": p["qty"],
+            "avg_cost": round(avg_cost, 4),
+            "last_price": last_price,
+            "price_source": price_src,
+            "market_value": round(p["qty"] * last_price, 2) if last_price else None,
+            "unrealized_pnl": (
+                round((last_price - avg_cost) * p["qty"], 2) if last_price else None
+            ),
+            "realized_pnl": round(p["realized"], 2),
+        }
+        positions.append(item)
+    return positions
+
+
+def portfolio_summary(db: Session) -> dict:
+    positions = compute_positions(db)
+    return {
+        "positions": positions,
+        "total_market_value": round(
+            sum(p["market_value"] or 0 for p in positions), 2),
+        "total_unrealized_pnl": round(
+            sum(p["unrealized_pnl"] or 0 for p in positions), 2),
+        "total_realized_pnl": round(
+            sum(p["realized_pnl"] for p in positions), 2),
+    }

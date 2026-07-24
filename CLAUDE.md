@@ -36,6 +36,10 @@
 │   ├── router/index.ts  # 路由配置
 │   ├── App.vue          # 根组件
 │   └── main.ts          # 前端入口
+├── cli/                 # hank-cli：headless 远程终端节点（独立 Cargo 项目，不进 workspace）
+├── quant/               # A股日频量化信息系统（独立 Python 项目，仅与 server 共用 MySQL）
+│   ├── app/             # FastAPI 后端：baostock/akshare 采集、指标、策略信号、记账、回测
+│   └── web/             # Vue 3 + Vite + Tailwind 4 + ECharts 看板（风格对齐 admin/）
 ├── openspec/            # OpenSpec 集成
 ├── config.toml          # 运行时配置
 └── Cargo.toml           # Rust workspace 配置
@@ -80,7 +84,14 @@ cargo build --workspace         # 构建所有 crate
 
 # Tauri 开发
 cd client && npm run tauri dev  # Tauri 开发模式
+
+# quant 量化系统(独立 Python 项目)
+cd quant && uv sync                          # 安装依赖(Python 3.11~3.13)
+cd quant && uv run uvicorn app.main:app --port 8100   # 后端(含定时采集任务)
+cd quant/web && pnpm install && pnpm dev     # 前端看板(/api 代理到 8100)
 ```
+
+quant 说明:A股日频量化信息系统,纯信息系统不做自动交易。baostock 提供历史/盘后日线(前复权),akshare 提供盘中快照;所有表带 `quant_` 前缀,与 server 共用同一个 MySQL,除此之外完全解耦。后期通过 quant 的 REST API 对接 server 的微信通道。详见 `quant/README.md`。
 
 ## 编码约定
 
