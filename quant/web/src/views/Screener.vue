@@ -17,6 +17,7 @@ const form = ref({
   volRatioMin: '',
   maBull: false,
   nearHighDays: '',
+  highDistMax: '',
   amountMinYi: '',
 })
 
@@ -36,13 +37,15 @@ async function search() {
   try {
     const chgMin = num(form.value.chgMin)
     const chgMax = num(form.value.chgMax)
+    const highDistMax = num(form.value.highDistMax)
     const amountYi = num(form.value.amountMinYi)
     const r = await api.screener({
-      chg_min: chgMin !== undefined ? chgMin / 100 : undefined,
-      chg_max: chgMax !== undefined ? chgMax / 100 : undefined,
+      pct_chg_min: chgMin !== undefined ? chgMin / 100 : undefined,
+      pct_chg_max: chgMax !== undefined ? chgMax / 100 : undefined,
       vol_ratio_min: num(form.value.volRatioMin),
       ma_bull: form.value.maBull || undefined,
-      near_high_days: num(form.value.nearHighDays),
+      high_window: num(form.value.nearHighDays),
+      high_dist_max: highDistMax !== undefined ? highDistMax / 100 : undefined,
       amount_min: amountYi !== undefined ? amountYi * 1e8 : undefined,
     })
     items.value = r.items ?? []
@@ -78,6 +81,10 @@ async function search() {
       <label class="text-sm">
         <span class="mb-1 block text-xs text-text-tertiary">N 日内接近新高</span>
         <input v-model="form.nearHighDays" type="number" min="1" placeholder="60" class="w-28 rounded-md border border-border px-2 py-1.5" />
+      </label>
+      <label class="text-sm">
+        <span class="mb-1 block text-xs text-text-tertiary">距新高幅度上限 %</span>
+        <input v-model="form.highDistMax" type="number" step="0.1" min="0" placeholder="5" class="w-28 rounded-md border border-border px-2 py-1.5" />
       </label>
       <label class="text-sm">
         <span class="mb-1 block text-xs text-text-tertiary">20日日均成交额下限(亿)</span>

@@ -4,10 +4,14 @@
 """
 from __future__ import annotations
 
+import logging
+
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import DailyBar, Snapshot, Trade
+
+logger = logging.getLogger(__name__)
 
 
 def _latest_prices(db: Session, codes: list[str]) -> dict[str, tuple[float, str]]:
@@ -30,11 +34,12 @@ def _latest_prices(db: Session, codes: list[str]) -> dict[str, tuple[float, str]
     return prices
 
 
-def compute_positions(db: Session) -> list[dict]:
-    """按 code 聚合所有成交,均价法推导持仓。
+def _compute_book(db: Session) -> dict[str, dict]:
+    """按 code 聚合所有成交,均价法推导 {code: {qty, cost, realized}}。
 
     买入:总成本 += price*qty + fee
-    卖出:已实现盈亏 += (price - 均价)*qty - fee;数量与成本按比例扣减
+    卖出:已实现盈亏 += (price - 均价)*qty - 手续费(按实际卖出数量分摊);
+    数量与成本按比例扣减。已清仓的 code 也保留,供汇总已实现盈亏用。
     """
     trades = db.execute(
         select(Trade).order_by(Trade.trade_date, Trade.id)
@@ -49,10 +54,21 @@ def compute_positions(db: Session) -> list[dict]:
         else:  # sell
             avg = p["cost"] / p["qty"] if p["qty"] > 0 else 0.0
             sell_qty = min(t.qty, p["qty"])
-            p["realized"] += (t.price - avg) * sell_qty - t.fee
+            if sell_qty < t.qty:
+                logger.warning(
+                    "卖出数量超过持仓 %s: 委托 %.0f,持仓 %.0f,按持仓截断",
+                    t.code, t.qty, p["qty"])
+            # 手续费按实际卖出数量分摊,截断部分不计费
+            fee_alloc = t.fee * sell_qty / t.qty if t.qty > 0 else 0.0
+            p["realized"] += (t.price - avg) * sell_qty - fee_alloc
             p["qty"] -= sell_qty
             p["cost"] -= avg * sell_qty
+    return book
 
+
+def compute_positions(db: Session) -> list[dict]:
+    """当前持仓列表(仅仍有持仓的股票)"""
+    book = _compute_book(db)
     holding_codes = [c for c, p in book.items() if p["qty"] > 1e-9]
     prices = _latest_prices(db, holding_codes)
 
@@ -78,6 +94,7 @@ def compute_positions(db: Session) -> list[dict]:
 
 
 def portfolio_summary(db: Session) -> dict:
+    book = _compute_book(db)
     positions = compute_positions(db)
     return {
         "positions": positions,
@@ -85,6 +102,7 @@ def portfolio_summary(db: Session) -> dict:
             sum(p["market_value"] or 0 for p in positions), 2),
         "total_unrealized_pnl": round(
             sum(p["unrealized_pnl"] or 0 for p in positions), 2),
+        # 已实现盈亏含已清仓股票,不能只对当前持仓求和
         "total_realized_pnl": round(
-            sum(p["realized_pnl"] for p in positions), 2),
+            sum(p["realized"] for p in book.values()), 2),
     }

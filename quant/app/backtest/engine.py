@@ -41,6 +41,7 @@ DEFAULT_COSTS = {
 
 MIN_BARS = 30
 PORTFOLIO_WARMUP_DAYS = 200  # 组合策略计算动量/均线需要 start 之前的历史
+SINGLE_WARMUP_DAYS = 200     # 单标的策略同样需要预热,否则 MA60 等指标在区间头部失真
 
 
 def _signals_from_positions(pos: pd.Series) -> tuple[pd.Series, pd.Series]:
@@ -63,8 +64,9 @@ def _equity_after_tax(pf: vbt.Portfolio, costs: dict) -> pd.Series | pd.DataFram
     sells["notional"] = sells["Size"] * sells["Price"] * costs["stamp_tax"]
     if isinstance(value, pd.DataFrame):  # 批量:按列分别扣
         out = value.copy()
-        for ci, col in enumerate(value.columns):
-            s = sells[sells["Column"] == ci]
+        for col in value.columns:
+            # records_readable 的 Column 是列标签(股票代码),不是整数序号
+            s = sells[sells["Column"] == col]
             if s.empty:
                 continue
             tax = s.groupby("Timestamp")["notional"].sum()
@@ -175,15 +177,23 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     if strategy_kind(strategy) == "portfolio":
         return _run_portfolio(db, strategy, codes, start, end, params, costs, save)
 
+    warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
     dfs: dict[str, pd.DataFrame] = {}
     positions: dict[str, pd.Series] = {}
     for code in codes:
-        df = load_bars_df(db, code, start=start, end=end)
+        # 多加载 start 之前的历史做指标预热,信号算完后切回 [start, end] 回测
+        df = load_bars_df(db, code, start=warmup_start, end=end)
         if len(df) < MIN_BARS:
             logger.warning("回测 %s 数据不足(%d 条),跳过", code, len(df))
             continue
+        pos = mod.positions(df, params)
+        mask = (df["date"] >= start).to_numpy()
+        df = df[mask].reset_index(drop=True)
+        if len(df) < MIN_BARS:
+            logger.warning("回测 %s 区间内数据不足(%d 条),跳过", code, len(df))
+            continue
         dfs[code] = df
-        positions[code] = mod.positions(df, params)
+        positions[code] = pos[mask]
     if not dfs:
         raise ValueError("所有标的都数据不足,无法回测")
 
@@ -331,17 +341,24 @@ def run_sweep(db: Session, strategy: str, codes: list[str],
     if len(combos) > 200:
         raise ValueError(f"参数组合过多({len(combos)}),上限 200")
 
-    dfs: dict[str, pd.DataFrame] = {}
+    warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
+    full_dfs: dict[str, pd.DataFrame] = {}  # 含预热段,用于计算信号
+    dfs: dict[str, pd.DataFrame] = {}       # 切回 [start, end],用于回测
     for code in codes:
-        df = load_bars_df(db, code, start=start, end=end)
-        if len(df) >= MIN_BARS:
-            dfs[code] = df
+        df = load_bars_df(db, code, start=warmup_start, end=end)
+        bt = df[df["date"] >= start].reset_index(drop=True)
+        if len(bt) >= MIN_BARS:
+            full_dfs[code] = df
+            dfs[code] = bt
     if not dfs:
         raise ValueError("所有标的都数据不足,无法回测")
 
     rows = []
     for combo in combos:
-        positions = {c: mod.positions(df, combo) for c, df in dfs.items()}
+        positions = {}
+        for c, df in full_dfs.items():
+            pos = mod.positions(df, combo)
+            positions[c] = pos[(df["date"] >= start).to_numpy()]
         results = _batch_single(dfs, positions, costs)
         per = [r["metrics"] for r in results.values()]
         annuals = [m["annual_return"] for m in per]

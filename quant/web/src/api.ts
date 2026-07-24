@@ -78,7 +78,7 @@ export interface SignalItem {
   code: string
   date: string
   strategy: string
-  side: 'buy' | 'sell'
+  side: 'buy' | 'sell' | 'watch'
   price: number
   reason: Record<string, unknown>
 }
@@ -306,19 +306,21 @@ export const api = {
   },
 
   screener(filters: {
-    chg_min?: number
-    chg_max?: number
+    pct_chg_min?: number
+    pct_chg_max?: number
     vol_ratio_min?: number
     ma_bull?: boolean
-    near_high_days?: number
+    high_window?: number
+    high_dist_max?: number
     amount_min?: number
   } = {}) {
     const params = new URLSearchParams()
-    if (filters.chg_min !== undefined) params.set('chg_min', String(filters.chg_min))
-    if (filters.chg_max !== undefined) params.set('chg_max', String(filters.chg_max))
+    if (filters.pct_chg_min !== undefined) params.set('pct_chg_min', String(filters.pct_chg_min))
+    if (filters.pct_chg_max !== undefined) params.set('pct_chg_max', String(filters.pct_chg_max))
     if (filters.vol_ratio_min !== undefined) params.set('vol_ratio_min', String(filters.vol_ratio_min))
     if (filters.ma_bull) params.set('ma_bull', 'true')
-    if (filters.near_high_days !== undefined) params.set('near_high_days', String(filters.near_high_days))
+    if (filters.high_window !== undefined) params.set('high_window', String(filters.high_window))
+    if (filters.high_dist_max !== undefined) params.set('high_dist_max', String(filters.high_dist_max))
     if (filters.amount_min !== undefined) params.set('amount_min', String(filters.amount_min))
     return request<ScreenerResult>(`/api/selection/screener?${params}`)
   },

@@ -14,7 +14,7 @@ import numpy as np
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..data.universe import current_pool
+from ..data.universe import current_pool, pool_at
 from ..models import FactorDaily, StrategyEval
 from ..selection.pipeline import score_row
 from ..strategy.strategies import (PORTFOLIO_STRATEGIES, REGISTRY,
@@ -29,13 +29,21 @@ EVAL_DAYS = 365
 TOP_SAMPLE = 50
 
 
-def top_scored_codes(db: Session, n: int = TOP_SAMPLE) -> list[str]:
-    """按最近一个因子日的评分取 Top N 代码"""
+def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
+                     as_of: date | None = None) -> list[str]:
+    """按 as_of(含)之前最近一个因子日的评分取 Top N 代码。
+
+    as_of 必须取回测起点:用回测结束时的最新因子选股再回看历史是前视偏差。
+    """
+    q = select(FactorDaily.date)
+    if as_of is not None:
+        q = q.where(FactorDaily.date <= as_of)
     fdate = db.execute(
-        select(FactorDaily.date).order_by(FactorDaily.date.desc()).limit(1)
+        q.order_by(FactorDaily.date.desc()).limit(1)
     ).scalar()
     if fdate is None:
-        return current_pool(db)[:n]
+        pool = pool_at(db, as_of) if as_of is not None else current_pool(db)
+        return pool[:n]
     rows = db.execute(
         select(FactorDaily).where(FactorDaily.date == fdate)
     ).scalars().all()
@@ -85,8 +93,10 @@ def run_evaluation(db: Session, day: date | None = None,
     """跑一轮批量评估并落库 quant_strategy_eval"""
     end = day or date.today()
     start = end - timedelta(days=period_days)
-    top_codes = top_scored_codes(db, TOP_SAMPLE)
-    pool = current_pool(db)
+    # 选股与成分池都取回测起点的时点数据,避免前视/幸存者偏差。
+    # 残余近似:回测区间内成分变动不随时间推进(引擎 codes 为静态列表)。
+    top_codes = top_scored_codes(db, TOP_SAMPLE, as_of=start)
+    pool = pool_at(db, start)
     logger.info("批量评估 [%s, %s]: 单标的样本 %d 只,组合池 %d 只",
                 start, end, len(top_codes), len(pool))
 

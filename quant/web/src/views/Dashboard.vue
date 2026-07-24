@@ -28,6 +28,18 @@ function sourceLabel(s: SnapshotItem): string {
   if (s.source === 'close') return '收盘'
   return '无数据'
 }
+
+function sideLabel(side: SignalItem['side']): string {
+  if (side === 'buy') return '买入'
+  if (side === 'sell') return '卖出'
+  return '观察'
+}
+
+function sideClass(side: SignalItem['side']): string {
+  if (side === 'buy') return 'text-up'
+  if (side === 'sell') return 'text-down'
+  return 'text-text-secondary'
+}
 </script>
 
 <template>
@@ -92,8 +104,8 @@ function sourceLabel(s: SnapshotItem): string {
                 </td>
                 <td class="px-4 py-2">{{ sig.strategy }}</td>
                 <td class="px-4 py-2">
-                  <span :class="sig.side === 'buy' ? 'text-up' : 'text-down'" class="font-medium">
-                    {{ sig.side === 'buy' ? '买入' : '卖出' }}
+                  <span :class="sideClass(sig.side)" class="font-medium">
+                    {{ sideLabel(sig.side) }}
                   </span>
                 </td>
                 <td class="px-4 py-2 text-right">{{ fmtPrice(sig.price) }}</td>

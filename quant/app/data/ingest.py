@@ -5,7 +5,7 @@ import logging
 from datetime import date, datetime, timedelta
 
 import pandas as pd
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
@@ -88,6 +88,36 @@ def backfill(db: Session, code: str, start: date | str, end: date | str | None =
     return n
 
 
+REANCHOR_TOLERANCE = 0.001  # 前复权重锚判定:重叠日 close 相对偏差阈值
+
+
+def _upsert_with_reanchor_check(db: Session, code: str, df: pd.DataFrame,
+                                fallback_start: date, end: date) -> int:
+    """upsert 前检测前复权重锚,必要时全量回填。
+
+    baostock 前复权价在分红送转后会回溯调整全部历史,只增量更新最近几天
+    会让新旧数据处于不同复权尺度,产生断层。取本次数据最早一天与库中同日
+    close 对比,偏差超阈值即判定为重锚,全量重拉。
+    """
+    if df.empty:
+        return 0
+    first_date = df["date"].min()
+    stored = db.execute(
+        select(DailyBar.close).where(
+            DailyBar.code == code, DailyBar.date == first_date)
+    ).scalar()
+    new_close = float(df[df["date"] == first_date]["close"].iloc[0])
+    if stored and abs(new_close - stored) / stored > REANCHOR_TOLERANCE:
+        min_date = db.execute(
+            select(func.min(DailyBar.date)).where(DailyBar.code == code)
+        ).scalar()
+        logger.warning(
+            "前复权重锚 %s: %s 库中 %.4f vs 新拉 %.4f,全量回填自 %s",
+            code, first_date, stored, new_close, min_date)
+        return backfill(db, code, start=min_date or fallback_start, end=end)
+    return upsert_bars(db, code, df)
+
+
 def ingest_daily(db: Session, code: str, day: date | None = None,
                  reconcile: bool = True) -> dict:
     """盘后日线增量:baostock 拉最近几天的数据 upsert,
@@ -95,7 +125,7 @@ def ingest_daily(db: Session, code: str, day: date | None = None,
     day = day or date.today()
     start = day - timedelta(days=10)  # 多拉几天覆盖节假日/补漏
     df = baostock_client.fetch_daily_bars(code, start, day)
-    n = upsert_bars(db, code, df)
+    n = _upsert_with_reanchor_check(db, code, df, fallback_start=start, end=day)
 
     result: dict = {"code": code, "upserted": n, "reconcile": None}
     if reconcile and not df.empty:
