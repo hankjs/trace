@@ -4,16 +4,21 @@
 - 信号(目标仓位)在 T 日收盘产生,T+1 日开盘价成交;
 - 单标的满仓/空仓(0/1 仓位),多标的时资金等分;
 - 组合策略消费 target_weights 矩阵,同样 T+1 开盘按目标权重调仓;
-- 费用:佣金 commission(默认万 2.5)双边,滑点 slippage(默认万 1,按价格比例)
-  由 vectorbt 直接收;印花税 stamp_tax(默认 0.05%,仅卖出)按订单记录精确扣减
-  (vectorbt 的 fees 双边同率,不支持单边费率);
+- 起点前已持有的状态不丢:单标的若回测窗口首日目标仓位为 1,以首日开盘价
+  合成建仓;组合以起点前最后一天的权重在首日开盘建仓(先 shift 再截断);
+- 费用:佣金 commission(默认万 2.5)双边、滑点 slippage(默认万 1,按价格比例)、
+  印花税 stamp_tax(默认 0.05%,仅卖出)全部进入撮合——fees 按 (bar, column)
+  广播,卖出单 = 佣金 + 印花税;净值、胜率、后续仓位规模为同一税后口径;
+- 组合调仓 call_seq="auto":同一调仓日先卖后买,买单可用卖出释放的现金,
+  避免"买列先于卖列执行导致买单被拒、换仓变全现金";
 - 输出净值曲线与指标:总收益率、年化、最大回撤、夏普、胜率、交易次数。
 
 vectorbt 1.1.0 注意(与 0.x 不同,勿凭记忆):
 - fees 与 slippage 是两个独立参数,slippage 直接支持,不要再加进 fees;
+- fees 接受按 (bar, column) 广播的数组,用于区分买/卖方向的费率;
 - 多列(批量)时 pf.value() 返回 DataFrame,pf.total_return() 等返回按列 Series;
 - 组合目标权重用 Portfolio.from_orders(size=权重矩阵, size_type="targetpercent",
-  cash_sharing=True, group_by=True);非调仓行给 NaN 则当日不下单;
+  cash_sharing=True, group_by=True, call_seq="auto");非调仓行给 NaN 则当日不下单;
 - 订单明细在 pf.orders.records_readable(列:Column/Timestamp/Size/Price/Side/Fees)。
 """
 from __future__ import annotations
@@ -52,32 +57,29 @@ def _signals_from_positions(pos: pd.Series) -> tuple[pd.Series, pd.Series]:
     return entries, exits
 
 
-def _equity_after_tax(pf: vbt.Portfolio, costs: dict) -> pd.Series | pd.DataFrame:
-    """从净值中精确扣除卖出印花税(按订单记录逐笔)"""
-    value = pf.value()
-    rr = pf.orders.records_readable
-    if rr is None or len(rr) == 0:
-        return value
-    sells = rr[rr["Side"] == "Sell"].copy()
-    if sells.empty:
-        return value
-    sells["notional"] = sells["Size"] * sells["Price"] * costs["stamp_tax"]
-    if isinstance(value, pd.DataFrame):  # 批量:按列分别扣
-        out = value.copy()
-        for col in value.columns:
-            # records_readable 的 Column 是列标签(股票代码),不是整数序号
-            s = sells[sells["Column"] == col]
-            if s.empty:
-                continue
-            tax = s.groupby("Timestamp")["notional"].sum()
-            out[col] = out[col] - tax.reindex(out.index, fill_value=0.0).cumsum()
-        return out
-    tax = sells.groupby("Timestamp")["notional"].sum()
-    return value - tax.reindex(value.index, fill_value=0.0).cumsum()
+def _signal_fee_matrix(entries: pd.DataFrame, exits: pd.DataFrame,
+                       costs: dict) -> np.ndarray:
+    """from_signals 的按单费率矩阵:买入 = 佣金,卖出 = 佣金 + 印花税。"""
+    fees = np.full(entries.shape, costs["commission"], dtype=float)
+    fees[exits.to_numpy()] += costs["stamp_tax"]
+    return fees
+
+
+def _order_fee_matrix(w_exec: pd.DataFrame, costs: dict) -> np.ndarray:
+    """from_orders 的按单费率矩阵:目标权重较上次下降视为卖出,加印花税。
+
+    方向按目标权重变化近似判定(targetpercent 的实际成交方向还受现金约束);
+    关键是税费进入现金核算,净值/胜率/后续仓位规模口径一致。
+    """
+    prev = w_exec.ffill().shift(1)
+    is_sell = (w_exec < prev).fillna(False).to_numpy()
+    fees = np.full(w_exec.shape, costs["commission"], dtype=float)
+    fees[is_sell] += costs["stamp_tax"]
+    return fees
 
 
 def _metrics_from_equity(eq: pd.Series, pf: vbt.Portfolio) -> dict:
-    """从(税后)净值序列 + Portfolio 计算指标"""
+    """从净值序列 + Portfolio 计算指标(费用已在撮合内扣除,口径一致)"""
     total_return = float(eq.iat[-1] / eq.iat[0] - 1)
     n_days = len(eq)
     annual = float((eq.iat[-1] / eq.iat[0]) ** (252 / max(n_days, 1)) - 1)
@@ -98,23 +100,6 @@ def _metrics_from_equity(eq: pd.Series, pf: vbt.Portfolio) -> dict:
     }
 
 
-def _bt_one(df: pd.DataFrame, pos: pd.Series, costs: dict) -> dict:
-    """单标的回测:pos 为目标仓位(0/1),次日开盘价成交。"""
-    if len(df) < 3:
-        raise ValueError("数据不足,无法回测")
-    idx = pd.DatetimeIndex(df["date"])
-    close = pd.Series(df["close"].to_numpy(float), index=idx)
-    open_ = pd.Series(df["open"].to_numpy(float), index=idx)
-    entries, exits = _signals_from_positions(pd.Series(pos.to_numpy(float), index=idx))
-    pf = vbt.Portfolio.from_signals(
-        close, entries, exits, price=open_,
-        init_cash=1.0, size=1.0, size_type="percent",
-        fees=costs["commission"], slippage=costs["slippage"], freq="1D",
-    )
-    eq = _equity_after_tax(pf, costs)
-    return {"equity": eq, "metrics": _metrics_from_equity(eq, pf)}
-
-
 def _to_price_matrix(dfs: dict[str, pd.DataFrame], col: str,
                      idx: pd.DatetimeIndex) -> pd.DataFrame:
     return pd.DataFrame(
@@ -123,13 +108,18 @@ def _to_price_matrix(dfs: dict[str, pd.DataFrame], col: str,
 
 
 def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
-                  costs: dict) -> dict[str, dict]:
+                  costs: dict, start: date) -> dict[str, dict]:
     """vectorbt 批量单标的回测:同一组 entries/exits 矩阵一次跑完。
+
+    dfs/positions 为含预热段的完整序列(positions 与 dfs[code] 行位置对齐),
+    start 为回测起点:信号在完整序列上计算(diff 不丢起点前的跳变),价格
+    矩阵截到 [start, ...];窗口首日目标仓位为 1 时以首日开盘价合成建仓
+    (起点前已持有的近似)。
 
     返回 {code: {"metrics": ..., "equity": Series}}
     """
     idx = pd.DatetimeIndex(
-        sorted({d for df in dfs.values() for d in df["date"]})
+        sorted({d for df in dfs.values() for d in df["date"] if d >= start})
     )
     close = _to_price_matrix(dfs, "close", idx)
     open_ = _to_price_matrix(dfs, "open", idx)
@@ -140,16 +130,20 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
             continue
         p = pd.Series(pos.to_numpy(float), index=pd.DatetimeIndex(dfs[code]["date"]))
         e, x = _signals_from_positions(p)
-        entries[code] = e.reindex(idx, fill_value=False)
-        exits[code] = x.reindex(idx, fill_value=False)
+        e = e.reindex(idx, fill_value=False)
+        x = x.reindex(idx, fill_value=False)
+        if len(idx) and p.reindex(idx).iloc[0] == 1.0 and not x.iloc[0]:
+            e.iloc[0] = True  # 起点前已持仓:首日开盘价合成建仓
+        entries[code] = e
+        exits[code] = x
 
     pf = vbt.Portfolio.from_signals(
         close, entries, exits, price=open_,
         init_cash=1.0, size=1.0, size_type="percent",
-        fees=costs["commission"], slippage=costs["slippage"], freq="1D",
+        fees=_signal_fee_matrix(entries, exits, costs),
+        slippage=costs["slippage"], freq="1D",
     )
-    eq_all = _equity_after_tax(pf, costs)
-    win_rates = pf.trades.win_rate()
+    eq_all = pf.value()
     out: dict[str, dict] = {}
     for code in close.columns:
         eq = eq_all[code].dropna()
@@ -181,23 +175,17 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     dfs: dict[str, pd.DataFrame] = {}
     positions: dict[str, pd.Series] = {}
     for code in codes:
-        # 多加载 start 之前的历史做指标预热,信号算完后切回 [start, end] 回测
+        # 多加载 start 之前的历史做指标预热;信号在完整序列上计算,引擎内切窗口
         df = load_bars_df(db, code, start=warmup_start, end=end)
-        if len(df) < MIN_BARS:
-            logger.warning("回测 %s 数据不足(%d 条),跳过", code, len(df))
-            continue
-        pos = mod.positions(df, params)
-        mask = (df["date"] >= start).to_numpy()
-        df = df[mask].reset_index(drop=True)
-        if len(df) < MIN_BARS:
-            logger.warning("回测 %s 区间内数据不足(%d 条),跳过", code, len(df))
+        if len(df) == 0 or int((df["date"] >= start).sum()) < MIN_BARS:
+            logger.warning("回测 %s 区间内数据不足,跳过", code)
             continue
         dfs[code] = df
-        positions[code] = pos[mask]
+        positions[code] = mod.positions(df, params)
     if not dfs:
         raise ValueError("所有标的都数据不足,无法回测")
 
-    results = _batch_single(dfs, positions, costs)
+    results = _batch_single(dfs, positions, costs, start)
     per_code = {c: r["metrics"] for c, r in results.items()}
     curves = [r["equity"] for r in results.values()]
 
@@ -224,6 +212,38 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     return result
 
 
+def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame],
+                   bt_idx: pd.DatetimeIndex, costs: dict) -> dict:
+    """组合模拟:weights_full 为含预热段的完整目标权重矩阵(行=交易日)。
+
+    先 shift(1) 再截断到 bt_idx:首个交易日以起点前最后一天的权重开盘建仓,
+    不丢起点前已持有的组合状态。
+    返回 {"equity": Series, "metrics": dict, "pf": Portfolio}
+    """
+    close = _to_price_matrix(pool_dfs, "close", bt_idx)
+    open_ = _to_price_matrix(pool_dfs, "open", bt_idx)
+
+    # T 日目标权重 -> T+1 开盘成交;只在权重变化的行下单(其余行 NaN)
+    w_exec_full = weights_full.shift(1)
+    changed_full = w_exec_full.ne(w_exec_full.shift()).any(axis=1)
+    w_exec = w_exec_full.reindex(bt_idx)
+    changed = changed_full.reindex(bt_idx, fill_value=False)
+    if len(changed):
+        changed.iloc[0] = True  # 首日建仓(起点前已有的权重)
+    w_orders = w_exec.where(pd.DataFrame(
+        np.repeat(changed.to_numpy()[:, None], w_exec.shape[1], axis=1),
+        index=w_exec.index, columns=w_exec.columns))
+
+    pf = vbt.Portfolio.from_orders(
+        close, size=w_orders, size_type="targetpercent", price=open_,
+        init_cash=1.0, fees=_order_fee_matrix(w_exec, costs),
+        slippage=costs["slippage"], cash_sharing=True, group_by=True,
+        call_seq="auto", freq="1D",
+    )
+    eq = pf.value().dropna()
+    return {"equity": eq, "metrics": _metrics_from_equity(eq, pf), "pf": pf}
+
+
 def _run_portfolio(db: Session, strategy: str, codes: list[str],
                    start: date, end: date, params: dict | None,
                    costs: dict, save: bool) -> dict:
@@ -245,27 +265,8 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
     if len(bt_idx) < 3:
         raise ValueError("回测区间交易日不足")
 
-    w = weights_full.reindex(bt_idx).fillna(0.0)
-    close = _to_price_matrix(pool_dfs, "close", bt_idx)
-    open_ = _to_price_matrix(pool_dfs, "open", bt_idx)
-
-    # T 日目标权重 -> T+1 开盘成交;只在权重变化的行下单(其余行 NaN)
-    w_exec = w.shift(1)
-    changed = w_exec.ne(w_exec.shift()).any(axis=1)
-    if len(w_exec):
-        changed.iloc[0] = True
-    w_orders = w_exec.where(pd.DataFrame(
-        np.repeat(changed.to_numpy()[:, None], w_exec.shape[1], axis=1),
-        index=w_exec.index, columns=w_exec.columns))
-
-    pf = vbt.Portfolio.from_orders(
-        close, size=w_orders, size_type="targetpercent", price=open_,
-        init_cash=1.0, fees=costs["commission"], slippage=costs["slippage"],
-        cash_sharing=True, group_by=True, freq="1D",
-    )
-    eq = _equity_after_tax(pf, costs)
-    eq = eq.dropna()
-    metrics = _metrics_from_equity(eq, pf)
+    sim = _portfolio_sim(weights_full, pool_dfs, bt_idx, costs)
+    eq = sim["equity"]
 
     result: dict = {
         "strategy": strategy,
@@ -274,7 +275,7 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
         "start": str(start),
         "end": str(end),
         "costs": costs,
-        "metrics": metrics,
+        "metrics": sim["metrics"],
         "equity": [
             {"date": str(d.date()), "equity": round(float(v), 6)}
             for d, v in eq.items()
@@ -342,24 +343,18 @@ def run_sweep(db: Session, strategy: str, codes: list[str],
         raise ValueError(f"参数组合过多({len(combos)}),上限 200")
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
-    full_dfs: dict[str, pd.DataFrame] = {}  # 含预热段,用于计算信号
-    dfs: dict[str, pd.DataFrame] = {}       # 切回 [start, end],用于回测
+    full_dfs: dict[str, pd.DataFrame] = {}  # 含预热段,信号在完整序列上计算
     for code in codes:
         df = load_bars_df(db, code, start=warmup_start, end=end)
-        bt = df[df["date"] >= start].reset_index(drop=True)
-        if len(bt) >= MIN_BARS:
+        if len(df) and int((df["date"] >= start).sum()) >= MIN_BARS:
             full_dfs[code] = df
-            dfs[code] = bt
-    if not dfs:
+    if not full_dfs:
         raise ValueError("所有标的都数据不足,无法回测")
 
     rows = []
     for combo in combos:
-        positions = {}
-        for c, df in full_dfs.items():
-            pos = mod.positions(df, combo)
-            positions[c] = pos[(df["date"] >= start).to_numpy()]
-        results = _batch_single(dfs, positions, costs)
+        positions = {c: mod.positions(df, combo) for c, df in full_dfs.items()}
+        results = _batch_single(full_dfs, positions, costs, start)
         per = [r["metrics"] for r in results.values()]
         annuals = [m["annual_return"] for m in per]
         rows.append({
@@ -378,7 +373,7 @@ def run_sweep(db: Session, strategy: str, codes: list[str],
             "per_code": {c: r["metrics"] for c, r in results.items()},
         })
     rows.sort(key=lambda r: -r["metrics"]["annual_return_median"])
-    return {"strategy": strategy, "codes": list(dfs), "start": str(start),
+    return {"strategy": strategy, "codes": list(full_dfs), "start": str(start),
             "end": str(end), "costs": costs, "results": rows}
 
 

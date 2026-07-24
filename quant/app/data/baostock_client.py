@@ -96,9 +96,12 @@ def fetch_daily_bars(code: str, start: date | str, end: date | str) -> pd.DataFr
     return df
 
 
-def fetch_index_members(index_name: str) -> pd.DataFrame:
-    """拉取指数当前成分股。index_name: hs300 / zz500。
+def fetch_index_members(index_name: str,
+                        day: date | str | None = None) -> pd.DataFrame:
+    """拉取指数成分股。index_name: hs300 / zz500。
 
+    day 为 None 时取最新成分;给定日期时取该日期时点(最近一次调整后)的成分,
+    用于重建历史成分区间(无幸存者偏差回测)。
     返回 DataFrame: code(如 sh.600000), name, update_date
     """
     query = {
@@ -108,13 +111,15 @@ def fetch_index_members(index_name: str) -> pd.DataFrame:
     if query is None:
         raise ValueError(f"未知指数: {index_name},可选: hs300 / zz500")
 
+    day_s = day.isoformat() if isinstance(day, (date, datetime)) else (day or "")
+
     global _logged_in
     own_login = not _logged_in
     with _login_lock:
         if own_login:
             _login()
         try:
-            rs = query()
+            rs = query(date=day_s)
             if rs.error_code != "0":
                 raise RuntimeError(
                     f"baostock 成分股查询失败 {index_name}: {rs.error_code} {rs.error_msg}"

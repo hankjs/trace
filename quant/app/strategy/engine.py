@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
@@ -51,6 +51,7 @@ def run_signals(db: Session, day: date | None = None,
 
     start = day - timedelta(days=LOOKBACK_DAYS)
     summary: dict[str, dict[str, str]] = {}
+    produced: dict[tuple[str, str], set[str]] = {}  # (strategy, code) -> 当日 side 集
     for name, params in strategies.items():
         mod = REGISTRY.get(name)
         if mod is None:
@@ -69,6 +70,7 @@ def run_signals(db: Session, day: date | None = None,
             pos = mod.positions(df, params)
             if pos.empty:
                 continue
+            produced.setdefault((name, code), set())  # 当日已重算,允许清理旧 side
             cur, prev = int(pos.iat[-1]), int(pos.iat[-2])
             price = float(df["close"].iat[-1])
             if cur != prev:
@@ -80,6 +82,7 @@ def run_signals(db: Session, day: date | None = None,
                     "close": price,
                 }
                 _save_signal(db, code, day, name, side, price, reason)
+                produced[(name, code)].add(side)
                 summary[name][code] = side
                 logger.info("信号 %s %s %s @ %.2f", name, code, side, price)
             elif hasattr(mod, "watch"):
@@ -87,8 +90,23 @@ def run_signals(db: Session, day: date | None = None,
                 if reason:
                     reason["params"] = params
                     _save_signal(db, code, day, name, "watch", price, reason)
+                    produced[(name, code)].add("watch")
                     summary[name][code] = "watch"
                     logger.info("watch %s %s @ %.2f %s", name, code, price, reason)
+
+    # 清理重算后已失效的 side:唯一键含 side,数据修正后 buy -> watch/sell/
+    # 无信号时旧记录不会被 on_duplicate_key_update 覆盖,需要显式删除
+    for (name, code), sides in produced.items():
+        q = delete(Signal).where(
+            Signal.code == code,
+            Signal.date == day,
+            Signal.strategy == name,
+        )
+        if sides:
+            q = q.where(Signal.side.notin_(sides))
+        res = db.execute(q)
+        if res.rowcount:
+            logger.info("清理失效信号 %s %s %s: %d 条", name, code, day, res.rowcount)
     db.commit()
     return {"date": str(day), "signals": summary,
             "total": sum(len(v) for v in summary.values())}

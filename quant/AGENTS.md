@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-The FastAPI backend lives in `app/`. `app/main.py` wires the API and scheduler; route handlers are under `app/api/`; SQLAlchemy setup and `quant_*` models are in `app/db.py` and `app/models.py`. Market ingestion belongs in `app/data/` (including `universe.py` for the hs300/zz500 index pool), factor computation in `app/factors/`, stock selection in `app/selection/` (daily Top-30 pipeline + parameterised screener), strategy implementations in `app/strategy/strategies/` (single-name `positions()` and portfolio `target_weights()` contracts), portfolio logic in `app/portfolio/`, and simulation code in `app/backtest/` (vectorbt-based engine, parameter sweep, weekly batch evaluation). One-off scripts (pool backfill, lookahead check, engine regression baseline) live in `scripts/`.
+The FastAPI backend lives in `app/`. `app/main.py` wires the API and scheduler; route handlers are under `app/api/`; SQLAlchemy setup and `quant_*` models are in `app/db.py` and `app/models.py`. Market ingestion belongs in `app/data/` (including `universe.py` for the hs300/zz500 index pool), factor computation in `app/factors/`, stock selection in `app/selection/` (daily Top-30 pipeline + parameterised screener), strategy implementations in `app/strategy/strategies/` (single-name `positions()` and portfolio `target_weights()` contracts), portfolio logic in `app/portfolio/`, and simulation code in `app/backtest/` (vectorbt-based engine, parameter sweep, weekly batch evaluation). One-off scripts (pool backfill, index-membership history rebuild, lookahead check, engine regression baseline) live in `scripts/`.
 
 The Vue 3 frontend is in `web/`. Page-level components live in `web/src/views/`, reusable components in `web/src/components/`, and shared API/types in `web/src/api.ts`. Production assets are generated into `web/dist/` and served by FastAPI when present; do not edit generated files.
 
@@ -21,7 +21,7 @@ Use four-space indentation, `snake_case` functions/modules, `PascalCase` classes
 
 ## Testing Guidelines
 
-No automated test framework is currently configured. Before submitting, run `pnpm build`, exercise affected endpoints through `/docs` or `curl`, and verify database-backed flows against disposable data. New backend tests should use `tests/test_<feature>.py`; add pytest and its configuration in the same change. For frontend tests, use `*.spec.ts` and document the added runner.
+Backend regression tests use pytest: `uv run pytest tests/` (engine tests are synthetic and need no database). Before submitting, run `pnpm build`, exercise affected endpoints through `/docs` or `curl`, and verify database-backed flows against disposable data. New backend tests should use `tests/test_<feature>.py`. For frontend tests, use `*.spec.ts` and document the added runner.
 
 ## Commit & Pull Request Guidelines
 

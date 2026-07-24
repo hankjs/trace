@@ -20,6 +20,11 @@ dependencies = [
     "bcrypt>=4.1",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [tool.uv]
 package = false
 

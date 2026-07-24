@@ -19,8 +19,8 @@ from ..models import FactorDaily, StrategyEval
 from ..selection.pipeline import score_row
 from ..strategy.strategies import (PORTFOLIO_STRATEGIES, REGISTRY,
                                    SINGLE_STRATEGIES)
-from .engine import (DEFAULT_COSTS, _batch_single, _median_or_none,
-                     _mean_or_none, run_backtest)
+from .engine import (DEFAULT_COSTS, SINGLE_WARMUP_DAYS, _batch_single,
+                     _median_or_none, _mean_or_none, run_backtest)
 from ..data.ingest import load_bars_df
 
 logger = logging.getLogger(__name__)
@@ -59,17 +59,19 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
 
 def _eval_single(db: Session, strategy: str, codes: list[str],
                  start: date, end: date) -> dict:
+    """单标的策略批量评估。与普通回测同一口径:预热 + 完整序列算信号。"""
     mod = REGISTRY[strategy]
+    warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
     dfs, positions = {}, {}
     for code in codes:
-        df = load_bars_df(db, code, start=start, end=end)
-        if len(df) < 60:
+        df = load_bars_df(db, code, start=warmup_start, end=end)
+        if len(df) == 0 or int((df["date"] >= start).sum()) < 60:
             continue
         dfs[code] = df
         positions[code] = mod.positions(df, None)
     if not dfs:
         return {"error": "数据不足"}
-    results = _batch_single(dfs, positions, DEFAULT_COSTS)
+    results = _batch_single(dfs, positions, DEFAULT_COSTS, start)
     per = [r["metrics"] for r in results.values()]
     return {
         "codes": len(dfs),

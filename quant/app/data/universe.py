@@ -7,12 +7,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from ..models import IndexMember
+from ..models import IndexMember, Stock
 from . import baostock_client
 from .ingest import upsert_stock
 
@@ -62,6 +62,80 @@ def sync_all_indices(db: Session, today: date | None = None) -> dict:
     """同步全部指数名录"""
     with baostock_client.login_session():
         return {name: sync_index_members(db, name, today) for name in INDEX_NAMES}
+
+
+def rebuild_index_members(db: Session, index_name: str, start: date,
+                          end: date | None = None,
+                          step_days: int = 14) -> dict:
+    """按历史采样重建一个指数的成分区间(in_date/out_date),覆盖现有记录。
+
+    baostock 支持按日期查询历史时点成分(query_xxx_stocks(date=...));
+    从 start 起每 step_days 天采样一次,把连续在册段合并为区间。
+    粒度误差 <= step_days 天(在册/调出日期最多偏一个采样间隔)。
+    末尾再跑一次增量同步,把最后采样点到今日之间的变动对齐。
+
+    建议在 baostock_client.login_session() 内调用(采样点数 = 跨度/step)。
+    """
+    end = end or date.today()
+    if start >= end:
+        raise ValueError(f"start({start}) 必须早于 end({end})")
+
+    days: list[date] = []
+    d = start
+    while d <= end:
+        days.append(d)
+        d += timedelta(days=step_days)
+    if days[-1] != end:
+        days.append(end)
+
+    snapshots: list[tuple[date, dict[str, str]]] = []
+    for d in days:
+        df = baostock_client.fetch_index_members(index_name, day=d)
+        remote = {r.code: r.name for r in df.itertuples()}
+        if not remote:
+            # 空响应按异常处理,跳过该点(避免把整池误判为调出)
+            logger.warning("历史成分 %s %s: 远端空,跳过该采样点", index_name, d)
+            continue
+        snapshots.append((d, remote))
+    if not snapshots:
+        raise ValueError(f"{index_name} 历史成分采样全部为空,未重建")
+
+    # 连续在册段 -> (in_date, out_date) 区间;缺采样的段按前一点延续
+    intervals: list[dict] = []
+    open_since: dict[str, date] = {}
+    for day, members in snapshots:
+        for code in members:
+            if code not in open_since:
+                open_since[code] = day
+        for code in list(open_since):
+            if code not in members:
+                intervals.append({"code": code,
+                                  "in_date": open_since.pop(code),
+                                  "out_date": day})
+    for code, in_d in open_since.items():
+        intervals.append({"code": code, "in_date": in_d, "out_date": None})
+
+    # 历史股票的名称也补进 quant_stock(供 ST 过滤/展示),不动已有记录
+    names: dict[str, str] = {}
+    for _, members in snapshots:
+        names.update(members)
+    existing = {r[0] for r in db.execute(select(Stock.code)).all()}
+    for code, name in names.items():
+        if code not in existing:
+            db.add(Stock(code=code, name=name))
+
+    db.execute(delete(IndexMember).where(IndexMember.index_name == index_name))
+    db.execute(
+        IndexMember.__table__.insert(),
+        [{"index_name": index_name, **iv} for iv in intervals],
+    )
+    db.commit()
+    logger.info("成分重建 %s [%s, %s]: 采样 %d 点,区间 %d 条",
+                index_name, start, end, len(snapshots), len(intervals))
+
+    sync = sync_index_members(db, index_name, today=end)
+    return {"index": index_name, "samples": len(snapshots),
+            "intervals": len(intervals), "sync": sync}
 
 
 def current_pool(db: Session) -> list[str]:

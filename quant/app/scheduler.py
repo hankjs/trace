@@ -1,10 +1,13 @@
 """APScheduler 定时任务(3.x 稳定 API)。
 
 调度链(交易日,Asia/Shanghai;非交易日由"当日无数据"兜底自然空跑):
-- 16:30  池内+自选 日线增量(池内只走 baostock;自选股另做 akshare 对账)
-- 17:00  因子计算(quant_factor_daily)→ 选股池 Top 30(quant_pick)
-- 17:05  信号引擎(自选+选股池股票 × 全部单标的策略,含 watch)
-- 周五 17:30  批量策略评估(quant_strategy_eval)
+- 16:30  晚间流水线(单个串行作业,保证下游用到的数据完整):
+  池内+自选 日线增量(池内只走 baostock,单登录会话;自选另做 akshare 对账)
+  -> 因子计算(quant_factor_daily)+ 选股池 Top 30(quant_pick)
+  -> 信号引擎(自选+选股池股票 × 全部单标的策略,含 watch)
+  -> 周五再加批量策略评估(quant_strategy_eval)
+  历史拆分的 17:00/17:05/17:30 独立定时,在行情任务超时时会读到
+  "部分股票已更新、部分未更新"的数据,故合并为顺序作业。
 - 每月 1 日 09:00  成分股名录同步(quant_index_member)
 - 盘中 9:30-15:00 每 30 分钟:akshare 快照落 quant_snapshot(仍只采自选)
 """
@@ -18,7 +21,7 @@ from sqlalchemy import select
 
 from .backtest.evaluate import run_evaluation
 from .config import settings
-from .data import ingest, universe
+from .data import baostock_client, ingest, universe
 from .db import SessionLocal
 from .models import Pick, Stock
 from .selection.pipeline import run_selection
@@ -41,7 +44,7 @@ def _watch_codes() -> list[str]:
 
 
 def job_daily_bars() -> None:
-    """16:30 盘后:池内日线增量(baostock)+ 自选股增量并对账"""
+    """盘后:池内日线增量(baostock 单登录会话)+ 自选股增量并对账"""
     if not _is_weekday():
         logger.info("非工作日,跳过盘后任务")
         return
@@ -50,12 +53,14 @@ def job_daily_bars() -> None:
         watch = _watch_codes()
         watch_set = set(watch)
         logger.info("盘后日线开始: 池内 %d 只,自选 %d 只", len(pool), len(watch))
-        for code in pool:
-            try:
-                # 池内只走 baostock(逐只 akshare 对账太慢);自选才对账
-                ingest.ingest_daily(db, code, reconcile=code in watch_set)
-            except Exception:  # noqa: BLE001 - 单只失败不影响其他
-                logger.exception("盘后日线失败 %s", code)
+        # 800 只复用一次 baostock 登录,避免逐只 login/logout 拖慢任务
+        with baostock_client.login_session():
+            for code in pool:
+                try:
+                    # 池内只走 baostock(逐只 akshare 对账太慢);自选才对账
+                    ingest.ingest_daily(db, code, reconcile=code in watch_set)
+                except Exception:  # noqa: BLE001 - 单只失败不影响其他
+                    logger.exception("盘后日线失败 %s", code)
         for code in watch_set - set(pool):
             try:
                 ingest.ingest_daily(db, code, reconcile=True)
@@ -96,8 +101,24 @@ def job_signals() -> None:
             logger.exception("信号计算失败")
 
 
+def job_evening_pipeline() -> None:
+    """16:30 盘后流水线:日线 -> 因子+选股 -> 信号 ->(周五)批量评估。
+
+    串行执行,下游任务只在数据完整后才开始;子任务各自带 weekday 判断
+    与异常隔离,单个环节失败不影响后续环节继续尝试。
+    """
+    if not _is_weekday():
+        logger.info("非工作日,跳过盘后流水线")
+        return
+    job_daily_bars()
+    job_factors_and_selection()
+    job_signals()
+    if datetime.now().weekday() == 4:  # 周五
+        job_weekly_eval()
+
+
 def job_weekly_eval() -> None:
-    """周五 17:30 批量策略评估"""
+    """批量策略评估(由晚间流水线在周五串行调用,也可手动触发)"""
     if not _is_weekday():
         return
     with SessionLocal() as db:
@@ -135,24 +156,10 @@ def job_intraday_snapshot() -> None:
 
 def start_scheduler() -> BackgroundScheduler:
     scheduler.add_job(
-        job_daily_bars, "cron",
+        job_evening_pipeline, "cron",
         day_of_week="mon-fri", hour=16, minute=30,
-        id="daily_bars", replace_existing=True,
-    )
-    scheduler.add_job(
-        job_factors_and_selection, "cron",
-        day_of_week="mon-fri", hour=17, minute=0,
-        id="factors_and_selection", replace_existing=True,
-    )
-    scheduler.add_job(
-        job_signals, "cron",
-        day_of_week="mon-fri", hour=17, minute=5,
-        id="signals", replace_existing=True,
-    )
-    scheduler.add_job(
-        job_weekly_eval, "cron",
-        day_of_week="fri", hour=17, minute=30,
-        id="weekly_eval", replace_existing=True,
+        id="evening_pipeline", replace_existing=True,
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
         job_sync_index_members, "cron",
@@ -165,8 +172,8 @@ def start_scheduler() -> BackgroundScheduler:
         id="intraday_snapshot", replace_existing=True,
     )
     scheduler.start()
-    logger.info("scheduler 已启动: 16:30 日线 -> 17:00 因子+选股 -> 17:05 信号; "
-                "周五 17:30 评估;每月 1 日成分股同步;盘中每 30 分钟快照")
+    logger.info("scheduler 已启动: 16:30 盘后流水线(日线->因子+选股->信号,"
+                "周五加评估);每月 1 日成分股同步;盘中每 30 分钟快照")
     return scheduler
 
 

@@ -130,12 +130,15 @@ def run_selection(db: Session, day: date | None = None,
     top = picked[:top_n]
 
     db.execute(delete(Pick).where(Pick.date == day))
-    db.execute(
-        Pick.__table__.insert(),
-        [{"date": day, "code": r["code"], "score": r["score"], "rank": i + 1,
-          "factors": {k: r[k] for k in FACTOR_COLUMNS}}
-         for i, r in enumerate(top)],
-    )
+    if top:
+        # 空结果(节假日/数据未更新/全部被过滤)跳过批量 insert:
+        # SQLAlchemy 对空参数列表会尝试默认值插入,违反非空约束
+        db.execute(
+            Pick.__table__.insert(),
+            [{"date": day, "code": r["code"], "score": r["score"], "rank": i + 1,
+              "factors": {k: r[k] for k in FACTOR_COLUMNS}}
+             for i, r in enumerate(top)],
+        )
     db.commit()
     logger.info("选股 %s: 池 %d,有效 %d,过滤 %s,入选 %d",
                 day, len(codes), len(rows), n_filtered, len(top))

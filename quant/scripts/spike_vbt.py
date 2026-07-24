@@ -25,7 +25,9 @@ END = date.today()
 START = END - timedelta(days=365)
 
 # 切换时手写引擎基准(ma_cross 5/20,近 1 年)
-BASELINE = {"total_return": -0.0944, "trade_count": 15}
+# 2026-07 更新:印花税进入撮合 + 起点前已持仓首日合成建仓(本窗口起点仓位为 1,
+# 多一次完整往返:15 -> 17 笔),原基准 -0.0944/15 记录的是旧口径的漏建仓结果
+BASELINE = {"total_return": -0.1228, "trade_count": 17}
 
 
 def main() -> None:
