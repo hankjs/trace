@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref } from "vue";
+import { API_BASE } from "../config";
 
 const logs = ref<string[]>([]);
 const running = ref(false);
@@ -54,9 +55,7 @@ async function runRealTest() {
       max_tokens: 2048,
     });
 
-    // Detect API base
-    const apiBase = (import.meta as any).env?.VITE_API_BASE || "http://localhost:3000";
-    const url = `${apiBase}/api/llm/completion`;
+    const url = `${API_BASE}/api/llm/completion`;
 
     log(`Starting real SSE test → ${url}`);
 
