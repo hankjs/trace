@@ -5,12 +5,13 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import admin, backtest, market, portfolio, selection, signals, watchlist
+from .api import admin, auth, backtest, market, portfolio, selection, signals, watchlist
+from .auth import require_user
 from .config import settings
 from .db import Base, engine
 from . import models  # noqa: F401 - 确保模型注册到 Base.metadata
@@ -42,13 +43,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(market.router)
-app.include_router(watchlist.router)
-app.include_router(signals.router)
-app.include_router(portfolio.router)
-app.include_router(backtest.router)
-app.include_router(selection.router)
-app.include_router(admin.router)
+app.include_router(auth.router)
+
+# 业务接口全部要求登录;/api/auth/login 与 /api/health 保持公开
+_auth = [Depends(require_user)]
+app.include_router(market.router, dependencies=_auth)
+app.include_router(watchlist.router, dependencies=_auth)
+app.include_router(signals.router, dependencies=_auth)
+app.include_router(portfolio.router, dependencies=_auth)
+app.include_router(backtest.router, dependencies=_auth)
+app.include_router(selection.router, dependencies=_auth)
+app.include_router(admin.router, dependencies=_auth)
 
 
 @app.get("/api/health")

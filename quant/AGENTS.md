@@ -29,4 +29,4 @@ History follows Conventional Commits, for example `feat: 添加量化` and `fix(
 
 ## Security & Configuration
 
-Keep database URLs in the repository-level or local `config.toml`; both are ignored and must not be committed. Preserve the `quant_` table prefix and never add automatic trade execution: this project is an information and backtesting system only.
+Keep database URLs in the repository-level or local `config.toml`; both are ignored and must not be committed. Preserve the `quant_` table prefix and never add automatic trade execution: this project is an information and backtesting system only. Auth shares the server's `users` table (read-only, raw SQL in `app/auth.py`) and JWT secret: `jwt_secret` is read from the root `[server].jwt_secret` or overridden by `[quant].jwt_secret` — on the production host (no root config.toml) it must be set in `quant/config.toml`.

@@ -16,6 +16,8 @@ dependencies = [
     "apscheduler>=3.10,<4",
     "pydantic>=2.0",
     "vectorbt>=1.1",
+    "pyjwt>=2.8",
+    "bcrypt>=4.1",
 ]
 
 [tool.uv]

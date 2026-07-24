@@ -15,16 +15,19 @@ class Settings:
         # 根 config.toml 可选:本地开发从 [server].database_url 读库,
         # 线上部署只有 quant/config.toml 时不要求根配置存在。
         database_url = ""
+        jwt_secret = ""
         root_cfg = REPO_ROOT / "config.toml"
         if root_cfg.exists():
             with open(root_cfg, "rb") as f:
                 root = tomllib.load(f)
             database_url = root.get("server", {}).get("database_url", "")
+            jwt_secret = root.get("server", {}).get("jwt_secret", "")
         if database_url.startswith("mysql://"):
             database_url = "mysql+pymysql://" + database_url[len("mysql://"):]
 
         # 默认值
         self.database_url: str = database_url
+        self.jwt_secret: str = jwt_secret
         self.cors_origins: list[str] = [
             "http://localhost:5173",
             "http://localhost:3000",
@@ -49,11 +52,18 @@ class Settings:
                 self.snapshot_retention_days = int(local["snapshot_retention_days"])
             if local.get("backfill_start"):
                 self.backfill_start = str(local["backfill_start"])
+            if local.get("jwt_secret"):
+                self.jwt_secret = str(local["jwt_secret"])
 
         if not self.database_url:
             raise ValueError(
                 "缺少数据库配置: 请在根 config.toml 配置 [server].database_url, "
                 "或在 quant/config.toml 配置 [quant].database_url"
+            )
+        if not self.jwt_secret:
+            raise ValueError(
+                "缺少 JWT 密钥配置: 请在根 config.toml 配置 [server].jwt_secret, "
+                "或在 quant/config.toml 配置 [quant].jwt_secret"
             )
 
 

@@ -1,10 +1,38 @@
 /** 后端 /api 封装:统一 fetch、错误处理(HTTP 错误取 FastAPI 的 detail)。 */
 
+const TOKEN_KEY = 'quant_token'
+const USERNAME_KEY = 'quant_username'
+
+export function getToken(): string | null {
+  return localStorage.getItem(TOKEN_KEY)
+}
+
+export function setAuth(token: string, username: string) {
+  localStorage.setItem(TOKEN_KEY, token)
+  localStorage.setItem(USERNAME_KEY, username)
+}
+
+export function clearAuth() {
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USERNAME_KEY)
+}
+
+export function currentUsername(): string {
+  return localStorage.getItem(USERNAME_KEY) ?? ''
+}
+
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(url, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  })
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  const token = getToken()
+  if (token) headers.Authorization = `Bearer ${token}`
+  const res = await fetch(url, { headers, ...options })
+  if (res.status === 401) {
+    // 未登录或 token 过期:清掉凭证回登录页(登录接口本身除外,由页面提示错误)
+    if (!url.startsWith('/api/auth/login')) {
+      clearAuth()
+      location.href = '/login'
+    }
+  }
   if (!res.ok) {
     let msg = `请求失败: ${res.status}`
     try {
@@ -188,6 +216,13 @@ export interface SweepResult {
 }
 
 export const api = {
+  login(username: string, password: string) {
+    return request<{ token: string; username: string }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password }),
+    })
+  },
+
   kline(code: string, start?: string, end?: string) {
     const params = new URLSearchParams({ code })
     if (start) params.set('start', start)

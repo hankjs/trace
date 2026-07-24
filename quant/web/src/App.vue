@@ -1,4 +1,18 @@
 <script setup lang="ts">
+import { computed } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { clearAuth, currentUsername } from './api'
+
+const route = useRoute()
+const router = useRouter()
+const isLoginPage = computed(() => route.path === '/login')
+const username = computed(() => currentUsername())
+
+function logout() {
+  clearAuth()
+  router.push('/login')
+}
+
 const nav = [
   { to: '/', label: '看板', exact: true },
   { to: '/picks', label: '选股池', exact: false },
@@ -12,7 +26,7 @@ const nav = [
 
 <template>
   <div class="min-h-screen">
-    <header class="border-b border-border bg-surface-raised">
+    <header v-if="!isLoginPage" class="border-b border-border bg-surface-raised">
       <div class="mx-auto flex max-w-6xl items-center gap-6 px-4 py-3">
         <router-link to="/" class="text-lg font-semibold tracking-wide">
           quant <span class="text-sm font-normal text-text-tertiary">量化看板</span>
@@ -29,6 +43,15 @@ const nav = [
             {{ item.label }}
           </router-link>
         </nav>
+        <div class="ml-auto flex items-center gap-3 text-sm">
+          <span class="text-text-tertiary">{{ username }}</span>
+          <button
+            class="rounded-md px-3 py-1.5 text-text-secondary hover:bg-hover hover:text-text-primary"
+            @click="logout"
+          >
+            退出
+          </button>
+        </div>
       </div>
     </header>
     <main class="mx-auto max-w-6xl px-4 py-6">
