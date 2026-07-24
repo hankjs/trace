@@ -11,8 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..data import ingest
+from ..backtest.evaluate import run_evaluation
+from ..data import ingest, universe
 from ..db import SessionLocal, get_db
+from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -80,3 +82,47 @@ async def import_stocks():
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"股票列表导入失败: {e}")
     return {"imported": n}
+
+
+@router.post("/sync-index-members")
+async def sync_index_members():
+    """手动同步成分股名录(hs300 + zz500)"""
+    def _job() -> dict:
+        with SessionLocal() as db:
+            return universe.sync_all_indices(db)
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _job)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"成分股同步失败: {e}")
+
+
+@router.post("/run-selection")
+async def run_selection_now(date_: date | None = Query(None, alias="date"),
+                            top_n: int = 30):
+    """手动触发指定日期的因子计算 + 选股(默认今天;该日无数据则空结果)"""
+    def _job() -> dict:
+        with SessionLocal() as db:
+            return run_selection(db, day=date_, top_n=top_n)
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _job)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"选股失败: {e}")
+
+
+@router.post("/run-eval")
+async def run_eval_now(date_: date | None = Query(None, alias="date"),
+                       period_days: int = 365):
+    """手动触发批量策略评估(落 quant_strategy_eval)"""
+    def _job() -> dict:
+        with SessionLocal() as db:
+            return run_evaluation(db, day=date_, period_days=period_days)
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _job)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"批量评估失败: {e}")

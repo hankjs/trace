@@ -1,9 +1,12 @@
 <script setup lang="ts">
 const nav = [
   { to: '/', label: '看板', exact: true },
+  { to: '/picks', label: '选股池', exact: false },
+  { to: '/screener', label: '筛选', exact: false },
   { to: '/signals', label: '信号', exact: false },
   { to: '/portfolio', label: '持仓', exact: false },
   { to: '/backtest', label: '回测', exact: false },
+  { to: '/leaderboard', label: '排行', exact: false },
 ]
 </script>
 

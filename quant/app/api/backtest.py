@@ -1,4 +1,4 @@
-"""回测:发起(同步执行)与结果查询。"""
+"""回测:发起(同步执行)、参数扫描、批量评估排行、结果查询。"""
 from __future__ import annotations
 
 from datetime import date
@@ -8,26 +8,59 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..backtest.engine import run_backtest
+from ..backtest.engine import run_backtest, run_sweep
+from ..backtest.evaluate import leaderboard
+from ..data.universe import current_pool
 from ..db import get_db
 from ..models import BacktestEquity, BacktestRun
-from ..strategy.strategies import REGISTRY
+from ..strategy.strategies import PORTFOLIO_STRATEGIES, REGISTRY, SINGLE_STRATEGIES
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
 
 class BacktestIn(BaseModel):
     strategy: str
-    codes: list[str]
+    codes: list[str] = []  # 组合策略可留空(默认当前股票池)
     start: date
     end: date
     params: dict = {}
     costs: dict = {}  # 可选覆盖 commission / stamp_tax / slippage
 
 
+class SweepIn(BaseModel):
+    strategy: str
+    codes: list[str]
+    start: date
+    end: date
+    param_grid: dict  # {参数名: [候选值]},笛卡尔积逐组回测
+    costs: dict = {}
+
+
 @router.get("/strategies")
 def list_strategies():
-    return {"strategies": sorted(REGISTRY.keys())}
+    return {"strategies": sorted(REGISTRY.keys()),
+            "single": sorted(SINGLE_STRATEGIES),
+            "portfolio": sorted(PORTFOLIO_STRATEGIES)}
+
+
+@router.post("/sweep")
+def sweep(body: SweepIn, db: Session = Depends(get_db)):
+    """参数扫描:逐组参数批量回测,返回各组 metrics(不落库)"""
+    if body.strategy not in REGISTRY:
+        raise HTTPException(400, f"未知策略 {body.strategy},可选: {sorted(REGISTRY)}")
+    if body.start >= body.end:
+        raise HTTPException(400, "start 必须早于 end")
+    try:
+        return run_sweep(db, body.strategy, [c.lower() for c in body.codes],
+                         body.start, body.end, body.param_grid, body.costs)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@router.get("/leaderboard")
+def get_leaderboard(db: Session = Depends(get_db)):
+    """策略排行:最近一轮批量评估(quant_strategy_eval)汇总"""
+    return leaderboard(db)
 
 
 @router.post("", status_code=201)
@@ -36,8 +69,13 @@ def create_backtest(body: BacktestIn, db: Session = Depends(get_db)):
         raise HTTPException(400, f"未知策略 {body.strategy},可选: {sorted(REGISTRY)}")
     if body.start >= body.end:
         raise HTTPException(400, "start 必须早于 end")
+    codes = [c.lower() for c in body.codes]
+    if body.strategy in PORTFOLIO_STRATEGIES and not codes:
+        codes = current_pool(db)
+    if not codes:
+        raise HTTPException(400, "codes 不能为空")
     try:
-        result = run_backtest(db, body.strategy, [c.lower() for c in body.codes],
+        result = run_backtest(db, body.strategy, codes,
                               body.start, body.end, body.params, body.costs)
     except ValueError as e:
         raise HTTPException(400, str(e))

@@ -15,6 +15,7 @@ dependencies = [
     "akshare>=1.14",
     "apscheduler>=3.10,<4",
     "pydantic>=2.0",
+    "vectorbt>=1.1",
 ]
 
 [tool.uv]

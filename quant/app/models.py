@@ -111,6 +111,68 @@ class BacktestRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class IndexMember(Base):
+    """指数成分股名录。out_date 为 NULL 表示当前在册。"""
+
+    __tablename__ = "quant_index_member"
+    __table_args__ = (
+        UniqueConstraint("index_name", "code", "in_date", name="uq_index_member"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    index_name: Mapped[str] = mapped_column(String(16), index=True)  # hs300 / zz500
+    code: Mapped[str] = mapped_column(String(16), index=True)
+    in_date: Mapped[date] = mapped_column(Date)
+    out_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+
+
+class FactorDaily(Base):
+    """每日因子值(股票池向量化计算,供选股/筛选用)"""
+
+    __tablename__ = "quant_factor_daily"
+    __table_args__ = (UniqueConstraint("code", "date", name="uq_factor_code_date"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(16), index=True)
+    date: Mapped[date] = mapped_column(Date, index=True)
+    mom20: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mom60: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rsi14: Mapped[float | None] = mapped_column(Float, nullable=True)
+    atr_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    vol_ratio5: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ma20_slope: Mapped[float | None] = mapped_column(Float, nullable=True)
+    amount_avg20: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class Pick(Base):
+    """每日选股池(Top N)。factors 为当日因子快照 JSON。"""
+
+    __tablename__ = "quant_pick"
+    __table_args__ = (UniqueConstraint("date", "code", name="uq_pick_date_code"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    date: Mapped[date] = mapped_column(Date, index=True)
+    code: Mapped[str] = mapped_column(String(16), index=True)
+    score: Mapped[float] = mapped_column(Float)
+    rank: Mapped[int] = mapped_column(Integer)
+    factors: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+
+class StrategyEval(Base):
+    """策略批量评估结果。scope: single:xxx / pool_top50 / pool。"""
+
+    __tablename__ = "quant_strategy_eval"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy: Mapped[str] = mapped_column(String(64), index=True)
+    params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    scope: Mapped[str] = mapped_column(String(64), index=True)
+    start: Mapped[date] = mapped_column(Date)
+    end: Mapped[date] = mapped_column(Date)
+    metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    run_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+
 class BacktestEquity(Base):
     """回测净值曲线"""
 

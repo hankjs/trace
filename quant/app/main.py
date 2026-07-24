@@ -10,7 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import admin, backtest, market, portfolio, signals, watchlist
+from .api import admin, backtest, market, portfolio, selection, signals, watchlist
 from .config import settings
 from .db import Base, engine
 from . import models  # noqa: F401 - 确保模型注册到 Base.metadata
@@ -47,6 +47,7 @@ app.include_router(watchlist.router)
 app.include_router(signals.router)
 app.include_router(portfolio.router)
 app.include_router(backtest.router)
+app.include_router(selection.router)
 app.include_router(admin.router)
 
 

@@ -8,7 +8,9 @@ from __future__ import annotations
 import pandas as pd
 
 NAME = "breakout"
+KIND = "single"
 DEFAULT_PARAMS = {"entry": 20, "exit": 10}
+WATCH_HIGH_DIST = 0.02  # 距 N 日新高 <2% 时给 watch 预警
 
 
 def positions(df: pd.DataFrame, params: dict | None = None) -> pd.Series:
@@ -27,3 +29,21 @@ def positions(df: pd.DataFrame, params: dict | None = None) -> pd.Series:
             holding = 0
         pos.iat[i] = holding
     return pos
+
+
+def watch(df: pd.DataFrame, params: dict | None = None) -> dict | None:
+    """临近触发:空仓状态下收盘距入场线(N 日新高)<2% 时预警"""
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    pos = positions(df, params)
+    if pos.empty or pos.iat[-1] != 0:
+        return None
+    entry_line = df["high"].shift(1).rolling(int(p["entry"])).max()
+    if pd.isna(entry_line.iat[-1]):
+        return None
+    c = float(df["close"].iat[-1])
+    line = float(entry_line.iat[-1])
+    dist = line / c - 1
+    if 0 < dist < WATCH_HIGH_DIST:
+        return {"type": "near_entry_line", "close": c,
+                "entry_line": round(line, 3), "dist": round(dist, 4)}
+    return None

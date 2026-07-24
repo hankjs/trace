@@ -104,6 +104,89 @@ export interface BacktestResult {
   equity: { date: string; equity: number }[]
 }
 
+/** 选股池因子(字段以后端实际响应为准,全部可选) */
+export interface PickFactors {
+  mom20?: number
+  mom60?: number
+  rsi14?: number
+  atr_pct?: number
+  vol_ratio5?: number
+  ma20_slope?: number
+  amount_avg20?: number
+  [key: string]: number | undefined
+}
+
+export interface PickItem {
+  rank: number
+  code: string
+  name: string
+  score: number
+  factors: PickFactors
+  /** 相对前一交易日的变动标记:'new' 新进等(字段名/取值做防御性适配) */
+  change?: string | null
+  is_new?: boolean
+  dropped?: boolean
+}
+
+export interface PicksResult {
+  date: string
+  prev_date?: string | null
+  items: PickItem[]
+  /** 调出名单:可能是对象或纯代码字符串 */
+  dropped?: (PickItem | string)[]
+}
+
+export interface ScreenerItem {
+  code: string
+  name: string
+  close: number
+  /** 涨跌幅:实际响应为 pct_chg,契约曾用 chg_pct,两者都兼容 */
+  pct_chg?: number
+  chg_pct?: number
+  high_dist?: number
+  mom20?: number
+  mom60?: number
+  rsi14?: number
+  vol_ratio5?: number
+  amount_avg20?: number
+  [key: string]: unknown
+}
+
+export interface ScreenerResult {
+  date?: string
+  total?: number
+  count?: number
+  items: ScreenerItem[]
+}
+
+export interface LeaderboardItem {
+  strategy: string
+  scope: string
+  start: string
+  end: string
+  metrics: Record<string, number>
+  run_at: string
+}
+
+/** 参数扫描指标:聚合口径可能带 _mean/_median 后缀,读取时用 metricOf 兜底 */
+export interface SweepMetrics {
+  [key: string]: number | undefined
+}
+
+export interface SweepResultItem {
+  params: Record<string, number>
+  metrics: SweepMetrics
+  per_code?: Record<string, Record<string, number>>
+}
+
+export interface SweepResult {
+  strategy: string
+  codes: string[]
+  start: string
+  end: string
+  results: SweepResultItem[]
+}
+
 export const api = {
   kline(code: string, start?: string, end?: string) {
     const params = new URLSearchParams({ code })
@@ -178,6 +261,48 @@ export const api = {
 
   getBacktest(runId: number) {
     return request<BacktestResult>(`/api/backtest/${runId}`)
+  },
+
+  picks(date?: string) {
+    const params = new URLSearchParams()
+    if (date) params.set('date', date)
+    const qs = params.toString()
+    return request<PicksResult>(`/api/selection/picks${qs ? `?${qs}` : ''}`)
+  },
+
+  screener(filters: {
+    chg_min?: number
+    chg_max?: number
+    vol_ratio_min?: number
+    ma_bull?: boolean
+    near_high_days?: number
+    amount_min?: number
+  } = {}) {
+    const params = new URLSearchParams()
+    if (filters.chg_min !== undefined) params.set('chg_min', String(filters.chg_min))
+    if (filters.chg_max !== undefined) params.set('chg_max', String(filters.chg_max))
+    if (filters.vol_ratio_min !== undefined) params.set('vol_ratio_min', String(filters.vol_ratio_min))
+    if (filters.ma_bull) params.set('ma_bull', 'true')
+    if (filters.near_high_days !== undefined) params.set('near_high_days', String(filters.near_high_days))
+    if (filters.amount_min !== undefined) params.set('amount_min', String(filters.amount_min))
+    return request<ScreenerResult>(`/api/selection/screener?${params}`)
+  },
+
+  leaderboard() {
+    return request<{ run_at?: string; items: LeaderboardItem[] }>('/api/backtest/leaderboard')
+  },
+
+  sweepBacktest(body: {
+    strategy: string
+    codes: string[]
+    start: string
+    end: string
+    param_grid: Record<string, number[]>
+  }) {
+    return request<SweepResult>('/api/backtest/sweep', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
   },
 
   backfill(code: string, start?: string, end?: string) {
