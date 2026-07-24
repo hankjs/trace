@@ -402,7 +402,8 @@ async fn kimi_list_dir(state: &Arc<AppState>, binding: &WeixinBinding, text: &st
             }
         }
     };
-    match client_shell(state, binding, &format!("ls -la {}", sh_quote(&path))).await {
+    // 微信聊天等宽对齐无效，-1F 一名一行、目录带 / 后缀，方便挑选 /cd 目标
+    match client_shell(state, binding, &format!("ls -1F {}", sh_quote(&path))).await {
         Ok(out) => {
             let out = out.trim_end();
             if out.is_empty() {
