@@ -48,6 +48,8 @@ def import_stock_list(db: Session) -> int:
 
 def upsert_bars(db: Session, code: str, df: pd.DataFrame) -> int:
     """日线 upsert(code+date 唯一键)"""
+    # 长期停牌股可能返回 OHLC 缺失的行,无法入库,直接丢弃
+    df = df.dropna(subset=["close"])
     if df.empty:
         return 0
     rows = [
