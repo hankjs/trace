@@ -152,6 +152,30 @@ join 与乘法。当前选择的是渐进方案：读取路径不动，先建立
 
 ## 6. 股票池抽象
 
+### 可见性：为什么不用 `user_id IS NULL`
+
+```
+quant_pool(id, kind, ref, name, min_list_days, owner_id NOT NULL, is_system)
+quant_pool_grant(pool_id, user_id, can_edit)
+quant_pool_member(pool_id, code)              ← 池与股票,只存代码
+```
+
+可见性 = `is_system` OR `owner_id` 是我 OR `grant` 里有我的行，收成
+`api/pools.py` 的 `visible_to(user_id)` 一个函数。
+
+早先用 `user_id IS NULL` 表示「系统级共享」，有三个问题：
+
+1. **唯一约束失效** —— `UniqueConstraint("user_id", "name")` 对预置池完全不起作用：SQL 里 NULL 互不相等，实测可插入 3 条同名系统池而不报错，而用户池的同名被正确拦住。**保护恰好在最需要它的地方失灵** —— 预置池是全用户共用的，重复的影响面最大。
+2. 可见性条件 `(user_id IS NULL) OR (user_id = :uid)` 散落 5 处，漏一次就是越权读取或漏掉预置池。
+3. 只能表达「我的」和「所有人的」，没有「分享给特定用户」。
+
+两个设计取舍：
+
+- **系统池归哨兵 UUID**（`00000000-...`），不指向 `users` 表的真实行。预置池不该因 admin 被删或换人而失去归属，也不该让「属于某人」与「系统级」混淆。代价是 `owner_id` 不能加 `users` 外键。
+- **系统池不在 `grant` 表插行**，靠 `is_system` 短路。否则每个新用户注册都要批量插授权行、新增系统池还要回填所有存量用户，漏一步就有人看不到预置池。`grant` 表只存真实的分享关系。
+
+### kind 的解析口径
+
 设计意图是把股票池统一抽象为 `pool_id` + `kind` 分派：
 
 | kind | 成员解析 | point-in-time |
