@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import date, datetime
+from datetime import date
 
 import akshare as ak
 import pandas as pd
+
+from .clock import naive_now_cst
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +90,7 @@ def fetch_spot_snapshot() -> pd.DataFrame:
     except Exception:
         logger.warning("东财快照不可用,降级为新浪源")
         out = _retry(_spot_sina, retries=2, delay=2.0)
-    out["ts"] = datetime.now().replace(microsecond=0)
+    out["ts"] = naive_now_cst().replace(microsecond=0)
     return out.dropna(subset=["price"])
 
 
