@@ -169,7 +169,7 @@ class Trade(Base):
     __tablename__ = "quant_trade"
 
     id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
-    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     trade_date: Mapped[date] = mapped_column(Date)
     side: Mapped[str] = mapped_column(String(8))  # buy / sell
@@ -185,7 +185,7 @@ class BacktestRun(Base):
     __tablename__ = "quant_backtest_run"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     strategy: Mapped[str] = mapped_column(String(64))
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     costs: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 回测复现:固化当时费率
@@ -306,7 +306,7 @@ class StrategyEval(Base):
     strategy: Mapped[str] = mapped_column(String(64), index=True)
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     scope: Mapped[str] = mapped_column(String(64), index=True)
-    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    batch_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     pool_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 评估所用股票池
     start: Mapped[date] = mapped_column(Date)
     end: Mapped[date] = mapped_column(Date)
@@ -342,6 +342,8 @@ class Pool(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     kind: Mapped[str] = mapped_column(String(16), index=True)  # index / all / static
     ref: Mapped[str | None] = mapped_column(String(32), nullable=True)  # 如 hs300_zz500
+    # NULL 是有意义的:表示系统级预置池,全用户共享。故此列不随
+    # quant_trade/quant_backtest_run 的 user_id 一起收紧为 NOT NULL。
     user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(64), default="")
     min_list_days: Mapped[int] = mapped_column(Integer, default=60)

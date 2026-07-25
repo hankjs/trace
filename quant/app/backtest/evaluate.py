@@ -154,15 +154,9 @@ def leaderboard(db: Session, limit: int = 50) -> dict:
     if latest is None:
         return {"run_at": None, "batch_id": None, "items": []}
     batch_id, latest_run = latest
-    if batch_id is None:
-        # 历史数据(batch_id 落地前写入的行)没有批次号,退回按 run_at 取单行
-        rows = db.execute(
-            select(StrategyEval).where(StrategyEval.run_at == latest_run)
-        ).scalars().all()
-    else:
-        rows = db.execute(
-            select(StrategyEval).where(StrategyEval.batch_id == batch_id)
-        ).scalars().all()
+    rows = db.execute(
+        select(StrategyEval).where(StrategyEval.batch_id == batch_id)
+    ).scalars().all()
 
     def sort_key(r: StrategyEval) -> float:
         m = r.metrics or {}

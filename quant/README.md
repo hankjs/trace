@@ -54,15 +54,15 @@ Swagger UI：`http://localhost:8100/docs`。
 `database_url`、`jwt_secret`、`cors_origins`、`snapshot_retention_days` 和
 `backfill_start`。配置文件均不得提交。
 
-后端启动时会通过 SQLAlchemy 创建缺失的 `quant_*` 表，并幂等升级估值/财报版本
-唯一键以及用户所有者字段，然后启动下述自动调度任务。
-
-从旧版共享自选和账本升级时，旧数据默认保持未归属并对普通用户不可见。确认目标用户
-的 `users.id` 后，显式执行一次：
+Schema 由 Alembic 管理，**后端启动时不再建表或改表**。首次部署与升级都需显式执行：
 
 ```bash
-uv run python scripts/claim_legacy_user_data.py --user-id 1
+uv run alembic upgrade head
 ```
+
+`scripts/verify_migration_parity.py` 会校验「全新库 `upgrade head`」与 `models.py`
+的 `create_all` 产出一致，防止两条路径漂移。迁移的顺序约束与实测踩坑见
+[`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) 第 6 节。
 
 除 `/api/health` 和 `/api/auth/login` 外，业务接口需要：
 

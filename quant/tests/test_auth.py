@@ -41,7 +41,13 @@ def test_new_token_uses_standard_string_subject():
     assert require_user(_request(token))["username"] == "tester"
 
 
-def test_require_user_accepts_legacy_numeric_subject():
+def test_require_user_rejects_non_string_subject():
+    """sub 必须是字符串。
+
+    共享 users.id 是 VARCHAR(36) UUID,Rust 侧 Claims.sub 也是 String,所以
+    数字 sub 只可能来自伪造或错误签发的 token —— 早先为「历史遗留」保留的
+    verify_sub=False 放宽没有真实数据支撑,已移除(库中仅 1 个用户,sub 为 UUID)。
+    """
     token = jwt.encode(
         {
             "sub": 42,
@@ -52,7 +58,9 @@ def test_require_user_accepts_legacy_numeric_subject():
         settings.jwt_secret,
         algorithm="HS256",
     )
-    assert require_user(_request(token))["sub"] == 42
+    with pytest.raises(HTTPException) as exc:
+        require_user(_request(token))
+    assert exc.value.status_code == 401
 
 
 def test_require_admin_rejects_regular_user():

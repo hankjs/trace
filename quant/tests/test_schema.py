@@ -57,7 +57,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0008_adjust_factor_source"}
+    assert heads == {"0009_tighten_not_null"}
     assert current_heads(migrated_db) == heads
 
 
@@ -93,13 +93,19 @@ def test_all_expected_tables_exist(migrated_db):
     ("table", "nullable"),
     [
         ("quant_watchlist", False),
-        ("quant_trade", True),
-        ("quant_backtest_run", True),
+        ("quant_trade", False),
+        ("quant_backtest_run", False),
+        # quant_pool 的 NULL 有意义:系统级预置池,全用户共享
         ("quant_pool", True),
     ],
 )
 def test_user_id_is_varchar_36(migrated_db, table, nullable):
-    """共享 users.id 是 VARCHAR(36) UUID,量化侧必须同类型,否则全线 401。"""
+    """共享 users.id 是 VARCHAR(36) UUID,量化侧必须同类型,否则全线 401。
+
+    可空性表达真实约束:系统尚未运营,库中「历史数据」经核实全是开发期测试
+    垃圾(已备份后清空),没有遗留数据要兼容,故 trade/backtest_run 的 user_id
+    收紧为 NOT NULL(0009)。quant_pool 例外 —— NULL 表示预置池。
+    """
     column = _columns(migrated_db, table)["user_id"]
     assert str(column["type"]).upper() == "VARCHAR(36)"
     assert bool(column["nullable"]) is nullable
@@ -349,10 +355,17 @@ def test_snapshot_pk_types_upgraded_to_bigint():
 # --- §3.1 NOT NULL 收紧(默认 no-op) -----------------------------------
 
 
-def test_not_null_revision_is_noop_by_default(migrated_db):
-    """默认路径下 user_id 仍可空,让遗留数据先能被认领脚本处理。"""
+def test_user_owned_columns_are_not_null_after_0009(migrated_db):
+    """0009 无条件收紧 user_id / batch_id 为 NOT NULL。
+
+    0006 曾设计成需环境变量显式开启的 no-op,理由是「人类无从决定时机」——
+    当时生产库有遗留的 user_id IS NULL 行。现在时机明确:系统未运营,那批行
+    经核实全是开发期测试数据(已备份后清空),schema 应表达真实约束。
+    """
     for table in ("quant_trade", "quant_backtest_run"):
-        assert bool(_columns(migrated_db, table)["user_id"]["nullable"]) is True
+        assert bool(_columns(migrated_db, table)["user_id"]["nullable"]) is False
+    assert bool(_columns(migrated_db, "quant_strategy_eval")
+                ["batch_id"]["nullable"]) is False
 
 
 def test_not_null_revision_refuses_while_orphan_rows_exist():
@@ -414,7 +427,12 @@ def test_not_null_revision_tightens_when_enabled_and_data_claimed():
 
 
 def test_legacy_database_upgrades_incrementally_preserving_data():
-    """改造前的既有库应能增量升级而不重建,遗留数据保留。"""
+    """改造前的既有库应能增量升级而不重建,数据保留。
+
+    注意 user_id 必须有值:0009 收紧为 NOT NULL 并自带前置校验,仍有 NULL 行
+    时会报错中止(那条路径由 test_not_null_revision_refuses_while_orphan_rows_exist
+    覆盖)。系统未运营,不存在需要跨过这一步的遗留数据。
+    """
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "legacy.db"
         # 先建出基线形态(模拟改造前的既有库)
@@ -426,11 +444,10 @@ def test_legacy_database_upgrades_incrementally_preserving_data():
             == "BIGINT"
         assert "id" in _columns(engine, "quant_daily_bar")
         with engine.begin() as conn:
-            # 遗留数据:user_id IS NULL 的成交(对应生产库现存的 3 条)
             conn.execute(text(
                 "INSERT INTO quant_trade "
                 "(user_id, code, trade_date, side, price, qty, fee, note) "
-                "VALUES (NULL, 'sh.600519', '2026-07-24', 'buy', 1400.5, 100, 5, '')"
+                "VALUES (42, 'sh.600519', '2026-07-24', 'buy', 1400.5, 100, 5, '')"
             ))
             conn.execute(text(
                 "INSERT INTO quant_daily_bar "
@@ -451,7 +468,7 @@ def test_legacy_database_upgrades_incrementally_preserving_data():
             with engine.connect() as conn:
                 assert conn.execute(text(
                     "SELECT user_id, code, price FROM quant_trade")).one() \
-                    == (None, "sh.600519", 1400.5)
+                    == ("42", "sh.600519", 1400.5)
                 # 换主键时整表重建,数据不能丢
                 assert conn.execute(text(
                     "SELECT code, close FROM quant_daily_bar")).one() \

@@ -66,15 +66,10 @@ def require_user(request: Request) -> dict:
         raise HTTPException(401, "未登录")
     token = auth[len("Bearer "):]
     try:
-        # 共享 users.id 是 VARCHAR(36) UUID,sub 始终是字符串 UUID。
-        # verify_sub=False 仅关闭 PyJWT 对 sub 必须为字符串的强校验,
-        # 以兼容极少数历史遗留的数字 sub token;取值逻辑见 user_id_from_claims。
-        claims = jwt.decode(
-            token,
-            settings.jwt_secret,
-            algorithms=["HS256"],
-            options={"verify_sub": False},
-        )
+        # 共享 users.id 是 VARCHAR(36) UUID,Rust 侧 Claims.sub 也是 String
+        # (crates/hank-db/src/lib.rs),故 sub 始终是字符串 —— 用 PyJWT 的
+        # 默认严格校验即可,不需要 verify_sub=False 放宽。
+        claims = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(401, "登录已过期,请重新登录")
     return claims
@@ -97,10 +92,7 @@ def require_client(request: Request) -> dict:
 
 
 def user_id_from_claims(claims: dict) -> str:
-    """提取共享 users.id(VARCHAR(36) UUID 字符串),拒绝缺失或空 subject 的 token。
-
-    历史遗留的数字 sub 也一并接受(转为字符串),但真实库中 sub 均为 UUID。
-    """
+    """提取共享 users.id(VARCHAR(36) UUID 字符串),拒绝缺失或空 subject 的 token。"""
     sub = claims.get("sub")
     if sub is None:
         raise HTTPException(401, "登录凭证缺少有效用户标识")
