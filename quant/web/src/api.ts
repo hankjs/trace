@@ -74,8 +74,10 @@ export interface Pool {
   name: string
   /** 新股上市满多少天才纳入,预置指数池为 0 */
   min_list_days: number
-  /** NULL = 全局共享的预置池,只读 */
-  user_id?: string | null
+  /** true = 全局共享的系统预置池,只读 */
+  is_system: boolean
+  /** 属主。系统池为哨兵 UUID(全零),不对应真实用户 */
+  owner_id?: string | null
   member_count?: number | null
   created_at?: string | null
 }
@@ -95,9 +97,14 @@ export interface PoolMember {
   industry?: string
 }
 
-/** 预置池(user_id 为空)不可改名、不可增删成员,只能「另存为」自定义池 */
+/**
+ * 预置池不可改名、不可增删成员,只能「另存为」自定义池。
+ *
+ * 用后端的 is_system 而不是 kind!=='static' 推断:后者在出现 kind='static'
+ * 的系统池时会判断错误,而权限判断不该依赖这种巧合。
+ */
 export function isPresetPool(pool: Pool | null | undefined): boolean {
-  return !!pool && pool.kind !== 'static'
+  return !!pool && pool.is_system === true
 }
 
 /** 静态池无成员历史,用于历史区间时结果含幸存者偏差 */

@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Base
 from app.models import (
+    SYSTEM_OWNER_ID,
     Pool,
     DailyBar,
     FactorDaily,
@@ -44,9 +45,9 @@ def _seed_pools(db) -> None:
     不被新股规则剔除。
     """
     db.add_all([
-        Pool(id=1, kind="index", ref="hs300_zz500", user_id=None,
+        Pool(id=1, kind="index", ref="hs300_zz500", owner_id=SYSTEM_OWNER_ID, is_system=True,
              name="沪深300+中证500", min_list_days=0),
-        Pool(id=2, kind="all", ref=None, user_id=None,
+        Pool(id=2, kind="all", ref=None, owner_id=SYSTEM_OWNER_ID, is_system=True,
              name="全部A股", min_list_days=0),
     ])
     db.flush()

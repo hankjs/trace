@@ -1,9 +1,10 @@
 """股票池组 CRUD。
 
 池分两类:
-- **预置池**(`user_id IS NULL`,kind='index'/'all'):全用户可读、**不可改不可删**。
+- **预置池**(`is_system=true`,kind='index'/'all'):全用户可读、**不可改不可删**。
   没有 `quant_pool_member` 行,成分由 `universe.resolve_pool` 按当日动态解析。
-- **自定义池**(kind='static'):按 `user_id` 隔离,直查 `quant_pool_member`。
+- **自定义池**(kind='static'):按 `owner_id` 归属 + `quant_pool_grant` 授权,
+  直查 `quant_pool_member`。
   只存代码不存日期,用于历史区间时带幸存者偏差(前端按 kind 标注)。
 
 `GET /{id}/members` 对预置池返回**当日解析出的当前成分**而不是空列表——
@@ -16,7 +17,7 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -26,7 +27,7 @@ from ..data.universe import (DEFAULT_MIN_LIST_DAYS, INDEX_NAMES,
                              MissingIndexHistoryError, resolve_pool,
                              resolve_pool_during)
 from ..db import get_db
-from ..models import Pool, PoolMember, Stock
+from ..models import Pool, PoolGrant, PoolMember, Stock
 
 router = APIRouter(prefix="/api/pools", tags=["pools"])
 
@@ -58,8 +59,32 @@ class PoolMembersIn(BaseModel):
 
 
 def is_preset(pool: Pool) -> bool:
-    """预置池:系统级共享(user_id 为空),只读。"""
-    return pool.user_id is None
+    """预置池:系统级共享,只读。"""
+    return bool(pool.is_system)
+
+
+def visible_to(user_id: str):
+    """可见性条件。收成一个函数,避免散落的判断漏写导致越权或漏数据。
+
+    = 系统池 OR 我的池 OR 授权给我的池。系统池靠 is_system 短路,不在
+    quant_pool_grant 插行(见 alembic 0011)。
+    """
+    granted = select(PoolGrant.pool_id).where(PoolGrant.user_id == user_id)
+    return or_(
+        Pool.is_system.is_(True),
+        Pool.owner_id == user_id,
+        Pool.id.in_(granted),
+    )
+
+
+def can_edit(db: Session, pool: Pool, user_id: str) -> bool:
+    """可写:自己的池,或被授权 can_edit。系统池一律不可写。"""
+    if pool.is_system:
+        return False
+    if pool.owner_id == user_id:
+        return True
+    grant = db.get(PoolGrant, (pool.id, user_id))
+    return bool(grant and grant.can_edit)
 
 
 def pool_out(pool: Pool, member_count: int | None = None) -> dict:
@@ -70,7 +95,9 @@ def pool_out(pool: Pool, member_count: int | None = None) -> dict:
         "ref": pool.ref,
         "name": pool.name,
         "min_list_days": pool.min_list_days,
-        "user_id": pool.user_id,
+        # 前端据 is_system 判断只读(取代旧的「user_id 为空即预置」)
+        "is_system": bool(pool.is_system),
+        "owner_id": pool.owner_id,
         "member_count": member_count,
         "created_at": pool.created_at.isoformat(sep=" ") if pool.created_at else None,
     }
@@ -88,15 +115,12 @@ def pool_ref_out(pool: Pool) -> dict:
 
 
 def get_pool_or_404(db: Session, pool_id: int, user_id: str) -> Pool:
-    """按可见性取池:预置池(user_id IS NULL)或本人的池;他人的池按不存在处理。
+    """按可见性取池(见 visible_to);不可见的池按不存在处理。
 
     刻意返回 404 而不是 403:否则可以靠状态码枚举出别人建了哪些池。
     """
     pool = db.execute(
-        select(Pool).where(
-            Pool.id == pool_id,
-            (Pool.user_id.is_(None)) | (Pool.user_id == user_id),
-        )
+        select(Pool).where(Pool.id == pool_id, visible_to(user_id))
     ).scalar_one_or_none()
     if pool is None:
         raise HTTPException(404, f"股票池 {pool_id} 不存在")
@@ -109,13 +133,13 @@ def default_pool(db: Session) -> Pool | None:
     与前端 `pools.ts` 的 defaultPool 同口径(优先 kind='all')。
     """
     pool = db.execute(
-        select(Pool).where(Pool.user_id.is_(None), Pool.kind == "all")
+        select(Pool).where(Pool.is_system.is_(True), Pool.kind == "all")
         .order_by(Pool.id)
     ).scalars().first()
     if pool is not None:
         return pool
     return db.execute(
-        select(Pool).where(Pool.user_id.is_(None)).order_by(Pool.id)
+        select(Pool).where(Pool.is_system.is_(True)).order_by(Pool.id)
     ).scalars().first()
 
 
@@ -247,8 +271,8 @@ def list_pools(db: Session = Depends(get_db),
     user_id = user_id_from_claims(claims)
     pools = db.execute(
         select(Pool).where(
-            (Pool.user_id.is_(None)) | (Pool.user_id == user_id)
-        ).order_by(Pool.user_id.is_not(None), Pool.id)
+            visible_to(user_id)
+        ).order_by(Pool.is_system.desc(), Pool.id)
     ).scalars().all()
     # 预置池成员按当日动态解析,列表页不逐池解析(全A 要扫全表);
     # member_count 只对静态池给出,前端按缺省处理。
@@ -280,8 +304,8 @@ def create_pool(body: PoolCreateIn, db: Session = Depends(get_db),
     name = body.name.strip()
     if not name:
         raise HTTPException(400, "股票池名称不能为空")
-    pool = Pool(kind="static", ref=None, user_id=user_id, name=name,
-                min_list_days=body.min_list_days)
+    pool = Pool(kind="static", ref=None, owner_id=user_id, is_system=False,
+                name=name, min_list_days=body.min_list_days)
     db.add(pool)
     try:
         db.flush()

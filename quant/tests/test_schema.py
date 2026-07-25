@@ -57,7 +57,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0010_daily_bar_is_st"}
+    assert heads == {"0011_pool_owner_and_grant"}
     assert current_heads(migrated_db) == heads
 
 
@@ -74,6 +74,7 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_index_member",
         "quant_pick",
         "quant_pool",
+        "quant_pool_grant",
         "quant_pool_member",
         "quant_signal",
         "quant_snapshot",
@@ -95,8 +96,6 @@ def test_all_expected_tables_exist(migrated_db):
         ("quant_watchlist", False),
         ("quant_trade", False),
         ("quant_backtest_run", False),
-        # quant_pool 的 NULL 有意义:系统级预置池,全用户共享
-        ("quant_pool", True),
     ],
 )
 def test_user_id_is_varchar_36(migrated_db, table, nullable):
@@ -311,27 +310,29 @@ def test_strategy_eval_has_indexed_batch_id(migrated_db):
 
 
 def test_system_pools_are_seeded(migrated_db):
-    """预置系统级池,user_id 全为 NULL,id 固定供代码引用。"""
+    """预置系统级池:owner_id 为哨兵 UUID、is_system=1,id 固定供代码引用。"""
     with migrated_db.connect() as conn:
         rows = conn.execute(text(
-            "SELECT id, kind, ref, user_id, name, min_list_days "
+            "SELECT id, kind, ref, owner_id, is_system, name, min_list_days "
             "FROM quant_pool ORDER BY id"
         )).all()
+    sys_id = "00000000-0000-0000-0000-000000000000"
     assert [tuple(row) for row in rows] == [
-        (1, "index", "hs300_zz500", None, "沪深300+中证500", 0),
-        (2, "all", None, None, "全部A股", 60),
-        (3, "index", "hs300", None, "沪深300", 0),
-        (4, "index", "zz500", None, "中证500", 0),
+        (1, "index", "hs300_zz500", sys_id, 1, "沪深300+中证500", 0),
+        (2, "all", None, sys_id, 1, "全部A股", 60),
+        (3, "index", "hs300", sys_id, 1, "沪深300", 0),
+        (4, "index", "zz500", sys_id, 1, "中证500", 0),
     ]
 
 
-def test_pool_name_is_unique_per_user(migrated_db):
-    """同一用户不能有两个同名池。"""
+def test_pool_name_is_unique_per_owner(migrated_db):
+    """同一属主不能有两个同名池。"""
     from sqlalchemy.exc import IntegrityError
 
     insert = text(
-        "INSERT INTO quant_pool (kind, ref, user_id, name, min_list_days, created_at) "
-        "VALUES ('static', NULL, 'user-a', '我的池', 60, '2026-07-25 00:00:00')"
+        "INSERT INTO quant_pool "
+        "(kind, ref, owner_id, is_system, name, min_list_days, created_at) "
+        "VALUES ('static', NULL, 'user-a', 0, '我的池', 60, '2026-07-25 00:00:00')"
     )
     with migrated_db.begin() as conn:
         conn.execute(insert)
@@ -341,7 +342,28 @@ def test_pool_name_is_unique_per_user(migrated_db):
                 conn.execute(insert)
     finally:
         with migrated_db.begin() as conn:
-            conn.execute(text("DELETE FROM quant_pool WHERE user_id = 'user-a'"))
+            conn.execute(text("DELETE FROM quant_pool WHERE owner_id = 'user-a'"))
+
+
+def test_system_pool_name_uniqueness_actually_holds(migrated_db):
+    """系统池同名也必须被拦住 —— 这是改掉 user_id NULL 的核心动机。
+
+    旧结构用 `user_id IS NULL` 表示系统级,而 SQL 里 NULL 互不相等,
+    `UniqueConstraint("user_id","name")` 对预置池**完全失效**:实测可插入
+    3 条同名系统池而不报错。保护恰好在最需要的地方失灵(预置池全用户共用,
+    重复的影响面最大)。改 owner_id NOT NULL 后约束才真正生效。
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    sys_id = "00000000-0000-0000-0000-000000000000"
+    dup = text(
+        "INSERT INTO quant_pool "
+        "(kind, ref, owner_id, is_system, name, min_list_days, created_at) "
+        "VALUES ('all', NULL, :owner, 1, '全部A股', 60, '2026-07-25 00:00:00')"
+    ).bindparams(owner=sys_id)
+    with pytest.raises(IntegrityError):
+        with migrated_db.begin() as conn:
+            conn.execute(dup)
 
 
 def test_snapshot_pk_types_upgraded_to_bigint():

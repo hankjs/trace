@@ -338,23 +338,54 @@ class BacktestEquity(Base):
     equity: Mapped[float] = mapped_column(_EQUITY)
 
 
+# 系统预置池的 owner_id。用哨兵 UUID 而不是某个真实用户:预置池不该因为
+# admin 被删或换人而失去归属,也不该让「属于某人」与「系统级」两种语义混淆。
+# 该值不对应 users 表的行,故 owner_id 不加 users 外键。
+SYSTEM_OWNER_ID = "00000000-0000-0000-0000-000000000000"
+
+
 class Pool(Base):
     """股票池定义。kind: index(动态查指数成分)/ all(全市场按上市退市ST过滤)/ static(直查成员)。
 
-    user_id NULL 表示系统级预置池;非空则按共享 users.id 隔离。
+    可见性 = `is_system` OR `owner_id` 是我 OR `quant_pool_grant` 里有我的行。
+
+    早先用 `user_id IS NULL` 表示系统级共享,有三个问题:
+    1. **唯一约束失效** —— MySQL 里 NULL 互不相等,实测可插入 3 条同名系统池
+       而不报错(用户池则正确拦住)。保护恰好在最需要的地方失灵;
+    2. 每个查询都要写 `(user_id IS NULL) OR (user_id = :uid)`,漏一次就是
+       越权或漏数据;
+    3. 只能表达「我的」和「所有人的」,没有「分享给特定用户」。
     """
 
     __tablename__ = "quant_pool"
-    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_pool_user_name"),)
+    __table_args__ = (
+        UniqueConstraint("owner_id", "name", name="uq_pool_owner_name"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     kind: Mapped[str] = mapped_column(String(16), index=True)  # index / all / static
     ref: Mapped[str | None] = mapped_column(String(32), nullable=True)  # 如 hs300_zz500
-    # NULL 是有意义的:表示系统级预置池,全用户共享。故此列不随
-    # quant_trade/quant_backtest_run 的 user_id 一起收紧为 NOT NULL。
-    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    # NOT NULL:系统池归 SYSTEM_OWNER_ID,不再用 NULL 表达「无主」
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # 显式标记而非靠 owner_id 推断。系统池不给每个用户插授权行(新用户注册
+    # 零成本,新增系统池也不必回填存量用户),靠这一列短路可见性判断。
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     name: Mapped[str] = mapped_column(String(64), default="")
     min_list_days: Mapped[int] = mapped_column(Integer, default=60)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class PoolGrant(Base):
+    """池的共享授权。只存**真实的**分享关系 —— 系统池靠 Pool.is_system 短路,
+    不在此表插行,否则每个新用户注册都要批量插授权、新增系统池要回填存量用户。
+    """
+
+    __tablename__ = "quant_pool_grant"
+
+    pool_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_pool.id", ondelete="CASCADE"), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True, index=True)
+    can_edit: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 

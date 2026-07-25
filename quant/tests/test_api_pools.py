@@ -27,8 +27,8 @@ from app.api.pools import (add_pool_members, create_pool, default_pool,
                            list_pools, remove_pool_member, update_pool,
                            PoolCreateIn, PoolMembersIn, PoolPatchIn)
 from app.db import Base
-from app.models import (BacktestRun, DailyBar, IndexMember, Pool, PoolMember,
-                        Stock)
+from app.models import (SYSTEM_OWNER_ID, BacktestRun, DailyBar, IndexMember,
+                        Pool, PoolMember, Stock)
 
 USER_A = "11111111-1111-1111-1111-111111111111"
 USER_B = "22222222-2222-2222-2222-222222222222"
@@ -50,13 +50,13 @@ def _session() -> Session:
 def _seed(db: Session) -> None:
     """预置池 4 条(对齐 Alembic 0005 的 seed)+ 股票资料 + 指数成分。"""
     db.add_all([
-        Pool(id=1, kind="index", ref="hs300_zz500", user_id=None,
+        Pool(id=1, kind="index", ref="hs300_zz500", owner_id=SYSTEM_OWNER_ID, is_system=True,
              name="沪深300+中证500", min_list_days=0),
-        Pool(id=2, kind="all", ref=None, user_id=None,
+        Pool(id=2, kind="all", ref=None, owner_id=SYSTEM_OWNER_ID, is_system=True,
              name="全部A股", min_list_days=60),
-        Pool(id=3, kind="index", ref="hs300", user_id=None,
+        Pool(id=3, kind="index", ref="hs300", owner_id=SYSTEM_OWNER_ID, is_system=True,
              name="沪深300", min_list_days=0),
-        Pool(id=4, kind="index", ref="zz500", user_id=None,
+        Pool(id=4, kind="index", ref="zz500", owner_id=SYSTEM_OWNER_ID, is_system=True,
              name="中证500", min_list_days=0),
     ])
     db.add_all([
@@ -147,7 +147,8 @@ def test_save_as_custom_pool_from_preset_snapshot_is_not_empty():
         members = list_pool_members(pool_id=created["id"], db=db, claims=CLAIMS_A)
 
     assert created["kind"] == "static"
-    assert created["user_id"] == USER_A
+    assert created["owner_id"] == USER_A
+    assert created["is_system"] is False
     assert created["member_count"] == 2
     assert [item["code"] for item in members["items"]] == [
         "sh.600519", "sz.000001",
@@ -228,7 +229,7 @@ def test_custom_pool_is_invisible_to_other_users():
 
         # 越权调用全部未落地
         assert db.get(Pool, pool_id).name == "我的池"
-        assert db.get(Pool, pool_id).user_id == USER_A
+        assert db.get(Pool, pool_id).owner_id == USER_A
 
 
 def test_same_pool_name_allowed_across_users_and_rejected_within_user():
@@ -237,7 +238,7 @@ def test_same_pool_name_allowed_across_users_and_rejected_within_user():
         create_pool(PoolCreateIn(name="核心池"), db=db, claims=CLAIMS_A)
         # 不同用户同名可以共存(唯一键是 (user_id, name))
         created_b = create_pool(PoolCreateIn(name="核心池"), db=db, claims=CLAIMS_B)
-        assert created_b["user_id"] == USER_B
+        assert created_b["owner_id"] == USER_B
 
         with pytest.raises(HTTPException) as exc:
             create_pool(PoolCreateIn(name="核心池"), db=db, claims=CLAIMS_A)
@@ -350,7 +351,7 @@ def test_pool_list_puts_presets_first_and_counts_only_static():
     ids = [item["id"] for item in listed["items"]]
     assert ids[:4] == [1, 2, 3, 4]
     assert listed["count"] == 5
-    presets = [item for item in listed["items"] if item["user_id"] is None]
+    presets = [item for item in listed["items"] if item["is_system"]]
     # 预置池的成员数按交易日动态解析,列表页不逐池解析(全A 要扫全表)
     assert all(item["member_count"] is None for item in presets)
     assert listed["items"][-1]["member_count"] == 1
