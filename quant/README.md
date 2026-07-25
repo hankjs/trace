@@ -61,6 +61,15 @@ Schema 由 Alembic 管理，**后端启动时不再建表或改表**。首次部
 uv run alembic upgrade head
 ```
 
+全新 MySQL 空库也可以直接导入 [`sql/init.sql`](sql/init.sql)，其中包含当前
+head 的全部 `quant_*` 表、索引、外键、系统种子数据和 Alembic 版本记录：
+
+```bash
+mysql [连接参数] 数据库名 < sql/init.sql
+```
+
+该脚本只用于空库；已有数据库仍必须执行 `uv run alembic upgrade head`。
+
 `scripts/verify_migration_parity.py` 会校验「全新库 `upgrade head`」与 `models.py`
 的 `create_all` 产出一致，防止两条路径漂移。迁移的顺序约束与实测踩坑见
 [`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) 第 8 节。
@@ -77,6 +86,7 @@ Authorization: Bearer <token>
 cd web
 pnpm install
 pnpm dev       # http://localhost:5173，/api 代理到 localhost:8100
+pnpm test      # Vitest + Vue Test Utils 单次运行
 ```
 
 生产构建：
