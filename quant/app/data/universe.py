@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 # 池类型。index=指数成分(point-in-time);all=全A;static=静态名单
 POOL_KINDS = ("index", "all", "static")
 DEFAULT_MIN_LIST_DAYS = 60  # 新股上市未满此天数不入池(池属性默认值)
+# list_date 缺失比例上限:超过则 kind='all' 拒绝解析而不是返回半个池子。
+# 少量新上市/退市票的元数据滞后是常态,故留 5% 余量。
+MAX_MISSING_LIST_DATE_RATIO = 0.05
 
 INDEX_NAMES = ("hs300", "zz500")
 
@@ -209,18 +212,28 @@ def _has_listing_columns() -> bool:
                for name in ("list_date", "delist_date", "is_st"))
 
 
+class IncompleteListingDataError(RuntimeError):
+    """`quant_stock.list_date` 回填不完整,`kind='all'` 无法可信解析。"""
+
+
 def all_market_pool(db: Session, day: date,
-                    min_list_days: int = DEFAULT_MIN_LIST_DAYS) -> list[str]:
+                    min_list_days: int = DEFAULT_MIN_LIST_DAYS,
+                    max_missing_ratio: float = MAX_MISSING_LIST_DATE_RATIO
+                    ) -> list[str]:
     """全A 口径:剔除新股、已退市、ST。
 
     条件:`list_date <= day - min_list_days`
       AND `(delist_date IS NULL OR delist_date > day)`
       AND `NOT is_st`
 
-    注意 `list_date` 未回填完整会**静默漏票**(NULL 不满足 <= 比较),
-    因此这里统计 `list_date IS NULL` 的数量并在超过阈值时告警——
-    `kind='all'` 下 `allow_current_fallback` 那种"缺历史成分"的护栏失效了
-    (全A 任意历史日都能解析),漏票是新的失败模式,必须有可观测性。
+    **`list_date` 缺失的票会被静默漏掉**(NULL 不满足 `<=` 比较)。这是
+    `kind='all'` 特有的新失败模式:index 口径靠 `allow_current_fallback`
+    在缺历史成分时抛错,而全A 任意历史日都"能"解析出一个结果——池子少了
+    三成也照样跑完回测,数字全错却没人知道。
+
+    因此这里做**硬护栏**:缺失比例超过 max_missing_ratio 直接抛
+    IncompleteListingDataError,不返回半个池子。低于阈值时告警但放行
+    (少量新上市/退市票的元数据滞后是常态)。
     """
     if not _has_listing_columns():
         logger.warning(
@@ -235,10 +248,18 @@ def all_market_pool(db: Session, day: date,
         select(func.count()).select_from(Stock)
         .where(Stock.list_date.is_(None))
     ).scalar() or 0
-    if missing:
+    if missing and total:
+        ratio = missing / total
+        if ratio > max_missing_ratio:
+            raise IncompleteListingDataError(
+                f"{missing}/{total} 只股票缺 list_date"
+                f"(占比 {ratio:.1%},上限 {max_missing_ratio:.0%}),"
+                f"kind='all' 会静默漏掉这些票导致回测口径错误。"
+                f"请先回填上市日期,或显式传 max_missing_ratio 放宽"
+            )
         logger.warning(
-            "kind='all' 解析 %s: %d/%d 只股票缺 list_date,这些票会被静默漏掉,"
-            "请回填上市日期", day, missing, total)
+            "kind='all' 解析 %s: %d/%d 只股票缺 list_date(占比 %.1f%%),"
+            "这些票会被漏掉,请回填上市日期", day, missing, total, ratio * 100)
 
     rows = db.execute(
         select(Stock.code).where(
@@ -262,7 +283,9 @@ def static_pool(db: Session, pool_id: int) -> list[str]:
 
 def resolve_pool(db: Session, day: date, *, kind: str = "all",
                  index_name: str | None = None, pool_id: int | None = None,
-                 min_list_days: int = DEFAULT_MIN_LIST_DAYS) -> list[str]:
+                 min_list_days: int = DEFAULT_MIN_LIST_DAYS,
+                 max_missing_ratio: float = MAX_MISSING_LIST_DATE_RATIO
+                 ) -> list[str]:
     """统一池解析入口:按 kind 分派为 day 当日的代码列表。
 
     | kind    | 规则 |
@@ -282,4 +305,5 @@ def resolve_pool(db: Session, day: date, *, kind: str = "all",
         if pool_id is None:
             raise ValueError("kind='static' 必须提供 pool_id")
         return static_pool(db, pool_id)
-    return all_market_pool(db, day, min_list_days=min_list_days)
+    return all_market_pool(db, day, min_list_days=min_list_days,
+                           max_missing_ratio=max_missing_ratio)

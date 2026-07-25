@@ -143,7 +143,8 @@ def all_db(monkeypatch):
 
 def test_all_kind_excludes_st_delisted_and_new_listings(all_db):
     """kind='all':ST、已退市、上市未满 60 天的票都要被剔除。"""
-    codes = universe.resolve_pool(all_db, DAY, kind="all")
+    # 该 fixture 有 1/6 缺 list_date(16.7%),超过 5% 硬阈值,故放宽后再断言
+    codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.2)
 
     assert codes == ["sh.good", "sh.good2"]
     assert "sh.st" not in codes          # ST
@@ -154,25 +155,44 @@ def test_all_kind_excludes_st_delisted_and_new_listings(all_db):
 
 def test_all_kind_min_list_days_is_configurable(all_db):
     """min_list_days 是池属性:放宽到 5 天后新股进池。"""
-    codes = universe.resolve_pool(all_db, DAY, kind="all", min_list_days=5)
+    codes = universe.resolve_pool(all_db, DAY, kind="all", min_list_days=5,
+                                  max_missing_ratio=0.2)
 
     assert "sh.newbie" in codes
 
 
-def test_all_kind_warns_when_list_date_missing(all_db, caplog):
-    """list_date 未回填会静默漏票,必须有计数告警(取代失效的 fallback 护栏)。"""
-    with caplog.at_level("WARNING"):
-        universe.resolve_pool(all_db, DAY, kind="all")
+def test_all_kind_refuses_to_resolve_when_list_date_coverage_is_poor(all_db):
+    """list_date 缺失超阈值:拒绝解析而不是返回半个池子(硬护栏)。
 
+    kind='all' 下 allow_current_fallback 那种"缺历史成分就抛错"的护栏失效了
+    ——全A 任意历史日都能解析出一个结果,池子少三成也照样跑完回测。
+    """
+    with pytest.raises(universe.IncompleteListingDataError) as exc:
+        universe.resolve_pool(all_db, DAY, kind="all")  # 默认阈值 5%
+
+    # 报错必须点明缺多少、占比、以及怎么办
+    msg = str(exc.value)
+    assert "1/6" in msg
+    assert "16.7%" in msg
+    assert "list_date" in msg
+
+
+def test_all_kind_warns_but_proceeds_below_threshold(all_db, caplog):
+    """缺失比例在阈值内:告警放行(少量元数据滞后是常态)。"""
+    with caplog.at_level("WARNING"):
+        codes = universe.resolve_pool(all_db, DAY, kind="all",
+                                      max_missing_ratio=0.2)
+
+    assert codes == ["sh.good", "sh.good2"]
     warnings = [r.getMessage() for r in caplog.records]
-    # 告警必须点名 list_date 并给出缺失计数(6 只里 1 只缺)
     assert any("list_date" in m for m in warnings)
     assert any("1/6" in m for m in warnings)
 
 
 def test_delist_date_after_day_still_counts_as_listed(all_db):
     """退市日晚于查询日:那天它还在市,必须在池内(point-in-time)。"""
-    codes = universe.resolve_pool(all_db, date(2023, 6, 30), kind="all")
+    codes = universe.resolve_pool(all_db, date(2023, 6, 30), kind="all",
+                                  max_missing_ratio=0.2)
 
     assert "sh.delisted" in codes  # 2024-01-01 才退市
 
@@ -196,7 +216,8 @@ def test_default_kind_is_all_market(index_db, monkeypatch):
     """默认口径必须是全A,不是指数成分。"""
     called = {}
 
-    def _spy(db, day, min_list_days=universe.DEFAULT_MIN_LIST_DAYS):
+    def _spy(db, day, min_list_days=universe.DEFAULT_MIN_LIST_DAYS,
+             max_missing_ratio=universe.MAX_MISSING_LIST_DATE_RATIO):
         called["hit"] = True
         return ["sh.all"]
 
