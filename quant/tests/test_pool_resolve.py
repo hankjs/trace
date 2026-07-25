@@ -108,6 +108,19 @@ class StockWithListing(_StockBase):
     is_st: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
 
+class BarForCoverage(_StockBase):
+    """最小 quant_daily_bar:护栏的统计口径只算「有日线的股票」。
+
+    数据源不覆盖的品种(如北交所 sh.92xxxx,baostock 既无上市日也无日线)
+    永远补不上 list_date,计入分母会让护栏永久触发。
+    """
+
+    __tablename__ = "quant_daily_bar"
+
+    code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    date: Mapped[date] = mapped_column(Date, primary_key=True)
+
+
 @pytest.fixture()
 def all_db(monkeypatch):
     """建带三列的 quant_stock,并把 universe 的 Stock 指向它。"""
@@ -135,8 +148,12 @@ def all_db(monkeypatch):
                          delist_date=None, is_st=False),
     ]
     monkeypatch.setattr(universe, "Stock", StockWithListing)
+    monkeypatch.setattr(universe, "DailyBar", BarForCoverage)
     with Session(engine) as db:
         db.add_all(rows)
+        # 上面 6 只都有日线,故都计入护栏的统计口径
+        db.add_all([BarForCoverage(code=r.code, date=date(2024, 1, 2))
+                    for r in rows])
         db.commit()
         yield db
 
@@ -175,6 +192,32 @@ def test_all_kind_refuses_to_resolve_when_list_date_coverage_is_poor(all_db):
     assert "1/6" in msg
     assert "16.7%" in msg
     assert "list_date" in msg
+
+
+def test_all_kind_ignores_stocks_without_bars_in_coverage_check(all_db):
+    """无日线的品种不计入护栏分母,否则默认口径会永久不可用。
+
+    实测踩过:baostock 不提供北交所(sh.92xxxx)数据,库里 330 只北交所股票
+    既无上市日也无日线,永远补不上 list_date。若把它们计入分母,缺失率
+    5.9% 恒超 5% 阈值,kind='all' 作为默认口径就永久抛错——而它们本来也
+    不该进池子(无日线无法回测)。
+    """
+    # 再插 20 只「无日线且缺 list_date」的票:分母不变,缺失率不受影响
+    all_db.add_all([
+        StockWithListing(code=f"sh.92{i:04d}", list_date=None,
+                         delist_date=None, is_st=False)
+        for i in range(20)
+    ])
+    all_db.commit()
+
+    # 仍是 1/6 而非 21/26 —— 这 20 只被排除在统计之外
+    with pytest.raises(universe.IncompleteListingDataError) as exc:
+        universe.resolve_pool(all_db, DAY, kind="all")
+    assert "1/6" in str(exc.value)
+
+    # 放宽阈值后它们也不会出现在池子里
+    codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.2)
+    assert codes == ["sh.good", "sh.good2"]
 
 
 def test_all_kind_warns_but_proceeds_below_threshold(all_db, caplog):

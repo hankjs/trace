@@ -16,7 +16,7 @@ from datetime import date, timedelta
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
-from ..models import IndexMember, Stock
+from ..models import DailyBar, IndexMember, Stock
 from . import baostock_client
 from .ingest import upsert_stock
 
@@ -248,22 +248,32 @@ def all_market_pool(db: Session, day: date,
             select(Stock.code).order_by(Stock.code)).all()]
 
     cutoff = day - timedelta(days=min_list_days)
-    total = db.execute(select(func.count()).select_from(Stock)).scalar() or 0
+    # 统计口径只算「有日线的股票」:数据源不覆盖的品种(如北交所 sh.92xxxx,
+    # baostock 既无上市日也无日线)永远补不上 list_date,把它们计入分母会让
+    # 护栏永久触发、默认口径永久不可用。它们本来也不该进全A池 —— 无日线
+    # 就无法回测。真正要防的是「有日线却缺上市日」,那才是元数据滞后。
+    has_bars = select(DailyBar.code).distinct().subquery()
+    total = db.execute(
+        select(func.count()).select_from(Stock)
+        .where(Stock.code.in_(select(has_bars.c.code)))
+    ).scalar() or 0
     missing = db.execute(
         select(func.count()).select_from(Stock)
-        .where(Stock.list_date.is_(None))
+        .where(Stock.list_date.is_(None),
+               Stock.code.in_(select(has_bars.c.code)))
     ).scalar() or 0
     if missing and total:
         ratio = missing / total
         if ratio > max_missing_ratio:
             raise IncompleteListingDataError(
-                f"{missing}/{total} 只股票缺 list_date"
+                f"{missing}/{total} 只有日线的股票缺 list_date"
                 f"(占比 {ratio:.1%},上限 {max_missing_ratio:.0%}),"
                 f"kind='all' 会静默漏掉这些票导致回测口径错误。"
-                f"请先回填上市日期,或显式传 max_missing_ratio 放宽"
+                f"请先回填上市日期(ingest.backfill_list_dates),"
+                f"或显式传 max_missing_ratio 放宽"
             )
         logger.warning(
-            "kind='all' 解析 %s: %d/%d 只股票缺 list_date(占比 %.1f%%),"
+            "kind='all' 解析 %s: %d/%d 只有日线的股票缺 list_date(占比 %.1f%%),"
             "这些票会被漏掉,请回填上市日期", day, missing, total, ratio * 100)
 
     rows = db.execute(
