@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..backtest.evaluate import run_evaluation
 from ..data import fundamentals, ingest, universe
+from ..data import calendar as trade_calendar
 from ..db import SessionLocal, get_db
 from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
@@ -23,13 +24,20 @@ router = APIRouter(prefix="/api/admin", tags=["admin"])
 @router.post("/backfill")
 async def backfill(code: str = Query(..., description="如 sh.600519"),
                    start: date = Query(None, description="默认取配置 backfill_start"),
-                   end: date | None = None):
-    """手动历史回填(baostock,线程池执行)"""
+                   end: date | None = None,
+                   force_rescale: bool = Query(
+                       False, description="强制重拉,忽略重锚检查结果")):
+    """手动历史回填(baostock,线程池执行)。
+
+    走 safe_backfill:库中已有历史时先校验前复权尺度,尺度错乱会自动
+    从最早日期起全量重拉,不会把新尺度 bar 接到旧尺度历史上。
+    """
     start = start or date.fromisoformat(settings.backfill_start)
 
     def _job() -> int:
         with SessionLocal() as db:
-            return ingest.backfill(db, code.lower(), start, end)
+            return ingest.safe_backfill(db, code.lower(), start, end,
+                                        force=force_rescale)
 
     loop = asyncio.get_running_loop()
     try:
@@ -71,17 +79,49 @@ async def snapshot_now():
 
 @router.post("/import-stocks")
 async def import_stocks():
-    """从 akshare 导入全市场股票列表"""
-    def _job() -> int:
+    """从 akshare + baostock 同步全市场股票名录(含改名/ST/上市退市标记)"""
+    def _job() -> dict:
         with SessionLocal() as db:
             return ingest.import_stock_list(db)
 
     loop = asyncio.get_running_loop()
     try:
-        n = await loop.run_in_executor(None, _job)
+        return await loop.run_in_executor(None, _job)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"股票列表导入失败: {e}")
-    return {"imported": n}
+
+
+@router.post("/sync-trade-calendar")
+async def sync_trade_calendar_now(
+    start: date | None = Query(None, description="默认今年 1 月 1 日"),
+    end: date | None = Query(None, description="默认明年 1 月 31 日"),
+):
+    """手动同步交易日历(baostock query_trade_dates -> quant_trade_calendar)"""
+    def _job() -> dict:
+        with SessionLocal() as db:
+            return trade_calendar.sync_trade_calendar(db, start=start, end=end)
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _job)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"交易日历同步失败: {e}")
+
+
+@router.post("/backfill-list-dates")
+async def backfill_list_dates_now():
+    """回填 quant_stock.list_date(全A 池 point-in-time 解析的前置)"""
+    def _job() -> dict:
+        with SessionLocal() as db:
+            return ingest.backfill_list_dates(db)
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _job)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"list_date 回填失败: {e}")
 
 
 @router.post("/sync-fundamentals")
