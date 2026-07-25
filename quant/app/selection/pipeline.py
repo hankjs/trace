@@ -157,6 +157,9 @@ def run_selection(db: Session, day: date | None = None,
     survivors = []
     for r in rows:
         name = names.get(r["code"], "") or ""
+        # 这里用当前名称判定 ST 是正确的:run_selection 跑的是**当日**选股,
+        # 当日的当前状态就是正确状态。历史回溯口径必须用 quant_daily_bar.is_st
+        # (逐日),见 alembic 0010 与 universe.all_market_pool。
         if "ST" in name.upper() or "退" in name:
             n_filtered["st"] += 1
             continue

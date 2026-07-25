@@ -276,12 +276,27 @@ def all_market_pool(db: Session, day: date,
             "kind='all' 解析 %s: %d/%d 只有日线的股票缺 list_date(占比 %.1f%%),"
             "这些票会被漏掉,请回填上市日期", day, missing, total, ratio * 100)
 
+    # ST 过滤必须用 day 当日的逐日状态,不能用 quant_stock.is_st(当前快照)。
+    # 后者是系统性前视偏差:抽样 8 只当前 ST 股,22464 个交易日里真正处于 ST
+    # 的只有 14.4%,用当前标记会把其余 85.6% 一并剔除 —— 而被剔掉的恰是后来
+    # 才出问题的公司,等于让策略提前知道谁将退化(见 alembic 0010)。
+    #
+    # 判定取 day 当日的 bar:is_st IS TRUE 才剔除。NULL 表示未采集,此时
+    # 退回 quant_stock.is_st 兜底(回填完成前的过渡),并非当作非 ST。
+    st_on_day = select(DailyBar.code).where(
+        DailyBar.date == day, DailyBar.is_st.is_(True))
+    has_st_data = select(DailyBar.code).where(
+        DailyBar.date == day, DailyBar.is_st.is_not(None))
+
     rows = db.execute(
         select(Stock.code).where(
             Stock.list_date.is_not(None),
             Stock.list_date <= cutoff,
             or_(Stock.delist_date.is_(None), Stock.delist_date > day),
-            or_(Stock.is_st.is_(None), Stock.is_st.is_(False)),
+            Stock.code.not_in(st_on_day),
+            # 当日无 is_st 数据的票才用当前状态兜底
+            or_(Stock.code.in_(has_st_data),
+                Stock.is_st.is_(None), Stock.is_st.is_(False)),
         ).order_by(Stock.code)
     ).all()
     return [r[0] for r in rows]

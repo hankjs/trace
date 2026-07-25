@@ -119,6 +119,8 @@ class BarForCoverage(_StockBase):
 
     code: Mapped[str] = mapped_column(String(16), primary_key=True)
     date: Mapped[date] = mapped_column(Date, primary_key=True)
+    # ST 过滤取 day 当日的逐日状态(alembic 0010);NULL 表示未采集
+    is_st: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
 
 @pytest.fixture()
@@ -267,3 +269,44 @@ def test_default_kind_is_all_market(index_db, monkeypatch):
     monkeypatch.setattr(universe, "all_market_pool", _spy)
     assert universe.resolve_pool(index_db, DAY) == ["sh.all"]
     assert called.get("hit") is True
+
+
+def test_all_kind_uses_daily_st_not_current_snapshot(all_db):
+    """ST 过滤必须用 day 当日的逐日状态,不能用 quant_stock.is_st 当前快照。
+
+    这是本次改造的核心:用当前状态过滤历史样本是系统性前视偏差 —— 实测抽样
+    8 只当前 ST 股,22464 个交易日里真正处于 ST 的只有 14.4%,用当前标记会把
+    其余 85.6% 一并剔除,而被剔掉的恰是后来才出问题的公司(alembic 0010)。
+
+    构造:sh.st 当前是 ST(quant_stock.is_st=True),但 DAY 当日 is_st=False
+    —— 它应当**入池**,因为研究日当时它不是 ST。
+    """
+    # DAY 当日该股不是 ST(逐日历史为 False)
+    all_db.add(BarForCoverage(code="sh.st", date=DAY, is_st=False))
+    all_db.commit()
+
+    codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.3)
+
+    assert "sh.st" in codes, "当日非 ST 的票被当前快照错误剔除(前视偏差)"
+
+
+def test_all_kind_excludes_stock_that_is_st_on_that_day(all_db):
+    """反向:当日确实是 ST 就必须剔除,即便 quant_stock.is_st 还没更新。"""
+    all_db.add(BarForCoverage(code="sh.good", date=DAY, is_st=True))
+    all_db.commit()
+
+    codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.3)
+
+    assert "sh.good" not in codes
+
+
+def test_all_kind_falls_back_to_snapshot_when_daily_st_missing(all_db):
+    """当日无 is_st 数据(NULL/无 bar)时退回当前状态兜底,不当作非 ST。
+
+    回填完成前的过渡行为:NULL 表示「未采集」,把它当 False 会让未采集的
+    ST 股混进样本。
+    """
+    # sh.st 在 DAY 当日无 bar(fixture 的 bar 是 2024-01-02)
+    codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.3)
+
+    assert "sh.st" not in codes, "缺当日 is_st 时应退回当前状态兜底"
