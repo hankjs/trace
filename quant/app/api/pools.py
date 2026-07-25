@@ -27,7 +27,8 @@ from ..data.universe import (DEFAULT_MIN_LIST_DAYS, INDEX_NAMES,
                              MissingIndexHistoryError, resolve_pool,
                              resolve_pool_during)
 from ..db import get_db
-from ..models import Pool, PoolGrant, PoolMember, Stock
+from ..models import Pool, PoolGrant, PoolMember
+from ..stock_repository import StockRepository
 
 router = APIRouter(prefix="/api/pools", tags=["pools"])
 
@@ -35,8 +36,6 @@ _CODE_RE = re.compile(r"^(sh|sz|bj)\.\d{6}$")
 # 单次批量导入上限。必须容得下「全部A股另存为自定义池」——A股总数已超 5000,
 # 卡在 2000 会让预置全A 池的另存为直接 422。留到 10000 覆盖可预见的扩容。
 MAX_CODES_PER_REQUEST = 10000
-# 单条 IN 查询的代码数上限(SQLite 默认 999 个占位符,MySQL 也不宜过大)
-_CODE_CHUNK = 500
 # min_list_days 上下界:0 = 不过滤新股,上限 10 年(超出即等于空池,无意义)
 MIN_LIST_DAYS_MAX = 3650
 
@@ -192,28 +191,6 @@ def _resolved(call) -> list[str]:
         raise HTTPException(422, str(exc)) from exc
 
 
-def _member_items(db: Session, codes: list[str]) -> list[dict]:
-    """代码列表 -> 带名称/行业的成员项;未入库的代码名称留空。"""
-    if not codes:
-        return []
-    unique = list(dict.fromkeys(codes))
-    stocks: dict[str, Stock] = {}
-    # 全A 池可达 5000+ 只,分批查避免单条 IN 占位符超限
-    for i in range(0, len(unique), _CODE_CHUNK):
-        rows = db.execute(
-            select(Stock).where(Stock.code.in_(unique[i:i + _CODE_CHUNK]))
-        ).scalars().all()
-        stocks.update({row.code: row for row in rows})
-    return [
-        {
-            "code": code,
-            "name": stocks[code].name if code in stocks else "",
-            "industry": stocks[code].industry if code in stocks else "",
-        }
-        for code in codes
-    ]
-
-
 def _member_counts(db: Session, pool_ids: list[int]) -> dict[int, int]:
     """静态池成员数(预置池无成员行,不在此列)。"""
     if not pool_ids:
@@ -224,21 +201,6 @@ def _member_counts(db: Session, pool_ids: list[int]) -> dict[int, int]:
         .group_by(PoolMember.pool_id)
     ).all()
     return {pool_id: count for pool_id, count in rows}
-
-
-def _existing_codes(db: Session, codes: list[str]) -> set[str]:
-    """分批查 quant_stock 里存在的代码。
-
-    「全A 另存为」一次可能带 5000+ 代码,单条 IN 会撑爆占位符/包体上限,
-    故按 _CODE_CHUNK 分批。
-    """
-    known: set[str] = set()
-    for i in range(0, len(codes), _CODE_CHUNK):
-        chunk = codes[i:i + _CODE_CHUNK]
-        known.update(r[0] for r in db.execute(
-            select(Stock.code).where(Stock.code.in_(chunk))
-        ).all())
-    return known
 
 
 def _split_codes(db: Session, codes: list[str]) -> tuple[list[str], list[str]]:
@@ -258,7 +220,7 @@ def _split_codes(db: Session, codes: list[str]) -> tuple[list[str], list[str]]:
         (normalized if _CODE_RE.fullmatch(code) else skipped).append(code)
     if not normalized:
         return [], skipped
-    known = _existing_codes(db, normalized)
+    known = StockRepository(db).existing_codes(normalized)
     accepted = [code for code in normalized if code in known]
     skipped.extend(code for code in normalized if code not in known)
     return accepted, sorted(skipped)
@@ -361,7 +323,7 @@ def list_pool_members(pool_id: int, db: Session = Depends(get_db),
     """池成员。预置池返回**当日解析出的当前成分**(供「另存为」取快照)。"""
     pool = get_pool_or_404(db, pool_id, user_id_from_claims(claims))
     codes = resolve_pool_codes(db, pool)
-    items = _member_items(db, codes)
+    items = StockRepository(db).items(codes)
     return {"count": len(items), "items": items, "resolved": is_preset(pool)}
 
 
@@ -384,7 +346,7 @@ def add_pool_members(pool_id: int, body: PoolMembersIn,
     return {
         "added": len(added),
         "skipped": skipped,
-        "items": _member_items(db, added),
+        "items": StockRepository(db).items(added),
     }
 
 

@@ -1,24 +1,37 @@
 """管理接口:手动触发回填、信号计算、快照、股票列表导入。
 
-baostock / akshare 均为同步阻塞调用,统一 run_in_executor 避免卡住事件循环。
+baostock / akshare 均为同步阻塞调用,统一在线程中执行以免卡住事件循环。
 """
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import date
+from typing import TypeVar
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..backtest.evaluate import run_evaluation
 from ..data import fundamentals, ingest, universe
 from ..data import calendar as trade_calendar
-from ..db import SessionLocal, get_db
+from ..db import SessionLocal
 from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+T = TypeVar("T")
+
+
+async def run_db_job(job: Callable[[Session], T]) -> T:
+    """在线程中执行同步数据库任务，并保证独立 Session 及时关闭。"""
+    def invoke() -> T:
+        with SessionLocal() as db:
+            return job(db)
+
+    return await asyncio.to_thread(invoke)
 
 
 @router.post("/backfill")
@@ -34,14 +47,10 @@ async def backfill(code: str = Query(..., description="如 sh.600519"),
     """
     start = start or date.fromisoformat(settings.backfill_start)
 
-    def _job() -> int:
-        with SessionLocal() as db:
-            return ingest.safe_backfill(db, code.lower(), start, end,
-                                        force=force_rescale)
-
-    loop = asyncio.get_running_loop()
     try:
-        n = await loop.run_in_executor(None, _job)
+        n = await run_db_job(
+            lambda db: ingest.safe_backfill(
+                db, code.lower(), start, end, force=force_rescale))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"回填失败: {e}")
     return {"code": code.lower(), "start": str(start),
@@ -51,13 +60,8 @@ async def backfill(code: str = Query(..., description="如 sh.600519"),
 @router.post("/run-signals")
 async def run_signals_now(date_: date | None = Query(None, alias="date")):
     """手动触发指定日期的信号计算(默认今天;该日无日线数据则无信号)"""
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return run_signals(db, day=date_)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(lambda db: run_signals(db, day=date_))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"信号计算失败: {e}")
 
@@ -65,13 +69,8 @@ async def run_signals_now(date_: date | None = Query(None, alias="date")):
 @router.post("/snapshot")
 async def snapshot_now():
     """手动抓取一次自选股盘中快照"""
-    def _job() -> int:
-        with SessionLocal() as db:
-            return ingest.ingest_snapshot(db)
-
-    loop = asyncio.get_running_loop()
     try:
-        n = await loop.run_in_executor(None, _job)
+        n = await run_db_job(ingest.ingest_snapshot)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"快照抓取失败: {e}")
     return {"snapshots": n}
@@ -80,13 +79,8 @@ async def snapshot_now():
 @router.post("/import-stocks")
 async def import_stocks():
     """从 akshare + baostock 同步全市场股票名录(含改名/ST/上市退市标记)"""
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return ingest.import_stock_list(db)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(ingest.import_stock_list)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"股票列表导入失败: {e}")
 
@@ -97,13 +91,10 @@ async def sync_trade_calendar_now(
     end: date | None = Query(None, description="默认明年 1 月 31 日"),
 ):
     """手动同步交易日历(baostock query_trade_dates -> quant_trade_calendar)"""
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return trade_calendar.sync_trade_calendar(db, start=start, end=end)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(
+            lambda db: trade_calendar.sync_trade_calendar(
+                db, start=start, end=end))
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     except Exception as e:  # noqa: BLE001
@@ -113,13 +104,8 @@ async def sync_trade_calendar_now(
 @router.post("/backfill-list-dates")
 async def backfill_list_dates_now():
     """回填 quant_stock.list_date(全A 池 point-in-time 解析的前置)"""
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return ingest.backfill_list_dates(db)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(ingest.backfill_list_dates)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"list_date 回填失败: {e}")
 
@@ -141,14 +127,11 @@ async def sync_adjust_factors_now(
     code_list = ([c.strip() for c in codes.split(",") if c.strip()]
                  if codes else None)
 
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return ingest.sync_adjust_factors(
-                db, codes=code_list, start=start, sleep_per_code=sleep_per_code)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(
+            lambda db: ingest.sync_adjust_factors(
+                db, codes=code_list, start=start,
+                sleep_per_code=sleep_per_code))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"复权因子采集失败: {e}")
 
@@ -171,9 +154,9 @@ async def sync_fundamentals_now(
     if codes is not None:
         explicit_codes = [code for code in codes.split(",") if code.strip()]
 
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return fundamentals.sync_fundamental_universe(
+    try:
+        return await run_db_job(
+            lambda db: fundamentals.sync_fundamental_universe(
                 db,
                 universe=universe_,
                 codes=explicit_codes,
@@ -181,11 +164,7 @@ async def sync_fundamentals_now(
                 include_valuation=include_valuation,
                 include_financials=include_financials,
                 valuation_history=valuation_history,
-            )
-
-    loop = asyncio.get_running_loop()
-    try:
-        return await loop.run_in_executor(None, _job)
+            ))
     except fundamentals.FundamentalSyncInProgressError as exc:
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
@@ -197,13 +176,8 @@ async def sync_fundamentals_now(
 @router.post("/sync-index-members")
 async def sync_index_members():
     """手动同步成分股名录(hs300 + zz500)"""
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return universe.sync_all_indices(db)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(universe.sync_all_indices)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"成分股同步失败: {e}")
 
@@ -212,13 +186,9 @@ async def sync_index_members():
 async def run_selection_now(date_: date | None = Query(None, alias="date"),
                             top_n: int = 30):
     """手动触发指定日期的因子计算 + 选股(默认今天;该日无数据则空结果)"""
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return run_selection(db, day=date_, top_n=top_n)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(
+            lambda db: run_selection(db, day=date_, top_n=top_n))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"选股失败: {e}")
 
@@ -227,12 +197,9 @@ async def run_selection_now(date_: date | None = Query(None, alias="date"),
 async def run_eval_now(date_: date | None = Query(None, alias="date"),
                        period_days: int = 365):
     """手动触发批量策略评估(落 quant_strategy_eval)"""
-    def _job() -> dict:
-        with SessionLocal() as db:
-            return run_evaluation(db, day=date_, period_days=period_days)
-
-    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(None, _job)
+        return await run_db_job(
+            lambda db: run_evaluation(
+                db, day=date_, period_days=period_days))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"批量评估失败: {e}")

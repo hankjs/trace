@@ -11,6 +11,8 @@ import threading
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.data import baostock_client as bc
@@ -99,3 +101,33 @@ def test_refcount_is_lock_protected_under_concurrency():
 
         assert errors == []
         assert bc._login_depth == 0
+
+
+def test_query_frame_expands_rows_and_preserves_error_context():
+    with mock.patch.object(bc, "bs") as bs:
+        bs.login.return_value = _ok_login()
+        result = mock.Mock(
+            error_code="0",
+            fields=["code", "code_name"],
+        )
+        result.next.side_effect = [True, True, False]
+        result.get_row_data.side_effect = [
+            ["sh.600519", "贵州茅台"],
+            ["sz.000001", "平安银行"],
+        ]
+        bs.query_stock_basic.return_value = result
+
+        frame = bc.fetch_stock_basic()
+
+        assert frame[["code", "name"]].to_dict("records") == [
+            {"code": "sh.600519", "name": "贵州茅台"},
+            {"code": "sz.000001", "name": "平安银行"},
+        ]
+
+        failed = mock.Mock(error_code="100", error_msg="服务不可用")
+        bs.query_stock_basic.return_value = failed
+        with pytest.raises(
+            RuntimeError,
+            match="baostock 证券资料查询失败: 100 服务不可用",
+        ):
+            bc.fetch_stock_basic()

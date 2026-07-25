@@ -6,9 +6,10 @@
  * 列表加载完成后会自动落到全部A股。
  */
 import { computed, onMounted, watch } from 'vue'
-import { AlertTriangle, Settings2 } from 'lucide-vue-next'
+import { AlertTriangle } from 'lucide-vue-next'
 import type { Pool } from '../api'
 import { hasSurvivorshipBias, usePools } from '../pools'
+import ManagedSelectField from './ManagedSelectField.vue'
 
 const props = withDefaults(defineProps<{
   label?: string
@@ -33,6 +34,10 @@ const selected = computed<Pool | null>(() =>
 
 /** 选中静态池时结果含幸存者偏差,由父页面决定是否展示 */
 const biased = computed(() => props.showBiasHint && hasSurvivorshipBias(selected.value))
+const selectOptions = computed(() => pools.value.map((pool) => ({
+  value: pool.id,
+  label: optionLabel(pool),
+})))
 
 const emit = defineEmits<{ change: [poolId: number | null] }>()
 
@@ -46,15 +51,10 @@ watch(pools, (items) => {
   if (!items.length) return
   const stillExists = items.some((pool) => pool.id === model.value)
   if (!stillExists) {
-    model.value = defaultPoolId(items as Pool[])
+    model.value = defaultPoolId(items)
     emit('change', model.value)
   }
 }, { immediate: true })
-
-function onSelect(value: number) {
-  model.value = value
-  emit('change', value)
-}
 
 onMounted(() => {
   void load().catch(() => { /* 错误已进 error,页面按需展示 */ })
@@ -62,36 +62,22 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="text-sm">
-    <div class="flex items-end gap-2">
-      <label class="block">
-        <span class="mb-1 block text-xs text-text-tertiary">{{ label }}</span>
-        <select
-          :value="model ?? ''"
-          :disabled="disabled || loading || !pools.length"
-          class="min-w-52 rounded-md border border-border bg-surface-raised px-2.5 py-1.5 text-sm disabled:opacity-50"
-          :aria-describedby="biased ? 'pool-bias-hint' : undefined"
-          @change="onSelect(Number(($event.target as HTMLSelectElement).value))"
-        >
-          <option v-if="loading" value="">加载中…</option>
-          <option v-else-if="!pools.length" value="">暂无可用股票池</option>
-          <option v-for="pool in pools" :key="pool.id" :value="pool.id">{{ optionLabel(pool) }}</option>
-        </select>
-      </label>
-      <router-link
-        v-if="manageLink"
-        :to="{ name: 'pools' }"
-        class="mb-0.5 inline-flex items-center gap-1 rounded-md border border-border px-2.5 py-1.5 text-xs text-text-secondary hover:bg-hover hover:text-text-primary"
-      >
-        <Settings2 :size="14" />
-        管理股票池
-      </router-link>
-    </div>
-
-    <p v-if="error" class="mt-1 text-xs text-up">股票池加载失败：{{ error }}</p>
-
+  <ManagedSelectField
+    v-model="model"
+    :label="label"
+    :options="selectOptions"
+    :loading="loading"
+    :error="error ? `股票池加载失败：${error}` : ''"
+    :disabled="disabled"
+    unavailable-label="暂无可用股票池"
+    :manage-link="manageLink"
+    :manage-to="{ name: 'pools' }"
+    manage-label="管理股票池"
+    :described-by="biased ? 'pool-bias-hint' : undefined"
+    @change="emit('change', $event)"
+  >
     <p
-      v-else-if="biased"
+      v-if="biased"
       id="pool-bias-hint"
       class="mt-1.5 flex items-start gap-1.5 text-xs leading-5 text-text-tertiary"
     >
@@ -102,5 +88,5 @@ onMounted(() => {
         预置池按成分变动历史逐日解析，不受此影响。
       </span>
     </p>
-  </div>
+  </ManagedSelectField>
 </template>

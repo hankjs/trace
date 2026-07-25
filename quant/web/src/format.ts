@@ -44,6 +44,19 @@ export function pnlClass(v: number | null | undefined): string {
   return v > 0 ? 'text-up' : 'text-down'
 }
 
+/** 聚合指标按 mean -> 原字段 -> median 的固定口径读取。 */
+export function aggregateMetric(
+  metrics: Record<string, unknown> | null | undefined,
+  key: string
+): number | undefined {
+  const source = metrics ?? {}
+  for (const candidate of [`${key}_mean`, key, `${key}_median`]) {
+    const value = source[candidate]
+    if (typeof value === 'number' && !Number.isNaN(value)) return value
+  }
+  return undefined
+}
+
 /** 浏览器本地日期，避免中国时区凌晨被 UTC ISO 字符串回退一天。 */
 export function localDateISO(value = new Date()): string {
   const year = value.getFullYear()

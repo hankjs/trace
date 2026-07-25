@@ -11,8 +11,9 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..auth import require_client, user_id_from_claims
-from ..models import Pick, Stock
+from ..models import Pick
 from ..selection.screener import InvalidFilterError, screen, structured_screen
+from ..stock_repository import StockRepository
 
 router = APIRouter(prefix="/api/selection", tags=["selection"])
 
@@ -72,7 +73,10 @@ def get_picks(date_: Date | None = Query(None, alias="date"),
             select(Pick.code).where(Pick.date == prev_day)).all()}
     cur_codes = {r.code for r in rows}
 
-    names = dict(db.execute(select(Stock.code, Stock.name)).all())
+    dropped = sorted(prev_codes - cur_codes)
+    stocks = StockRepository(db).by_codes(
+        [row.code for row in rows] + dropped)
+    names = {code: stock.name for code, stock in stocks.items()}
     items = [
         {
             "rank": r.rank,
@@ -84,7 +88,6 @@ def get_picks(date_: Date | None = Query(None, alias="date"),
         }
         for r in rows
     ]
-    dropped = sorted(prev_codes - cur_codes)
     return {
         "date": str(day),
         "prev_date": str(prev_day) if prev_day else None,

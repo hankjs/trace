@@ -4,6 +4,7 @@ import { ArrowRight, BarChart3, Bell, CheckCircle2, ClipboardList, Filter, Histo
 import { api, type PickItem, type SignalItem, type SnapshotItem } from '../api'
 import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
+import InlineFeedback from '../components/InlineFeedback.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { fmtPct, fmtPrice, pnlClass } from '../format'
 
@@ -72,7 +73,7 @@ onMounted(async () => {
       </template>
     </PageHeader>
 
-    <p v-if="error" role="status" class="rounded-md border border-warning/25 bg-warning-soft px-4 py-2 text-sm text-warning">{{ error }}</p>
+    <InlineFeedback v-if="error" tone="warning">{{ error }}</InlineFeedback>
     <LoadingRows v-if="loading" :rows="6" />
 
     <template v-else>

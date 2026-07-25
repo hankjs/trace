@@ -3,6 +3,8 @@ import { computed, onMounted, ref } from 'vue'
 import { ChevronDown, ChevronUp } from 'lucide-vue-next'
 import { api, type PickItem } from '../api'
 import { catalogEntry, factorName, loadCatalog } from '../catalog'
+import InlineFeedback from '../components/InlineFeedback.vue'
+import LoadingRows from '../components/LoadingRows.vue'
 import { fmtBigAmount, fmtPct, localDateISO } from '../format'
 
 const date = ref('')
@@ -89,8 +91,8 @@ onMounted(async () => {
       </form>
     </div>
 
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-text-tertiary">加载中…</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <LoadingRows v-if="loading" :rows="5" />
 
     <template v-else>
       <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">

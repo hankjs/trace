@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { api, type PortfolioSummary, type Trade } from '../api'
+import InlineFeedback from '../components/InlineFeedback.vue'
+import LoadingRows from '../components/LoadingRows.vue'
 import PageHeader from '../components/PageHeader.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import { fmtAmount, fmtPrice, fmtQty, fmtSigned, localDateISO, pnlClass } from '../format'
@@ -92,8 +94,8 @@ onMounted(load)
   <div class="space-y-6">
     <PageHeader title="我的持仓" description="记录已在外部交易软件中完成的成交，并查看持仓估值。" />
 
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-text-tertiary">加载中…</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <LoadingRows v-if="loading" :rows="5" />
 
     <template v-else-if="summary">
       <section class="grid grid-cols-1 gap-3 sm:grid-cols-3">
@@ -190,7 +192,7 @@ onMounted(load)
           <button type="submit" :disabled="submitting" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50">
             {{ submitting ? '保存中…' : '保存记录' }}
           </button>
-          <p v-if="formError" class="w-full text-sm text-up">{{ formError }}</p>
+          <InlineFeedback v-if="formError" tone="error" class="w-full">{{ formError }}</InlineFeedback>
         </form>
       </section>
 

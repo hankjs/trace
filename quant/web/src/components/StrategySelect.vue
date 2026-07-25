@@ -6,9 +6,9 @@
  * 列表加载完成后会自动落到默认策略(公共策略里 id 最小的那条)。
  */
 import { computed, onMounted, watch } from 'vue'
-import { Settings2 } from 'lucide-vue-next'
 import type { Strategy, StrategyKind } from '../api'
 import { defaultStrategyId, useStrategies } from '../strategies'
+import ManagedSelectField from './ManagedSelectField.vue'
 
 const props = withDefaults(defineProps<{
   label?: string
@@ -41,6 +41,10 @@ const options = computed<Strategy[]>(() =>
 const selected = computed<Strategy | null>(() =>
   options.value.find((strategy) => strategy.id === model.value) ?? null
 )
+const selectOptions = computed(() => options.value.map((strategy) => ({
+  value: strategy.id,
+  label: optionLabel(strategy),
+})))
 
 /** 自定义策略加后缀区分,与股票池下拉同口径;停用的策略同样标出来 */
 function optionLabel(strategy: Strategy): string {
@@ -58,15 +62,10 @@ watch(options, (items) => {
   if (props.allowEmpty && model.value === null) return
   const stillExists = items.some((strategy) => strategy.id === model.value)
   if (!stillExists) {
-    model.value = props.allowEmpty ? null : defaultStrategyId(props.kind ?? undefined, items as Strategy[])
+    model.value = props.allowEmpty ? null : defaultStrategyId(props.kind ?? undefined, items)
     emit('change', model.value)
   }
 }, { immediate: true })
-
-function onSelect(value: string) {
-  model.value = value === '' ? null : Number(value)
-  emit('change', model.value)
-}
 
 onMounted(() => {
   void load().catch(() => { /* 错误已进 error,页面按需展示 */ })
@@ -74,38 +73,23 @@ onMounted(() => {
 </script>
 
 <template>
-  <div class="text-sm">
-    <div class="flex items-end gap-2">
-      <label class="block">
-        <span class="mb-1 block text-xs text-text-tertiary">{{ label }}</span>
-        <select
-          :value="model ?? ''"
-          :disabled="disabled || loading || (!options.length && !allowEmpty)"
-          class="min-w-52 rounded-md border border-border bg-surface-raised px-2.5 py-1.5 text-sm disabled:opacity-50"
-          :aria-describedby="selected && !selected.params_valid ? 'strategy-params-hint' : undefined"
-          @change="onSelect(($event.target as HTMLSelectElement).value)"
-        >
-          <option v-if="loading" value="">加载中…</option>
-          <option v-else-if="allowEmpty" value="">{{ emptyLabel }}</option>
-          <option v-else-if="!options.length" value="">暂无可用策略</option>
-          <option v-for="strategy in options" :key="strategy.id" :value="strategy.id">
-            {{ optionLabel(strategy) }}
-          </option>
-        </select>
-      </label>
-      <router-link
-        v-if="manageLink"
-        :to="{ name: 'strategies', query: { tab: 'manage' } }"
-        class="mb-0.5 inline-flex items-center gap-1 rounded-md border border-border px-2.5 py-1.5 text-xs text-text-secondary hover:bg-hover hover:text-text-primary"
-      >
-        <Settings2 :size="14" />
-        管理策略
-      </router-link>
-    </div>
-
-    <p v-if="error" class="mt-1 text-xs text-up">策略加载失败：{{ error }}</p>
-
-    <p v-else-if="selected" class="mt-1 text-xs text-text-tertiary">
+  <ManagedSelectField
+    v-model="model"
+    :label="label"
+    :options="selectOptions"
+    :loading="loading"
+    :error="error ? `策略加载失败：${error}` : ''"
+    :disabled="disabled"
+    :allow-empty="allowEmpty"
+    :empty-label="emptyLabel"
+    unavailable-label="暂无可用策略"
+    :manage-link="manageLink"
+    :manage-to="{ name: 'strategies', query: { tab: 'manage' } }"
+    manage-label="管理策略"
+    :described-by="selected && !selected.params_valid ? 'strategy-params-hint' : undefined"
+    @change="emit('change', $event)"
+  >
+    <p v-if="selected" class="mt-1 text-xs text-text-tertiary">
       算法模板：{{ selected.template_name }} · {{ selected.kind_name }}
     </p>
 
@@ -116,5 +100,5 @@ onMounted(() => {
     >
       该策略的参数与当前算法模板不匹配，请到「管理策略」修正后再使用。
     </p>
-  </div>
+  </ManagedSelectField>
 </template>

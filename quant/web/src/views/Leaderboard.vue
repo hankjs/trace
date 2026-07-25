@@ -2,7 +2,9 @@
 import { computed, onMounted, ref } from 'vue'
 import { api, type LeaderboardItem } from '../api'
 import { loadCatalog, metricName, templateName } from '../catalog'
-import { fmtPct } from '../format'
+import InlineFeedback from '../components/InlineFeedback.vue'
+import LoadingRows from '../components/LoadingRows.vue'
+import { aggregateMetric, fmtPct } from '../format'
 
 const items = ref<LeaderboardItem[]>([])
 const runAt = ref('')
@@ -28,13 +30,7 @@ function scopeLabel(scope: string): string {
 }
 
 function metricNum(it: LeaderboardItem, key: string): number | undefined {
-  // 单标的聚合口径带 _mean/_median 后缀,组合口径为原名;按 mean → 原名 → median 兜底
-  const m = it.metrics ?? {}
-  for (const k of [`${key}_mean`, key, `${key}_median`]) {
-    const v = m[k]
-    if (typeof v === 'number' && !Number.isNaN(v)) return v
-  }
-  return undefined
+  return aggregateMetric(it.metrics, key)
 }
 
 function metricText(v: number | undefined, pct = true): string {
@@ -85,8 +81,8 @@ onMounted(async () => {
       <p v-if="runAt" class="text-xs text-text-tertiary">最近评估:{{ runAt }}</p>
     </div>
 
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-text-tertiary">加载中…</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <LoadingRows v-if="loading" :rows="5" />
 
     <div v-else class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
       <table class="w-full text-sm">

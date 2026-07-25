@@ -5,7 +5,6 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..catalog import manual_trade_side_name
@@ -14,6 +13,7 @@ from ..db import get_db
 from ..models import Stock
 from ..portfolio import positions as pos_svc
 from ..portfolio import trades as trade_svc
+from ..stock_repository import StockRepository
 
 router = APIRouter(prefix="/api/portfolio", tags=["portfolio"])
 
@@ -26,14 +26,6 @@ class TradeIn(BaseModel):
     qty: float = Field(..., gt=0)
     fee: float = Field(0.0, ge=0)
     note: str = ""
-
-
-def _stock_map(db: Session, codes: list[str]) -> dict[str, Stock]:
-    if not codes:
-        return {}
-    unique_codes = list(dict.fromkeys(codes))
-    rows = db.execute(select(Stock).where(Stock.code.in_(unique_codes))).scalars().all()
-    return {row.code: row for row in rows}
 
 
 def _trade_out(t, stock: Stock | None = None) -> dict:
@@ -56,7 +48,7 @@ def _trade_out(t, stock: Stock | None = None) -> dict:
 def list_trades(code: str | None = None, db: Session = Depends(get_db),
                 claims: dict = Depends(require_client)):
     rows = trade_svc.list_trades(db, user_id_from_claims(claims), code)
-    stocks = _stock_map(db, [t.code for t in rows])
+    stocks = StockRepository(db).by_codes(t.code for t in rows)
     return {
         "count": len(rows),
         "items": [_trade_out(t, stocks.get(t.code)) for t in rows],
@@ -67,7 +59,7 @@ def list_trades(code: str | None = None, db: Session = Depends(get_db),
 def add_trade(body: TradeIn, db: Session = Depends(get_db),
               claims: dict = Depends(require_client)):
     code = body.code.strip().lower()
-    stock = db.get(Stock, code)
+    stock = StockRepository(db).by_codes([code]).get(code)
     if stock is None:
         raise HTTPException(
             422, f"股票代码 {code or '（空）'} 不存在，请先从股票搜索结果中选择",
@@ -100,7 +92,8 @@ def get_positions(db: Session = Depends(get_db),
                   claims: dict = Depends(require_client)):
     """持仓:均价法成本 + 最新价浮动盈亏 + 汇总"""
     summary = pos_svc.portfolio_summary(db, user_id_from_claims(claims))
-    stocks = _stock_map(db, [item["code"] for item in summary["positions"]])
+    stocks = StockRepository(db).by_codes(
+        item["code"] for item in summary["positions"])
     for item in summary["positions"]:
         stock = stocks.get(item["code"])
         item["name"] = stock.name if stock else ""

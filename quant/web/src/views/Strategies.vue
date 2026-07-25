@@ -11,11 +11,14 @@ import { Copy, Lock, Plus, Trash2 } from 'lucide-vue-next'
 import {
   api,
   type CatalogEntry,
-  type CatalogParameter,
   type Strategy,
-  type StrategyParamValue,
 } from '../api'
+import StrategyParamFields from '../components/StrategyParamFields.vue'
+import InlineFeedback from '../components/InlineFeedback.vue'
+import LoadingRows from '../components/LoadingRows.vue'
 import { useStrategies } from '../strategies'
+import { useAsyncAction } from '../useAsyncAction'
+import { useStrategyParamForm } from '../useStrategyParamForm'
 
 const {
   strategies,
@@ -31,17 +34,13 @@ const {
 const templates = ref<CatalogEntry[]>([])
 const selectedId = ref<number | null>(null)
 const creating = ref(false)
-const error = ref('')
-const notice = ref('')
-const busy = ref(false)
+const { busy, error, notice, clear, fail, run: runAction } = useAsyncAction()
 
 /** 新建表单 */
 const draft = reactive({ name: '', template: '' })
-const draftParams = reactive<Record<string, StrategyParamValue>>({})
 
 /** 选中策略的编辑态,保存前不写回列表 */
 const editName = ref('')
-const editParams = reactive<Record<string, StrategyParamValue>>({})
 
 const selected = computed<Strategy | null>(
   () => strategies.value.find((strategy) => strategy.id === selectedId.value) ?? null
@@ -55,32 +54,14 @@ function templateOf(key: string): CatalogEntry | undefined {
   return templates.value.find((entry) => entry.key === key)
 }
 
-function paramsOf(key: string): CatalogParameter[] {
+function paramsOf(key: string) {
   return templateOf(key)?.params ?? []
 }
 
-/**
- * 只提交与模板默认值不同的键:后端刻意只存用户显式覆盖的参数,
- * 这样模板默认值调整后,用户没碰过的参数会跟着变。
- */
-function overrides(template: string, values: Record<string, StrategyParamValue>): Record<string, StrategyParamValue> {
-  const result: Record<string, StrategyParamValue> = {}
-  for (const parameter of paramsOf(template)) {
-    const value = values[parameter.key]
-    if (value === undefined || value === '') continue
-    if (parameter.default !== undefined && value === parameter.default) continue
-    result[parameter.key] = value
-  }
-  return result
-}
-
-function fillParams(target: Record<string, StrategyParamValue>, template: string, source: Record<string, StrategyParamValue> = {}) {
-  for (const key of Object.keys(target)) delete target[key]
-  for (const parameter of paramsOf(template)) {
-    const value = source[parameter.key] ?? parameter.default
-    if (value !== undefined) target[parameter.key] = value
-  }
-}
+const draftParameterDefs = computed(() => paramsOf(draft.template))
+const draftParamForm = useStrategyParamForm(draftParameterDefs)
+const editParameterDefs = computed(() => paramsOf(selected.value?.template ?? ''))
+const editParamForm = useStrategyParamForm(editParameterDefs)
 
 async function refreshStrategies(selectId?: number) {
   invalidate()
@@ -93,86 +74,75 @@ async function refreshStrategies(selectId?: number) {
   }
 }
 
-/** 参数表单值:number 型走数字输入,布尔走勾选框 */
-function isBooleanParam(parameter: CatalogParameter): boolean {
-  return parameter.value_type === 'boolean'
-}
-
 // 也监听 templates:参数表单要有模板的参数定义才能填初值,
 // 而模板元数据可能比策略列表后到
 watch([selected, templates], ([strategy]) => {
   if (!strategy) return
   editName.value = strategy.name
-  fillParams(editParams, strategy.template, strategy.effective_params)
+  editParamForm.reset(strategy.effective_params)
 })
 
 watch(selectedId, () => {
-  error.value = ''
-  notice.value = ''
+  clear()
 })
 
 watch(strategies, (items) => {
   if (selectedId.value === null && items.length) selectedId.value = items[0].id
 }, { immediate: true })
 
-watch(() => draft.template, (template) => {
-  fillParams(draftParams, template)
+watch(() => draft.template, () => {
+  draftParamForm.reset()
 })
 
 function startCreate() {
   creating.value = true
-  error.value = ''
-  notice.value = ''
+  clear()
   draft.name = ''
   draft.template = templates.value[0]?.key ?? ''
-  fillParams(draftParams, draft.template)
+  draftParamForm.reset()
 }
 
 async function createStrategy() {
   const name = draft.name.trim()
   if (!name) {
-    error.value = '请填写策略名称'
+    fail('请填写策略名称')
     return
   }
   if (!draft.template) {
-    error.value = '请选择算法模板'
+    fail('请选择算法模板')
     return
   }
-  busy.value = true
-  error.value = ''
-  try {
+  if (!draftParamForm.validate()) {
+    fail('请修正策略参数后再创建')
+    return
+  }
+  await runAction(async () => {
     const strategy = await api.createStrategy({
       name,
       template: draft.template,
-      params: overrides(draft.template, draftParams),
+      params: draftParamForm.overrides.value,
     })
-    notice.value = `已创建「${strategy.name}」，可在回测页选用。`
     await refreshStrategies(strategy.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+    return strategy
+  }, { success: (strategy) => `已创建「${strategy.name}」，可在回测页选用。` })
 }
 
 /** 另存为我的策略:公共策略只读,调参前先复制一份 */
 async function saveAsMine() {
   const source = selected.value
   if (!source) return
-  busy.value = true
-  error.value = ''
-  try {
+  if (paramsOf(source.template).length && !editParamForm.validate()) {
+    fail('请修正策略参数后再另存')
+    return
+  }
+  await runAction(async () => {
     const copy = await api.duplicateStrategy(source.id, {
       // 模板元数据未就绪时不传 params,让后端沿用源策略的参数而不是重置为默认值
-      ...(paramsOf(source.template).length ? { params: overrides(source.template, editParams) } : {}),
+      ...(paramsOf(source.template).length ? { params: editParamForm.overrides.value } : {}),
     })
-    notice.value = `已另存为「${copy.name}」，可自由改名和调参。`
     await refreshStrategies(copy.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+    return copy
+  }, { success: (copy) => `已另存为「${copy.name}」，可自由改名和调参。` })
 }
 
 async function saveName() {
@@ -180,20 +150,13 @@ async function saveName() {
   if (!strategy || readonlyStrategy.value) return
   const name = editName.value.trim()
   if (!name) {
-    error.value = '请填写策略名称'
+    fail('请填写策略名称')
     return
   }
-  busy.value = true
-  error.value = ''
-  try {
+  await runAction(async () => {
     await api.updateStrategy(strategy.id, { name })
-    notice.value = '已保存策略名称。'
     await refreshStrategies(strategy.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+  }, { success: '已保存策略名称。' })
 }
 
 async function saveParams() {
@@ -201,65 +164,48 @@ async function saveParams() {
   if (!strategy || readonlyStrategy.value) return
   if (!paramsOf(strategy.template).length) {
     // 模板元数据还没到时 overrides() 会算出空对象,提交上去等于把参数重置为默认值
-    error.value = '算法模板元数据尚未加载完成，请稍后重试'
+    fail('算法模板元数据尚未加载完成，请稍后重试')
     return
   }
-  busy.value = true
-  error.value = ''
-  try {
-    await api.updateStrategy(strategy.id, { params: overrides(strategy.template, editParams) })
-    notice.value = '已保存策略参数。历史回测保留当时的参数快照，不受影响。'
-    await refreshStrategies(strategy.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
+  if (!editParamForm.validate()) {
+    fail('请修正策略参数后再保存')
+    return
   }
+  await runAction(async () => {
+    await api.updateStrategy(strategy.id, { params: editParamForm.overrides.value })
+    await refreshStrategies(strategy.id)
+  }, { success: '已保存策略参数。历史回测保留当时的参数快照，不受影响。' })
 }
 
 async function toggleEnabled(strategy: Strategy) {
   if (!strategy.editable) return
-  busy.value = true
-  error.value = ''
-  try {
+  await runAction(async () => {
     await api.updateStrategy(strategy.id, { enabled: !strategy.enabled })
-    notice.value = strategy.enabled
-      ? `已停用「${strategy.name}」，不再参与每日信号计算。`
-      : `已启用「${strategy.name}」，将参与每日信号计算。`
     await refreshStrategies(strategy.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+  }, {
+    success: strategy.enabled
+      ? `已停用「${strategy.name}」，不再参与每日信号计算。`
+      : `已启用「${strategy.name}」，将参与每日信号计算。`,
+  })
 }
 
 async function deleteStrategy() {
   const strategy = selected.value
   if (!strategy || readonlyStrategy.value || usedByBacktests.value > 0) return
   if (!window.confirm(`确认删除策略「${strategy.name}」？该策略的信号记录会一并删除，操作不可撤销。`)) return
-  busy.value = true
-  error.value = ''
-  try {
+  await runAction(async () => {
     await api.deleteStrategy(strategy.id)
-    notice.value = `已删除「${strategy.name}」。`
     selectedId.value = null
     await refreshStrategies()
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+  }, { success: `已删除「${strategy.name}」。` })
 }
 
 async function init() {
-  try {
+  await runAction(async () => {
     const [templateResult] = await Promise.all([api.strategyTemplates(), loadStrategies(true)])
     templates.value = templateResult.items ?? []
     if (!draft.template) draft.template = templates.value[0]?.key ?? ''
-  } catch (caught) {
-    error.value = (caught as Error).message
-  }
+  })
 }
 
 void init()
@@ -280,14 +226,14 @@ void init()
       </p>
     </div>
 
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
-    <p v-if="notice" class="rounded-md border border-border bg-info-soft px-4 py-2 text-sm text-text-secondary">{{ notice }}</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
     <div class="grid gap-5 lg:grid-cols-[18rem_1fr]">
       <!-- 策略列表 + 新建入口 -->
       <section class="space-y-3" aria-labelledby="strategy-list-heading">
         <h3 id="strategy-list-heading" class="text-sm font-semibold">全部策略</h3>
-        <p v-if="strategiesLoading" class="text-sm text-text-tertiary">加载中…</p>
+        <LoadingRows v-if="strategiesLoading" :rows="3" />
         <template v-else>
           <div v-for="group in [
             { title: '公共策略', items: presetStrategies },
@@ -383,31 +329,12 @@ void init()
 
           <div v-if="paramsOf(draft.template).length" class="rounded-md border border-border bg-surface-raised p-4">
             <span class="mb-2 block text-xs font-medium text-text-secondary">策略参数</span>
-            <div class="flex flex-wrap gap-3">
-              <label v-for="parameter in paramsOf(draft.template)" :key="parameter.key" class="text-sm">
-                <span class="mb-1 block text-xs text-text-tertiary">
-                  {{ parameter.name }}<template v-if="parameter.unit">（{{ parameter.unit }}）</template>
-                </span>
-                <input
-                  v-if="isBooleanParam(parameter)"
-                  v-model="draftParams[parameter.key]"
-                  type="checkbox"
-                  class="h-4 w-4 rounded border-border"
-                />
-                <input
-                  v-else
-                  v-model.number="draftParams[parameter.key]"
-                  type="number"
-                  :min="parameter.minimum"
-                  :max="parameter.maximum"
-                  :step="parameter.step ?? 'any'"
-                  class="w-32 rounded-md border border-border px-2 py-1.5"
-                />
-                <span v-if="parameter.description" class="mt-1 block max-w-56 text-xs leading-5 text-text-tertiary">
-                  {{ parameter.description }}
-                </span>
-              </label>
-            </div>
+            <StrategyParamFields
+              v-model="draftParamForm.values"
+              :parameters="draftParameterDefs"
+              :errors="draftParamForm.errors"
+              id-prefix="draft-strategy-param"
+            />
           </div>
         </form>
       </section>
@@ -467,9 +394,9 @@ void init()
           因此不能删除，只能<strong class="font-medium text-text-primary">停用</strong>。停用后不再参与每日信号计算，历史回测保持可查。
         </p>
 
-        <p v-if="!selected.params_valid" class="rounded-md border border-up/30 bg-up/5 px-4 py-3 text-sm leading-6 text-up">
+        <InlineFeedback v-if="!selected.params_valid" tone="error">
           该策略保存的参数与当前算法模板不匹配（模板参数可能已调整）。请在下方确认参数后重新保存。
-        </p>
+        </InlineFeedback>
 
         <div v-if="templateOf(selected.template)" class="max-w-3xl text-xs leading-5 text-text-secondary">
           <p>{{ templateOf(selected.template)?.description }}</p>
@@ -502,33 +429,13 @@ void init()
               约束：{{ templateOf(selected.template)?.constraints?.join('；') }}
             </span>
           </div>
-          <div class="flex flex-wrap gap-3">
-            <label v-for="parameter in paramsOf(selected.template)" :key="parameter.key" class="text-sm">
-              <span class="mb-1 block text-xs text-text-tertiary">
-                {{ parameter.name }}<template v-if="parameter.unit">（{{ parameter.unit }}）</template>
-              </span>
-              <input
-                v-if="isBooleanParam(parameter)"
-                v-model="editParams[parameter.key]"
-                type="checkbox"
-                :disabled="readonlyStrategy"
-                class="h-4 w-4 rounded border-border disabled:opacity-50"
-              />
-              <input
-                v-else
-                v-model.number="editParams[parameter.key]"
-                type="number"
-                :min="parameter.minimum"
-                :max="parameter.maximum"
-                :step="parameter.step ?? 'any'"
-                :disabled="readonlyStrategy"
-                class="w-32 rounded-md border border-border px-2 py-1.5 disabled:opacity-50"
-              />
-              <span v-if="parameter.description" class="mt-1 block max-w-56 text-xs leading-5 text-text-tertiary">
-                {{ parameter.description }}
-              </span>
-            </label>
-          </div>
+          <StrategyParamFields
+            v-model="editParamForm.values"
+            :parameters="editParameterDefs"
+            :errors="editParamForm.errors"
+            :disabled="readonlyStrategy"
+            id-prefix="edit-strategy-param"
+          />
           <button
             v-if="!readonlyStrategy"
             type="button"

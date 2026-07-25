@@ -4,6 +4,7 @@ import { Search } from 'lucide-vue-next'
 import { api, type SignalItem, type WatchItem } from '../api'
 import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
+import InlineFeedback from '../components/InlineFeedback.vue'
 import PageHeader from '../components/PageHeader.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import StrategySelect from '../components/StrategySelect.vue'
@@ -99,7 +100,7 @@ onMounted(async () => {
       </button>
     </form>
 
-    <p v-if="error" role="alert" class="rounded-md border border-up/30 bg-danger-soft px-4 py-2 text-sm text-up">{{ error }}</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <LoadingRows v-if="loading" :rows="5" />
 
     <div v-else-if="items.length" class="overflow-x-auto rounded-md border border-border bg-surface-raised">

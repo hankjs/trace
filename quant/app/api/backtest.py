@@ -15,7 +15,8 @@ from ..api.pools import (default_pool, get_pool_or_404, pool_ref_out,
                          resolve_pool_codes, resolve_pool_codes_during)
 from ..api.strategies import get_strategy_or_404
 from ..db import get_db
-from ..models import BacktestEquity, BacktestRun, Pool, Stock, Strategy
+from ..models import BacktestEquity, BacktestRun, Pool, Strategy
+from ..stock_repository import StockRepository
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
@@ -40,28 +41,11 @@ class SweepIn(BaseModel):
     costs: dict = Field(default_factory=dict)
 
 
-def _stock_items(db: Session, codes: list[str] | None) -> list[dict]:
-    codes = codes or []
-    if not codes:
-        return []
-    unique_codes = list(dict.fromkeys(codes))
-    rows = db.execute(select(Stock).where(Stock.code.in_(unique_codes))).scalars().all()
-    stocks = {row.code: row for row in rows}
-    return [
-        {
-            "code": code,
-            "name": stocks[code].name if code in stocks else "",
-            "industry": stocks[code].industry if code in stocks else "",
-        }
-        for code in codes
-    ]
-
-
 def _decorate_result(result: dict, db: Session, pool: Pool | None = None) -> dict:
     # strategy_name / template 由引擎从策略行带出,这里不再补
     codes = result.get("codes")
     if isinstance(codes, list):
-        result["stocks"] = _stock_items(db, codes)
+        result["stocks"] = StockRepository(db).items(codes)
     if pool is not None:
         result["pool"] = pool_ref_out(pool)
     return result
@@ -168,7 +152,7 @@ def get_backtest(run_id: int, db: Session = Depends(get_db),
         "template": strategy.template if strategy else None,
         "params": run.params,
         "codes": run.codes,
-        "stocks": _stock_items(db, run.codes),
+        "stocks": StockRepository(db).items(run.codes),
         "start": str(run.start),
         "end": str(run.end),
         "metrics": run.metrics,

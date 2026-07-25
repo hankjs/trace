@@ -11,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.strategy.strategies import momentum_rotation, multifactor_hold
+from app.strategy.rebalance import top_n_rebalance_weights
 
 
 PORTFOLIO_STRATEGIES = [momentum_rotation, multifactor_hold]
@@ -84,3 +85,26 @@ def test_momentum_rotation_applies_daily_ma20_risk_filter():
 
     assert weights.loc[dates[85], "falling"] == pytest.approx(1.0)
     assert weights.loc[dates[90], "falling"] == pytest.approx(0.0)
+
+
+def test_risk_filter_is_temporary_but_eligibility_exit_persists():
+    dates = pd.bdate_range(date(2024, 1, 1), periods=5)
+    scores = pd.DataFrame({"a": [2.0] * 5, "b": [1.0] * 5}, index=dates)
+    eligibility = pd.DataFrame(True, index=dates, columns=scores.columns)
+    eligibility.loc[dates[3], "a"] = False
+    blocked = pd.DataFrame(False, index=dates, columns=scores.columns)
+    blocked.loc[dates[1], "a"] = True
+
+    weights = top_n_rebalance_weights(
+        scores,
+        [True, False, False, False, False],
+        1,
+        eligibility=eligibility,
+        risk_blocked=blocked,
+    )
+
+    assert weights.loc[dates[0], "a"] == pytest.approx(1.0)
+    assert weights.loc[dates[1], "a"] == pytest.approx(0.0)
+    assert weights.loc[dates[2], "a"] == pytest.approx(1.0)
+    assert weights.loc[dates[3], "a"] == pytest.approx(0.0)
+    assert weights.loc[dates[4], "a"] == pytest.approx(0.0)

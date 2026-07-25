@@ -5,6 +5,8 @@ import type { EChartsCoreOption } from 'echarts/core'
 import { api, type KlineBar, type SignalItem } from '../api'
 import { fmtBigAmount, fmtPct, fmtPrice, pnlClass } from '../format'
 import EChart from '../components/EChart.vue'
+import InlineFeedback from '../components/InlineFeedback.vue'
+import LoadingRows from '../components/LoadingRows.vue'
 
 const UP = '#d43a3a'
 const DOWN = '#1a9e6b'
@@ -230,8 +232,8 @@ onMounted(loadAll)
     </div>
 
     <p v-if="backfillMsg" class="text-sm text-text-secondary">{{ backfillMsg }}</p>
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
-    <p v-if="loading" class="text-sm text-text-tertiary">加载中…</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <LoadingRows v-if="loading" :rows="6" />
 
     <div v-else-if="bars.length" class="rounded-lg border border-border bg-surface-raised p-2">
       <EChart :option="chartOption" height="560px" />

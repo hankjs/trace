@@ -14,6 +14,7 @@ import {
 } from '../api'
 import { categoryLabels, operatorLabels, useCatalog } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
+import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
 import { isKnownPoolId } from '../pools'
 import { fmtBigAmount, fmtPct, fmtPrice, pnlClass } from '../format'
@@ -599,7 +600,7 @@ onMounted(async () => {
       </button>
     </p>
 
-    <p v-if="error" role="alert" class="rounded-md border border-up/30 bg-danger-soft px-4 py-2 text-sm text-up">{{ error }}</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <LoadingRows v-if="loading" :rows="5" />
 
     <section v-else-if="searched && !error" aria-labelledby="result-heading">

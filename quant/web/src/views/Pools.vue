@@ -9,7 +9,10 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { AlertTriangle, ClipboardPaste, Lock, Plus, Trash2 } from 'lucide-vue-next'
 import { api, isPresetPool, normalizeStockCode, type Pool, type PoolMember } from '../api'
 import PageHeader from '../components/PageHeader.vue'
+import InlineFeedback from '../components/InlineFeedback.vue'
+import LoadingRows from '../components/LoadingRows.vue'
 import { usePools } from '../pools'
+import { useAsyncAction } from '../useAsyncAction'
 
 const { pools, loading: poolsLoading, error: loadError, load: loadPools, invalidate } = usePools()
 
@@ -20,10 +23,9 @@ onMounted(() => {
 
 const selectedId = ref<number | null>(null)
 const members = ref<PoolMember[]>([])
-const membersLoading = ref(false)
-const error = ref('')
-const notice = ref('')
-const busy = ref(false)
+const { busy, error, notice, clear, fail, run: runAction } = useAsyncAction()
+const memberAction = useAsyncAction()
+const membersLoading = memberAction.busy
 
 const newPoolName = ref('')
 const pasteText = ref('')
@@ -60,21 +62,18 @@ async function loadMembers(id: number | null) {
     members.value = []
     return
   }
-  membersLoading.value = true
-  try {
+  await memberAction.run(async () => {
     const response = await api.poolMembers(id)
     members.value = response.items ?? []
-  } catch (caught) {
+  })
+  if (memberAction.error.value) {
     members.value = []
-    error.value = (caught as Error).message
-  } finally {
-    membersLoading.value = false
+    fail(memberAction.error.value)
   }
 }
 
 watch(selectedId, (id) => {
-  error.value = ''
-  notice.value = ''
+  clear()
   pasteText.value = ''
   void loadMembers(id)
 })
@@ -86,111 +85,80 @@ watch(pools, (items) => {
 async function createPool() {
   const name = newPoolName.value.trim()
   if (!name) {
-    error.value = '请填写股票池名称'
+    fail('请填写股票池名称')
     return
   }
-  busy.value = true
-  error.value = ''
-  try {
+  await runAction(async () => {
     const pool = await api.createPool({ name, min_list_days: minListDays.value })
     newPoolName.value = ''
-    notice.value = `已创建「${pool.name}」，可在右侧粘贴代码导入成员。`
     await refreshPools(pool.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+    return pool
+  }, { success: (pool) => `已创建「${pool.name}」，可在右侧粘贴代码导入成员。` })
 }
 
 /** 预置池另存为自定义池:用当前成分做初始成员快照 */
 async function saveAsCustom() {
-  if (!selected.value) return
-  busy.value = true
-  error.value = ''
-  try {
-    const source = selected.value
+  const source = selected.value
+  if (!source) return
+  await runAction(async () => {
     const snapshot = await api.poolMembers(source.id)
     const pool = await api.createPool({
       name: `${source.name} 副本`,
       min_list_days: source.min_list_days,
       codes: (snapshot.items ?? []).map((member) => member.code),
     })
-    notice.value = `已按当前成分另存为「${pool.name}」。该副本为静态名单，不含成员变动历史。`
     await refreshPools(pool.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+    return pool
+  }, { success: (pool) => `已按当前成分另存为「${pool.name}」。该副本为静态名单，不含成员变动历史。` })
 }
 
 async function importCodes() {
-  if (!selected.value || readonlyPool.value) return
+  const pool = selected.value
+  if (!pool || readonlyPool.value) return
   if (!parsedCodes.value.length) {
-    error.value = '没有识别到合法的股票代码'
+    fail('没有识别到合法的股票代码')
     return
   }
-  busy.value = true
-  error.value = ''
-  try {
-    const result = await api.addPoolMembers(selected.value.id, parsedCodes.value)
-    const skipped = result.skipped?.length ? `，${result.skipped.length} 个代码未入库被忽略` : ''
-    notice.value = `已导入 ${result.added} 只股票${skipped}。`
+  await runAction(async () => {
+    const result = await api.addPoolMembers(pool.id, parsedCodes.value)
     pasteText.value = ''
-    await Promise.all([loadMembers(selected.value.id), refreshPools(selected.value.id)])
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+    await Promise.all([loadMembers(pool.id), refreshPools(pool.id)])
+    return result
+  }, {
+    success: (result) => {
+      const skipped = result.skipped?.length ? `，${result.skipped.length} 个代码未入库被忽略` : ''
+      return `已导入 ${result.added} 只股票${skipped}。`
+    },
+  })
 }
 
 async function removeMember(code: string) {
-  if (!selected.value || readonlyPool.value) return
-  busy.value = true
-  error.value = ''
-  try {
-    await api.removePoolMember(selected.value.id, code)
-    await Promise.all([loadMembers(selected.value.id), refreshPools(selected.value.id)])
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+  const pool = selected.value
+  if (!pool || readonlyPool.value) return
+  await runAction(async () => {
+    await api.removePoolMember(pool.id, code)
+    await Promise.all([loadMembers(pool.id), refreshPools(pool.id)])
+  })
 }
 
 async function saveSettings() {
-  if (!selected.value || readonlyPool.value) return
-  busy.value = true
-  error.value = ''
-  try {
-    await api.updatePool(selected.value.id, { min_list_days: selected.value.min_list_days })
-    notice.value = '已保存股票池设置。'
-    await refreshPools(selected.value.id)
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+  const pool = selected.value
+  if (!pool || readonlyPool.value) return
+  await runAction(async () => {
+    await api.updatePool(pool.id, { min_list_days: pool.min_list_days })
+    await refreshPools(pool.id)
+  }, { success: '已保存股票池设置。' })
 }
 
 async function deletePool() {
   const pool = selected.value
   if (!pool || readonlyPool.value) return
   if (!window.confirm(`确认删除股票池「${pool.name}」？该操作不可撤销。`)) return
-  busy.value = true
-  error.value = ''
-  try {
+  await runAction(async () => {
     await api.deletePool(pool.id)
-    notice.value = `已删除「${pool.name}」。`
     selectedId.value = null
     await refreshPools()
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    busy.value = false
-  }
+  }, { success: `已删除「${pool.name}」。` })
 }
 </script>
 
@@ -201,14 +169,14 @@ async function deletePool() {
       description="选股与回测的研究范围。预置池按指数成分变动历史逐日解析，自定义池只保存当前名单。"
     />
 
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
-    <p v-if="notice" class="rounded-md border border-border bg-info-soft px-4 py-2 text-sm text-text-secondary">{{ notice }}</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
     <div class="grid gap-5 lg:grid-cols-[18rem_1fr]">
       <!-- 池列表 + 新建 -->
       <section class="space-y-3" aria-labelledby="pool-list-heading">
         <h2 id="pool-list-heading" class="text-sm font-semibold">全部股票池</h2>
-        <p v-if="poolsLoading" class="text-sm text-text-tertiary">加载中…</p>
+        <LoadingRows v-if="poolsLoading" :rows="3" />
         <ul v-else class="space-y-1.5">
           <li v-for="pool in pools" :key="pool.id">
             <button
@@ -229,8 +197,8 @@ async function deletePool() {
               </span>
             </button>
           </li>
-          <li v-if="loadError" class="rounded-md border border-up/30 bg-up/5 px-3 py-3 text-center text-xs text-up">
-            {{ loadError }}
+          <li v-if="loadError">
+            <InlineFeedback tone="error">股票池加载失败：{{ loadError }}</InlineFeedback>
           </li>
           <li v-else-if="!pools.length" class="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-text-tertiary">
             暂无股票池
@@ -362,7 +330,7 @@ async function deletePool() {
             成员
             <span class="ml-1 font-normal text-text-tertiary">（{{ members.length }}）</span>
           </h3>
-          <p v-if="membersLoading" class="text-sm text-text-tertiary">加载中…</p>
+          <LoadingRows v-if="membersLoading" :rows="3" />
           <template v-else-if="members.length">
             <div class="flex flex-wrap gap-2">
               <span

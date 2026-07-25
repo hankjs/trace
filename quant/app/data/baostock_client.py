@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import date, datetime
+from typing import Any
 
 import baostock as bs
 import pandas as pd
@@ -46,34 +48,55 @@ def _release_session() -> None:
             bs.logout()
 
 
+class BaoStockClient:
+    """管理 baostock 会话和非线程安全的响应读取。"""
+
+    def __init__(self) -> None:
+        self._query_lock = threading.RLock()
+
+    @contextmanager
+    def session(self):
+        _acquire_session()
+        try:
+            yield
+        finally:
+            _release_session()
+
+    def _query_frame(
+        self,
+        query: Callable[[], Any],
+        error_context: str,
+    ) -> pd.DataFrame:
+        """执行查询、检查错误并完整展开结果集。"""
+        with self.session(), self._query_lock:
+            result = query()
+            if result.error_code != "0":
+                raise RuntimeError(
+                    f"{error_context}: {result.error_code} {result.error_msg}"
+                )
+            rows = []
+            while result.error_code == "0" and result.next():
+                rows.append(result.get_row_data())
+            if result.error_code != "0":
+                raise RuntimeError(
+                    f"{error_context}: {result.error_code} {result.error_msg}"
+                )
+            return pd.DataFrame(rows, columns=result.fields)
+
+
+_client = BaoStockClient()
+
+
 @contextmanager
 def login_session():
     """批量拉取时复用一次登录。
 
     可重入(refcount):嵌套调用只增加引用计数,内层退出不会提前 logout
     把外层剩余工作丢进未登录状态(REVIEW §3.5 baostock 会话不可重入)。
-    baostock 本身非线程安全,仍应在单线程上下文批量使用。
+    baostock 本身非线程安全,查询和响应读取由客户端锁串行化。
     """
-    _acquire_session()
-    try:
+    with _client.session():
         yield
-    finally:
-        _release_session()
-
-
-@contextmanager
-def _ensure_session():
-    """单次 fetch 用:已有会话则直接复用,否则临时登录一次。
-
-    引用计数的读取与自增在同一把锁内完成,消除原先
-    `own_login = not _logged_in` 锁外读取的竞态。锁只保护 login/logout,
-    不再横跨整个 fetch,并发的 admin backfill 不会被整段串行阻塞。
-    """
-    _acquire_session()
-    try:
-        yield
-    finally:
-        _release_session()
 
 
 def fetch_daily_bars(code: str, start: date | str, end: date | str) -> pd.DataFrame:
@@ -87,23 +110,17 @@ def fetch_daily_bars(code: str, start: date | str, end: date | str) -> pd.DataFr
     # (回测的 ST 口径必须逐日,见 alembic 0010 的实测偏差数据)
     fields_adj = "date,open,high,low,close,volume,amount,isST"
     fields_raw = "date,close"
-    with _ensure_session():
+    with _client.session():
         frames = []
         # adjustflag: 2=前复权, 3=不复权
         for adj, fields in (("2", fields_adj), ("3", fields_raw)):
-            rs = bs.query_history_k_data_plus(
-                code, fields, start_date=start_s, end_date=end_s,
-                frequency="d", adjustflag=adj,
-            )
-            if rs.error_code != "0":
-                raise RuntimeError(
-                    f"baostock 查询失败 {code}: {rs.error_code} {rs.error_msg}"
-                )
-            rows = []
-            while (rs.error_code == "0") & rs.next():
-                rows.append(rs.get_row_data())
-            df = pd.DataFrame(rows, columns=rs.fields)
-            frames.append(df)
+            frames.append(_client._query_frame(
+                lambda adj=adj, fields=fields: bs.query_history_k_data_plus(
+                    code, fields, start_date=start_s, end_date=end_s,
+                    frequency="d", adjustflag=adj,
+                ),
+                f"baostock 查询失败 {code}",
+            ))
 
     if frames[0].empty:
         return pd.DataFrame(
@@ -150,16 +167,10 @@ def fetch_index_members(index_name: str,
 
     day_s = day.isoformat() if isinstance(day, (date, datetime)) else (day or "")
 
-    with _ensure_session():
-        rs = query(date=day_s)
-        if rs.error_code != "0":
-            raise RuntimeError(
-                f"baostock 成分股查询失败 {index_name}: {rs.error_code} {rs.error_msg}"
-            )
-        rows = []
-        while (rs.error_code == "0") & rs.next():
-            rows.append(rs.get_row_data())
-        df = pd.DataFrame(rows, columns=rs.fields)
+    df = _client._query_frame(
+        lambda: query(date=day_s),
+        f"baostock 成分股查询失败 {index_name}",
+    )
 
     if df.empty:
         return pd.DataFrame(columns=["code", "name", "update_date"])
@@ -176,16 +187,10 @@ def fetch_trade_dates(start: date | str, end: date | str) -> pd.DataFrame:
     start_s = start.isoformat() if isinstance(start, (date, datetime)) else str(start)
     end_s = end.isoformat() if isinstance(end, (date, datetime)) else str(end)
 
-    with _ensure_session():
-        rs = bs.query_trade_dates(start_date=start_s, end_date=end_s)
-        if rs.error_code != "0":
-            raise RuntimeError(
-                f"baostock 交易日历查询失败: {rs.error_code} {rs.error_msg}"
-            )
-        rows = []
-        while (rs.error_code == "0") & rs.next():
-            rows.append(rs.get_row_data())
-        df = pd.DataFrame(rows, columns=rs.fields)
+    df = _client._query_frame(
+        lambda: bs.query_trade_dates(start_date=start_s, end_date=end_s),
+        "baostock 交易日历查询失败",
+    )
 
     if df.empty:
         return pd.DataFrame(columns=["date", "is_open"])
@@ -201,16 +206,10 @@ def fetch_stock_basic() -> pd.DataFrame:
     返回 DataFrame: code, name, list_date(date|None), delist_date(date|None),
     type(str: 1股票/2指数/3其他/4可转债/5ETF), status(str: 1上市/0退市)
     """
-    with _ensure_session():
-        rs = bs.query_stock_basic()
-        if rs.error_code != "0":
-            raise RuntimeError(
-                f"baostock 证券资料查询失败: {rs.error_code} {rs.error_msg}"
-            )
-        rows = []
-        while (rs.error_code == "0") & rs.next():
-            rows.append(rs.get_row_data())
-        df = pd.DataFrame(rows, columns=rs.fields)
+    df = _client._query_frame(
+        bs.query_stock_basic,
+        "baostock 证券资料查询失败",
+    )
 
     cols = ["code", "name", "list_date", "delist_date", "type", "status"]
     if df.empty:
@@ -242,16 +241,11 @@ def fetch_adjust_factors(code: str, start: date | str | None = None,
     start_s = start.isoformat() if isinstance(start, (date, datetime)) else (start or "")
     end_s = end.isoformat() if isinstance(end, (date, datetime)) else (end or "")
 
-    with _ensure_session():
-        rs = bs.query_adjust_factor(code=code, start_date=start_s, end_date=end_s)
-        if rs.error_code != "0":
-            raise RuntimeError(
-                f"baostock 复权因子查询失败 {code}: {rs.error_code} {rs.error_msg}"
-            )
-        rows = []
-        while (rs.error_code == "0") & rs.next():
-            rows.append(rs.get_row_data())
-        df = pd.DataFrame(rows, columns=rs.fields)
+    df = _client._query_frame(
+        lambda: bs.query_adjust_factor(
+            code=code, start_date=start_s, end_date=end_s),
+        f"baostock 复权因子查询失败 {code}",
+    )
 
     cols = ["code", "divid_operate_date", "fore_factor", "back_factor"]
     if df.empty:

@@ -3,15 +3,18 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { AlertTriangle } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
-import { api, hasSurvivorshipBias, type BacktestResult, type SweepResult, type SweepMetrics, type WatchItem } from '../api'
+import { api, hasSurvivorshipBias, type BacktestResult, type SweepResult, type WatchItem } from '../api'
 import { catalogEntry, loadCatalog, metricName, templateName } from '../catalog'
-import { fmtPct, fmtPrice } from '../format'
+import { aggregateMetric, fmtPct, fmtPrice } from '../format'
 import EChart from '../components/EChart.vue'
+import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import StrategySelect from '../components/StrategySelect.vue'
+import StrategyParamFields from '../components/StrategyParamFields.vue'
 import { poolById } from '../pools'
 import { invalidateStrategies, strategyById, useStrategies } from '../strategies'
+import { useStrategyParamForm } from '../useStrategyParamForm'
 
 const route = useRoute()
 
@@ -46,26 +49,14 @@ const templateMeta = computed(() =>
 )
 const strategyParams = computed(() => templateMeta.value?.params ?? [])
 const isPortfolio = computed(() => strategy.value?.kind === 'portfolio')
-const parameterValues = reactive<Record<string, number>>({})
-
-/** 参数表单初值取策略的实际生效参数(已合并模板默认值) */
-function resetParameterValues() {
-  for (const key of Object.keys(parameterValues)) delete parameterValues[key]
-  const effective = strategy.value?.effective_params ?? {}
-  for (const parameter of strategyParams.value) {
-    const value = effective[parameter.key] ?? parameter.default
-    if (typeof value === 'number') parameterValues[parameter.key] = value
-  }
-}
+const parameterForm = useStrategyParamForm(strategyParams)
+const parameterValues = parameterForm.values
 
 /** 与策略自身参数是否有差异:有差异才是「临时调参」,才值得提示另存 */
-const paramsTweaked = computed(() => {
-  const effective = strategy.value?.effective_params ?? {}
-  return strategyParams.value.some((parameter) => parameterValues[parameter.key] !== effective[parameter.key])
-})
+const paramsTweaked = computed(() => parameterForm.differsFrom(strategy.value?.effective_params ?? {}))
 
-watch(strategy, () => {
-  resetParameterValues()
+watch([strategy, strategyParams], () => {
+  parameterForm.reset(strategy.value?.effective_params ?? {})
   notice.value = ''
   saveAsName.value = ''
   if (isPortfolio.value && mode.value === 'sweep') mode.value = 'single'
@@ -75,12 +66,16 @@ watch(strategy, () => {
 async function saveTweakedAsStrategy() {
   const source = strategy.value
   if (!source) return
+  if (!parameterForm.validate()) {
+    error.value = '请修正策略参数后再另存'
+    return
+  }
   running.value = true
   error.value = ''
   try {
     const created = await api.duplicateStrategy(source.id, {
       name: saveAsName.value.trim() || undefined,
-      params: { ...parameterValues },
+      params: parameterForm.overrides.value,
     })
     invalidateStrategies()
     await loadStrategies(true)
@@ -130,7 +125,7 @@ function parseGrid(): Record<string, number[]> {
 const sweepRows = computed(() => {
   const rows = [...(sweepResult.value?.results ?? [])]
   rows.sort(
-    (a, b) => (metricOf(b.metrics, 'total_return') ?? -Infinity) - (metricOf(a.metrics, 'total_return') ?? -Infinity)
+    (a, b) => (aggregateMetric(b.metrics, 'total_return') ?? -Infinity) - (aggregateMetric(a.metrics, 'total_return') ?? -Infinity)
   )
   return rows
 })
@@ -139,12 +134,6 @@ const bestKey = computed(() => {
   const best = sweepRows.value[0]
   return best ? JSON.stringify(best.params) : ''
 })
-
-/** 扫描指标聚合口径可能带 _mean/_median 后缀,做兜底 */
-function metricOf(m: SweepMetrics, key: string): number | undefined {
-  const v = m[`${key}_mean`] ?? m[key] ?? m[`${key}_median`]
-  return typeof v === 'number' && !Number.isNaN(v) ? v : undefined
-}
 
 function paramsText(params: Record<string, number>): string {
   return Object.entries(params)
@@ -163,7 +152,7 @@ const heatmapOption = computed<EChartsCoreOption | null>(() => {
   const yVals = [...new Set(rows.map((r) => r.params[yName]))].sort((a, b) => a - b)
   const data: [number, number, number][] = []
   for (const r of rows) {
-    const v = metricOf(r.metrics, 'total_return')
+    const v = aggregateMetric(r.metrics, 'total_return')
     if (v === undefined) continue
     data.push([xVals.indexOf(r.params[xName]), yVals.indexOf(r.params[yName]), +v.toFixed(4)])
   }
@@ -331,6 +320,10 @@ async function run() {
     error.value = '请选择起止日期'
     return
   }
+  if (!parameterForm.validate()) {
+    error.value = '请修正策略参数后再运行回测'
+    return
+  }
   running.value = true
   try {
     result.value = await api.runBacktest({
@@ -340,7 +333,7 @@ async function run() {
       end: form.end,
       // 组合策略按股票池解析成分(取代旧的「codes 留空隐式动态池」约定)
       ...(isPortfolio.value && poolId.value !== null ? { pool_id: poolId.value } : {}),
-      params: { ...parameterValues },
+      params: parameterForm.snapshot(),
     })
   } catch (e) {
     error.value = (e as Error).message
@@ -373,7 +366,7 @@ onMounted(async () => {
     // 但仍等一次 load,避免 strategyId 落位前先渲染出空参数表单
     const [, w] = await Promise.all([loadStrategies(), api.watchlist()])
     watchlist.value = w.items
-    resetParameterValues()
+    parameterForm.reset(strategy.value?.effective_params ?? {})
   } catch (e) {
     error.value = (e as Error).message
   }
@@ -438,22 +431,12 @@ onMounted(async () => {
           策略参数
           <span class="ml-1 font-normal text-text-tertiary">（此处调参只作用于本次回测，不改动策略本身）</span>
         </span>
-        <div class="flex flex-wrap gap-3">
-          <label v-for="parameter in strategyParams" :key="parameter.key" class="text-sm">
-            <span class="mb-1 block text-xs text-text-tertiary">
-              {{ parameter.name }}<template v-if="parameter.unit">（{{ parameter.unit }}）</template>
-            </span>
-            <input
-              v-model.number="parameterValues[parameter.key]"
-              type="number"
-              :min="parameter.minimum"
-              :max="parameter.maximum"
-              :step="parameter.step ?? 'any'"
-              required
-              class="w-32 rounded-md border border-border px-2 py-1.5"
-            />
-          </label>
-        </div>
+        <StrategyParamFields
+          v-model="parameterValues"
+          :parameters="strategyParams"
+          :errors="parameterForm.errors"
+          id-prefix="backtest-param"
+        />
 
         <!-- 临时调参后可固化为一条新策略,原策略(尤其公共策略)保持不变 -->
         <div v-if="paramsTweaked" class="mt-3 flex flex-wrap items-end gap-2">
@@ -558,8 +541,8 @@ onMounted(async () => {
       </button>
     </div>
 
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
-    <p v-if="notice" class="rounded-md border border-border bg-info-soft px-4 py-2 text-sm text-text-secondary">{{ notice }}</p>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
     <!-- 参数扫描结果 -->
     <template v-if="mode === 'sweep' && sweepResult">
@@ -601,22 +584,22 @@ onMounted(async () => {
                 >最优</span>
               </td>
               <td class="px-4 py-2 font-medium">{{ paramsText(r.params) }}</td>
-              <td class="px-4 py-2 text-right" :class="(metricOf(r.metrics, 'total_return') ?? 0) >= 0 ? 'text-up' : 'text-down'">
-                {{ metricOf(r.metrics, 'total_return') !== undefined ? fmtPct(metricOf(r.metrics, 'total_return')) : '--' }}
+              <td class="px-4 py-2 text-right" :class="(aggregateMetric(r.metrics, 'total_return') ?? 0) >= 0 ? 'text-up' : 'text-down'">
+                {{ aggregateMetric(r.metrics, 'total_return') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'total_return')) : '--' }}
               </td>
-              <td class="px-4 py-2 text-right" :class="(metricOf(r.metrics, 'annual_return') ?? 0) >= 0 ? 'text-up' : 'text-down'">
-                {{ metricOf(r.metrics, 'annual_return') !== undefined ? fmtPct(metricOf(r.metrics, 'annual_return')) : '--' }}
+              <td class="px-4 py-2 text-right" :class="(aggregateMetric(r.metrics, 'annual_return') ?? 0) >= 0 ? 'text-up' : 'text-down'">
+                {{ aggregateMetric(r.metrics, 'annual_return') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'annual_return')) : '--' }}
               </td>
               <td class="px-4 py-2 text-right text-down">
-                {{ metricOf(r.metrics, 'max_drawdown') !== undefined ? fmtPct(metricOf(r.metrics, 'max_drawdown')) : '--' }}
+                {{ aggregateMetric(r.metrics, 'max_drawdown') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'max_drawdown')) : '--' }}
               </td>
               <td class="px-4 py-2 text-right">
-                {{ metricOf(r.metrics, 'sharpe') !== undefined ? fmtPrice(metricOf(r.metrics, 'sharpe')) : '--' }}
+                {{ aggregateMetric(r.metrics, 'sharpe') !== undefined ? fmtPrice(aggregateMetric(r.metrics, 'sharpe')) : '--' }}
               </td>
               <td class="px-4 py-2 text-right">
-                {{ metricOf(r.metrics, 'win_rate') !== undefined ? fmtPct(metricOf(r.metrics, 'win_rate')) : '--' }}
+                {{ aggregateMetric(r.metrics, 'win_rate') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'win_rate')) : '--' }}
               </td>
-              <td class="px-4 py-2 text-right">{{ metricOf(r.metrics, 'trade_count') ?? '--' }}</td>
+              <td class="px-4 py-2 text-right">{{ aggregateMetric(r.metrics, 'trade_count') ?? '--' }}</td>
             </tr>
           </tbody>
         </table>
