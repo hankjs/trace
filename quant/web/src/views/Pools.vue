@@ -5,13 +5,18 @@
  * 预置池(kind='index'/'all')全局共享且只读,只能「另存为自定义池」。
  * 自定义池(kind='static')只存代码不存日期,故无成员历史 —— 页面需明示该取舍。
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { AlertTriangle, ClipboardPaste, Lock, Plus, Trash2 } from 'lucide-vue-next'
 import { api, isPresetPool, normalizeStockCode, type Pool, type PoolMember } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import { usePools } from '../pools'
 
-const { pools, loading: poolsLoading, load: loadPools, invalidate } = usePools()
+const { pools, loading: poolsLoading, error: loadError, load: loadPools, invalidate } = usePools()
+
+onMounted(() => {
+  // 直接打开本页时共享缓存可能为空,必须主动拉取;失败原因已由 loadPools 写入 loadError
+  void loadPools().catch(() => {})
+})
 
 const selectedId = ref<number | null>(null)
 const members = ref<PoolMember[]>([])
@@ -224,7 +229,10 @@ async function deletePool() {
               </span>
             </button>
           </li>
-          <li v-if="!pools.length" class="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-text-tertiary">
+          <li v-if="loadError" class="rounded-md border border-up/30 bg-up/5 px-3 py-3 text-center text-xs text-up">
+            {{ loadError }}
+          </li>
+          <li v-else-if="!pools.length" class="rounded-md border border-dashed border-border px-3 py-6 text-center text-xs text-text-tertiary">
             暂无股票池
           </li>
         </ul>
