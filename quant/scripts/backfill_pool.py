@@ -113,7 +113,15 @@ def main() -> None:
 
     with SessionLocal() as db:
         if args.all:
-            pool = sorted(r[0] for r in db.execute(select(Stock.code)).all())
+            # 跳过北交所:baostock 完全不覆盖(bj. 前缀报 10004011),留在池里
+            # 只会每只白跑 3 次重试加退避。它们由 ingest.sync_bj_market 走
+            # akshare 新浪源采集(见 alembic 0008)。
+            pool = sorted(
+                r[0] for r in db.execute(
+                    select(Stock.code).where(
+                        Stock.code.not_like(f"{ingest.BJ_PREFIX}%"))
+                ).all()
+            )
         else:
             pool = universe.current_pool(db)
         if force_codes:
