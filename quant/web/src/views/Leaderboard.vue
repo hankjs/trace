@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { api, type LeaderboardItem } from '../api'
-import { loadCatalog, metricName, strategyName } from '../catalog'
+import { loadCatalog, metricName, templateName } from '../catalog'
 import { fmtPct } from '../format'
 
 const items = ref<LeaderboardItem[]>([])
@@ -48,7 +48,7 @@ function metricClass(v: number | undefined): string {
 }
 
 function rowKey(it: LeaderboardItem): string {
-  return `${it.strategy}|${it.scope}|${it.start}|${it.end}`
+  return `${it.strategy_id}|${it.scope}|${it.start}|${it.end}`
 }
 
 function toggleExpand(it: LeaderboardItem) {
@@ -113,8 +113,11 @@ onMounted(async () => {
             >
               <td class="px-4 py-2 text-text-tertiary">{{ i + 1 }}</td>
               <td class="px-4 py-2">
-                <div class="font-medium">{{ strategyName(it.strategy) }}</div>
-                <code class="text-[11px] text-text-tertiary">{{ it.strategy }}</code>
+                <div class="flex items-center gap-1.5">
+                  <span class="font-medium">{{ it.strategy }}</span>
+                  <span v-if="!it.is_system" class="rounded bg-active px-1.5 py-0.5 text-[11px] text-accent">自定义</span>
+                </div>
+                <div class="text-[11px] text-text-tertiary">{{ templateName(it.template) }}</div>
               </td>
               <td class="px-4 py-2">
                 <span class="rounded bg-active px-1.5 py-0.5 text-xs text-text-secondary">

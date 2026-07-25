@@ -155,17 +155,25 @@ class Snapshot(Base):
 
 
 class Signal(Base):
-    """策略信号。side: buy / sell / watch,reason 为 JSON(触发原因明细)。"""
+    """策略信号。side: buy / sell / watch,reason 为 JSON(触发原因明细)。
+
+    `strategy_id` 指向 `quant_strategy`,取代原先的 `strategy` 字符串列
+    (见 alembic 0012)。ON DELETE CASCADE:信号是夜间任务的派生数据,策略删了
+    重算不出来也不该留着悬空引用。
+    """
 
     __tablename__ = "quant_signal"
     __table_args__ = (
-        UniqueConstraint("code", "date", "strategy", "side", name="uq_signal"),
+        UniqueConstraint("code", "date", "strategy_id", "side", name="uq_signal"),
     )
 
     id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     date: Mapped[date] = mapped_column(Date, index=True)
-    strategy: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_strategy.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
     side: Mapped[str] = mapped_column(String(8))
     price: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
     reason: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -188,13 +196,21 @@ class Trade(Base):
 
 
 class BacktestRun(Base):
-    """回测任务"""
+    """回测任务。
+
+    `strategy_id` 用 ON DELETE RESTRICT(与 Signal/StrategyEval 的 CASCADE
+    不同):回测是用户主动发起并要求可复现审计的记录,不能因为删了策略就静默
+    消失。API 在删除仍被回测引用的策略时返回 409,引导用户改用「停用」。
+    """
 
     __tablename__ = "quant_backtest_run"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
-    strategy: Mapped[str] = mapped_column(String(64))
+    strategy_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_strategy.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     costs: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 回测复现:固化当时费率
     pool_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 回测所用股票池
@@ -306,12 +322,18 @@ class Pick(Base):
 
 
 class StrategyEval(Base):
-    """策略批量评估结果。scope: single:xxx / pool_top50 / pool。"""
+    """策略批量评估结果。scope: single:xxx / pool_top50 / pool。
+
+    ON DELETE CASCADE:与 Signal 同理,评估是定时任务的派生数据,下一轮会重算。
+    """
 
     __tablename__ = "quant_strategy_eval"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    strategy: Mapped[str] = mapped_column(String(64), index=True)
+    strategy_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_strategy.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     scope: Mapped[str] = mapped_column(String(64), index=True)
     batch_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
@@ -338,10 +360,47 @@ class BacktestEquity(Base):
     equity: Mapped[float] = mapped_column(_EQUITY)
 
 
-# 系统预置池的 owner_id。用哨兵 UUID 而不是某个真实用户:预置池不该因为
-# admin 被删或换人而失去归属,也不该让「属于某人」与「系统级」两种语义混淆。
-# 该值不对应 users 表的行,故 owner_id 不加 users 外键。
+# 系统预置池/预置策略的 owner_id。用哨兵 UUID 而不是某个真实用户:预置内容
+# 不该因为 admin 被删或换人而失去归属,也不该让「属于某人」与「系统级」两种
+# 语义混淆。该值不对应 users 表的行,故 owner_id 不加 users 外键。
 SYSTEM_OWNER_ID = "00000000-0000-0000-0000-000000000000"
+
+
+class Strategy(Base):
+    """用户可管理的策略实例 = 算法模板 + 一组参数。
+
+    归属模型与 `Pool` 完全一致(见 alembic 0011):可见性 = `is_system`
+    OR `owner_id` 是我。**不建 grant 表** —— 当前只需要「公共」和「我的」两
+    档,定向分享等真有需求再照 `quant_pool_grant` 补,不预先建一张没人写的表。
+
+    `template` 指向 `app/strategy/strategies` 里的算法模块,算法逻辑仍在代码
+    里,本表只存参数组合。这也是后续「规则构建器」的扩展点:新增
+    `template='rule'` 和一列 `rules JSON` 即可,不动现有行的语义。
+
+    `kind` 是 template 的冗余(模块的 `KIND`)。冗余是刻意的:夜间信号引擎要
+    取「所有启用的单标的策略」,有了这一列就是一条带索引的查询,否则得把全部
+    策略行读进内存再逐行查 REGISTRY 过滤。写入时由 API 从模块回填,用户改不到。
+    """
+
+    __tablename__ = "quant_strategy"
+    __table_args__ = (
+        UniqueConstraint("owner_id", "name", name="uq_strategy_owner_name"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # NOT NULL:系统策略归 SYSTEM_OWNER_ID,不用 NULL 表达「无主」(NULL 会让
+    # UniqueConstraint 失效 —— MySQL 里 NULL 互不相等,详见 alembic 0011)
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    template: Mapped[str] = mapped_column(String(32), index=True)  # ma_cross / breakout ...
+    kind: Mapped[str] = mapped_column(String(16), index=True)  # single / portfolio
+    # 空 dict 表示全用模板默认参数;只存用户显式覆盖的键,模板默认值改动能自动生效
+    params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 停用的策略不进夜间信号引擎和批量评估,但历史信号/回测记录保留。
+    # 删除策略会牵连历史(见下方三张表的外键),故「停用」是常规操作、删除是例外。
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class Pool(Base):

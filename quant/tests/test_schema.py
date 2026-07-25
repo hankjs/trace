@@ -57,7 +57,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0011_pool_owner_and_grant"}
+    assert heads == {"0012_strategy_table"}
     assert current_heads(migrated_db) == heads
 
 
@@ -79,6 +79,7 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_signal",
         "quant_snapshot",
         "quant_stock",
+        "quant_strategy",
         "quant_strategy_eval",
         "quant_trade",
         "quant_trade_calendar",
@@ -364,6 +365,97 @@ def test_system_pool_name_uniqueness_actually_holds(migrated_db):
     with pytest.raises(IntegrityError):
         with migrated_db.begin() as conn:
             conn.execute(dup)
+
+
+def test_system_strategies_are_seeded(migrated_db):
+    """预置公共策略:6 个算法模板各一条,归哨兵 UUID、is_system=1、id 固定。"""
+    with migrated_db.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT id, owner_id, is_system, name, template, kind, enabled "
+            "FROM quant_strategy ORDER BY id"
+        )).all()
+    sys_id = "00000000-0000-0000-0000-000000000000"
+    assert [tuple(row) for row in rows] == [
+        (1, sys_id, 1, "双均线趋势策略", "ma_cross", "single", 1),
+        (2, sys_id, 1, "价格突破策略", "breakout", "single", 1),
+        (3, sys_id, 1, "上升趋势中的超跌反弹策略", "mean_reversion", "single", 1),
+        (4, sys_id, 1, "缩量整理后的放量突破策略", "volume_breakout", "single", 1),
+        (5, sys_id, 1, "强势股票轮动策略", "momentum_rotation", "portfolio", 1),
+        (6, sys_id, 1, "多指标综合评分持有策略", "multifactor_hold", "portfolio", 1),
+    ]
+
+
+def test_seeded_strategies_match_code_templates(migrated_db):
+    """seed 的 template/kind 必须与代码里的模块一致。
+
+    迁移里的 seed 是写死的常量,模块改名或改 KIND 时不会自动跟着变 ——
+    漂移会让策略行指向不存在的模板(信号引擎跳过、回测直接报错)。
+    """
+    from app.strategy.strategies import REGISTRY
+
+    with migrated_db.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT template, kind FROM quant_strategy WHERE is_system = 1"
+        )).all()
+    assert {row[0] for row in rows} == set(REGISTRY)
+    for template, kind in rows:
+        assert kind == REGISTRY[template].KIND
+
+
+def test_strategy_name_is_unique_per_owner(migrated_db):
+    """同一属主不能有两个同名策略(不同用户可以同名)。"""
+    from sqlalchemy.exc import IntegrityError
+
+    insert = text(
+        "INSERT INTO quant_strategy "
+        "(owner_id, is_system, name, template, kind, params, enabled, created_at) "
+        "VALUES (:owner, 0, '我的策略', 'ma_cross', 'single', '{}', 1,"
+        " '2026-07-25 00:00:00')"
+    )
+    with migrated_db.begin() as conn:
+        conn.execute(insert.bindparams(owner="user-a"))
+    try:
+        with pytest.raises(IntegrityError):
+            with migrated_db.begin() as conn:
+                conn.execute(insert.bindparams(owner="user-a"))
+        # 换个属主同名则允许
+        with migrated_db.begin() as conn:
+            conn.execute(insert.bindparams(owner="user-b"))
+    finally:
+        with migrated_db.begin() as conn:
+            conn.execute(text(
+                "DELETE FROM quant_strategy WHERE owner_id IN ('user-a','user-b')"))
+
+
+@pytest.mark.parametrize(
+    ("table", "ondelete"),
+    [
+        # 派生数据随策略删除;回测是用户资产,RESTRICT 挡住删除(见 alembic 0012)
+        ("quant_signal", "CASCADE"),
+        ("quant_strategy_eval", "CASCADE"),
+        ("quant_backtest_run", "RESTRICT"),
+    ],
+)
+def test_strategy_id_foreign_keys(migrated_db, table, ondelete):
+    """三张表的 strategy 字符串列已换成 strategy_id 外键,且 NOT NULL。"""
+    columns = _columns(migrated_db, table)
+    assert "strategy" not in columns, f"{table} 仍有旧的 strategy 字符串列"
+    assert bool(columns["strategy_id"]["nullable"]) is False
+
+    fks = inspect(migrated_db).get_foreign_keys(table)
+    match = [fk for fk in fks if fk["constrained_columns"] == ["strategy_id"]]
+    assert match, f"{table}.strategy_id 缺外键"
+    assert match[0]["referred_table"] == "quant_strategy"
+    assert (match[0]["options"].get("ondelete") or "").upper() == ondelete
+
+
+def test_signal_unique_constraint_uses_strategy_id(migrated_db):
+    """uq_signal 从 (code,date,strategy,side) 重建为按 strategy_id。"""
+    uniques = {
+        u["name"]: u["column_names"]
+        for u in inspect(migrated_db).get_unique_constraints("quant_signal")
+    }
+    assert uniques["uq_signal"] == ["code", "date", "strategy_id", "side"]
 
 
 def test_snapshot_pk_types_upgraded_to_bigint():

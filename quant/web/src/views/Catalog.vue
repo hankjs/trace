@@ -7,19 +7,19 @@ import PageHeader from '../components/PageHeader.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import WorkspaceTabs from '../components/WorkspaceTabs.vue'
 
-type CatalogTab = 'factors' | 'strategies' | 'signals'
+type CatalogTab = 'factors' | 'strategy_templates' | 'signals'
 
 const { catalog, loading, usingFallback, load } = useCatalog()
 const active = ref<CatalogTab>('factors')
 const query = ref('')
 const tabs = [
   { key: 'factors', label: '指标' },
-  { key: 'strategies', label: '策略' },
+  { key: 'strategy_templates', label: '算法模板' },
   { key: 'signals', label: '信号' },
 ]
 
 const entries = computed<CatalogEntry[]>(() => {
-  if (active.value === 'strategies') return catalog.value.strategies
+  if (active.value === 'strategy_templates') return catalog.value.strategy_templates
   if (active.value === 'signals') return catalog.value.signals
 
   const all = [...catalog.value.indicators, ...catalog.value.factors, ...catalog.value.backtest_metrics, ...catalog.value.filter_fields]

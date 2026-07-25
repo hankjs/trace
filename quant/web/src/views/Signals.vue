@@ -2,20 +2,21 @@
 import { onMounted, ref } from 'vue'
 import { Search } from 'lucide-vue-next'
 import { api, type SignalItem, type WatchItem } from '../api'
-import { loadCatalog, reasonText, signalName, strategyName } from '../catalog'
+import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
 import PageHeader from '../components/PageHeader.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
+import StrategySelect from '../components/StrategySelect.vue'
 import { fmtPrice } from '../format'
 
 const items = ref<SignalItem[]>([])
 const watchMap = ref<Record<string, WatchItem>>({})
-const strategies = ref<string[]>([])
 const loading = ref(true)
 const error = ref('')
 const fDate = ref('')
 const fCode = ref('')
-const fStrategy = ref('')
+/** null = 全部策略 */
+const fStrategyId = ref<number | null>(null)
 const fSide = ref('')
 
 async function load() {
@@ -25,7 +26,7 @@ async function load() {
     const result = await api.signals({
       date: fDate.value || undefined,
       code: fCode.value.trim() || undefined,
-      strategy: fStrategy.value || undefined,
+      strategy_id: fStrategyId.value ?? undefined,
       side: fSide.value || undefined,
       limit: 200,
     })
@@ -48,8 +49,13 @@ function sideClass(side: SignalItem['side']): string {
   return 'bg-active text-text-secondary'
 }
 
+/** 展示策略实例名(用户自定义);算法模板名作为副标题 */
 function strategyLabel(signal: SignalItem): string {
-  return signal.strategy_name || strategyName(signal.strategy)
+  return signal.strategy_name || `策略 ${signal.strategy_id}`
+}
+
+function templateLabel(signal: SignalItem): string {
+  return signal.template ? templateName(signal.template) : ''
 }
 
 function sideLabel(signal: SignalItem): string {
@@ -59,11 +65,10 @@ function sideLabel(signal: SignalItem): string {
 onMounted(async () => {
   await loadCatalog()
   try {
-    const [watch, strategyResult] = await Promise.all([api.watchlist(), api.strategies()])
+    const watch = await api.watchlist()
     watchMap.value = Object.fromEntries(watch.items.map((item) => [item.code, item]))
-    strategies.value = strategyResult.strategies
   } catch {
-    strategies.value = []
+    watchMap.value = {}
   }
   await load()
 })
@@ -79,13 +84,7 @@ onMounted(async () => {
         <input v-model="fDate" type="date" class="rounded-md border border-border px-2 py-1.5" />
       </label>
       <StockSearchInput v-model="fCode" label="股票" />
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">策略</span>
-        <select v-model="fStrategy" class="max-w-56 rounded-md border border-border px-2 py-1.5">
-          <option value="">全部策略</option>
-          <option v-for="strategy in strategies" :key="strategy" :value="strategy">{{ strategyName(strategy) }}</option>
-        </select>
-      </label>
+      <StrategySelect v-model="fStrategyId" allow-empty :manage-link="false" />
       <label class="text-sm">
         <span class="mb-1 block text-xs text-text-tertiary">提示类型</span>
         <select v-model="fSide" class="rounded-md border border-border px-2 py-1.5">
@@ -123,8 +122,11 @@ onMounted(async () => {
               <div class="mt-0.5 text-xs text-text-tertiary">{{ signal.code }}</div>
             </td>
             <td class="px-4 py-3">
-              <div>{{ strategyLabel(signal) }}</div>
-              <code class="text-[11px] text-text-tertiary">{{ signal.strategy }}</code>
+              <div class="flex items-center gap-1.5">
+                <span>{{ strategyLabel(signal) }}</span>
+                <span v-if="signal.is_system === false" class="rounded bg-active px-1.5 py-0.5 text-[11px] text-accent">自定义</span>
+              </div>
+              <div class="mt-0.5 text-[11px] text-text-tertiary">{{ templateLabel(signal) }}</div>
             </td>
             <td class="px-4 py-3">
               <span class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-1 text-xs font-medium" :class="sideClass(signal.side)">

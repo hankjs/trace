@@ -4,52 +4,95 @@ import { useRoute } from 'vue-router'
 import { AlertTriangle } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
 import { api, hasSurvivorshipBias, type BacktestResult, type SweepResult, type SweepMetrics, type WatchItem } from '../api'
-import { catalogEntry, loadCatalog, metricName, strategyName } from '../catalog'
+import { catalogEntry, loadCatalog, metricName, templateName } from '../catalog'
 import { fmtPct, fmtPrice } from '../format'
 import EChart from '../components/EChart.vue'
 import PoolSelect from '../components/PoolSelect.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
+import StrategySelect from '../components/StrategySelect.vue'
 import { poolById } from '../pools'
+import { invalidateStrategies, strategyById, useStrategies } from '../strategies'
 
 const route = useRoute()
 
-const strategies = ref<string[]>([])
+const { load: loadStrategies } = useStrategies()
 const watchlist = ref<WatchItem[]>([])
 const result = ref<BacktestResult | null>(null)
 const running = ref(false)
 const error = ref('')
+const notice = ref('')
 const runIdInput = ref('')
 const searchCode = ref('')
 /** 组合策略的研究范围;单标的策略不使用 */
 const poolId = ref<number | null>(null)
+/** 选中的策略实例 id;参数元数据来自它的算法模板 */
+const strategyId = ref<number | null>(null)
+const saveAsName = ref('')
 
 /** 模式:single 单次回测 / sweep 参数扫描 */
 const mode = ref<'single' | 'sweep'>('single')
 
 const form = reactive({
-  strategy: '',
   codes: [] as string[],
   codesText: '',
   start: '',
   end: '',
 })
 
-const strategyMeta = computed(() => catalogEntry('strategies', form.strategy))
-const strategyParams = computed(() => strategyMeta.value?.params ?? [])
-const isPortfolio = computed(() => strategyMeta.value?.kind === 'portfolio')
+const strategy = computed(() => strategyById(strategyId.value))
+/** 算法模板的元数据:说明、限制与参数定义 */
+const templateMeta = computed(() =>
+  strategy.value ? catalogEntry('strategy_templates', strategy.value.template) : undefined
+)
+const strategyParams = computed(() => templateMeta.value?.params ?? [])
+const isPortfolio = computed(() => strategy.value?.kind === 'portfolio')
 const parameterValues = reactive<Record<string, number>>({})
 
+/** 参数表单初值取策略的实际生效参数(已合并模板默认值) */
 function resetParameterValues() {
   for (const key of Object.keys(parameterValues)) delete parameterValues[key]
+  const effective = strategy.value?.effective_params ?? {}
   for (const parameter of strategyParams.value) {
-    if (typeof parameter.default === 'number') parameterValues[parameter.key] = parameter.default
+    const value = effective[parameter.key] ?? parameter.default
+    if (typeof value === 'number') parameterValues[parameter.key] = value
   }
 }
 
-watch(() => form.strategy, () => {
+/** 与策略自身参数是否有差异:有差异才是「临时调参」,才值得提示另存 */
+const paramsTweaked = computed(() => {
+  const effective = strategy.value?.effective_params ?? {}
+  return strategyParams.value.some((parameter) => parameterValues[parameter.key] !== effective[parameter.key])
+})
+
+watch(strategy, () => {
   resetParameterValues()
+  notice.value = ''
+  saveAsName.value = ''
   if (isPortfolio.value && mode.value === 'sweep') mode.value = 'single'
 })
+
+/** 把临时调好的参数另存为一条新策略,不改动原策略(公共策略本就只读) */
+async function saveTweakedAsStrategy() {
+  const source = strategy.value
+  if (!source) return
+  running.value = true
+  error.value = ''
+  try {
+    const created = await api.duplicateStrategy(source.id, {
+      name: saveAsName.value.trim() || undefined,
+      params: { ...parameterValues },
+    })
+    invalidateStrategies()
+    await loadStrategies(true)
+    strategyId.value = created.id
+    saveAsName.value = ''
+    notice.value = `已另存为「${created.name}」，之后可直接选用。`
+  } catch (caught) {
+    error.value = (caught as Error).message
+  } finally {
+    running.value = false
+  }
+}
 
 // ---- 参数扫描 ----
 
@@ -164,7 +207,7 @@ const heatmapOption = computed<EChartsCoreOption | null>(() => {
 async function runSweep() {
   error.value = ''
   const codes = parsedCodes()
-  if (!form.strategy) {
+  if (strategyId.value === null) {
     error.value = '请选择策略'
     return
   }
@@ -184,7 +227,7 @@ async function runSweep() {
   running.value = true
   try {
     sweepResult.value = await api.sweepBacktest({
-      strategy: form.strategy,
+      strategy_id: strategyId.value,
       codes,
       start: form.start,
       end: form.end,
@@ -274,8 +317,9 @@ function parsedCodes(): string[] {
 
 async function run() {
   error.value = ''
+  notice.value = ''
   const codes = parsedCodes()
-  if (!form.strategy) {
+  if (strategyId.value === null) {
     error.value = '请选择策略'
     return
   }
@@ -290,7 +334,7 @@ async function run() {
   running.value = true
   try {
     result.value = await api.runBacktest({
-      strategy: form.strategy,
+      strategy_id: strategyId.value,
       codes,
       start: form.start,
       end: form.end,
@@ -325,10 +369,11 @@ async function loadRun() {
 onMounted(async () => {
   await loadCatalog()
   try {
-    const [s, w] = await Promise.all([api.strategies(), api.watchlist()])
-    strategies.value = s.strategies
+    // 策略列表由 StrategySelect 自行加载,这里只补自选股;
+    // 但仍等一次 load,避免 strategyId 落位前先渲染出空参数表单
+    const [, w] = await Promise.all([loadStrategies(), api.watchlist()])
     watchlist.value = w.items
-    if (s.strategies.length) form.strategy = s.strategies[0]
+    resetParameterValues()
   } catch (e) {
     error.value = (e as Error).message
   }
@@ -369,12 +414,7 @@ onMounted(async () => {
       @submit.prevent="mode === 'single' ? run() : runSweep()"
     >
       <div class="flex flex-wrap items-end gap-3">
-        <label class="text-sm">
-          <span class="mb-1 block text-xs text-text-tertiary">策略</span>
-          <select v-model="form.strategy" class="rounded-md border border-border px-2 py-1.5">
-            <option v-for="s in strategies" :key="s" :value="s">{{ strategyName(s) }}</option>
-          </select>
-        </label>
+        <StrategySelect v-model="strategyId" />
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">开始日期</span>
           <input v-model="form.start" type="date" class="rounded-md border border-border px-2 py-1.5" />
@@ -388,13 +428,16 @@ onMounted(async () => {
         </button>
       </div>
 
-      <div v-if="strategyMeta" class="max-w-3xl text-xs leading-5 text-text-secondary">
-        <p>{{ strategyMeta.description }}</p>
-        <p v-if="strategyMeta.caveat" class="mt-1 text-text-tertiary">限制：{{ strategyMeta.caveat }}</p>
+      <div v-if="templateMeta" class="max-w-3xl text-xs leading-5 text-text-secondary">
+        <p>{{ templateMeta.description }}</p>
+        <p v-if="templateMeta.caveat" class="mt-1 text-text-tertiary">限制：{{ templateMeta.caveat }}</p>
       </div>
 
       <div v-if="mode === 'single' && strategyParams.length" class="border-t border-border-subtle pt-3">
-        <span class="mb-2 block text-xs font-medium text-text-secondary">策略参数</span>
+        <span class="mb-2 block text-xs font-medium text-text-secondary">
+          策略参数
+          <span class="ml-1 font-normal text-text-tertiary">（此处调参只作用于本次回测，不改动策略本身）</span>
+        </span>
         <div class="flex flex-wrap gap-3">
           <label v-for="parameter in strategyParams" :key="parameter.key" class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">
@@ -410,6 +453,26 @@ onMounted(async () => {
               class="w-32 rounded-md border border-border px-2 py-1.5"
             />
           </label>
+        </div>
+
+        <!-- 临时调参后可固化为一条新策略,原策略(尤其公共策略)保持不变 -->
+        <div v-if="paramsTweaked" class="mt-3 flex flex-wrap items-end gap-2">
+          <label class="text-sm">
+            <span class="mb-1 block text-xs text-text-tertiary">新策略名称（留空自动加「副本」）</span>
+            <input
+              v-model="saveAsName"
+              placeholder="如 双均线（快5慢30）"
+              class="w-56 rounded-md border border-border px-2 py-1.5 text-sm"
+            />
+          </label>
+          <button
+            type="button"
+            :disabled="running"
+            class="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+            @click="saveTweakedAsStrategy"
+          >
+            另存为我的策略
+          </button>
         </div>
       </div>
 
@@ -496,11 +559,15 @@ onMounted(async () => {
     </div>
 
     <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
+    <p v-if="notice" class="rounded-md border border-border bg-info-soft px-4 py-2 text-sm text-text-secondary">{{ notice }}</p>
 
     <!-- 参数扫描结果 -->
     <template v-if="mode === 'sweep' && sweepResult">
       <div class="flex items-center gap-3 text-sm text-text-secondary">
-        <span>策略: <span class="font-medium text-text-primary">{{ strategyName(sweepResult.strategy) }}</span></span>
+        <span>
+          策略: <span class="font-medium text-text-primary">{{ sweepResult.strategy_name }}</span>
+          <span class="ml-1 text-xs text-text-tertiary">（{{ templateName(sweepResult.template) }}）</span>
+        </span>
         <span>{{ sweepResult.start }} ~ {{ sweepResult.end }}</span>
         <span>{{ sweepRows.length }} 组参数组合</span>
       </div>
@@ -566,8 +633,10 @@ onMounted(async () => {
     <template v-if="mode === 'single' && result">
       <div class="flex items-center gap-3 text-sm text-text-secondary">
         <span>回测编号：<span class="font-medium text-text-primary">{{ result.run_id }}</span></span>
-        <template v-if="result.strategy">
-          <span>策略: {{ strategyName(result.strategy) }}</span>
+        <template v-if="result.strategy_id">
+          <!-- 策略行可能已被删除,后端此时回显 strategy_name = null -->
+          <span>策略: {{ result.strategy_name ?? '策略已删除' }}</span>
+          <span v-if="result.template" class="text-xs text-text-tertiary">{{ templateName(result.template) }}</span>
           <span>{{ result.start }} ~ {{ result.end }}</span>
         </template>
         <span v-if="resultPool">股票池: {{ resultPool.name }}</span>

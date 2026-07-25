@@ -7,8 +7,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.catalog import (BACKTEST_METRICS, FACTOR_FIELDS, FILTER_FIELDS,
-                         STRATEGIES, catalog_payload, render_signal_reason,
-                         signal_reason_type)
+                         STRATEGY_TEMPLATES, catalog_payload,
+                         render_signal_reason, signal_reason_type)
 from app.strategy.strategies import REGISTRY
 
 
@@ -17,10 +17,14 @@ def test_catalog_covers_runtime_factors_and_strategies():
         "mom20", "mom60", "rsi14", "atr_pct", "vol_ratio5",
         "ma20_slope", "amount_avg20",
     }
-    assert set(STRATEGIES) == set(REGISTRY)
+    assert set(STRATEGY_TEMPLATES) == set(REGISTRY)
     for key, module in REGISTRY.items():
-        params = {item["key"]: item["default"] for item in STRATEGIES[key]["params"]}
+        entry = STRATEGY_TEMPLATES[key]
+        params = {item["key"]: item["default"] for item in entry["params"]}
         assert params == module.DEFAULT_PARAMS
+        # kind 在目录与模块里各存一份(quant_strategy.kind 由模块回填),
+        # 三者漂移会让组合策略被当成单标的跑进按个股出信号的引擎
+        assert entry["kind"] == module.KIND
 
 
 def test_filter_field_contract_reserves_fundamental_keys():
@@ -51,7 +55,7 @@ def test_catalog_items_have_explanations_and_limits():
     assert payload["product_boundary"]["execution"] == "manual_external"
     assert payload["signals"] == payload["signal_sides"]
     for section in (
-        "factors", "indicators", "filter_fields", "strategies",
+        "factors", "indicators", "filter_fields", "strategy_templates",
         "signal_sides", "manual_trade_sides", "signal_reason_types",
         "backtest_metrics",
     ):

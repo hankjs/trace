@@ -32,6 +32,11 @@ const router = createRouter({
       path: '/leaderboard',
       redirect: (to) => ({ name: 'strategies', query: { ...to.query, tab: 'leaderboard' } }),
     },
+    {
+      // 策略管理是策略研究工作台的一个页签,保留独立路径便于从选择器直达
+      path: '/strategies/manage',
+      redirect: (to) => ({ name: 'strategies', query: { ...to.query, tab: 'manage' } }),
+    },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })

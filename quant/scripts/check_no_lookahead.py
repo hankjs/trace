@@ -17,8 +17,8 @@ import pandas as pd  # noqa: E402
 
 from app.data.ingest import load_bars_df  # noqa: E402
 from app.db import SessionLocal  # noqa: E402
-from app.strategy.strategies import (PORTFOLIO_STRATEGIES, REGISTRY,  # noqa: E402
-                                     SINGLE_STRATEGIES)
+from app.strategy.strategies import (PORTFOLIO_TEMPLATES, REGISTRY,  # noqa: E402
+                                     SINGLE_TEMPLATES)
 
 CODES = ["sh.600519", "sz.000001", "sh.600036"]
 PARAM_SETS = [None, {"fast": 3, "slow": 15}, {"window": 15}, {"top_n": 5}]
@@ -26,7 +26,7 @@ PARAM_SETS = [None, {"fast": 3, "slow": 15}, {"window": 15}, {"top_n": 5}]
 
 def check_single(db) -> int:
     fails = 0
-    for name in SINGLE_STRATEGIES:
+    for name in SINGLE_TEMPLATES:
         mod = REGISTRY[name]
         for code in CODES:
             df = load_bars_df(db, code, start=date.today() - timedelta(days=400))
@@ -51,7 +51,7 @@ def check_portfolio(db) -> int:
         if len(df) >= 90:
             pool_dfs[code] = df
     dates = sorted({d for df in pool_dfs.values() for d in df["date"]})
-    for name in PORTFOLIO_STRATEGIES:
+    for name in PORTFOLIO_TEMPLATES:
         mod = REGISTRY[name]
         for params in PARAM_SETS:
             full = mod.target_weights(dates, pool_dfs, params)

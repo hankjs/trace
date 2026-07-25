@@ -10,7 +10,7 @@
 | 文档 | 内容 |
 |---|---|
 | 本文 | 功能、启动、API、调度 |
-| [`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) | 数据分层、前复权价的重写风险、精度陷阱、数据源覆盖边界 |
+| [`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) | 数据分层、前复权价的重写风险、精度陷阱、数据源覆盖边界、池与策略抽象 |
 | [`REVIEW.md`](REVIEW.md) | 代码与数据库审查基线 |
 | [`DESIGN.md`](DESIGN.md) | UI 设计系统（与数据架构无关） |
 | `alembic/versions/*.py` | 每次 schema 变更的设计理由（写在 docstring 里） |
@@ -24,8 +24,9 @@
 5. 用户自行判断并在外部应用交易；需要复盘时再手工记录成交和持仓。
 
 前端提供“今日研究、选股、信号提醒、策略研究、我的持仓、研究词典”等工作区。
-指标、策略、信号和回测指标的中文名称及限制来自后端固定字典
-`GET /api/catalog`，英文 key 只作为稳定的内部标识。
+指标、算法模板、信号和回测指标的中文名称及限制来自后端固定字典
+`GET /api/catalog`，英文 key 只作为稳定的内部标识。策略本身不在这份字典里 ——
+它是可增删的业务数据，走 `GET /api/strategies`。
 
 当前筛选器是结构化条件构建器，支持条件启停、AND/OR 分组、独立命中数量和浏览器本地方案保存。
 **自然语言选股尚未实现**，不会把用户句子转换成筛选条件。
@@ -62,7 +63,7 @@ uv run alembic upgrade head
 
 `scripts/verify_migration_parity.py` 会校验「全新库 `upgrade head`」与 `models.py`
 的 `create_all` 产出一致，防止两条路径漂移。迁移的顺序约束与实测踩坑见
-[`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) 第 6 节。
+[`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) 第 8 节。
 
 除 `/api/health` 和 `/api/auth/login` 外，业务接口需要：
 
@@ -113,7 +114,8 @@ AkShare 做对账，东财接口不可用时部分行情能力会降级到新浪
 | `quant_factor_daily`、`quant_pick` | 每日技术因子和 Top 30 候选 |
 | `quant_valuation_snapshot` | PE(TTM)、PB、PS(TTM)、股息率、总市值 |
 | `quant_fundamental_snapshot` | ROE、收入/利润增长、毛利率、净利率、负债率、现金流质量 |
-| `quant_signal` | 单标的策略提示及结构化原因 |
+| `quant_strategy` | 策略定义：算法模板 + 参数 + 名字；公共策略 `is_system=1`，其余按 `owner_id` 归属 |
+| `quant_signal` | 单标的策略提示及结构化原因，按 `strategy_id` 关联策略 |
 | `quant_strategy_eval` | 周度策略批量评估，同批以 `batch_id` 标识 |
 | `quant_backtest_run`、`quant_backtest_equity` | 按用户隔离的回测参数、费率快照、指标和净值曲线 |
 | `quant_trade` | 按用户隔离的外部已完成成交手工记录 |
@@ -198,11 +200,16 @@ ST 有两个字段，**只有一个能用于回测**：`quant_daily_bar.is_st` �
 结果时需知情。每晚调度会自动补新数据并回补最近 10 天；一次性补齐用
 `uv run python scripts/backfill_is_st.py`（单进程，约 25 分钟）。
 
-## 内置策略与回测
+## 策略与回测
 
-系统注册 6 个策略：
+策略 = **算法模板 + 一组参数 + 用户起的名字**，存在 `quant_strategy`。分两类：
 
-| key | 中文名称 | 类型 |
+- **公共策略**（`is_system=true`）：全用户可见、不可改不可删。下列 6 个算法模板
+  各预置一条，参数为模板默认值。
+- **自定义策略**：用户自建，按 `owner_id` 归属，只有属主可见可改。要在公共策略
+  上调参，先「另存为我的策略」再改。
+
+| 模板 key | 中文名称 | 类型 |
 |---|---|---|
 | `ma_cross` | 双均线趋势策略 | 单只股票 |
 | `breakout` | 价格突破策略 | 单只股票 |
@@ -211,11 +218,25 @@ ST 有两个字段，**只有一个能用于回测**：`quant_daily_bar.is_st` �
 | `momentum_rotation` | 强势股票轮动策略 | 股票组合 |
 | `multifactor_hold` | 多指标综合评分持有策略 | 股票组合 |
 
-默认参数和参数范围由 `/api/catalog` 与 `/api/backtest/strategies` 返回。
+算法逻辑在 `app/strategy/strategies/`，仍由代码实现；表里只存参数组合。策略行的
+`params` 只保存用户显式覆盖的键，模板默认值调整后会自动生效；回测落库时才把
+**实际生效的全量参数**固化成快照，保证历史结果可复现。
+
+参数定义与取值范围由 `/api/catalog` 的 `strategy_templates` 与
+`/api/strategies/templates` 返回。每用户上限 50 条策略、同时启用 10 条 —— 启用的
+策略每天都要参与信号计算，成本是「股票数 × 启用策略数」。
+
+夜间信号引擎与周度批量评估跑**所有启用的**策略（含用户自建）；信号列表和策略
+排行按可见性过滤，别人的策略不会出现在你的页面上。
+
 回测默认费用为双边佣金万 2.5、卖出印花税 0.05%、滑点万 1，可在 `costs`
 中覆盖；收益和回撤从初始资金起算，包含首日建仓成本。组合策略留空 `codes` 时，
 使用回测区间内的历史指数成分，并按每个交易日的在册状态决定可选股票，不使用当前
 成分替代历史。单标的策略支持参数网格扫描；策略排行读取最近一轮批量评估。
+
+删除策略会级联删除它的信号与评估结果（定时任务的派生数据，下一轮会重算），但
+被回测记录引用时会被拒绝（409）—— 回测是要求可审计复现的用户资产，此时请改用
+「停用」。
 
 ## API 一览
 
@@ -223,16 +244,18 @@ ST 有两个字段，**只有一个能用于回测**：`quant_daily_bar.is_st` �
 |---|---|---|
 | GET | `/api/health` | 无需登录的健康检查 |
 | POST/GET | `/api/auth/login`、`/api/auth/me` | 登录与当前用户 |
-| GET | `/api/catalog` | 固定中文指标、筛选字段、策略、信号和回测指标字典 |
+| GET | `/api/catalog` | 固定中文指标、筛选字段、算法模板、信号和回测指标字典 |
 | GET | `/api/market/stocks?q=&limit=` | 按中文名、六位代码或标准代码搜索股票；空查询只返回自选 |
 | GET | `/api/market/kline`、`/api/market/snapshot` | 日线和自选股最新展示价格 |
 | GET/POST/DELETE | `/api/watchlist`、`/api/watchlist/{code}` | 自选股管理 |
 | GET | `/api/selection/picks` | 每日 Top 30 候选及新进/调出 |
 | GET/POST | `/api/selection/screener` | 简单筛选兼容接口 / 结构化组合筛选 |
-| GET | `/api/signals` | 带股票中文名、策略中文名和中文原因的提示查询 |
+| GET | `/api/signals` | 带股票中文名、策略名和中文原因的提示查询；按 `strategy_id` 过滤，只出可见策略 |
 | GET/POST/DELETE | `/api/portfolio/trades`、`/api/portfolio/trades/{id}` | 手工成交记账 |
 | GET | `/api/portfolio/positions` | 均价成本、参考市值与盈亏 |
-| GET | `/api/backtest/strategies`、`/api/backtest/leaderboard` | 策略目录和评估排行 |
+| GET/POST/PATCH/DELETE | `/api/strategies`、`/api/strategies/{id}` | 策略管理；公共策略只读 |
+| GET/POST | `/api/strategies/templates`、`/api/strategies/{id}/duplicate` | 算法模板元数据 / 另存为我的策略 |
+| GET | `/api/backtest/leaderboard` | 策略评估排行；只出可见策略 |
 | POST | `/api/backtest`、`/api/backtest/sweep` | 同步回测和单标的参数扫描 |
 | GET | `/api/backtest/{id}` | 已保存回测、净值曲线和当时使用的股票池 |
 | GET/POST/PATCH/DELETE | `/api/pools`、`/api/pools/{id}` | 股票池组管理；预置池只读 |
@@ -278,7 +301,8 @@ app/
 ├── factors/             # 每日技术因子
 ├── indicators/          # MA、EMA、MACD、RSI、ATR、量比
 ├── selection/           # Top 30 pipeline 与结构化筛选器
-├── strategy/strategies/ # 6 个单标的/组合策略
+├── strategy/strategies/ # 6 个单标的/组合算法模板
+├── strategy/store.py    # 策略行查询与可见性规则(公共 / 我的)
 ├── backtest/            # vectorbt 回测、参数扫描和批量评估
 ├── portfolio/           # 手工成交和持仓推导
 ├── catalog.py           # 固定中英文字典与用户说明

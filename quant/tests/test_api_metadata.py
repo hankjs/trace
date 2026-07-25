@@ -14,20 +14,35 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
-from app.api.backtest import get_backtest, list_strategies
+from app.api.backtest import get_backtest
 from app.api.market import get_kline, search_stocks
 from app.api.portfolio import TradeIn, add_trade, get_positions, list_trades
 from app.api.signals import list_signals
 from app.db import Base
 from app.models import (
+    SYSTEM_OWNER_ID,
     BacktestEquity,
     BacktestRun,
     DailyBar,
     Signal,
     Stock,
+    Strategy,
     Trade,
     WatchlistItem,
 )
+
+
+def _seed_preset_strategy(db: Session, strategy_id: int = 1,
+                          template: str = "ma_cross", kind: str = "single",
+                          name: str = "双均线趋势策略") -> Strategy:
+    """预置策略一条(对齐 Alembic 0012 的 seed)。"""
+    strategy = Strategy(
+        id=strategy_id, owner_id=SYSTEM_OWNER_ID, is_system=True, name=name,
+        template=template, kind=kind, params={}, enabled=True,
+    )
+    db.add(strategy)
+    db.commit()
+    return strategy
 
 CLAIMS = {"sub": "1", "username": "tester", "can_client": True}
 
@@ -72,15 +87,17 @@ def _seed_search_stocks(db: Session) -> None:
 def test_signal_response_has_stock_and_human_reason():
     with _session() as db:
         _seed_stock_and_bar(db)
+        _seed_preset_strategy(db)
         db.add(Signal(
             id=1, code="sh.600519", date=date(2026, 7, 24),
-            strategy="ma_cross", side="buy", price=1410.0,
+            strategy_id=1, side="buy", price=1410.0,
             reason={"params": {}, "prev_position": 0, "cur_position": 1},
         ))
         db.commit()
 
         result = list_signals(
-            date_=None, code=None, strategy=None, side=None, limit=20, db=db,
+            date_=None, code=None, strategy_id=None, side=None, limit=20, db=db,
+            claims=CLAIMS,
         )
 
         item = result["items"][0]
@@ -92,15 +109,9 @@ def test_signal_response_has_stock_and_human_reason():
         assert item["reason_text"] == "5日均线上穿20日均线，策略模拟状态变为持有。"
 
 
-def test_strategy_list_keeps_legacy_keys_and_adds_catalog_items():
-    result = list_strategies()
-    assert result["strategies"] == [
-        "breakout", "ma_cross", "mean_reversion", "momentum_rotation",
-        "multifactor_hold", "volume_breakout",
-    ]
-    assert set(result["single"]) | set(result["portfolio"]) == set(result["strategies"])
-    assert {item["key"] for item in result["items"]} == set(result["strategies"])
-    assert all(item["params"] for item in result["items"])
+# 原「回测页策略列表」测试随 GET /api/backtest/strategies 一并删除:
+# 该端点与 GET /api/strategies 重复。策略列表的可见性隔离由
+# tests/test_api_strategies.py::test_custom_strategy_is_invisible_to_other_users 覆盖。
 
 
 def test_kline_response_has_stock_metadata():
@@ -215,10 +226,11 @@ def test_manual_trades_are_isolated_by_user():
 
 def test_backtest_details_are_isolated_by_user():
     with _session() as db:
+        _seed_preset_strategy(db)
         run = BacktestRun(
             id=1,
             user_id=1,
-            strategy="ma_cross",
+            strategy_id=1,
             params={"fast": 5, "slow": 20},
             codes=["sh.600519"],
             start=date(2026, 1, 1),

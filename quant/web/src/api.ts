@@ -116,6 +116,58 @@ export function hasSurvivorshipBias(pool: Pool | PoolRef | null | undefined): bo
   return pool.kind === 'static'
 }
 
+/**
+ * 策略实例 = 算法模板 + 一组参数 + 用户起的名字。
+ *
+ * 与股票池同一套归属模型:公共策略(is_system)全用户可读且只读,
+ * 自定义策略按 owner_id 归属。别人的策略后端返回 404 而不是 403。
+ */
+export interface Strategy {
+  id: number
+  /** 用户起的名字,同一属主内唯一(重名后端返回 409) */
+  name: string
+  /** 算法模板 key,如 ma_cross。建好后不可改,换算法即新建策略 */
+  template: string
+  /** 算法模板的中文名 */
+  template_name: string
+  kind: StrategyKind
+  kind_name: string
+  /** 只含用户显式覆盖的键;模板默认值调整后未覆盖的参数会跟着变 */
+  params: Record<string, StrategyParamValue>
+  /** params 合并模板默认值后的实际生效参数,表单初值取这里 */
+  effective_params: Record<string, StrategyParamValue>
+  /** false = 库里残留了模板已不认识的参数键,需用户修正后才能跑 */
+  params_valid: boolean
+  /** 启用的策略每天参与信号计算,单独占 max_enabled 配额 */
+  enabled: boolean
+  /** true = 全局共享的公共策略,只读 */
+  is_system: boolean
+  /** 属主。公共策略为哨兵 UUID(全零),不对应真实用户 */
+  owner_id?: string | null
+  /** 后端算好的可写标记,前端据此决定是否展示改名/删除入口 */
+  editable: boolean
+  /** 被多少条回测引用;>0 时删除会 409,只能改为停用 */
+  backtest_count?: number | null
+  created_at?: string | null
+}
+
+/** single 逐只股票跑;portfolio 在股票池上排序后模拟持有一组 */
+export type StrategyKind = 'single' | 'portfolio'
+
+/** 策略参数值。模板参数目前都是数值,布尔/字符串留给后续模板 */
+export type StrategyParamValue = number | string | boolean
+
+/** 每个用户的策略数量与启用数上限,由后端下发 */
+export interface StrategyLimits {
+  max_total: number
+  max_enabled: number
+}
+
+/** 公共策略只读,改名/改参数/删除一律走「另存为我的策略」 */
+export function isPresetStrategy(strategy: Strategy | null | undefined): boolean {
+  return !!strategy && strategy.is_system === true
+}
+
 export interface KlineBar {
   date: string
   open: number
@@ -152,8 +204,13 @@ export interface SignalItem {
   name?: string
   industry?: string
   date: string
-  strategy: string
+  /** 产生该提示的策略实例 id */
+  strategy_id: number
+  /** 策略实例名(用户自定义),不是算法模板名 */
   strategy_name?: string
+  /** 算法模板 key,如 ma_cross */
+  template?: string
+  is_system?: boolean
   side: 'buy' | 'sell' | 'watch'
   side_name?: string
   price: number
@@ -204,7 +261,12 @@ export interface BacktestMetrics {
 
 export interface BacktestResult {
   run_id: number
-  strategy?: string
+  strategy_id?: number
+  /** 策略实例名;策略行已被删除时后端回显 null */
+  strategy_name?: string | null
+  template?: string | null
+  /** 本次实际生效的全量参数快照 */
+  params?: Record<string, StrategyParamValue>
   codes?: string[]
   stocks?: StockRef[]
   start?: string
@@ -309,7 +371,7 @@ export interface ScreenerConditionCount {
 export type CatalogSection =
   | 'factors'
   | 'indicators'
-  | 'strategies'
+  | 'strategy_templates'
   | 'signals'
   | 'backtest_metrics'
   | 'filter_fields'
@@ -358,7 +420,8 @@ export interface CatalogParameter {
 export interface CatalogPayload {
   factors: CatalogEntry[]
   indicators: CatalogEntry[]
-  strategies: CatalogEntry[]
+  /** 算法模板元数据(参数定义、限制);策略实例本身走 /api/strategies */
+  strategy_templates: CatalogEntry[]
   signals: CatalogEntry[]
   backtest_metrics: CatalogEntry[]
   filter_fields: CatalogEntry[]
@@ -395,15 +458,12 @@ export interface StructuredScreenerRequest {
   watchlist_only?: boolean
 }
 
-export interface StrategyListResult {
-  strategies: string[]
-  items?: CatalogEntry[]
-  single?: string[]
-  portfolio?: string[]
-}
-
 export interface LeaderboardItem {
+  strategy_id: number
+  /** 策略实例名 */
   strategy: string
+  template: string
+  is_system: boolean
   scope: string
   start: string
   end: string
@@ -423,7 +483,9 @@ export interface SweepResultItem {
 }
 
 export interface SweepResult {
-  strategy: string
+  strategy_id: number
+  strategy_name: string
+  template: string
   codes: string[]
   stocks?: StockRef[]
   start: string
@@ -474,11 +536,11 @@ export const api = {
     })
   },
 
-  signals(filters: { date?: string; code?: string; strategy?: string; side?: string; limit?: number } = {}) {
+  signals(filters: { date?: string; code?: string; strategy_id?: number; side?: string; limit?: number } = {}) {
     const params = new URLSearchParams()
     if (filters.date) params.set('date', filters.date)
     if (filters.code) params.set('code', filters.code)
-    if (filters.strategy) params.set('strategy', filters.strategy)
+    if (filters.strategy_id) params.set('strategy_id', String(filters.strategy_id))
     if (filters.side) params.set('side', filters.side)
     if (filters.limit) params.set('limit', String(filters.limit))
     return request<{ count: number; items: SignalItem[] }>(`/api/signals?${params}`)
@@ -504,12 +566,61 @@ export const api = {
     return request<PortfolioSummary>('/api/portfolio/positions')
   },
 
-  strategies() {
-    return request<StrategyListResult>('/api/backtest/strategies')
-  },
-
   catalog() {
     return request<Partial<CatalogPayload>>('/api/catalog')
+  },
+
+  // ---- 策略 ----
+
+  strategies() {
+    return request<{ count?: number; items: Strategy[]; limits: StrategyLimits }>('/api/strategies')
+  },
+
+  strategy(id: number) {
+    return request<Strategy>(`/api/strategies/${id}`)
+  },
+
+  /** 算法模板元数据(参数定义等)。与目录的 strategy_templates 同源,单独一份省一次整份目录请求 */
+  strategyTemplates() {
+    return request<{ items: CatalogEntry[] }>('/api/strategies/templates')
+  },
+
+  /** params 只需给要覆盖模板默认值的键 */
+  createStrategy(body: {
+    name: string
+    template: string
+    params?: Record<string, StrategyParamValue>
+    enabled?: boolean
+  }) {
+    return request<Strategy>('/api/strategies', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
+  /** 另存为我的策略。公共策略只读,调参前先复制一份;name 留空由后端加「副本」 */
+  duplicateStrategy(id: number, body: { name?: string; params?: Record<string, StrategyParamValue> } = {}) {
+    return request<Strategy>(`/api/strategies/${id}/duplicate`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
+  /** 改名 / 改参数 / 启停。模板不可改,换算法请新建 */
+  updateStrategy(id: number, body: {
+    name?: string
+    params?: Record<string, StrategyParamValue>
+    enabled?: boolean
+  }) {
+    return request<Strategy>(`/api/strategies/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+  },
+
+  /** 被回测引用时后端返回 409,提示改为停用 */
+  deleteStrategy(id: number) {
+    return request<{ deleted: number; id: number }>(`/api/strategies/${id}`, { method: 'DELETE' })
   },
 
   // ---- 股票池组 ----
@@ -557,11 +668,12 @@ export const api = {
   },
 
   runBacktest(body: {
-    strategy: string
+    strategy_id: number
     codes: string[]
     start: string
     end: string
     pool_id?: number
+    /** 临时覆盖策略自身的参数,不改策略行 */
     params?: Record<string, unknown>
     costs?: Record<string, unknown>
   }) {
@@ -599,7 +711,7 @@ export const api = {
   },
 
   sweepBacktest(body: {
-    strategy: string
+    strategy_id: number
     codes: string[]
     start: string
     end: string

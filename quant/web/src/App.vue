@@ -70,6 +70,8 @@ const guides: Record<string, ResearchGuide> = {
     title: '策略研究提示',
     summary: '先理解策略规则和限制，再选择股票与时间区间回测。不同市场阶段的表现可能差异很大。',
     concepts: [
+      { term: '算法模板', explanation: '系统内置的规则算法，如双均线趋势，决定有哪些参数可调。' },
+      { term: '策略', explanation: '一个算法模板加一组参数和你起的名字。公共策略只读，调参请另存为自己的策略。' },
       { term: '回测', explanation: '按历史数据模拟策略表现，用于验证规则，不是收益承诺。' },
       { term: '最大回撤', explanation: '历史模拟净值从高点到低点的最大跌幅。' },
     ],

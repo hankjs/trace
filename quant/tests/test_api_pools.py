@@ -28,7 +28,11 @@ from app.api.pools import (add_pool_members, create_pool, default_pool,
                            PoolCreateIn, PoolMembersIn, PoolPatchIn)
 from app.db import Base
 from app.models import (SYSTEM_OWNER_ID, BacktestRun, DailyBar, IndexMember,
-                        Pool, PoolMember, Stock)
+                        Pool, PoolMember, Stock, Strategy)
+
+# 回测用的公共策略(对齐 Alembic 0012 的 seed):单标的 1 号、组合 5 号
+MA_CROSS_ID = 1
+ROTATION_ID = 5
 
 USER_A = "11111111-1111-1111-1111-111111111111"
 USER_B = "22222222-2222-2222-2222-222222222222"
@@ -48,7 +52,15 @@ def _session() -> Session:
 
 
 def _seed(db: Session) -> None:
-    """预置池 4 条(对齐 Alembic 0005 的 seed)+ 股票资料 + 指数成分。"""
+    """预置池 4 条(对齐 Alembic 0005)+ 公共策略(对齐 0012)+ 股票与成分。"""
+    db.add_all([
+        Strategy(id=MA_CROSS_ID, owner_id=SYSTEM_OWNER_ID, is_system=True,
+                 name="双均线趋势策略", template="ma_cross", kind="single",
+                 params={}, enabled=True),
+        Strategy(id=ROTATION_ID, owner_id=SYSTEM_OWNER_ID, is_system=True,
+                 name="强势股票轮动策略", template="momentum_rotation",
+                 kind="portfolio", params={}, enabled=True),
+    ])
     db.add_all([
         Pool(id=1, kind="index", ref="hs300_zz500", owner_id=SYSTEM_OWNER_ID, is_system=True,
              name="沪深300+中证500", min_list_days=0),
@@ -419,16 +431,16 @@ def test_historical_backtest_echoes_pool_for_survivorship_annotation():
             db=db, claims=CLAIMS_A,
         )
         db.add_all([
-            BacktestRun(id=1, user_id=USER_A, strategy="momentum_rotation",
+            BacktestRun(id=1, user_id=USER_A, strategy_id=ROTATION_ID,
                         params={}, codes=["sh.600519"], pool_id=static["id"],
                         start=date(2024, 1, 1), end=date(2024, 6, 30),
                         metrics={"total_return": 0.1}),
-            BacktestRun(id=2, user_id=USER_A, strategy="momentum_rotation",
+            BacktestRun(id=2, user_id=USER_A, strategy_id=ROTATION_ID,
                         params={}, codes=["sh.600519"], pool_id=3,
                         start=date(2024, 1, 1), end=date(2024, 6, 30),
                         metrics={"total_return": 0.2}),
             # 池已被删除的历史回测
-            BacktestRun(id=3, user_id=USER_A, strategy="momentum_rotation",
+            BacktestRun(id=3, user_id=USER_A, strategy_id=ROTATION_ID,
                         params={}, codes=["sh.600519"], pool_id=999,
                         start=date(2024, 1, 1), end=date(2024, 6, 30),
                         metrics={"total_return": 0.3}),
@@ -457,7 +469,7 @@ def test_backtest_rejects_pool_owned_by_another_user():
                               db=db, claims=CLAIMS_B)
         with pytest.raises(HTTPException) as exc:
             create_backtest(
-                BacktestIn(strategy="momentum_rotation", codes=[],
+                BacktestIn(strategy_id=ROTATION_ID, codes=[],
                            start=date(2024, 1, 1), end=date(2024, 6, 30),
                            pool_id=created["id"]),
                 db=db, claims=CLAIMS_A,
@@ -477,7 +489,7 @@ def test_portfolio_backtest_resolves_static_pool_and_persists_pool_id():
             db=db, claims=CLAIMS_A,
         )
         result = create_backtest(
-            BacktestIn(strategy="momentum_rotation", codes=[],
+            BacktestIn(strategy_id=ROTATION_ID, codes=[],
                        start=start, end=end, pool_id=pool["id"]),
             db=db, claims=CLAIMS_A,
         )
@@ -502,7 +514,7 @@ def test_explicit_codes_backtest_does_not_echo_pool():
         _seed(db)
         _seed_bars(db, ["sh.600519"], start, end)
         result = create_backtest(
-            BacktestIn(strategy="ma_cross", codes=["sh.600519"],
+            BacktestIn(strategy_id=MA_CROSS_ID, codes=["sh.600519"],
                        start=start, end=end),
             db=db, claims=CLAIMS_A,
         )

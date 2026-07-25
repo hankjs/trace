@@ -5,16 +5,25 @@ import PageHeader from '../components/PageHeader.vue'
 import WorkspaceTabs from '../components/WorkspaceTabs.vue'
 import Backtest from './Backtest.vue'
 import Leaderboard from './Leaderboard.vue'
+import Strategies from './Strategies.vue'
 
 const route = useRoute()
 const router = useRouter()
 const tabs = [
   { key: 'backtest', label: '回测验证' },
   { key: 'leaderboard', label: '策略比较' },
+  { key: 'manage', label: '策略管理' },
 ]
 
-const active = computed(() => route.query.tab === 'leaderboard' ? 'leaderboard' : 'backtest')
-const activeComponent = computed(() => active.value === 'leaderboard' ? Leaderboard : Backtest)
+const active = computed(() => {
+  const tab = route.query.tab
+  return tab === 'leaderboard' || tab === 'manage' ? tab : 'backtest'
+})
+const activeComponent = computed(() => {
+  if (active.value === 'leaderboard') return Leaderboard
+  if (active.value === 'manage') return Strategies
+  return Backtest
+})
 
 function changeTab(tab: string) {
   router.replace({ name: 'strategies', query: { ...route.query, tab } })

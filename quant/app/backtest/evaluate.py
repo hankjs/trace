@@ -1,9 +1,13 @@
-"""批量策略评估(每周五跑):全部注册策略 × 默认参数 × 近 1 年。
+"""批量策略评估(每周五跑):全部**启用的**策略 × 各自参数 × 近 1 年。
 
 - 单标的策略:对池内评分 Top 50 批量回测,汇总中位数/均值年化、最大回撤、胜率,
   scope="pool_top50";
 - 组合策略:池级回测(target_weights),scope="pool";
 - 结果落 quant_strategy_eval;leaderboard() 供排行页查询。
+
+评估对象是 `quant_strategy` 的行(公共 + 用户自建),不再是代码里的模板列表:
+用户存了自己的参数组合,排行榜要能拿它和公共策略比。每行按自己的 params 跑,
+`enabled=0` 的行跳过。用户策略的评估结果只有属主能在排行榜看到(见 leaderboard)。
 """
 from __future__ import annotations
 
@@ -15,12 +19,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..data.universe import current_pool, pool_at, pool_during
-from ..models import FactorDaily, StrategyEval
+from ..models import FactorDaily, Strategy, StrategyEval
 from ..selection.pipeline import score_cross_section
-from ..strategy.strategies import (PORTFOLIO_STRATEGIES, REGISTRY,
-                                   SINGLE_STRATEGIES)
+from ..strategy.store import enabled_strategies, visible_to
+from ..strategy.strategies import resolve_module
 from .engine import (DEFAULT_COSTS, SINGLE_WARMUP_DAYS, _batch_single,
-                     _median_or_none, _mean_or_none, run_backtest)
+                     _median_or_none, _mean_or_none, run_backtest,
+                     validate_params)
 from ..data.ingest import load_bars_df
 
 logger = logging.getLogger(__name__)
@@ -59,10 +64,11 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
     return [c for _, c in scored[:n]]
 
 
-def _eval_single(db: Session, strategy: str, codes: list[str],
+def _eval_single(db: Session, strategy: Strategy, codes: list[str],
                  start: date, end: date) -> dict:
     """单标的策略批量评估。与普通回测同一口径:预热 + 完整序列算信号。"""
-    mod = REGISTRY[strategy]
+    mod = resolve_module(strategy)
+    params = validate_params(strategy.template, strategy.params)
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
     dfs, positions = {}, {}
     for code in codes:
@@ -70,7 +76,7 @@ def _eval_single(db: Session, strategy: str, codes: list[str],
         if len(df) == 0 or int((df["date"] >= start).sum()) < 60:
             continue
         dfs[code] = df
-        positions[code] = mod.positions(df, None)
+        positions[code] = mod.positions(df, params)
     if not dfs:
         return {"error": "数据不足"}
     results = _batch_single(dfs, positions, DEFAULT_COSTS, start)
@@ -105,45 +111,54 @@ def run_evaluation(db: Session, day: date | None = None,
                 start, end, batch_id, len(top_codes), len(pool))
 
     saved = []
-    for name in SINGLE_STRATEGIES:
+    for strategy in enabled_strategies(db, kind="single"):
         try:
-            metrics = _eval_single(db, name, top_codes, start, end)
-            scope = "pool_top50"
-        except Exception as e:  # noqa: BLE001
-            logger.exception("评估失败 %s", name)
-            metrics, scope = {"error": str(e)}, "pool_top50"
-        db.add(StrategyEval(strategy=name, params={}, scope=scope,
+            metrics = _eval_single(db, strategy, top_codes, start, end)
+        except Exception as e:  # noqa: BLE001 - 单个策略失败不影响本轮其余
+            logger.exception("评估失败 %s", strategy.name)
+            metrics = {"error": str(e)}
+        # params 存实际生效的全量参数,与回测落库同口径:策略行之后被改,
+        # 这一轮的评估结果仍能解释是按什么参数跑出来的
+        db.add(StrategyEval(strategy_id=strategy.id,
+                            params=strategy.params or {}, scope="pool_top50",
                             start=start, end=end, metrics=metrics,
                             batch_id=batch_id))
-        saved.append({"strategy": name, "scope": scope})
-        logger.info("评估 %s: %s", name,
+        saved.append({"strategy_id": strategy.id, "strategy": strategy.name,
+                      "scope": "pool_top50"})
+        logger.info("评估 %s: %s", strategy.name,
                     {k: v for k, v in metrics.items() if k != "per_code"})
 
-    for name in PORTFOLIO_STRATEGIES:
+    for strategy in enabled_strategies(db, kind="portfolio"):
         try:
             res = run_backtest(
-                db, name, pool, start, end, save=False, dynamic_universe=True,
+                db, strategy, pool, start, end, save=False,
+                dynamic_universe=True,
             )
             metrics = res["metrics"]
         except Exception as e:  # noqa: BLE001
-            logger.exception("评估失败 %s", name)
+            logger.exception("评估失败 %s", strategy.name)
             metrics = {"error": str(e)}
-        db.add(StrategyEval(strategy=name, params={}, scope="pool",
+        db.add(StrategyEval(strategy_id=strategy.id,
+                            params=strategy.params or {}, scope="pool",
                             start=start, end=end, metrics=metrics,
                             batch_id=batch_id))
-        saved.append({"strategy": name, "scope": "pool"})
-        logger.info("评估 %s: %s", name, metrics)
+        saved.append({"strategy_id": strategy.id, "strategy": strategy.name,
+                      "scope": "pool"})
+        logger.info("评估 %s: %s", strategy.name, metrics)
 
     db.commit()
     return {"start": str(start), "end": str(end), "batch_id": batch_id,
             "evaluated": saved}
 
 
-def leaderboard(db: Session, limit: int = 50) -> dict:
+def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
     """最近一轮评估结果,按年化中位数/组合年化排序。
 
     按 batch_id 整批取,不用 run_at 精确相等:同一轮里各行的 run_at 相差数
     分钟(每行落库前要跑完一次回测),精确匹配只能捞回最后一条。
+
+    **按可见性过滤**:评估会跑所有用户启用的策略,但排行榜只能出公共策略和
+    我自己的 —— 否则别人的策略名和参数会出现在我的页面上。
     """
     if limit <= 0:
         return {"run_at": None, "batch_id": None, "items": []}
@@ -155,17 +170,22 @@ def leaderboard(db: Session, limit: int = 50) -> dict:
         return {"run_at": None, "batch_id": None, "items": []}
     batch_id, latest_run = latest
     rows = db.execute(
-        select(StrategyEval).where(StrategyEval.batch_id == batch_id)
-    ).scalars().all()
+        select(StrategyEval, Strategy)
+        .join(Strategy, Strategy.id == StrategyEval.strategy_id)
+        .where(StrategyEval.batch_id == batch_id, visible_to(user_id))
+    ).all()
 
-    def sort_key(r: StrategyEval) -> float:
-        m = r.metrics or {}
+    def sort_key(row) -> float:
+        m = row[0].metrics or {}
         v = m.get("annual_return_median", m.get("annual_return"))
         return v if isinstance(v, (int, float)) else -9
 
     items = [
         {
-            "strategy": r.strategy,
+            "strategy_id": r.strategy_id,
+            "strategy": s.name,
+            "template": s.template,
+            "is_system": bool(s.is_system),
             "scope": r.scope,
             "start": str(r.start),
             "end": str(r.end),
@@ -174,7 +194,7 @@ def leaderboard(db: Session, limit: int = 50) -> dict:
             "run_at": r.run_at.isoformat(sep=" "),
             "batch_id": r.batch_id,
         }
-        for r in sorted(rows, key=sort_key, reverse=True)[:limit]
+        for r, s in sorted(rows, key=sort_key, reverse=True)[:limit]
     ]
     return {"run_at": latest_run.isoformat(sep=" "), "batch_id": batch_id,
             "items": items}

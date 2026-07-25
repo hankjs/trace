@@ -276,7 +276,11 @@ def _param(
     }
 
 
-STRATEGIES: dict[str, dict[str, Any]] = {
+# 算法模板字典,键 = `app/strategy/strategies` 里的模块 NAME。
+# 这里描述的是**算法**(有哪些参数、什么含义、什么限制),不是用户的策略实例 ——
+# 后者是 `quant_strategy` 的行(模板 + 一组参数 + 名字),见 alembic 0012。
+# `kind` 与模块的 `KIND` 必须一致,tests/test_catalog.py 交叉校验。
+STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
     "ma_cross": {
         "key": "ma_cross", "name": "双均线趋势策略",
         "description": "短期均线上穿长期均线时进入模拟持有，下穿时退出。",
@@ -498,7 +502,9 @@ def catalog_payload() -> dict[str, Any]:
         "factors": _ordered_items(FACTOR_FIELDS),
         "indicators": _ordered_items(INDICATORS),
         "filter_fields": _ordered_items(FILTER_FIELDS),
-        "strategies": _ordered_items(STRATEGIES),
+        # 算法模板元数据。策略实例(用户/公共)走 GET /api/strategies,
+        # 那是随用户变化的业务数据,不属于这份静态目录。
+        "strategy_templates": _ordered_items(STRATEGY_TEMPLATES),
         "signals": _ordered_items(SIGNAL_SIDES),
         "signal_sides": _ordered_items(SIGNAL_SIDES),
         "manual_trade_sides": _ordered_items(MANUAL_TRADE_SIDES),
@@ -507,8 +513,18 @@ def catalog_payload() -> dict[str, Any]:
     }
 
 
-def strategy_name(key: str) -> str:
-    return STRATEGIES.get(key, {}).get("name", key)
+def template_name(key: str) -> str:
+    """算法模板的中文名。策略实例的名字由用户自定,取 `quant_strategy.name`。"""
+    return STRATEGY_TEMPLATES.get(key, {}).get("name", key)
+
+
+def template_params(key: str) -> list[dict[str, Any]]:
+    """模板的参数元数据(前端表单与后端校验共用同一份)。"""
+    return STRATEGY_TEMPLATES.get(key, {}).get("params", [])
+
+
+def template_defaults(key: str) -> dict[str, Any]:
+    return {p["key"]: p["default"] for p in template_params(key)}
 
 
 def signal_side_name(key: str) -> str:
@@ -542,41 +558,46 @@ def signal_reason_type(reason: dict[str, Any] | None) -> str:
     return "unknown"
 
 
-def render_signal_reason(strategy: str, side: str,
-                         reason: dict[str, Any] | None) -> str:
-    """把信号原因转换为面向用户的中文句子，不直接拼接内部 JSON。"""
+def render_signal_reason(template: str, side: str,
+                         reason: dict[str, Any] | None,
+                         display_name: str | None = None) -> str:
+    """把信号原因转换为面向用户的中文句子，不直接拼接内部 JSON。
+
+    `template` 是算法模板 key(决定用哪套措辞),`display_name` 是策略实例的
+    名字 —— 只有兜底分支会用到它。两者分开传:同一模板可以有多个策略实例
+    (「我的双均线 10/30」),句子里该出现用户起的名字,不是模板名。
+    """
     reason = reason if isinstance(reason, dict) else {}
     reason_type = signal_reason_type(reason)
-    defaults = {
-        p["key"]: p["default"] for p in STRATEGIES.get(strategy, {}).get("params", [])
-    }
+    defaults = template_defaults(template)
     params = {**defaults, **(reason.get("params") if isinstance(reason.get("params"), dict) else {})}
 
     if reason_type == "position_change":
-        if strategy == "ma_cross":
+        if template == "ma_cross":
             relation = "上穿" if side == "buy" else "下穿"
             return (f"{params.get('fast', 5)}日均线{relation}{params.get('slow', 20)}日均线，"
                     f"策略模拟状态变为{'持有' if side == 'buy' else '未持有'}。")
-        if strategy == "breakout":
+        if template == "breakout":
             if side == "buy":
                 return (f"收盘价突破此前{params.get('entry', 20)}个交易日最高价，"
                         "策略模拟状态变为持有。")
             return (f"收盘价跌破此前{params.get('exit', 10)}个交易日最低价，"
                     "策略模拟状态变为未持有。")
-        if strategy == "mean_reversion":
+        if template == "mean_reversion":
             if side == "buy":
                 return (f"收盘价仍在{params.get('ma', 60)}日均线上方，且RSI 14低于"
                         f"{params.get('rsi_buy', 30)}，策略模拟状态变为持有。")
             return (f"RSI 14高于{params.get('rsi_sell', 55)}或收盘价跌破"
                     f"{params.get('ma', 60)}日均线，策略模拟状态变为未持有。")
-        if strategy == "volume_breakout":
+        if template == "volume_breakout":
             if side == "buy":
                 return (f"价格在{params.get('window', 20)}日平台整理后放量突破上沿，"
                         "策略模拟状态变为持有。")
             return "收盘价跌破整理平台下沿或波动止损线，策略模拟状态变为未持有。"
         prev = "持有" if reason.get("prev_position") == 1 else "未持有"
         cur = "持有" if reason.get("cur_position") == 1 else "未持有"
-        return f"{strategy_name(strategy)}的模拟目标状态从“{prev}”变为“{cur}”。"
+        label = display_name or template_name(template)
+        return f"{label}的模拟目标状态从“{prev}”变为“{cur}”。"
 
     if reason_type == "near_cross":
         direction = {"golden": "金叉", "death": "死叉"}.get(

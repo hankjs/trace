@@ -221,7 +221,52 @@ quant_pool_member(pool_id, code)              ← 池与股票,只存代码
 
 `kind='all'` / `'static'` 不做此判断 —— 它们返回空可能是合法结果。
 
-## 7. 迁移与 Schema 管理
+## 7. 策略抽象
+
+```
+quant_strategy(id, owner_id NOT NULL, is_system, name, template, kind, params, enabled)
+quant_signal(..., strategy_id → quant_strategy)        ← ON DELETE CASCADE
+quant_strategy_eval(..., strategy_id → quant_strategy) ← ON DELETE CASCADE
+quant_backtest_run(..., strategy_id → quant_strategy)  ← ON DELETE RESTRICT
+```
+
+策略从「代码里的常量」变成了行（`0012_strategy_table`）。动机很直接：用户能在回测页
+临时改参数，但**改完的参数无处安放**，更不可能让夜间信号引擎按用户自己的参数出信号。
+
+可见性沿用第 6 节股票池那套 `is_system` + `owner_id`（哨兵 UUID 归属系统行），
+收成 `app/strategy/store.py` 的 `visible_to(user_id)`。三个取舍值得记住：
+
+- **没有 `grant` 表。** 池有「分享给特定用户」的需求，策略当前只需要「公共」和
+  「我的」两档。不预先建一张没人写的表 —— 真有需求时照 `quant_pool_grant` 补。
+- **算法仍在代码里，表只存参数组合。** `template` 指向 `app/strategy/strategies/`
+  的模块，`kind` 是模块 `KIND` 的冗余（写入时由 API 回填，用户改不到）。冗余是刻意
+  的：夜间引擎要按「所有启用的单标的策略」取行，有这一列就是一条带索引的查询。
+  这也是后续规则构建器的扩展点 —— 新增 `template='rule'` 加一列 `rules JSON` 即可。
+- **`params` 只存用户显式覆盖的键。** 模板默认值调整后，用户没碰过的参数应当跟着
+  变。实际生效值在跑的时候合并；回测落库时才固化成全量快照，否则默认参数一改，
+  历史结果就无法审计复现。
+
+### 两种 ON DELETE 不同，是因为两种数据的性质不同
+
+`signal` / `strategy_eval` 是定时任务的**派生数据**，删了下一轮重算，用 CASCADE。
+`backtest_run` 是用户主动发起、要求可复现审计的**资产**，不能因为删了策略就静默
+消失，用 RESTRICT —— API 在删除仍被回测引用的策略时返回 409，引导改用「停用」。
+
+### 定时任务跑所有启用的策略，成本是乘法
+
+信号引擎的成本是「股票数 × 启用策略数」。策略从 4 个固定模板变成「所有用户启用的
+策略」，这个乘数就落到了夜间流水线上，为此做了两件事：
+
+1. **循环倒置**。原实现是 `for 策略: for 股票: load_bars_df(...)`，同一只股票的
+   日线按策略数重复查库。改成「每只股票加载一次，再跑全部策略」，查库次数与策略数
+   解耦（`tests/test_signal_engine.py` 用调用计数把这个顺序钉住，防止回退）。
+2. **启用数单独限额**（每用户 10 条，总数 50 条）。存着不跑的策略只占一行，跑起来
+   的每一个都要乘进全市场股票数。
+
+评估跨用户跑，但信号列表与策略排行**按可见性过滤** —— 否则别人的策略名和参数会
+出现在你的页面上。
+
+## 8. 迁移与 Schema 管理
 
 Schema 由 Alembic 管理（`alembic/versions/`），**启动时不再建表或改表**。
 `scripts/verify_migration_parity.py` 校验「全新库 `upgrade head`」与「`models.py`
@@ -237,7 +282,7 @@ Schema 由 Alembic 管理（`alembic/versions/`），**启动时不再建表或�
 - 逐列 `MODIFY COLUMN` 的 revision 中断后可安全续跑（幂等），会留下「部分列已转换」
   的中间状态。
 
-## 8. 当前数据规模（2026-07-25 实测）
+## 9. 当前数据规模（2026-07-25 实测）
 
 | 项 | 数值 |
 |---|---|

@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { ArrowRight, BarChart3, Bell, CheckCircle2, ClipboardList, Filter, History } from 'lucide-vue-next'
 import { api, type PickItem, type SignalItem, type SnapshotItem } from '../api'
-import { loadCatalog, reasonText, signalName, strategyName } from '../catalog'
+import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
 import PageHeader from '../components/PageHeader.vue'
 import { fmtPct, fmtPrice, pnlClass } from '../format'
@@ -166,8 +166,11 @@ onMounted(async () => {
               <div class="text-xs text-text-tertiary">{{ signal.code }} · {{ signal.date }}</div>
             </div>
             <div>
-              <div class="text-sm">{{ signal.strategy_name || strategyName(signal.strategy) }}</div>
-              <code class="text-[11px] text-text-tertiary">{{ signal.strategy }}</code>
+              <div class="flex items-center gap-1.5 text-sm">
+                <span>{{ signal.strategy_name || `策略 ${signal.strategy_id}` }}</span>
+                <span v-if="signal.is_system === false" class="rounded bg-active px-1.5 py-0.5 text-[11px] text-accent">自定义</span>
+              </div>
+              <div class="text-[11px] text-text-tertiary">{{ signal.template ? templateName(signal.template) : '' }}</div>
             </div>
             <p class="text-xs leading-5 text-text-secondary">{{ reasonText(signal.reason, signal.reason_text) }}</p>
             <span class="w-fit rounded-md bg-active px-2 py-1 text-xs font-medium text-accent">{{ signal.side_name || signalName(signal.side) }}</span>

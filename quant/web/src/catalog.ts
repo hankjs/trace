@@ -150,7 +150,7 @@ export const fallbackCatalog: CatalogPayload = {
     { key: 'atr', name: '平均真实波幅（ATR）', description: '综合当日振幅与跳空计算指定窗口的平均波动。', category: 'technical', caveat: '比较不同股价股票时应使用占价格比例。' },
     { key: 'volume_ratio', name: '成交量相对均量', description: '当日成交量相对过去指定窗口平均成交量的倍数。', category: 'technical', unit: '倍', caveat: '本系统为日频口径，不等同于盘中量比。' },
   ],
-  strategies: [
+  strategy_templates: [
     {
       key: 'ma_cross',
       name: '双均线趋势策略',
@@ -280,7 +280,7 @@ export async function loadCatalog(): Promise<CatalogPayload> {
     catalog.value = {
       factors: normalizeEntries(remote.factors, fallbackCatalog.factors),
       indicators: normalizeEntries(remote.indicators, fallbackCatalog.indicators),
-      strategies: normalizeEntries(remote.strategies, fallbackCatalog.strategies),
+      strategy_templates: normalizeEntries(remote.strategy_templates, fallbackCatalog.strategy_templates),
       signals: normalizeEntries(remote.signals, fallbackCatalog.signals),
       backtest_metrics: normalizeEntries(remote.backtest_metrics, fallbackCatalog.backtest_metrics),
       filter_fields: normalizeEntries(remote.filter_fields, fallbackCatalog.filter_fields),
@@ -308,8 +308,9 @@ export function factorName(key: string): string {
   return catalogName('factors', key)
 }
 
-export function strategyName(key: string): string {
-  return catalogName('strategies', key)
+/** 算法模板的中文名。策略实例的名字由用户自定,取策略行的 name */
+export function templateName(key: string): string {
+  return catalogName('strategy_templates', key)
 }
 
 export function signalName(key: string): string {

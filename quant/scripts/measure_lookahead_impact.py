@@ -22,7 +22,7 @@ import pandas as pd  # noqa: E402
 from app.backtest import engine  # noqa: E402
 from app.data.ingest import load_bars_df  # noqa: E402
 from app.db import SessionLocal  # noqa: E402
-from app.strategy.strategies import REGISTRY, SINGLE_STRATEGIES  # noqa: E402
+from app.strategy.strategies import REGISTRY, SINGLE_TEMPLATES  # noqa: E402
 
 CODES = ["sh.600519", "sz.000001", "sh.600036", "sh.601318", "sz.000002",
          "sz.300750", "sh.688111", "sz.002594"]
@@ -41,7 +41,7 @@ def _old_held_before(pos: pd.Series, first_bar: pd.Timestamp) -> bool:
 def main() -> None:
     cases: list[dict] = []
     with SessionLocal() as db:
-        for strategy in SINGLE_STRATEGIES:
+        for strategy in SINGLE_TEMPLATES:
             mod = REGISTRY[strategy]
             found = 0
             for code in CODES:

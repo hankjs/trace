@@ -35,9 +35,9 @@ from sqlalchemy.orm import Session
 
 from ..data.ingest import load_bars_df
 from ..data.universe import membership_intervals
-from ..catalog import STRATEGIES
+from ..catalog import STRATEGY_TEMPLATES
 from ..models import BacktestEquity, BacktestRun
-from ..strategy.strategies import REGISTRY, strategy_kind
+from ..strategy.strategies import resolve_module
 
 logger = logging.getLogger(__name__)
 
@@ -104,12 +104,19 @@ def _validate_costs(costs: dict | None) -> dict[str, float]:
     return result
 
 
-def _validate_params(strategy: str, params: dict | None) -> dict:
+def _validate_params(template: str, params: dict | None) -> dict:
+    """按模板元数据校验并归一参数,返回**实际生效的全量参数**(已合并默认值)。
+
+    策略实例的 params 与用户在回测页临时填的参数走同一条校验:库里的行同样
+    可能因模板参数改名而残留无效键,不能因为「存过库」就跳过校验。
+    """
     supplied = params or {}
-    metadata = {item["key"]: item for item in STRATEGIES[strategy]["params"]}
+    if template not in STRATEGY_TEMPLATES:
+        raise ValueError(f"未知策略模板: {template}")
+    metadata = {item["key"]: item for item in STRATEGY_TEMPLATES[template]["params"]}
     unknown = set(supplied) - set(metadata)
     if unknown:
-        raise ValueError(f"{strategy} 不支持参数: {', '.join(sorted(unknown))}")
+        raise ValueError(f"{template} 不支持参数: {', '.join(sorted(unknown))}")
     normalized = {}
     for key, value in supplied.items():
         spec = metadata[key]
@@ -132,13 +139,20 @@ def _validate_params(strategy: str, params: dict | None) -> dict:
         item["key"]: normalized.get(item["key"], item["default"])
         for item in metadata.values()
     }
-    if strategy == "ma_cross" and merged["fast"] >= merged["slow"]:
+    if template == "ma_cross" and merged["fast"] >= merged["slow"]:
         raise ValueError("参数 fast 必须小于 slow")
-    if strategy == "mean_reversion" and merged["rsi_buy"] >= merged["rsi_sell"]:
+    if template == "mean_reversion" and merged["rsi_buy"] >= merged["rsi_sell"]:
         raise ValueError("参数 rsi_buy 必须小于 rsi_sell")
-    if strategy == "momentum_rotation" and merged["w_mom20"] + merged["w_mom60"] <= 0:
+    if template == "momentum_rotation" and merged["w_mom20"] + merged["w_mom60"] <= 0:
         raise ValueError("动量权重之和必须大于 0")
-    return normalized
+    # 返回合并后的全量参数:策略行只存用户覆盖的键,但回测要按实际生效值执行
+    # 和落库(否则模板默认值一改,历史结果就无法复现)
+    return merged
+
+
+# 公开别名:策略 CRUD 也要按同一套规则校验参数,不该跨包导私有名。
+# 引擎内部沿用 `_validate_params`(旧测试按该名断言错误消息)。
+validate_params = _validate_params
 
 
 def _equity_statistics(eq: pd.Series, initial_cash: float = 1.0
@@ -298,23 +312,27 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
     return out
 
 
-def run_backtest(db: Session, strategy: str, codes: list[str],
+def run_backtest(db: Session, strategy, codes: list[str],
                  start: date, end: date, params: dict | None = None,
                  costs: dict | None = None, save: bool = True,
                  dynamic_universe: bool = False,
-                 user_id: int | None = None,
+                 user_id: str | None = None,
                  pool_id: int | None = None) -> dict:
     """跑回测并(默认)落库。多标的时资金等分,组合净值为各标的净值平均。
 
-    组合策略(KIND=portfolio)走 target_weights + vectorbt 组合回测。
-    """
-    mod = REGISTRY.get(strategy)
-    if mod is None:
-        raise ValueError(f"未知策略: {strategy},可选: {list(REGISTRY)}")
-    costs = _validate_costs(costs)
-    params = _validate_params(strategy, params)
+    `strategy` 是 `quant_strategy` 的行(模板 + 参数)。`params` 为可选的临时
+    覆盖(回测页调参),覆盖优先于策略行自身的 params —— 这让「试参数」不必先
+    存策略,存策略也不妨碍临时试别的值。
 
-    if strategy_kind(strategy) == "portfolio":
+    组合模板(KIND=portfolio)走 target_weights + vectorbt 组合回测。
+    """
+    mod = resolve_module(strategy)
+    costs = _validate_costs(costs)
+    # 策略行的 params 打底,调用方的临时覆盖在上
+    params = _validate_params(
+        strategy.template, {**(strategy.params or {}), **(params or {})})
+
+    if mod.KIND == "portfolio":
         return _run_portfolio(
             db, strategy, codes, start, end, params, costs, save,
             dynamic_universe=dynamic_universe, user_id=user_id,
@@ -348,7 +366,9 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     metrics = _combo_metrics(combo, per_code)
 
     result: dict = {
-        "strategy": strategy,
+        "strategy_id": strategy.id,
+        "strategy_name": strategy.name,
+        "template": strategy.template,
         # params 存**实际生效**的全量参数(_validate_params 已合并默认值),
         # 不是用户显式填写的子集:默认值一改历史结果就无法复现
         "params": params,
@@ -417,12 +437,15 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
     return {"equity": eq, "metrics": _metrics_from_equity(eq, pf), "pf": pf}
 
 
-def _run_portfolio(db: Session, strategy: str, codes: list[str],
+def _run_portfolio(db: Session, strategy, codes: list[str],
                    start: date, end: date, params: dict | None,
                    costs: dict, save: bool, *, dynamic_universe: bool,
-                   user_id: int | None, pool_id: int | None = None) -> dict:
-    """组合策略回测:target_weights -> T+1 开盘按目标权重调仓。"""
-    mod = REGISTRY[strategy]
+                   user_id: str | None, pool_id: int | None = None) -> dict:
+    """组合策略回测:target_weights -> T+1 开盘按目标权重调仓。
+
+    params 已由 run_backtest 校验合并,这里不再重复校验。
+    """
+    mod = resolve_module(strategy)
     warmup_start = start - timedelta(days=PORTFOLIO_WARMUP_DAYS)
     pool_dfs: dict[str, pd.DataFrame] = {}
     for code in codes:
@@ -454,7 +477,9 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
     eq = sim["equity"]
 
     result: dict = {
-        "strategy": strategy,
+        "strategy_id": strategy.id,
+        "strategy_name": strategy.name,
+        "template": strategy.template,
         # 同 run_backtest:params 为实际生效的全量参数,codes 为实际样本
         "params": params,
         "codes": list(pool_dfs),
@@ -505,24 +530,20 @@ def _weighted_win_rate(per_code: dict[str, dict]) -> float | None:
 
 
 def _save_run(db: Session, result: dict, start: date, end: date,
-              combo: pd.Series, user_id: int | None = None,
+              combo: pd.Series, user_id: str | None = None,
               pool_id: int | None = None) -> None:
     """落库一次回测。costs 快照与实际样本一并存,否则费率/默认参数一改,
-    历史结果就无法审计复现。pool_id 存所用股票池,供按编号回查时回显。"""
-    fields = dict(
-        strategy=result["strategy"], params=result["params"],
+    历史结果就无法审计复现。pool_id 存所用股票池,供按编号回查时回显。
+
+    params 存的是**实际生效的全量参数**,不是策略行的 params —— 策略行可以被
+    用户改,历史回测不能随之变化。
+    """
+    run = BacktestRun(
+        strategy_id=result["strategy_id"], params=result["params"],
         codes=result["codes"], start=start, end=end,
         metrics=result["metrics"], user_id=user_id,
+        costs=result["costs"], pool_id=pool_id,
     )
-    # costs / pool_id 列由 agent-migrate 增加;尚未上线时降级把快照并入 params,
-    # 保证复现信息不丢(列到位后自动走上面的专列)
-    if hasattr(BacktestRun, "costs"):
-        fields["costs"] = result["costs"]
-    else:
-        fields["params"] = {**result["params"], "_costs": result["costs"]}
-    if pool_id is not None and hasattr(BacktestRun, "pool_id"):
-        fields["pool_id"] = pool_id
-    run = BacktestRun(**fields)
     db.add(run)
     db.flush()
     db.execute(
@@ -534,14 +555,16 @@ def _save_run(db: Session, result: dict, start: date, end: date,
     result["run_id"] = run.id
 
 
-def run_sweep(db: Session, strategy: str, codes: list[str],
+def run_sweep(db: Session, strategy, codes: list[str],
               start: date, end: date, param_grid: dict,
               costs: dict | None = None) -> dict:
-    """参数扫描:param_grid = {参数名: [候选值]},笛卡尔积逐组批量回测(不落库)。"""
-    mod = REGISTRY.get(strategy)
-    if mod is None:
-        raise ValueError(f"未知策略: {strategy}")
-    if strategy_kind(strategy) != "single":
+    """参数扫描:param_grid = {参数名: [候选值]},笛卡尔积逐组批量回测(不落库)。
+
+    扫描的是**模板参数**,策略行只用来定模板 —— 每组候选值都是完整的一组参数,
+    策略行自身的 params 不参与合并(否则扫描结果取决于当前存的值,不可复现)。
+    """
+    mod = resolve_module(strategy)
+    if mod.KIND != "single":
         raise ValueError("参数扫描目前只支持单标的策略")
     costs = _validate_costs(costs)
     if not param_grid:
@@ -556,7 +579,7 @@ def run_sweep(db: Session, strategy: str, codes: list[str],
         raise ValueError(f"参数组合过多({count}),上限 200")
     combos = []
     for vals in itertools.product(*(param_grid[k] for k in keys)):
-        combos.append(_validate_params(strategy, dict(zip(keys, vals))))
+        combos.append(_validate_params(strategy.template, dict(zip(keys, vals))))
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
     full_dfs: dict[str, pd.DataFrame] = {}  # 含预热段,信号在完整序列上计算
@@ -594,7 +617,9 @@ def run_sweep(db: Session, strategy: str, codes: list[str],
     rows.sort(key=lambda r: -(r["metrics"]["annual_return_median"]
                               if r["metrics"]["annual_return_median"] is not None
                               else float("inf")))
-    return {"strategy": strategy, "codes": list(full_dfs), "start": str(start),
+    return {"strategy_id": strategy.id, "strategy_name": strategy.name,
+            "template": strategy.template,
+            "codes": list(full_dfs), "start": str(start),
             "end": str(end), "costs": costs, "results": rows}
 
 
