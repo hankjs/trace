@@ -35,6 +35,10 @@ class Settings:
         ]
         self.snapshot_retention_days: int = 30
         self.backfill_start: str = "2015-01-01"
+        # 调度器跨进程互斥:多 worker/多副本部署时,即使本开关为 True,
+        # 也只有抢到 MySQL GET_LOCK 的那个实例真正运行定时任务(见 scheduler.py)。
+        # 置 False 可让某些实例彻底不参与调度(如纯 API worker)。
+        self.scheduler_enabled: bool = True
 
         # quant 自己的覆盖配置(可选)
         local_cfg = QUANT_DIR / "config.toml"
@@ -54,6 +58,8 @@ class Settings:
                 self.backfill_start = str(local["backfill_start"])
             if local.get("jwt_secret"):
                 self.jwt_secret = str(local["jwt_secret"])
+            if "scheduler_enabled" in local:
+                self.scheduler_enabled = bool(local["scheduler_enabled"])
 
         if not self.database_url:
             raise ValueError(
