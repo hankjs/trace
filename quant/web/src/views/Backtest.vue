@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
+import { AlertTriangle } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
-import { api, type BacktestResult, type SweepResult, type SweepMetrics, type WatchItem } from '../api'
+import { api, hasSurvivorshipBias, type BacktestResult, type SweepResult, type SweepMetrics, type WatchItem } from '../api'
 import { catalogEntry, loadCatalog, metricName, strategyName } from '../catalog'
 import { fmtPct, fmtPrice } from '../format'
 import EChart from '../components/EChart.vue'
+import PoolSelect from '../components/PoolSelect.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
+import { poolById } from '../pools'
 
 const route = useRoute()
 
@@ -17,6 +20,8 @@ const running = ref(false)
 const error = ref('')
 const runIdInput = ref('')
 const searchCode = ref('')
+/** 组合策略的研究范围;单标的策略不使用 */
+const poolId = ref<number | null>(null)
 
 /** 模式:single 单次回测 / sweep 参数扫描 */
 const mode = ref<'single' | 'sweep'>('single')
@@ -233,6 +238,13 @@ const metrics = computed(() => {
   ]
 })
 
+/**
+ * 回测结果所用池是否为静态池。优先用后端回显的 pool(查询历史回测时本地没有选择状态),
+ * 回退到当前选择。预置池(index/all)按逐日成分解析,不标注。
+ */
+const resultPool = computed(() => result.value?.pool ?? (isPortfolio.value ? poolById(poolId.value) : null))
+const resultBiased = computed(() => hasSurvivorshipBias(resultPool.value))
+
 function toggleCode(code: string) {
   const i = form.codes.indexOf(code)
   if (i >= 0) form.codes.splice(i, 1)
@@ -282,6 +294,8 @@ async function run() {
       codes,
       start: form.start,
       end: form.end,
+      // 组合策略按股票池解析成分(取代旧的「codes 留空隐式动态池」约定)
+      ...(isPortfolio.value && poolId.value !== null ? { pool_id: poolId.value } : {}),
       params: { ...parameterValues },
     })
   } catch (e) {
@@ -399,9 +413,13 @@ onMounted(async () => {
         </div>
       </div>
 
+      <div v-if="isPortfolio" class="border-t border-border-subtle pt-3">
+        <PoolSelect v-model="poolId" label="股票池（组合策略的选股范围）" />
+      </div>
+
       <div>
         <span class="mb-1 block text-xs text-text-tertiary">
-          {{ isPortfolio ? '股票（留空则使用区间内动态指数成分）' : '股票（点击选择自选股，或逗号分隔输入）' }}
+          {{ isPortfolio ? '股票（留空则使用所选股票池在区间内的动态成分）' : '股票（点击选择自选股，或逗号分隔输入）' }}
         </span>
         <div class="mb-2 flex flex-wrap gap-2">
           <button
@@ -552,7 +570,22 @@ onMounted(async () => {
           <span>策略: {{ strategyName(result.strategy) }}</span>
           <span>{{ result.start }} ~ {{ result.end }}</span>
         </template>
+        <span v-if="resultPool">股票池: {{ resultPool.name }}</span>
       </div>
+
+      <!-- 静态池无成员历史,历史区间结果含幸存者偏差;预置池逐日解析成分,不标注 -->
+      <p
+        v-if="resultBiased"
+        class="flex items-start gap-2 rounded-md border border-warning/30 bg-warning-soft px-4 py-3 text-sm leading-6 text-text-secondary"
+      >
+        <AlertTriangle :size="16" class="mt-0.5 shrink-0 text-warning" />
+        <span>
+          本次回测使用自定义静态股票池<template v-if="resultPool">「{{ resultPool.name }}」</template>，
+          该池只保存当前成员名单、不含成员变动历史，等于用今天的名单回溯过去，
+          已退市或期间被移出的股票不在样本内，结果存在<strong class="font-medium text-text-primary">幸存者偏差</strong>，
+          收益通常偏乐观。需要严格历史口径时请改用预置池（全部A股 / 指数成分）重跑。
+        </span>
+      </p>
 
       <section class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         <div v-for="m in metrics" :key="m.label" class="rounded-lg border border-border bg-surface-raised p-3">

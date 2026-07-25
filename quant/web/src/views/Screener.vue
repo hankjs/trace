@@ -9,30 +9,42 @@ import {
   type ScreenerGroup,
   type ScreenerItem,
   type ScreenerMatchReason,
+  type PoolRef,
   type StructuredScreenerRequest,
 } from '../api'
 import { categoryLabels, operatorLabels, useCatalog } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
+import PoolSelect from '../components/PoolSelect.vue'
+import { isKnownPoolId } from '../pools'
 import { fmtBigAmount, fmtPct, fmtPrice, pnlClass } from '../format'
 
 interface SavedScheme {
   name: string
   logic: FilterLogic
-  universe: StructuredScreenerRequest['universe']
+  /** v2 起存 pool_id;null 表示用后端默认池(全部A股) */
+  pool_id: number | null
   groups: ScreenerGroup[]
 }
 
-const STORAGE_KEY = 'quant_screener_schemes_v1'
+/**
+ * v1 方案里 universe 存的是 'pool'/'hs300'/'all' 等字符串,与 pool_id 语义不兼容,
+ * 直接当 pool_id 用会筛错范围。故 bump 到 _v2:v1 方案不迁移(旧字符串无法可靠映射到
+ * 新建的池 id),v2 首次加载为空,并在页面提示旧方案需重建。详见 logs/decisions-web.md。
+ */
+const STORAGE_KEY = 'quant_screener_schemes_v2'
+const LEGACY_STORAGE_KEY = 'quant_screener_schemes_v1'
 const { catalog, load: loadCatalog } = useCatalog()
 const groups = ref<ScreenerGroup[]>([])
 const rootLogic = ref<FilterLogic>('and')
-const universe = ref<NonNullable<StructuredScreenerRequest['universe']>>('pool')
+const poolId = ref<number | null>(null)
 const items = ref<ScreenerItem[]>([])
 const combinedCount = ref(0)
 const candidateCount = ref(0)
 const conditionCounts = ref<Record<string, number>>({})
 const fieldCoverage = ref<Record<string, number>>({})
 const resultDate = ref('')
+/** 后端回显的实际使用池,用于结果区标注 */
+const resultPool = ref<PoolRef | null>(null)
 const valuationMaxAgeDays = ref(7)
 const searched = ref(false)
 const loading = ref(false)
@@ -40,6 +52,8 @@ const error = ref('')
 const schemeName = ref('')
 const selectedScheme = ref('')
 const savedSchemes = ref<SavedScheme[]>(readSchemes())
+/** 存在 v1 遗留方案时提示用户需重建(v1 的 universe 字符串无法映射到 pool_id) */
+const legacySchemeCount = ref(countLegacySchemes())
 let sequence = 0
 
 const presets: { name: string; conditions: [string, string, string | boolean, string?][] }[] = [
@@ -47,14 +61,6 @@ const presets: { name: string; conditions: [string, string, string | boolean, st
   { name: '趋势稳健', conditions: [['mom20', 'gte', '0'], ['ma_bull', 'eq', true]] },
   { name: '质量价值', conditions: [['pe_ttm', 'between', '0', '25'], ['roe', 'gte', '10']] },
   { name: '财务稳健', conditions: [['roe', 'gte', '12'], ['debt_ratio', 'lte', '60']] },
-]
-
-const universeOptions: { value: NonNullable<StructuredScreenerRequest['universe']>; label: string }[] = [
-  { value: 'pool', label: '沪深300 + 中证500' },
-  { value: 'hs300', label: '沪深300' },
-  { value: 'zz500', label: '中证500' },
-  { value: 'watchlist', label: '我的自选股' },
-  { value: 'all', label: '全部A股' },
 ]
 
 const groupedFields = computed(() => {
@@ -169,9 +175,8 @@ function scaleValue(value: string | number | boolean | null | undefined, meta: C
 }
 
 function buildRequest(): StructuredScreenerRequest {
-  return {
+  const request: StructuredScreenerRequest = {
     logic: rootLogic.value,
-    universe: universe.value,
     limit: 300,
     groups: groups.value.map((group) => ({
       id: group.id,
@@ -186,6 +191,9 @@ function buildRequest(): StructuredScreenerRequest {
       }),
     })),
   }
+  // 未选池时不传 pool_id,由后端落到默认池
+  if (poolId.value !== null) request.pool_id = poolId.value
+  return request
 }
 
 function validate(): string {
@@ -220,6 +228,7 @@ async function search() {
     } else conditionCounts.value = result.condition_counts ?? {}
     fieldCoverage.value = result.field_coverage ?? {}
     resultDate.value = result.date ?? ''
+    resultPool.value = result.pool ?? null
     valuationMaxAgeDays.value = result.data_policy?.valuation_max_age_days ?? 7
   } catch (caught) {
     items.value = []
@@ -227,6 +236,7 @@ async function search() {
     candidateCount.value = 0
     conditionCounts.value = {}
     fieldCoverage.value = {}
+    resultPool.value = null
     error.value = (caught as Error).message
   } finally {
     loading.value = false
@@ -253,10 +263,30 @@ function applyPreset(preset: typeof presets[number]) {
 function readSchemes(): SavedScheme[] {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
-    return Array.isArray(parsed) ? parsed : []
+    if (!Array.isArray(parsed)) return []
+    // 只接受 pool_id 为数字或 null 的方案,防御手工改坏的 localStorage
+    return parsed.filter((scheme): scheme is SavedScheme =>
+      !!scheme && typeof scheme.name === 'string'
+      && (scheme.pool_id === null || typeof scheme.pool_id === 'number')
+    )
   } catch {
     return []
   }
+}
+
+function countLegacySchemes(): number {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY) ?? '[]')
+    return Array.isArray(parsed) ? parsed.length : 0
+  } catch {
+    return 0
+  }
+}
+
+/** 用户确认后清掉 v1 遗留数据,不再提示 */
+function discardLegacySchemes() {
+  localStorage.removeItem(LEGACY_STORAGE_KEY)
+  legacySchemeCount.value = 0
 }
 
 function cloneGroups(value: ScreenerGroup[]): ScreenerGroup[] {
@@ -269,7 +299,7 @@ function saveScheme() {
     error.value = '请先填写方案名称'
     return
   }
-  const scheme: SavedScheme = { name, logic: rootLogic.value, universe: universe.value, groups: cloneGroups(groups.value) }
+  const scheme: SavedScheme = { name, logic: rootLogic.value, pool_id: poolId.value, groups: cloneGroups(groups.value) }
   const index = savedSchemes.value.findIndex((item) => item.name === name)
   if (index >= 0) savedSchemes.value.splice(index, 1, scheme)
   else savedSchemes.value.push(scheme)
@@ -283,9 +313,12 @@ function loadScheme() {
   if (!scheme) return
   groups.value = cloneGroups(scheme.groups)
   rootLogic.value = scheme.logic
-  universe.value = scheme.universe ?? 'pool'
+  // 方案里的池可能已被删除,失效则回落默认池(由 PoolSelect 补齐)
+  poolId.value = isKnownPoolId(scheme.pool_id) ? scheme.pool_id : null
   schemeName.value = scheme.name
-  error.value = ''
+  error.value = scheme.pool_id !== null && !isKnownPoolId(scheme.pool_id)
+    ? '该方案保存的股票池已不存在，已回退到默认股票池。'
+    : ''
 }
 
 function deleteScheme() {
@@ -384,13 +417,8 @@ onMounted(async () => {
 <template>
   <div class="space-y-5">
     <section aria-labelledby="preset-heading">
-      <div class="flex flex-wrap items-end justify-between gap-3">
-        <label class="text-sm">
-          <span class="mb-1 block text-xs text-text-tertiary">研究范围</span>
-          <select v-model="universe" class="rounded-md border border-border px-2.5 py-1.5 text-sm">
-            <option v-for="option in universeOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
-          </select>
-        </label>
+      <div class="flex flex-wrap items-start justify-between gap-3">
+        <PoolSelect v-model="poolId" label="研究范围（股票池）" />
         <div class="flex flex-wrap items-center gap-2">
         <h2 id="preset-heading" class="mr-1 text-sm font-medium">快速方案</h2>
         <button
@@ -559,6 +587,18 @@ onMounted(async () => {
       </div>
     </section>
 
+    <p
+      v-if="legacySchemeCount"
+      class="flex flex-wrap items-center gap-2 rounded-md border border-border bg-warning-soft px-4 py-2 text-xs text-text-secondary"
+    >
+      <span>
+        检测到 {{ legacySchemeCount }} 个旧版筛选方案。旧方案保存的研究范围是已废弃的口径名称，无法安全对应到现在的股票池，需要重新保存一次。
+      </span>
+      <button type="button" class="rounded border border-border px-2 py-0.5 hover:bg-hover" @click="discardLegacySchemes">
+        知道了，清除旧方案
+      </button>
+    </p>
+
     <p v-if="error" role="alert" class="rounded-md border border-up/30 bg-danger-soft px-4 py-2 text-sm text-up">{{ error }}</p>
     <LoadingRows v-if="loading" :rows="5" />
 
@@ -568,7 +608,10 @@ onMounted(async () => {
           组合命中 <span class="text-base text-accent">{{ combinedCount }}</span> 只
           <span v-if="candidateCount" class="ml-1 font-normal text-text-tertiary">（研究范围 {{ candidateCount }} 只）</span>
         </h2>
-        <span v-if="resultDate" class="text-xs text-text-tertiary">数据日期 {{ resultDate }}</span>
+        <span class="flex items-center gap-3 text-xs text-text-tertiary">
+          <span v-if="resultPool">股票池 {{ resultPool.name }}</span>
+          <span v-if="resultDate">数据日期 {{ resultDate }}</span>
+        </span>
       </div>
 
       <div v-if="partialDataFields.length" class="mb-3 rounded-md border border-warning/30 bg-warning-soft px-3 py-2 text-xs leading-5 text-warning">

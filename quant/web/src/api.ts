@@ -58,6 +58,57 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>
 }
 
+/**
+ * 股票池种类:
+ * - index  预置指数成分池(沪深300/中证500 等),按 in_date/out_date 做 point-in-time 解析
+ * - all    全部A股,按 list_date/delist_date/is_st 解析,同样 point-in-time
+ * - static 自定义静态池,只存代码不存日期,历史区间存在幸存者偏差
+ */
+export type PoolKind = 'index' | 'all' | 'static'
+
+export interface Pool {
+  id: number
+  kind: PoolKind
+  /** kind='index' 时的指数引用,如 hs300_zz500 */
+  ref?: string | null
+  name: string
+  /** 新股上市满多少天才纳入,预置指数池为 0 */
+  min_list_days: number
+  /** NULL = 全局共享的预置池,只读 */
+  user_id?: string | null
+  member_count?: number | null
+  created_at?: string | null
+}
+
+/** 筛选/回测响应里回显的池信息 */
+export interface PoolRef {
+  id: number
+  name: string
+  kind: PoolKind
+  /** 后端显式回传;缺省时前端按 kind==='static' 推断 */
+  has_survivorship_bias?: boolean
+}
+
+export interface PoolMember {
+  code: string
+  name?: string
+  industry?: string
+}
+
+/** 预置池(user_id 为空)不可改名、不可增删成员,只能「另存为」自定义池 */
+export function isPresetPool(pool: Pool | null | undefined): boolean {
+  return !!pool && pool.kind !== 'static'
+}
+
+/** 静态池无成员历史,用于历史区间时结果含幸存者偏差 */
+export function hasSurvivorshipBias(pool: Pool | PoolRef | null | undefined): boolean {
+  if (!pool) return false
+  if ('has_survivorship_bias' in pool && typeof pool.has_survivorship_bias === 'boolean') {
+    return pool.has_survivorship_bias
+  }
+  return pool.kind === 'static'
+}
+
 export interface KlineBar {
   date: string
   open: number
@@ -151,6 +202,8 @@ export interface BacktestResult {
   stocks?: StockRef[]
   start?: string
   end?: string
+  /** 组合回测所用股票池;静态池需在结果页标注幸存者偏差 */
+  pool?: PoolRef
   metrics: BacktestMetrics
   equity: { date: string; equity: number }[]
 }
@@ -179,9 +232,8 @@ export interface PickItem {
   name: string
   score: number
   factors: PickFactors
-  /** 相对前一交易日的变动标记:'new' 新进等(字段名/取值做防御性适配) */
+  /** 相对前一交易日的变动:'new' 新进 / 'keep' 保留 */
   change?: string | null
-  is_new?: boolean
   dropped?: boolean
 }
 
@@ -197,9 +249,8 @@ export interface ScreenerItem {
   code: string
   name: string
   close?: number
-  /** 涨跌幅:实际响应为 pct_chg,契约曾用 chg_pct,两者都兼容 */
+  /** 涨跌幅 */
   pct_chg?: number
-  chg_pct?: number
   high_dist?: number
   mom20?: number
   mom60?: number
@@ -220,7 +271,8 @@ export interface ScreenerResult {
   combined_count?: number
   candidate_count?: number
   field_coverage?: Record<string, number>
-  universe?: string
+  /** 本次实际使用的股票池(取代旧的 universe 字符串回显) */
+  pool?: PoolRef
   condition_counts?: Record<string, number> | ScreenerConditionCount[]
   independent_counts?: Record<string, number>
   data_policy?: {
@@ -327,7 +379,8 @@ export interface StructuredScreenerRequest {
   logic: FilterLogic
   groups: ScreenerGroup[]
   limit?: number
-  universe?: 'pool' | 'hs300_zz500' | 'hs300' | 'zz500' | 'watchlist' | 'all'
+  /** 股票池 id;不传由后端取默认池(全部A股) */
+  pool_id?: number
 }
 
 export interface StrategyListResult {
@@ -447,7 +500,59 @@ export const api = {
     return request<Partial<CatalogPayload>>('/api/catalog')
   },
 
-  runBacktest(body: { strategy: string; codes: string[]; start: string; end: string; params?: Record<string, unknown>; costs?: Record<string, unknown> }) {
+  // ---- 股票池组 ----
+
+  pools() {
+    return request<{ count?: number; items: Pool[] }>('/api/pools')
+  },
+
+  pool(id: number) {
+    return request<Pool>(`/api/pools/${id}`)
+  },
+
+  createPool(body: { name: string; min_list_days?: number; codes?: string[] }) {
+    return request<Pool>('/api/pools', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
+  updatePool(id: number, body: { name?: string; min_list_days?: number }) {
+    return request<Pool>(`/api/pools/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+  },
+
+  deletePool(id: number) {
+    return request<{ deleted: number }>(`/api/pools/${id}`, { method: 'DELETE' })
+  },
+
+  poolMembers(id: number) {
+    return request<{ count?: number; items: PoolMember[] }>(`/api/pools/${id}/members`)
+  },
+
+  /** 批量增加成员(粘贴导入用),返回实际写入与被忽略的代码 */
+  addPoolMembers(id: number, codes: string[]) {
+    return request<{ added: number; skipped?: string[]; items?: PoolMember[] }>(`/api/pools/${id}/members`, {
+      method: 'POST',
+      body: JSON.stringify({ codes }),
+    })
+  },
+
+  removePoolMember(id: number, code: string) {
+    return request<{ deleted: number }>(`/api/pools/${id}/members/${code}`, { method: 'DELETE' })
+  },
+
+  runBacktest(body: {
+    strategy: string
+    codes: string[]
+    start: string
+    end: string
+    pool_id?: number
+    params?: Record<string, unknown>
+    costs?: Record<string, unknown>
+  }) {
     return request<BacktestResult>('/api/backtest', {
       method: 'POST',
       body: JSON.stringify(body),
@@ -465,59 +570,16 @@ export const api = {
     return request<PicksResult>(`/api/selection/picks${qs ? `?${qs}` : ''}`)
   },
 
-  screener(filters: {
-    pct_chg_min?: number
-    pct_chg_max?: number
-    vol_ratio_min?: number
-    ma_bull?: boolean
-    high_window?: number
-    high_dist_max?: number
-    amount_min?: number
-  } = {}) {
-    const params = new URLSearchParams()
-    if (filters.pct_chg_min !== undefined) params.set('pct_chg_min', String(filters.pct_chg_min))
-    if (filters.pct_chg_max !== undefined) params.set('pct_chg_max', String(filters.pct_chg_max))
-    if (filters.vol_ratio_min !== undefined) params.set('vol_ratio_min', String(filters.vol_ratio_min))
-    if (filters.ma_bull) params.set('ma_bull', 'true')
-    if (filters.high_window !== undefined) params.set('high_window', String(filters.high_window))
-    if (filters.high_dist_max !== undefined) params.set('high_dist_max', String(filters.high_dist_max))
-    if (filters.amount_min !== undefined) params.set('amount_min', String(filters.amount_min))
-    return request<ScreenerResult>(`/api/selection/screener?${params}`)
-  },
-
-  async structuredScreener(body: StructuredScreenerRequest) {
-    try {
-      return await request<ScreenerResult>('/api/selection/screener', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
-    } catch (error) {
-      const status = (error as Error & { status?: number }).status
-      if (status !== 404 && status !== 405) throw error
-
-      const active = body.groups.flatMap((group) => group.conditions).filter((condition) => condition.enabled)
-      const legacy: {
-        pct_chg_min?: number
-        pct_chg_max?: number
-        vol_ratio_min?: number
-        ma_bull?: boolean
-        high_window?: number
-        high_dist_max?: number
-        amount_min?: number
-      } = {}
-      for (const condition of active) {
-        const value = Number(condition.value)
-        if (condition.field === 'pct_chg' && condition.operator === 'gte') legacy.pct_chg_min = value
-        else if (condition.field === 'pct_chg' && condition.operator === 'lte') legacy.pct_chg_max = value
-        else if (condition.field === 'vol_ratio5' && condition.operator === 'gte') legacy.vol_ratio_min = value
-        else if (condition.field === 'ma_bull' && condition.operator === 'eq') legacy.ma_bull = Boolean(condition.value)
-        else if (condition.field === 'high_window' && condition.operator === 'eq') legacy.high_window = value
-        else if (condition.field === 'high_dist' && condition.operator === 'lte') legacy.high_dist_max = value
-        else if (condition.field === 'amount_avg20' && condition.operator === 'gte') legacy.amount_min = value
-        else throw error
-      }
-      return api.screener(legacy)
-    }
+  // 结构化筛选:直连 POST /api/selection/screener。
+  // 这里刻意不做任何降级重试。历史上曾在接口不可用时改调旧版 GET 接口,
+  // 但旧接口不支持条件组的 OR 逻辑,也不支持任何基本面条件,
+  // 结果是用户看到与所设筛选条件不符的列表却没有任何提示。
+  // 现在失败就直接抛错,由页面把错误呈现给用户。
+  structuredScreener(body: StructuredScreenerRequest) {
+    return request<ScreenerResult>('/api/selection/screener', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
   },
 
   leaderboard() {
