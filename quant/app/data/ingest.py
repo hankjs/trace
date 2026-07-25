@@ -199,10 +199,14 @@ def upsert_bars(db: Session, code: str, df: pd.DataFrame) -> int:
             "raw_close": None if pd.isna(r.raw_close) else float(r.raw_close),
             "volume": 0.0 if pd.isna(r.volume) else float(r.volume),
             "amount": 0.0 if pd.isna(r.amount) else float(r.amount),
+            # 逐日 ST 状态:NULL 表示未采集,不能当 False 用(见 alembic 0010)
+            "is_st": (None if getattr(r, "is_st", None) is None
+                      or pd.isna(r.is_st) else bool(r.is_st)),
         }
         for r in df.itertuples()
     ]
-    updated_cols = ("open", "high", "low", "close", "raw_close", "volume", "amount")
+    updated_cols = ("open", "high", "low", "close", "raw_close", "volume",
+                    "amount", "is_st")
     dialect = db.get_bind().dialect.name
     if dialect == "sqlite":
         stmt = sqlite_insert(DailyBar).values(rows)

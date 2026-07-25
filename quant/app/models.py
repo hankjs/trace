@@ -99,6 +99,14 @@ class DailyBar(Base):
     raw_close: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
     volume: Mapped[float] = mapped_column(_SHARES, default=0)
     amount: Mapped[float] = mapped_column(_SHARES, default=0)
+    # 当日是否风险警示股(baostock 日线的 isST 字段,逐日真实历史)。
+    #
+    # 这是**回测唯一应当使用的 ST 口径**。quant_stock.is_st 只有当前状态、
+    # 会被改名覆盖,用它过滤历史样本是系统性前视偏差:实测抽样 8 只当前 ST 股,
+    # 22464 个交易日里真正处于 ST 的只有 14.4%,其余 85.6% 会被错误剔除 ——
+    # 而被剔掉的恰是后来才出问题的公司,等于让策略提前知道谁将退化,
+    # 方向上高估策略表现。
+    is_st: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
 
 class AdjustFactor(Base):

@@ -339,3 +339,44 @@ def test_derive_factors_survives_low_price_rounding_noise(db):
     # 只该有首行 + 那次真实除权,不该有 4 个假除权日
     assert list(out["divid_operate_date"]) == [date(2021, 3, 1), date(2021, 6, 17)]
     assert out["fore_factor"].tolist() == pytest.approx([0.772, 0.9425], rel=1e-3)
+
+
+def test_daily_bar_is_st_distinguishes_null_from_false(db):
+    """NULL 表示「未采集」,False 表示「确认非 ST」—— 不能混用。
+
+    既有 1138 万行在 0010 之前没有 isST,回填前为 NULL。若过滤时把 NULL 当
+    False,那些未采集的行会被当成「确认非 ST」放进样本;反之当 True 则全被
+    剔除。两种都错,必须显式区分。
+    """
+    from app.models import DailyBar
+    db.add_all([
+        _bar("sh.600053", date(2026, 4, 29), 11.43, 11.43),           # is_st 未设 -> NULL
+        DailyBar(code="sh.600053", date=date(2026, 4, 30), open=10.86,
+                 high=10.86, low=10.86, close=10.86, raw_close=10.86,
+                 volume=1, amount=1, is_st=True),
+        DailyBar(code="sh.600053", date=date(2026, 4, 28), open=11.43,
+                 high=11.43, low=11.43, close=11.43, raw_close=11.43,
+                 volume=1, amount=1, is_st=False),
+    ])
+    db.commit()
+
+    assert db.get(DailyBar, ("sh.600053", date(2026, 4, 29))).is_st is None
+    assert db.get(DailyBar, ("sh.600053", date(2026, 4, 30))).is_st is True
+    assert db.get(DailyBar, ("sh.600053", date(2026, 4, 28))).is_st is False
+
+
+def test_upsert_bars_persists_is_st(db):
+    """采集到的逐日 ST 状态必须落库,否则回测口径退回当前状态(前视偏差)。"""
+    from app.models import DailyBar
+    bars = pd.DataFrame([
+        {"date": date(2026, 4, 29), "open": 11.4, "high": 11.5, "low": 11.3,
+         "close": 11.43, "raw_close": 11.43, "volume": 1, "amount": 1,
+         "is_st": False},
+        {"date": date(2026, 4, 30), "open": 10.9, "high": 11.0, "low": 10.8,
+         "close": 10.86, "raw_close": 10.86, "volume": 1, "amount": 1,
+         "is_st": True},
+    ])
+    assert ingest.upsert_bars(db, "sh.600053", bars) == 2
+
+    assert db.get(DailyBar, ("sh.600053", date(2026, 4, 29))).is_st is False
+    assert db.get(DailyBar, ("sh.600053", date(2026, 4, 30))).is_st is True

@@ -57,7 +57,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0009_tighten_not_null"}
+    assert heads == {"0010_daily_bar_is_st"}
     assert current_heads(migrated_db) == heads
 
 

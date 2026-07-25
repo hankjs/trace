@@ -83,11 +83,14 @@ def fetch_daily_bars(code: str, start: date | str, end: date | str) -> pd.DataFr
     start_s = start.isoformat() if isinstance(start, (date, datetime)) else str(start)
     end_s = end.isoformat() if isinstance(end, (date, datetime)) else str(end)
 
-    fields = "date,open,high,low,close,volume,amount"
+    # isST 只需从前复权那次请求取:它与复权方式无关,且多取一列不增加请求数
+    # (回测的 ST 口径必须逐日,见 alembic 0010 的实测偏差数据)
+    fields_adj = "date,open,high,low,close,volume,amount,isST"
+    fields_raw = "date,close"
     with _ensure_session():
         frames = []
         # adjustflag: 2=前复权, 3=不复权
-        for adj in ("2", "3"):
+        for adj, fields in (("2", fields_adj), ("3", fields_raw)):
             rs = bs.query_history_k_data_plus(
                 code, fields, start_date=start_s, end_date=end_s,
                 frequency="d", adjustflag=adj,
@@ -104,7 +107,8 @@ def fetch_daily_bars(code: str, start: date | str, end: date | str) -> pd.DataFr
 
     if frames[0].empty:
         return pd.DataFrame(
-            columns=["date", "open", "high", "low", "close", "raw_close", "volume", "amount"]
+            columns=["date", "open", "high", "low", "close", "raw_close",
+                     "volume", "amount", "is_st"]
         )
 
     adj = frames[0]
@@ -119,6 +123,13 @@ def fetch_daily_bars(code: str, start: date | str, end: date | str) -> pd.DataFr
     for col in ("open", "high", "low", "close", "raw_close", "volume", "amount"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["date"] = pd.to_datetime(df["date"]).dt.date
+    # isST 是 '0'/'1' 字符串;空值保持 None 表示「未知」而非「非 ST」
+    if "isST" in df.columns:
+        st = pd.to_numeric(df["isST"], errors="coerce")
+        df["is_st"] = st.map(lambda v: None if pd.isna(v) else bool(v))
+        df = df.drop(columns=["isST"])
+    else:
+        df["is_st"] = None
     return df
 
 
