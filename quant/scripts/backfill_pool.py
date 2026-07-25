@@ -28,7 +28,7 @@ from sqlalchemy import func, select  # noqa: E402
 
 from app.data import baostock_client, ingest, universe  # noqa: E402
 from app.data.clock import today_cst  # noqa: E402
-from app.db import Base, SessionLocal, engine  # noqa: E402
+from app.db import SessionLocal  # noqa: E402
 from app import models  # noqa: E402,F401 - 确保建表元数据注册
 from app.models import DailyBar, Stock  # noqa: E402
 
@@ -103,7 +103,9 @@ def main() -> None:
         parser.error("--shard 必须在 0 到 --shards-1 之间")
     force_all, force_codes = _parse_force_rescale(args.force_rescale)
 
-    Base.metadata.create_all(engine)
+    # 建表交给 Alembic(uv run alembic upgrade head),这里不再 create_all:
+    # 否则会按当时的 models 建出绕过迁移版本管理的表,让生产库变成
+    # 「部分新表已存在但列不全」的混合状态,Alembic 之后无法干净接管。
     start = (date.fromisoformat(args.start) if args.start
              else today_cst() - timedelta(days=args.years * 365))
     if start > today_cst():
