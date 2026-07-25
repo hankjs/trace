@@ -72,16 +72,25 @@ def add_trade(body: TradeIn, db: Session = Depends(get_db),
         raise HTTPException(
             422, f"股票代码 {code or '（空）'} 不存在，请先从股票搜索结果中选择",
         )
-    t = trade_svc.add_trade(db, user_id_from_claims(claims), code,
-                            body.trade_date, body.side,
-                            body.price, body.qty, body.fee, body.note)
+    try:
+        t = trade_svc.add_trade(db, user_id_from_claims(claims), code,
+                                body.trade_date, body.side,
+                                body.price, body.qty, body.fee, body.note)
+    except trade_svc.OversellError as exc:
+        raise HTTPException(422, str(exc)) from exc
     return _trade_out(t, stock)
 
 
 @router.delete("/trades/{trade_id}")
 def delete_trade(trade_id: int, db: Session = Depends(get_db),
                  claims: dict = Depends(require_client)):
-    if not trade_svc.delete_trade(db, user_id_from_claims(claims), trade_id):
+    try:
+        deleted = trade_svc.delete_trade(
+            db, user_id_from_claims(claims), trade_id)
+    except trade_svc.OversellError as exc:
+        # 删掉这笔买入会让后续卖出透支,拒绝并提示
+        raise HTTPException(422, str(exc)) from exc
+    if not deleted:
         raise HTTPException(404, f"成交记录 {trade_id} 不存在")
     return {"deleted": trade_id}
 

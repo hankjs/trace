@@ -15,10 +15,10 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import (FundamentalSnapshot, IndexMember, Stock,
+from ..models import (FundamentalSnapshot, Stock,
                       ValuationSnapshot, WatchlistItem)
 from . import akshare_client
-from .universe import current_pool
+from .universe import pool_at
 
 logger = logging.getLogger(__name__)
 
@@ -480,21 +480,25 @@ def _normalize_code(code: str) -> str:
     return akshare_client.symbol_to_code(code.zfill(6))
 
 
-def _universe_codes(db: Session, universe: str) -> list[str]:
+def _universe_codes(db: Session, universe: str,
+                    as_of: date | None = None) -> list[str]:
+    """解析研究范围为代码列表。
+
+    指数口径统一走 universe.py 的 point-in-time 解析(pool_at):此前这里只取
+    `out_date IS NULL`(今天的成分),用它同步历史财报就是幸存者偏差——今天
+    已被调出指数的股票在历史区间内本该在册,却永远同步不到。
+    as_of 为 None 时按今天解析(日常增量同步的语义)。
+    """
     universe = universe.lower()
+    day = as_of or date.today()
     if universe == "watchlist":
         return [r[0] for r in db.execute(
             select(WatchlistItem.code).distinct().order_by(WatchlistItem.code)
         ).all()]
     if universe == "pool":
-        return current_pool(db)
+        return pool_at(db, day)
     if universe in {"hs300", "zz500"}:
-        return [r[0] for r in db.execute(
-            select(IndexMember.code).where(
-                IndexMember.index_name == universe,
-                IndexMember.out_date.is_(None),
-            ).distinct().order_by(IndexMember.code)
-        ).all()]
+        return pool_at(db, day, index_name=universe)
     if universe == "all":
         return [r[0] for r in db.execute(select(Stock.code).order_by(Stock.code)).all()]
     raise ValueError("universe 只能是 watchlist、pool、hs300、zz500 或 all")

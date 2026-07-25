@@ -8,15 +8,15 @@
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import date, timedelta
 
-import numpy as np
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..data.universe import current_pool, pool_at, pool_during
 from ..models import FactorDaily, StrategyEval
-from ..selection.pipeline import score_row
+from ..selection.pipeline import score_cross_section
 from ..strategy.strategies import (PORTFOLIO_STRATEGIES, REGISTRY,
                                    SINGLE_STRATEGIES)
 from .engine import (DEFAULT_COSTS, SINGLE_WARMUP_DAYS, _batch_single,
@@ -47,12 +47,14 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
     rows = db.execute(
         select(FactorDaily).where(FactorDaily.date == fdate)
     ).scalars().all()
-    scored = []
-    for r in rows:
-        s = score_row({k: getattr(r, k) for k in
-                       ("mom20", "mom60", "ma20_slope", "vol_ratio5")})
-        if s is not None:
-            scored.append((s, r.code))
+    # 截面标准化打分:量纲统一,单因子缺失按截面中位数填充而不丢整只
+    scores = score_cross_section([
+        {"code": r.code,
+         **{k: getattr(r, k) for k in
+            ("mom20", "mom60", "ma20_slope", "vol_ratio5")}}
+        for r in rows
+    ])
+    scored = [(s, code) for code, s in scores.items() if s is not None]
     scored.sort(key=lambda t: (-t[0], t[1]))
     return [c for _, c in scored[:n]]
 
@@ -75,14 +77,11 @@ def _eval_single(db: Session, strategy: str, codes: list[str],
     per = [r["metrics"] for r in results.values()]
     return {
         "codes": len(dfs),
-        "annual_return_median": round(float(np.median(
-            [m["annual_return"] for m in per])), 4),
-        "annual_return_mean": round(float(np.mean(
-            [m["annual_return"] for m in per])), 4),
-        "total_return_median": round(float(np.median(
-            [m["total_return"] for m in per])), 4),
-        "max_drawdown_median": round(float(np.median(
-            [m["max_drawdown"] for m in per])), 4),
+        # 短序列指标为 None(engine.MIN_STAT_BARS),聚合统一走 None 容忍的 helper
+        "annual_return_median": _median_or_none([m["annual_return"] for m in per]),
+        "annual_return_mean": _mean_or_none([m["annual_return"] for m in per]),
+        "total_return_median": _median_or_none([m["total_return"] for m in per]),
+        "max_drawdown_median": _median_or_none([m["max_drawdown"] for m in per]),
         "sharpe_median": _median_or_none([m["sharpe"] for m in per]),
         "win_rate_mean": _mean_or_none([m["win_rate"] for m in per]),
         "trade_count": sum(m["trade_count"] for m in per),
@@ -95,11 +94,15 @@ def run_evaluation(db: Session, day: date | None = None,
     """跑一轮批量评估并落库 quant_strategy_eval"""
     end = day or date.today()
     start = end - timedelta(days=period_days)
+    # 一轮评估共用一个 batch_id:run_at 是 default=datetime.now,在每个对象
+    # **实例化**时求值,而循环每次迭代要跑完整回测(数分钟),十几行的 run_at
+    # 会相差数分钟。leaderboard 按 batch_id 查才能整批捞回。
+    batch_id = uuid.uuid4().hex
     # 单标的样本取起点时点；组合池使用区间成分并集和逐日 eligibility。
     top_codes = top_scored_codes(db, TOP_SAMPLE, as_of=start)
     pool = pool_during(db, start, end)
-    logger.info("批量评估 [%s, %s]: 单标的样本 %d 只,组合池 %d 只",
-                start, end, len(top_codes), len(pool))
+    logger.info("批量评估 [%s, %s] batch=%s: 单标的样本 %d 只,组合池 %d 只",
+                start, end, batch_id, len(top_codes), len(pool))
 
     saved = []
     for name in SINGLE_STRATEGIES:
@@ -110,7 +113,8 @@ def run_evaluation(db: Session, day: date | None = None,
             logger.exception("评估失败 %s", name)
             metrics, scope = {"error": str(e)}, "pool_top50"
         db.add(StrategyEval(strategy=name, params={}, scope=scope,
-                            start=start, end=end, metrics=metrics))
+                            start=start, end=end, metrics=metrics,
+                            batch_id=batch_id))
         saved.append({"strategy": name, "scope": scope})
         logger.info("评估 %s: %s", name,
                     {k: v for k, v in metrics.items() if k != "per_code"})
@@ -125,24 +129,40 @@ def run_evaluation(db: Session, day: date | None = None,
             logger.exception("评估失败 %s", name)
             metrics = {"error": str(e)}
         db.add(StrategyEval(strategy=name, params={}, scope="pool",
-                            start=start, end=end, metrics=metrics))
+                            start=start, end=end, metrics=metrics,
+                            batch_id=batch_id))
         saved.append({"strategy": name, "scope": "pool"})
         logger.info("评估 %s: %s", name, metrics)
 
     db.commit()
-    return {"start": str(start), "end": str(end), "evaluated": saved}
+    return {"start": str(start), "end": str(end), "batch_id": batch_id,
+            "evaluated": saved}
 
 
 def leaderboard(db: Session, limit: int = 50) -> dict:
-    """每个策略最近一轮评估结果,按年化中位数/组合年化排序"""
-    latest_run = db.execute(
-        select(StrategyEval.run_at).order_by(StrategyEval.run_at.desc()).limit(1)
-    ).scalar()
-    if latest_run is None:
-        return {"run_at": None, "items": []}
-    rows = db.execute(
-        select(StrategyEval).where(StrategyEval.run_at == latest_run)
-    ).scalars().all()
+    """最近一轮评估结果,按年化中位数/组合年化排序。
+
+    按 batch_id 整批取,不用 run_at 精确相等:同一轮里各行的 run_at 相差数
+    分钟(每行落库前要跑完一次回测),精确匹配只能捞回最后一条。
+    """
+    if limit <= 0:
+        return {"run_at": None, "batch_id": None, "items": []}
+    latest = db.execute(
+        select(StrategyEval.batch_id, StrategyEval.run_at)
+        .order_by(StrategyEval.run_at.desc()).limit(1)
+    ).first()
+    if latest is None:
+        return {"run_at": None, "batch_id": None, "items": []}
+    batch_id, latest_run = latest
+    if batch_id is None:
+        # 历史数据(batch_id 落地前写入的行)没有批次号,退回按 run_at 取单行
+        rows = db.execute(
+            select(StrategyEval).where(StrategyEval.run_at == latest_run)
+        ).scalars().all()
+    else:
+        rows = db.execute(
+            select(StrategyEval).where(StrategyEval.batch_id == batch_id)
+        ).scalars().all()
 
     def sort_key(r: StrategyEval) -> float:
         m = r.metrics or {}
@@ -158,7 +178,9 @@ def leaderboard(db: Session, limit: int = 50) -> dict:
             "metrics": {k: v for k, v in (r.metrics or {}).items()
                         if k != "per_code"},
             "run_at": r.run_at.isoformat(sep=" "),
+            "batch_id": r.batch_id,
         }
         for r in sorted(rows, key=sort_key, reverse=True)[:limit]
     ]
-    return {"run_at": latest_run.isoformat(sep=" "), "items": items}
+    return {"run_at": latest_run.isoformat(sep=" "), "batch_id": batch_id,
+            "items": items}

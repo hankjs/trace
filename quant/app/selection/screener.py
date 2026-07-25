@@ -9,17 +9,16 @@ import logging
 from datetime import date, timedelta
 from typing import Any
 
+import pandas as pd
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..catalog import FILTER_FIELDS
-from ..data.ingest import load_bars_df
 from ..data.universe import current_pool, pool_at
 from ..models import (
     DailyBar,
     FactorDaily,
     FundamentalSnapshot,
-    IndexMember,
     Stock,
     ValuationSnapshot,
     WatchlistItem,
@@ -28,6 +27,11 @@ from ..models import (
 logger = logging.getLogger(__name__)
 
 VALUATION_MAX_AGE_DAYS = 7
+MAX_HIGH_WINDOW = 750  # 约 3 年交易日,防止无上界的窗口打爆查询区间
+
+
+class InvalidFilterError(ValueError):
+    """结构化筛选条件不合法。"""
 
 
 def _latest_factor_date(db: Session, day: date | None) -> date | None:
@@ -35,6 +39,36 @@ def _latest_factor_date(db: Session, day: date | None) -> date | None:
     if day:
         q = q.where(FactorDaily.date <= day)
     return db.execute(q.order_by(FactorDaily.date.desc()).limit(1)).scalar()
+
+
+def _load_bars_batch(db: Session, codes: list[str], start: date,
+                     end: date) -> dict[str, pd.DataFrame]:
+    """一次查询取回多只股票的日线,按 code 切成 DataFrame。
+
+    取代"逐只 load_bars_df"的 N+1:全A 默认口径下 5400 只 × 每只一次往返
+    必然把接口拖超时。这里按 code IN (...) 分批查询,单次扫描后在内存分组。
+    """
+    if not codes:
+        return {}
+    frames: dict[str, pd.DataFrame] = {}
+    chunk = 500  # 避免 IN 列表过长撑爆 SQL 解析
+    for i in range(0, len(codes), chunk):
+        batch = codes[i:i + chunk]
+        rows = db.execute(
+            select(DailyBar.code, DailyBar.date, DailyBar.open, DailyBar.high,
+                   DailyBar.low, DailyBar.close, DailyBar.volume,
+                   DailyBar.amount)
+            .where(DailyBar.code.in_(batch),
+                   DailyBar.date >= start, DailyBar.date <= end)
+            .order_by(DailyBar.code, DailyBar.date)
+        ).all()
+        if not rows:
+            continue
+        df = pd.DataFrame(rows, columns=["code", "date", "open", "high", "low",
+                                         "close", "volume", "amount"])
+        for code, group in df.groupby("code", sort=False):
+            frames[str(code)] = group.drop(columns=["code"]).reset_index(drop=True)
+    return frames
 
 
 def screen(db: Session, day: date | None = None,
@@ -46,7 +80,14 @@ def screen(db: Session, day: date | None = None,
            high_window: int = 60,
            amount_min: float | None = None,
            limit: int = 100) -> dict:
-    """条件筛选。返回 {date, total, items:[{code, name, 因子..., pct_chg, high_dist}]}"""
+    """条件筛选。返回 {date, total, items:[{code, name, 因子..., pct_chg, high_dist}]}
+
+    total 为**匹配总数**(截断前),items 才受 limit 限制。
+    """
+    if limit <= 0:
+        raise InvalidFilterError("limit 必须为正整数")
+    if high_window <= 0 or high_window > MAX_HIGH_WINDOW:
+        raise InvalidFilterError(f"high_window 必须在 1 到 {MAX_HIGH_WINDOW} 之间")
     fdate = _latest_factor_date(db, day)
     if fdate is None:
         return {"date": None, "total": 0, "items": []}
@@ -60,11 +101,13 @@ def screen(db: Session, day: date | None = None,
 
     names = dict(db.execute(select(Stock.code, Stock.name)).all())
     start = fdate - timedelta(days=max(high_window, 60) * 2 + 30)
+    # 批量取日线,避免逐只往返(全A 口径下 N+1 会直接超时)
+    bars = _load_bars_batch(db, [r.code for r in rows], start, fdate)
 
     items = []
     for r in rows:
-        df = load_bars_df(db, r.code, start=start, end=fdate)
-        if len(df) < 2 or df["date"].iat[-1] != fdate:
+        df = bars.get(r.code)
+        if df is None or len(df) < 2 or df["date"].iat[-1] != fdate:
             continue
         close = float(df["close"].iat[-1])
         prev = float(df["close"].iat[-2])
@@ -94,12 +137,8 @@ def screen(db: Session, day: date | None = None,
         })
 
     items.sort(key=lambda x: (-(x["mom20"] or -9), x["code"]))
-    items = items[:limit]
-    return {"date": str(fdate), "total": len(items), "items": items}
-
-
-class InvalidFilterError(ValueError):
-    """结构化筛选条件不合法。"""
+    total = len(items)  # 截断前的匹配总数
+    return {"date": str(fdate), "total": total, "items": items[:limit]}
 
 
 def _coerce_scalar(value: Any, value_type: str) -> Any:
@@ -324,22 +363,13 @@ def _codes_for_universe(
             .order_by(WatchlistItem.code)
         ).all()]
     if universe in {"hs300", "zz500"}:
-        codes = [r[0] for r in db.execute(
-            select(IndexMember.code).where(
-                IndexMember.index_name == universe,
-                IndexMember.in_date <= day,
-                (IndexMember.out_date.is_(None)) | (IndexMember.out_date > day),
-            ).distinct().order_by(IndexMember.code)
-        ).all()]
+        # 单指数 point-in-time 口径统一走 universe.py,不在这里重写
+        # in_date/out_date 条件(重复实现会各自漂移)
+        codes = pool_at(db, day, index_name=universe)
         if codes:
             return codes
         if allow_current_fallback:
-            return [r[0] for r in db.execute(
-                select(IndexMember.code).where(
-                    IndexMember.index_name == universe,
-                    IndexMember.out_date.is_(None),
-                ).distinct().order_by(IndexMember.code)
-            ).all()]
+            return current_pool(db, index_name=universe)
         raise InvalidFilterError(
             f"{day} 缺少 {universe} 历史成分，请先回填指数成分数据"
         )

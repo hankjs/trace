@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
+import pandas as pd
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
@@ -27,7 +28,10 @@ SCORE_WEIGHTS = {
     "ma20_slope": 0.20,
 }
 VOL_CONFIRM_CAP = 3.0       # 量比加分封顶
-VOL_CONFIRM_WEIGHT = 0.02   # 每单位量比加分
+VOL_CONFIRM_WEIGHT = 0.02   # 每单位量比加分(score_row 的原始量纲口径)
+# 截面 z-score 口径下的量能权重:各因子已无量纲,0.02 会小到失去意义。
+# 取 0.05 使量能只做"确认"(主项动量权重合计 1.0),不会盖过动量。
+VOL_CONFIRM_WEIGHT_Z = 0.05
 TOP_N = 30
 MIN_AMOUNT_AVG20 = 5e7      # 20 日日均成交额下限 5000 万
 MIN_LIST_BARS = 120         # 上市 >120 天(以库内日线数近似)
@@ -35,8 +39,12 @@ LOOKBACK_DAYS = 200         # 计算因子加载的历史窗口
 
 
 def score_row(row: dict) -> float | None:
-    """单票打分;趋势过滤(close 低于 ma20 即 ma20_slope 相关条件外,
-    这里要求 mom20 > -0.2 防止接飞刀)等硬过滤已在 pipeline 做,这里纯加权。"""
+    """单票打分(原始量纲加权)。
+
+    保留给只有单行、无截面可比的调用方。**排序请勿用它**:mom20 与 mom60
+    量纲不同、无去极值,vol_ratio5 的加成上限与真实动量价差同量级,高换手股
+    能压过动量更强的股。截面排序统一走 score_cross_section()。
+    """
     score = 0.0
     for k, w in SCORE_WEIGHTS.items():
         v = row.get(k)
@@ -47,6 +55,45 @@ def score_row(row: dict) -> float | None:
     if vol is not None:
         score += VOL_CONFIRM_WEIGHT * min(vol, VOL_CONFIRM_CAP)
     return round(score, 6)
+
+
+def _winsorized_zscore(values: pd.Series) -> pd.Series:
+    """去极值(1%/99% 分位裁剪)后做 z-score;NaN 按截面中位数填充。
+
+    无量纲化是横向可比的前提:mom20(月度动量)与 mom60(季度动量)原始
+    尺度差一倍以上,直接加权等于偷偷给 mom60 更大权重。
+    """
+    filled = values.astype(float)
+    median = filled.median()
+    filled = filled.fillna(0.0 if pd.isna(median) else median)
+    if len(filled) >= 5:  # 样本太少时分位裁剪没有意义
+        lo, hi = filled.quantile(0.01), filled.quantile(0.99)
+        filled = filled.clip(lower=lo, upper=hi)
+    std = filled.std(ddof=0)
+    if not std > 0:
+        return pd.Series(0.0, index=filled.index)
+    return (filled - filled.mean()) / std
+
+
+def score_cross_section(rows: list[dict]) -> dict[str, float]:
+    """对同一截面的候选打分,返回 {code: score}。
+
+    因子先去极值 + z-score 再加权,量纲统一;单因子缺失按截面中位数填充,
+    不再因任一因子 NaN 就 `return None` 丢掉整只(静默缩小池子)。
+    量能确认(vol_ratio5)同样标准化后按小权重加成,不会盖过动量主项。
+    """
+    if not rows:
+        return {}
+    frame = pd.DataFrame(rows).set_index("code")
+    total = pd.Series(0.0, index=frame.index)
+    for key, weight in SCORE_WEIGHTS.items():
+        col = frame[key] if key in frame else pd.Series(dtype=float,
+                                                        index=frame.index)
+        total += weight * _winsorized_zscore(col)
+    if "vol_ratio5" in frame:
+        capped = frame["vol_ratio5"].astype(float).clip(upper=VOL_CONFIRM_CAP)
+        total += VOL_CONFIRM_WEIGHT_Z * _winsorized_zscore(capped)
+    return {str(code): round(float(v), 6) for code, v in total.items()}
 
 
 def compute_factor_rows(db: Session, codes: list[str],
@@ -107,6 +154,7 @@ def run_selection(db: Session, day: date | None = None,
 
     picked = []
     n_filtered = {"st": 0, "suspended": 0, "new": 0, "amount": 0, "trend": 0}
+    survivors = []
     for r in rows:
         name = names.get(r["code"], "") or ""
         if "ST" in name.upper() or "退" in name:
@@ -124,7 +172,12 @@ def run_selection(db: Session, day: date | None = None,
         if not r["above_ma20"]:
             n_filtered["trend"] += 1
             continue
-        score = score_row(r)
+        survivors.append(r)
+
+    # 硬过滤后在**同一截面**上标准化打分:量纲统一,单因子缺失不再丢整只
+    scores = score_cross_section(survivors)
+    for r in survivors:
+        score = scores.get(r["code"])
         if score is None:
             continue
         picked.append({**r, "score": score})

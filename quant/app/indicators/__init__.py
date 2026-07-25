@@ -46,5 +46,10 @@ def atr(high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> 
 
 
 def volume_ratio(volume: pd.Series, window: int = 5) -> pd.Series:
-    """量比:当日成交量 / 过去 N 日均量(日频近似口径)"""
-    return volume / volume.shift(1).rolling(window).mean()
+    """量比:当日成交量 / 过去 N 日均量(日频近似口径)。
+
+    分母为 0(停牌期间均量为 0)时置 NaN 而非 inf:inf 能满足任何
+    `vol_ratio5 >= x` 筛选条件,又不被 NaN 过滤拦下,会把停牌股顶上榜首。
+    """
+    avg = volume.shift(1).rolling(window).mean()
+    return volume / avg.where(avg > 0)

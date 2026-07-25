@@ -48,6 +48,9 @@ DEFAULT_COSTS = {
 }
 
 MIN_BARS = 30
+MIN_STAT_BARS = 20  # 短于此的净值序列指标不可靠,返回 None
+TRADING_DAYS = 242  # A股年均实际交易日(旧代码误用 252 的日历近似)
+RISK_FREE_RATE = 0.0  # 年化无风险利率,默认 0(此时夏普退化为信息比率)
 PORTFOLIO_WARMUP_DAYS = 200  # 组合策略计算动量/均线需要 start 之前的历史
 SINGLE_WARMUP_DAYS = 200     # 单标的策略同样需要预热,否则 MA60 等指标在区间头部失真
 
@@ -58,6 +61,20 @@ def _signals_from_positions(pos: pd.Series) -> tuple[pd.Series, pd.Series]:
     entries = (diff > 0).shift(1, fill_value=False)
     exits = (diff < 0).shift(1, fill_value=False)
     return entries, exits
+
+
+def _held_before(pos: pd.Series, first_bar: pd.Timestamp) -> bool:
+    """回测起点之前是否已持仓(用于合成首日建仓)。
+
+    看的是 first_bar **之前**最后一根 bar 的目标仓位,而不是 first_bar 当天的
+    仓位:后者由当日收盘价算出,若据此在当日开盘建仓,就用上了当天收盘才知道
+    的信号——一笔前视成交。起点前无历史(预热段为空)时返回 False:没有证据
+    表明已持仓,交给正常的 T+1 信号流处理。
+    """
+    prior = pos.loc[pos.index < first_bar]
+    if not len(prior):
+        return False
+    return float(prior.iloc[-1]) == 1.0
 
 
 def _signal_fee_matrix(entries: pd.DataFrame, exits: pd.DataFrame,
@@ -124,29 +141,54 @@ def _validate_params(strategy: str, params: dict | None) -> dict:
     return normalized
 
 
-def _equity_statistics(eq: pd.Series, initial_cash: float = 1.0) -> tuple[float, float, float, pd.Series]:
-    """从初始资金起算收益、年化、回撤和逐日收益，包含首日成交成本。"""
+def _equity_statistics(eq: pd.Series, initial_cash: float = 1.0
+                       ) -> tuple[float, float | None, float, pd.Series]:
+    """从初始资金起算收益、年化、回撤和逐日收益，包含首日成交成本。
+
+    - 年化基数 TRADING_DAYS=242(A股年均实际交易日),非日历近似 252;
+    - 回撤为净值**自身峰谷**(cummax 不再以初始资金播种),净值 [0.5,0.4]
+      得 -0.20 而非 -0.60;
+    - 序列短于 MIN_STAT_BARS 时年化不可靠,返回 None(3 bar 时 242/3 次方
+      会把噪声放大成天文数字)。
+    """
+    if not len(eq):
+        raise ValueError("净值序列为空,无法计算指标")
     total_return = float(eq.iat[-1] / initial_cash - 1)
-    annual = float((eq.iat[-1] / initial_cash) ** (252 / max(len(eq), 1)) - 1)
-    running_max = eq.cummax().clip(lower=initial_cash)
+    annual: float | None = None
+    if len(eq) >= MIN_STAT_BARS:
+        annual = float((eq.iat[-1] / initial_cash) ** (TRADING_DAYS / len(eq)) - 1)
+    running_max = eq.cummax()
     max_dd = float((eq / running_max - 1).min())
     rets = eq.pct_change()
     rets.iloc[0] = eq.iat[0] / initial_cash - 1
     return total_return, annual, max_dd, rets.dropna()
 
 
-def _metrics_from_equity(eq: pd.Series, pf: vbt.Portfolio) -> dict:
+def _sharpe_ratio(rets: pd.Series, risk_free: float = RISK_FREE_RATE
+                  ) -> float | None:
+    """年化夏普。risk_free 为年化无风险利率,按 TRADING_DAYS 折成单期超额。
+
+    risk_free=0 时退化为对零的信息比率(旧口径)。
+    """
+    if len(rets) < MIN_STAT_BARS:
+        return None
+    std = float(rets.std())
+    if not std > 0:
+        return None
+    excess = float(rets.mean()) - risk_free / TRADING_DAYS
+    return round(float(excess / std * np.sqrt(TRADING_DAYS)), 4)
+
+
+def _metrics_from_equity(eq: pd.Series, pf: vbt.Portfolio,
+                         risk_free: float = RISK_FREE_RATE) -> dict:
     """从净值序列 + Portfolio 计算指标(费用已在撮合内扣除,口径一致)"""
     total_return, annual, max_dd, rets = _equity_statistics(eq)
-    sharpe = None
-    if len(rets) > 2 and float(rets.std()) > 0:
-        sharpe = round(float(rets.mean() / rets.std() * np.sqrt(252)), 4)
     win_rate = pf.trades.win_rate()
     return {
         "total_return": round(total_return, 4),
-        "annual_return": round(annual, 4),
+        "annual_return": None if annual is None else round(annual, 4),
         "max_drawdown": round(max_dd, 4),
-        "sharpe": sharpe,
+        "sharpe": _sharpe_ratio(rets, risk_free),
         "win_rate": None if pd.isna(win_rate) else round(float(win_rate), 4),
         "trade_count": int(pf.orders.count()),
         "round_trips": int(pf.trades.count()),
@@ -160,14 +202,54 @@ def _to_price_matrix(dfs: dict[str, pd.DataFrame], col: str,
     ).reindex(idx)
 
 
+def _limit_pct(code: str) -> float:
+    """按板块返回涨跌停幅度。创业板(sz.30)/科创板(sh.688)为 20%,其余 10%。
+
+    ST 股实为 5%,但库内无 point-in-time 的 ST 标记(quant_stock.is_st 是当前
+    状态),用它回填历史会引入前视,故 ST 一律按 10% 处理——偏保守方向。
+    """
+    bare = code.split(".")[-1]
+    if bare.startswith("30") or bare.startswith("688"):
+        return 0.20
+    return 0.10
+
+
+def _limit_up_mask(dfs: dict[str, pd.DataFrame], idx: pd.DatetimeIndex
+                   ) -> pd.DataFrame:
+    """标记"当日开盘即涨停、买不进"的 (bar, code)。
+
+    open 与前收都取前复权价:同一复权序列内比值即真实涨幅,除权造成的跳变
+    对两者同向作用。留 0.5% 容差吸收四舍五入与复权残差,避免误判。
+
+    突破/动量策略常在大涨次日入场,而那天开盘往往一字板买不到——不拦就是
+    方向固定向上的系统性虚增。
+    """
+    mask = pd.DataFrame(False, index=idx, columns=list(dfs))
+    for code, df in dfs.items():
+        if code not in mask.columns or not len(df):
+            continue
+        d = df.set_index("date")
+        prev_close = d["close"].shift(1)
+        ratio = d["open"] / prev_close.where(prev_close > 0)
+        hit = (ratio >= 1 + _limit_pct(code) * 0.995).fillna(False)
+        mask[code] = hit.reindex(idx, fill_value=False).fillna(False).astype(bool)
+    return mask
+
+
 def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
                   costs: dict, start: date) -> dict[str, dict]:
     """vectorbt 批量单标的回测:同一组 entries/exits 矩阵一次跑完。
 
     dfs/positions 为含预热段的完整序列(positions 与 dfs[code] 行位置对齐),
     start 为回测起点:信号在完整序列上计算(diff 不丢起点前的跳变),价格
-    矩阵截到 [start, ...];窗口首日目标仓位为 1 时以首日开盘价合成建仓
-    (起点前已持有的近似)。
+    矩阵截到 [start, ...];**起点前一根 bar** 的目标仓位为 1 时以首日开盘价
+    合成建仓(起点前已持有的近似)。
+
+    注意判定用的是 start 之前那根 bar 而非窗口首日:窗口首日的仓位是用当日
+    收盘价算出来的,若拿它去当日开盘成交就等于用了当天才知道的信号
+    (前视偏差)。与 _portfolio_sim 的"先 shift 再截断"同一口径。
+
+    入场当日开盘一字涨停的,该笔**丢弃不顺延**(见 decisions D6)。
 
     返回 {code: {"metrics": ..., "equity": Series}}
     """
@@ -185,10 +267,17 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
         e, x = _signals_from_positions(p)
         e = e.reindex(idx, fill_value=False)
         x = x.reindex(idx, fill_value=False)
-        if len(idx) and p.reindex(idx).iloc[0] == 1.0 and not x.iloc[0]:
-            e.iloc[0] = True  # 起点前已持仓:首日开盘价合成建仓
+        # 起点前已持仓 -> 首日开盘价合成建仓。判定必须看 start 之前那根 bar 的
+        # 仓位:窗口首日的仓位由当日收盘价算出,拿它当日开盘成交是前视偏差。
+        if len(idx) and _held_before(p, idx[0]) and not x.iloc[0]:
+            e.iloc[0] = True
         entries[code] = e
         exits[code] = x
+
+    # 开盘一字涨停买不进:该笔入场丢弃(不顺延)
+    blocked = _limit_up_mask(dfs, idx).reindex(columns=close.columns,
+                                               fill_value=False)
+    entries = entries & ~blocked
 
     pf = vbt.Portfolio.from_signals(
         close, entries, exits, price=open_,
@@ -248,15 +337,22 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     per_code = {c: r["metrics"] for c, r in results.items()}
     curves = [r["equity"] for r in results.values()]
 
-    # 每只标的各自从同一初始资金 1.0 开始，缺失起点按现金处理，再等权合成。
-    aligned = pd.concat(curves, axis=1).ffill().fillna(1.0)
+    # 每只标的各自从初始资金 1.0 开始,再等权合成。
+    # 起点尚无数据的标的用 NaN 而非 1.0:填 1.0 等于把它当"净值恰好不变的
+    # 现金"计入分母,会把等权平均系统性拉向零收益。mean(skipna) 只对当时
+    # 真实存在的标的取平均,标的陆续上市时分母随之变化。
+    aligned = pd.concat(curves, axis=1).ffill()
     combo = aligned.mean(axis=1)
     metrics = _combo_metrics(combo, per_code)
 
     result: dict = {
         "strategy": strategy,
-        "params": params or {},
-        "codes": codes,
+        # params 存**实际生效**的全量参数(_validate_params 已合并默认值),
+        # 不是用户显式填写的子集:默认值一改历史结果就无法复现
+        "params": params,
+        # codes 存剔除数据不足标的后的实际样本;requested_codes 留存请求列表
+        "codes": list(results),
+        "requested_codes": codes,
         "start": str(start),
         "end": str(end),
         "costs": costs,
@@ -356,8 +452,10 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
 
     result: dict = {
         "strategy": strategy,
-        "params": params or {},
-        "codes": codes,
+        # 同 run_backtest:params 为实际生效的全量参数,codes 为实际样本
+        "params": params,
+        "codes": list(pool_dfs),
+        "requested_codes": codes,
         "start": str(start),
         "end": str(end),
         "costs": costs,
@@ -372,29 +470,53 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
     return result
 
 
-def _combo_metrics(combo: pd.Series, per_code: dict[str, dict]) -> dict:
+def _combo_metrics(combo: pd.Series, per_code: dict[str, dict],
+                   risk_free: float = RISK_FREE_RATE) -> dict:
     total_return, annual, max_dd, rets = _equity_statistics(combo)
-    sharpe = None
-    if len(rets) > 2 and float(rets.std()) > 0:
-        sharpe = round(float(rets.mean() / rets.std() * np.sqrt(252)), 4)
-    win_rates = [m["win_rate"] for m in per_code.values() if m["win_rate"] is not None]
     return {
         "total_return": round(total_return, 4),
-        "annual_return": round(annual, 4),
+        "annual_return": None if annual is None else round(annual, 4),
         "max_drawdown": round(max_dd, 4),
-        "sharpe": sharpe,
-        "win_rate": round(sum(win_rates) / len(win_rates), 4) if win_rates else None,
+        "sharpe": _sharpe_ratio(rets, risk_free),
+        "win_rate": _weighted_win_rate(per_code),
         "trade_count": sum(m["trade_count"] for m in per_code.values()),
         "round_trips": sum(m["round_trips"] for m in per_code.values()),
         "per_code": per_code,
     }
 
 
+def _weighted_win_rate(per_code: dict[str, dict]) -> float | None:
+    """组合胜率:按各标的回合交易数加权,而非算术平均。
+
+    算术平均会让只做了 1 笔交易的标的与做了 100 笔的标的等权,
+    2 笔全胜的标的把整体胜率拉高到失真。
+    """
+    num = den = 0.0
+    for m in per_code.values():
+        wr, trips = m.get("win_rate"), m.get("round_trips") or 0
+        if wr is None or trips <= 0:
+            continue
+        num += wr * trips
+        den += trips
+    return round(num / den, 4) if den > 0 else None
+
+
 def _save_run(db: Session, result: dict, start: date, end: date,
               combo: pd.Series, user_id: int | None = None) -> None:
-    run = BacktestRun(strategy=result["strategy"], params=result["params"],
-                      codes=result["codes"], start=start, end=end,
-                      metrics=result["metrics"], user_id=user_id)
+    """落库一次回测。costs 快照与实际样本一并存,否则费率/默认参数一改,
+    历史结果就无法审计复现。"""
+    fields = dict(
+        strategy=result["strategy"], params=result["params"],
+        codes=result["codes"], start=start, end=end,
+        metrics=result["metrics"], user_id=user_id,
+    )
+    # costs 列由 agent-migrate 增加;尚未上线时降级把快照并入 params,
+    # 保证复现信息不丢(列到位后自动走上面的专列)
+    if hasattr(BacktestRun, "costs"):
+        fields["costs"] = result["costs"]
+    else:
+        fields["params"] = {**result["params"], "_costs": result["costs"]}
+    run = BacktestRun(**fields)
     db.add(run)
     db.flush()
     db.execute(
@@ -444,23 +566,28 @@ def run_sweep(db: Session, strategy: str, codes: list[str],
         positions = {c: mod.positions(df, combo) for c, df in full_dfs.items()}
         results = _batch_single(full_dfs, positions, costs, start)
         per = [r["metrics"] for r in results.values()]
-        annuals = [m["annual_return"] for m in per]
         rows.append({
             "params": combo,
             "metrics": {
-                "annual_return_mean": round(float(np.mean(annuals)), 4),
-                "annual_return_median": round(float(np.median(annuals)), 4),
-                "total_return_mean": round(
-                    float(np.mean([m["total_return"] for m in per])), 4),
-                "max_drawdown_median": round(
-                    float(np.median([m["max_drawdown"] for m in per])), 4),
+                # 短序列的 annual_return 为 None(见 MIN_STAT_BARS),聚合要跳过
+                "annual_return_mean": _mean_or_none(
+                    [m["annual_return"] for m in per]),
+                "annual_return_median": _median_or_none(
+                    [m["annual_return"] for m in per]),
+                "total_return_mean": _mean_or_none(
+                    [m["total_return"] for m in per]),
+                "max_drawdown_median": _median_or_none(
+                    [m["max_drawdown"] for m in per]),
                 "sharpe_median": _median_or_none([m["sharpe"] for m in per]),
                 "win_rate_mean": _mean_or_none([m["win_rate"] for m in per]),
                 "trade_count": sum(m["trade_count"] for m in per),
             },
             "per_code": {c: r["metrics"] for c, r in results.items()},
         })
-    rows.sort(key=lambda r: -r["metrics"]["annual_return_median"])
+    # 无法年化的组(全部标的序列过短)排在最后
+    rows.sort(key=lambda r: -(r["metrics"]["annual_return_median"]
+                              if r["metrics"]["annual_return_median"] is not None
+                              else float("inf")))
     return {"strategy": strategy, "codes": list(full_dfs), "start": str(start),
             "end": str(end), "costs": costs, "results": rows}
 
