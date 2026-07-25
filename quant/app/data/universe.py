@@ -191,15 +191,20 @@ def membership_intervals(db: Session, codes: list[str], start: date,
     ).scalars().all())
 
 
-def pool_during(db: Session, start: date, end: date) -> list[str]:
-    """返回区间内任一时点属于沪深300或中证500的股票并集。"""
-    rows = db.execute(
-        select(IndexMember.code).where(
-            IndexMember.in_date <= end,
-            or_(IndexMember.out_date.is_(None), IndexMember.out_date > start),
-        ).distinct()
-    ).all()
-    return sorted(r[0] for r in rows)
+def pool_during(db: Session, start: date, end: date,
+                index_name: str | None = None) -> list[str]:
+    """返回区间内任一时点在册的股票并集。
+
+    index_name 为 None 时跨全部指数(即沪深300+中证500 口径);
+    给定时只取该指数,与 pool_at / current_pool 的参数语义一致。
+    """
+    q = select(IndexMember.code).where(
+        IndexMember.in_date <= end,
+        or_(IndexMember.out_date.is_(None), IndexMember.out_date > start),
+    )
+    if index_name is not None:
+        q = q.where(IndexMember.index_name == index_name)
+    return sorted(r[0] for r in db.execute(q.distinct()).all())
 
 
 def _has_listing_columns() -> bool:
@@ -307,3 +312,22 @@ def resolve_pool(db: Session, day: date, *, kind: str = "all",
         return static_pool(db, pool_id)
     return all_market_pool(db, day, min_list_days=min_list_days,
                            max_missing_ratio=max_missing_ratio)
+
+
+def resolve_pool_during(db: Session, start: date, end: date, *,
+                        kind: str = "all", index_name: str | None = None,
+                        pool_id: int | None = None,
+                        min_list_days: int = DEFAULT_MIN_LIST_DAYS,
+                        max_missing_ratio: float = MAX_MISSING_LIST_DATE_RATIO
+                        ) -> list[str]:
+    """区间并集口径:回测样本需覆盖区间内任一时点入池过的票。
+
+    index 走 pool_during(含期间调出的票,逐日 eligibility 掩码另行处理);
+    all 用 end 当日解析(退市票由 delist_date > end 条件保留至退市当日,
+    区间内新上市的票按 end 时点判定,不会漏);static 与时点无关。
+    """
+    if kind == "index":
+        return pool_during(db, start, end, index_name=index_name)
+    return resolve_pool(db, end, kind=kind, index_name=index_name,
+                        pool_id=pool_id, min_list_days=min_list_days,
+                        max_missing_ratio=max_missing_ratio)

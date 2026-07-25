@@ -13,9 +13,10 @@ from ..backtest.engine import run_backtest, run_sweep
 from ..backtest.evaluate import leaderboard
 from ..auth import require_client, user_id_from_claims
 from ..catalog import STRATEGIES, strategy_name
-from ..data.universe import pool_at, pool_during
+from ..api.pools import (default_pool, get_pool_or_404, pool_ref_out,
+                         resolve_pool_codes, resolve_pool_codes_during)
 from ..db import get_db
-from ..models import BacktestEquity, BacktestRun, Stock
+from ..models import BacktestEquity, BacktestRun, Pool, Stock
 from ..strategy.strategies import PORTFOLIO_STRATEGIES, REGISTRY, SINGLE_STRATEGIES
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
@@ -26,6 +27,7 @@ class BacktestIn(BaseModel):
     codes: list[str] = Field(default_factory=list, max_length=800)  # 可留空用动态池
     start: date
     end: date
+    pool_id: int | None = None  # 组合策略留空 codes 时的股票池,缺省落默认池
     params: dict = Field(default_factory=dict)
     costs: dict = Field(default_factory=dict)  # 可选覆盖费用
 
@@ -56,13 +58,15 @@ def _stock_items(db: Session, codes: list[str] | None) -> list[dict]:
     ]
 
 
-def _decorate_result(result: dict, db: Session) -> dict:
+def _decorate_result(result: dict, db: Session, pool: Pool | None = None) -> dict:
     strategy = result.get("strategy")
     if isinstance(strategy, str):
         result["strategy_name"] = strategy_name(strategy)
     codes = result.get("codes")
     if isinstance(codes, list):
         result["stocks"] = _stock_items(db, codes)
+    if pool is not None:
+        result["pool"] = pool_ref_out(pool)
     return result
 
 
@@ -105,36 +109,52 @@ def create_backtest(body: BacktestIn, db: Session = Depends(get_db),
         raise HTTPException(400, f"未知策略 {body.strategy},可选: {sorted(REGISTRY)}")
     if body.start >= body.end:
         raise HTTPException(400, "start 必须早于 end")
+    user_id = user_id_from_claims(claims)
     codes = list(dict.fromkeys(c.lower() for c in body.codes))
-    dynamic_universe = body.strategy in PORTFOLIO_STRATEGIES and not codes
-    if dynamic_universe:
-        if not pool_at(db, body.start):
-            raise HTTPException(
-                400, "回测起点缺少历史指数成分，请先运行成分历史回填",
-            )
-        codes = pool_during(db, body.start, body.end)
+
+    # 组合策略且未显式指定 codes 时按股票池解析成分。
+    # pool_id 缺省落系统默认池(全A),与前端 pools.ts 的 defaultPool 同口径。
+    pool: Pool | None = None
+    if body.pool_id is not None:
+        pool = get_pool_or_404(db, body.pool_id, user_id)
+    use_pool = body.strategy in PORTFOLIO_STRATEGIES and not codes
+    if use_pool:
+        if pool is None:
+            pool = default_pool(db)
+        if pool is None:
+            raise HTTPException(400, "系统尚未初始化股票池，请先执行数据库迁移")
+        if pool.kind == "index":
+            # 指数口径:逐日 eligibility 掩码依赖成分历史,缺回填直接拒绝
+            if not resolve_pool_codes(db, pool, body.start):
+                raise HTTPException(
+                    400, "回测起点缺少历史指数成分，请先运行成分历史回填",
+                )
+        codes = resolve_pool_codes_during(db, pool, body.start, body.end)
         if not codes:
             raise HTTPException(
-                400, "回测区间缺少历史指数成分，请先运行成分历史回填",
+                400, f"股票池「{pool.name}」在回测区间内没有成分股",
             )
     if not codes:
         raise HTTPException(400, "codes 不能为空")
     try:
         result = run_backtest(db, body.strategy, codes,
                               body.start, body.end, body.params, body.costs,
-                              dynamic_universe=dynamic_universe,
-                              user_id=user_id_from_claims(claims))
+                              # 成分变动的逐日掩码只对指数口径有意义
+                              dynamic_universe=use_pool and pool.kind == "index",
+                              user_id=user_id,
+                              pool_id=pool.id if use_pool else None)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return _decorate_result(result, db)
+    return _decorate_result(result, db, pool if use_pool else None)
 
 
 @router.get("/{run_id}")
 def get_backtest(run_id: int, db: Session = Depends(get_db),
                  claims: dict = Depends(require_client)):
+    user_id = user_id_from_claims(claims)
     run = db.execute(select(BacktestRun).where(
         BacktestRun.id == run_id,
-        BacktestRun.user_id == user_id_from_claims(claims),
+        BacktestRun.user_id == user_id,
     )).scalar_one_or_none()
     if run is None:
         raise HTTPException(404, f"回测 {run_id} 不存在")
@@ -142,7 +162,7 @@ def get_backtest(run_id: int, db: Session = Depends(get_db),
         select(BacktestEquity).where(BacktestEquity.run_id == run_id)
         .order_by(BacktestEquity.date)
     ).scalars().all()
-    return {
+    result = {
         "run_id": run.id,
         "strategy": run.strategy,
         "strategy_name": strategy_name(run.strategy),
@@ -155,3 +175,10 @@ def get_backtest(run_id: int, db: Session = Depends(get_db),
         "created_at": run.created_at.isoformat(sep=" "),
         "equity": [{"date": str(e.date), "equity": e.equity} for e in equity],
     }
+    # 回显当时所用的池:按编号查历史回测时前端没有本地选择状态,
+    # 幸存者偏差标注只能靠这里带回的 kind 判断。池被删则回显 None。
+    pool_id = getattr(run, "pool_id", None)
+    if pool_id is not None:
+        pool = db.execute(select(Pool).where(Pool.id == pool_id)).scalar_one_or_none()
+        result["pool"] = pool_ref_out(pool) if pool is not None else None
+    return result

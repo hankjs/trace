@@ -302,7 +302,8 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
                  start: date, end: date, params: dict | None = None,
                  costs: dict | None = None, save: bool = True,
                  dynamic_universe: bool = False,
-                 user_id: int | None = None) -> dict:
+                 user_id: int | None = None,
+                 pool_id: int | None = None) -> dict:
     """跑回测并(默认)落库。多标的时资金等分,组合净值为各标的净值平均。
 
     组合策略(KIND=portfolio)走 target_weights + vectorbt 组合回测。
@@ -317,6 +318,7 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
         return _run_portfolio(
             db, strategy, codes, start, end, params, costs, save,
             dynamic_universe=dynamic_universe, user_id=user_id,
+            pool_id=pool_id,
         )
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
@@ -363,7 +365,8 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
         ],
     }
     if save:
-        _save_run(db, result, start, end, combo, user_id=user_id)
+        _save_run(db, result, start, end, combo, user_id=user_id,
+                  pool_id=pool_id)
     return result
 
 
@@ -417,7 +420,7 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
 def _run_portfolio(db: Session, strategy: str, codes: list[str],
                    start: date, end: date, params: dict | None,
                    costs: dict, save: bool, *, dynamic_universe: bool,
-                   user_id: int | None) -> dict:
+                   user_id: int | None, pool_id: int | None = None) -> dict:
     """组合策略回测:target_weights -> T+1 开盘按目标权重调仓。"""
     mod = REGISTRY[strategy]
     warmup_start = start - timedelta(days=PORTFOLIO_WARMUP_DAYS)
@@ -466,7 +469,7 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
         ],
     }
     if save:
-        _save_run(db, result, start, end, eq, user_id=user_id)
+        _save_run(db, result, start, end, eq, user_id=user_id, pool_id=pool_id)
     return result
 
 
@@ -502,20 +505,23 @@ def _weighted_win_rate(per_code: dict[str, dict]) -> float | None:
 
 
 def _save_run(db: Session, result: dict, start: date, end: date,
-              combo: pd.Series, user_id: int | None = None) -> None:
+              combo: pd.Series, user_id: int | None = None,
+              pool_id: int | None = None) -> None:
     """落库一次回测。costs 快照与实际样本一并存,否则费率/默认参数一改,
-    历史结果就无法审计复现。"""
+    历史结果就无法审计复现。pool_id 存所用股票池,供按编号回查时回显。"""
     fields = dict(
         strategy=result["strategy"], params=result["params"],
         codes=result["codes"], start=start, end=end,
         metrics=result["metrics"], user_id=user_id,
     )
-    # costs 列由 agent-migrate 增加;尚未上线时降级把快照并入 params,
+    # costs / pool_id 列由 agent-migrate 增加;尚未上线时降级把快照并入 params,
     # 保证复现信息不丢(列到位后自动走上面的专列)
     if hasattr(BacktestRun, "costs"):
         fields["costs"] = result["costs"]
     else:
         fields["params"] = {**result["params"], "_costs": result["costs"]}
+    if pool_id is not None and hasattr(BacktestRun, "pool_id"):
+        fields["pool_id"] = pool_id
     run = BacktestRun(**fields)
     db.add(run)
     db.flush()
