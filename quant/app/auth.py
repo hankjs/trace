@@ -43,7 +43,7 @@ def authenticate(db: Session, username: str, password: str) -> dict | None:
 def create_token(user: dict) -> str:
     """签发与 server 兼容的 HS256 JWT。"""
     claims = {
-        "sub": user["id"],
+        "sub": str(user["id"]),
         "username": user["username"],
         "can_admin": user["can_admin"],
         "can_client": user["can_client"],
@@ -59,7 +59,23 @@ def require_user(request: Request) -> dict:
         raise HTTPException(401, "未登录")
     token = auth[len("Bearer "):]
     try:
-        claims = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
+        # The shared Rust service historically emitted a numeric `sub`. New
+        # tokens use the JWT-standard string form, while verification remains
+        # compatible with existing cross-service tokens.
+        claims = jwt.decode(
+            token,
+            settings.jwt_secret,
+            algorithms=["HS256"],
+            options={"verify_sub": False},
+        )
     except jwt.PyJWTError:
         raise HTTPException(401, "登录已过期,请重新登录")
+    return claims
+
+
+def require_admin(request: Request) -> dict:
+    """FastAPI 依赖：仅允许 JWT 中明确具有管理员权限的用户。"""
+    claims = require_user(request)
+    if claims.get("can_admin") not in (True, 1):
+        raise HTTPException(403, "需要管理员权限")
     return claims

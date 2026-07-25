@@ -7,14 +7,26 @@ from __future__ import annotations
 
 import logging
 from datetime import date, timedelta
+from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..catalog import FILTER_FIELDS
 from ..data.ingest import load_bars_df
-from ..models import FactorDaily, Stock
+from ..data.universe import current_pool, pool_at
+from ..models import (
+    DailyBar,
+    FactorDaily,
+    FundamentalSnapshot,
+    IndexMember,
+    Stock,
+    ValuationSnapshot,
+)
 
 logger = logging.getLogger(__name__)
+
+VALUATION_MAX_AGE_DAYS = 7
 
 
 def _latest_factor_date(db: Session, day: date | None) -> date | None:
@@ -83,3 +95,474 @@ def screen(db: Session, day: date | None = None,
     items.sort(key=lambda x: (-(x["mom20"] or -9), x["code"]))
     items = items[:limit]
     return {"date": str(fdate), "total": len(items), "items": items}
+
+
+class InvalidFilterError(ValueError):
+    """结构化筛选条件不合法。"""
+
+
+def _coerce_scalar(value: Any, value_type: str) -> Any:
+    if value_type == "number":
+        if value is None or isinstance(value, bool):
+            raise InvalidFilterError("数值条件必须填写数字")
+        try:
+            return float(value)
+        except (TypeError, ValueError) as exc:
+            raise InvalidFilterError(f"无法把 {value!r} 解析为数字") from exc
+    if value_type == "boolean":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.lower() in {"true", "false"}:
+            return value.lower() == "true"
+        raise InvalidFilterError("布尔条件必须是 true 或 false")
+    if value_type == "string":
+        if value is None:
+            raise InvalidFilterError("文本条件不能为空")
+        return str(value)
+    return value
+
+
+def _compile_condition(raw: dict[str, Any], fallback_id: str) -> dict[str, Any]:
+    field = str(raw.get("field", ""))
+    metadata = FILTER_FIELDS.get(field)
+    if metadata is None or not metadata.get("available", True):
+        raise InvalidFilterError(f"不支持的筛选字段: {field}")
+    operator = str(raw.get("operator", "")).lower()
+    if operator not in metadata.get("operators", ()):
+        raise InvalidFilterError(f"字段 {field} 不支持操作符 {operator}")
+
+    compiled = {
+        "id": str(raw.get("id") or fallback_id),
+        "field": field,
+        "field_name": metadata["name"],
+        "operator": operator,
+        "value": None,
+        "value_to": None,
+    }
+    if operator in {"is_null", "not_null"}:
+        return compiled
+
+    value_type = metadata.get("value_type", "number")
+    value = raw.get("value")
+    if operator in {"in", "not_in"}:
+        if isinstance(value, str):
+            value = [part.strip() for part in value.split(",") if part.strip()]
+        if not isinstance(value, (list, tuple, set)) or not value:
+            raise InvalidFilterError(f"操作符 {operator} 需要非空数组 value")
+        compiled["value"] = [_coerce_scalar(v, value_type) for v in value]
+        return compiled
+
+    compiled["value"] = _coerce_scalar(value, value_type)
+    if operator == "between":
+        value_to = raw.get("value_to", raw.get("value2"))
+        compiled["value_to"] = _coerce_scalar(value_to, value_type)
+        if compiled["value"] > compiled["value_to"]:
+            raise InvalidFilterError(f"条件 {compiled['id']} 的区间下限不能大于上限")
+    return compiled
+
+
+def _matches(actual: Any, condition: dict[str, Any]) -> bool:
+    operator = condition["operator"]
+    if operator == "is_null":
+        return actual is None or actual == ""
+    if operator == "not_null":
+        return actual is not None and actual != ""
+    if actual is None or actual == "":
+        return False
+
+    value = condition["value"]
+    if operator == "eq":
+        return actual == value
+    if operator == "ne":
+        return actual != value
+    if operator == "gt":
+        return actual > value
+    if operator == "gte":
+        return actual >= value
+    if operator == "lt":
+        return actual < value
+    if operator == "lte":
+        return actual <= value
+    if operator == "between":
+        return value <= actual <= condition["value_to"]
+    if operator == "in":
+        return actual in value
+    if operator == "not_in":
+        return actual not in value
+    raise InvalidFilterError(f"未知操作符: {operator}")
+
+
+def evaluate_conditions(rows: list[dict[str, Any]], payload: dict[str, Any]) -> dict:
+    """纯函数条件引擎，供 API 与测试共同使用。"""
+    root_logic = str(payload.get("logic", "and")).lower()
+    if root_logic not in {"and", "or"}:
+        raise InvalidFilterError("logic 只能是 and 或 or")
+
+    expressions: list[tuple[str, Any]] = []
+    compiled_conditions: list[dict[str, Any]] = []
+    used_ids: set[str] = set()
+
+    def compile_one(raw: dict[str, Any], fallback_id: str) -> dict[str, Any] | None:
+        if not raw.get("enabled", True):
+            return None
+        condition = _compile_condition(raw, fallback_id)
+        if condition["id"] in used_ids:
+            raise InvalidFilterError(f"条件 id 重复: {condition['id']}")
+        used_ids.add(condition["id"])
+        compiled_conditions.append(condition)
+        return condition
+
+    for index, raw in enumerate(payload.get("conditions") or [], start=1):
+        condition = compile_one(raw, f"condition_{index}")
+        if condition:
+            expressions.append(("condition", condition))
+
+    for group_index, raw_group in enumerate(payload.get("groups") or [], start=1):
+        group_logic = str(raw_group.get("logic", "and")).lower()
+        if group_logic not in {"and", "or"}:
+            raise InvalidFilterError("分组 logic 只能是 and 或 or")
+        group_id = str(raw_group.get("id") or f"group_{group_index}")
+        group_conditions = []
+        for condition_index, raw in enumerate(raw_group.get("conditions") or [], start=1):
+            condition = compile_one(raw, f"{group_id}_condition_{condition_index}")
+            if condition:
+                group_conditions.append(condition)
+        if group_conditions:
+            expressions.append(("group", (group_logic, group_conditions)))
+
+    independent_counts = {condition["id"]: 0 for condition in compiled_conditions}
+    enabled_fields = list(dict.fromkeys(
+        condition["field"] for condition in compiled_conditions
+    ))
+    field_coverage = {
+        field: sum(
+            1 for row in rows
+            if row["values"].get(field) is not None
+            and row["values"].get(field) != ""
+        )
+        for field in enabled_fields
+    }
+    matched_rows = []
+    for row in rows:
+        values = row["values"]
+        states = {
+            condition["id"]: _matches(values.get(condition["field"]), condition)
+            for condition in compiled_conditions
+        }
+        for condition_id, matched in states.items():
+            if matched:
+                independent_counts[condition_id] += 1
+
+        expression_states = []
+        for kind, expression in expressions:
+            if kind == "condition":
+                expression_states.append(states[expression["id"]])
+            else:
+                logic, conditions = expression
+                results = [states[condition["id"]] for condition in conditions]
+                expression_states.append(all(results) if logic == "and" else any(results))
+        combined = (
+            True if not expression_states
+            else all(expression_states) if root_logic == "and"
+            else any(expression_states)
+        )
+        if combined:
+            matched_ids = [key for key, matched in states.items() if matched]
+            failed_ids = [key for key, matched in states.items() if not matched]
+            reasons = [
+                {
+                    "condition_id": condition["id"],
+                    "field": condition["field"],
+                    "field_name": condition["field_name"],
+                    "actual": values.get(condition["field"]),
+                    "matched": states[condition["id"]],
+                }
+                for condition in compiled_conditions
+            ]
+            matched_rows.append({
+                **row,
+                "matched_conditions": matched_ids,
+                "failed_conditions": failed_ids,
+                "match_reasons": reasons,
+            })
+
+    return {
+        "items": matched_rows,
+        "independent_counts": independent_counts,
+        "condition_counts": [
+            {
+                "id": condition["id"],
+                "field": condition["field"],
+                "field_name": condition["field_name"],
+                "matched": independent_counts[condition["id"]],
+                "available": field_coverage[condition["field"]],
+                "total": len(rows),
+            }
+            for condition in compiled_conditions
+        ],
+        "field_coverage": field_coverage,
+    }
+
+
+def _codes_for_universe(
+    db: Session,
+    universe: str,
+    day: date,
+    *,
+    allow_current_fallback: bool,
+) -> list[str]:
+    universe = universe.lower()
+    if universe == "all":
+        return [r[0] for r in db.execute(select(Stock.code).order_by(Stock.code)).all()]
+    if universe == "watchlist":
+        return [r[0] for r in db.execute(
+            select(Stock.code).where(Stock.is_watch.is_(True)).order_by(Stock.code)
+        ).all()]
+    if universe in {"hs300", "zz500"}:
+        codes = [r[0] for r in db.execute(
+            select(IndexMember.code).where(
+                IndexMember.index_name == universe,
+                IndexMember.in_date <= day,
+                (IndexMember.out_date.is_(None)) | (IndexMember.out_date > day),
+            ).distinct().order_by(IndexMember.code)
+        ).all()]
+        if codes:
+            return codes
+        if allow_current_fallback:
+            return [r[0] for r in db.execute(
+                select(IndexMember.code).where(
+                    IndexMember.index_name == universe,
+                    IndexMember.out_date.is_(None),
+                ).distinct().order_by(IndexMember.code)
+            ).all()]
+        raise InvalidFilterError(
+            f"{day} 缺少 {universe} 历史成分，请先回填指数成分数据"
+        )
+    if universe not in {"pool", "hs300_zz500"}:
+        raise InvalidFilterError(
+            "universe 只能是 pool、hs300_zz500、hs300、zz500、watchlist 或 all"
+        )
+    codes = pool_at(db, day)
+    if codes:
+        return codes
+    if allow_current_fallback:
+        return current_pool(db)
+    raise InvalidFilterError(
+        f"{day} 缺少沪深300和中证500历史成分，"
+        "不能用当前成分替代，请先回填指数成分数据"
+    )
+
+
+def _latest_rows_by_code(
+    db: Session,
+    model: Any,
+    where: tuple[Any, ...],
+    order_by: tuple[Any, ...],
+) -> dict[str, Any]:
+    """用窗口函数在数据库内把历史版本压缩为每只股票一行。"""
+    ranked = select(
+        model.id.label("row_id"),
+        func.row_number().over(
+            partition_by=model.code,
+            order_by=order_by,
+        ).label("row_number"),
+    ).where(*where).subquery()
+    rows = db.execute(
+        select(model)
+        .join(ranked, model.id == ranked.c.row_id)
+        .where(ranked.c.row_number == 1)
+    ).scalars()
+    return {row.code: row for row in rows}
+
+
+def _build_screen_rows(
+    db: Session,
+    day: date,
+    universe: str,
+    *,
+    allow_current_fallback: bool,
+) -> list[dict[str, Any]]:
+    codes = _codes_for_universe(
+        db, universe, day, allow_current_fallback=allow_current_fallback,
+    )
+    if not codes:
+        return []
+    code_set = set(codes)
+    stocks = {
+        row.code: row
+        for row in db.execute(select(Stock).where(Stock.code.in_(codes))).scalars()
+    }
+    factors = {
+        row.code: row
+        for row in db.execute(select(FactorDaily).where(
+            FactorDaily.date == day,
+            FactorDaily.code.in_(codes),
+        )).scalars()
+    }
+    listing_days = dict(db.execute(
+        select(DailyBar.code, func.count(DailyBar.id)).where(
+            DailyBar.code.in_(codes),
+            DailyBar.date <= day,
+        ).group_by(DailyBar.code)
+    ).all())
+
+    valuation_cutoff = day - timedelta(days=VALUATION_MAX_AGE_DAYS)
+    valuations = _latest_rows_by_code(
+        db,
+        ValuationSnapshot,
+        (
+            ValuationSnapshot.code.in_(codes),
+            ValuationSnapshot.data_date >= valuation_cutoff,
+            ValuationSnapshot.data_date <= day,
+            ValuationSnapshot.available_date <= day,
+        ),
+        (
+            ValuationSnapshot.data_date.desc(),
+            ValuationSnapshot.available_date.desc(),
+            ValuationSnapshot.id.desc(),
+        ),
+    )
+
+    fundamentals = _latest_rows_by_code(
+        db,
+        FundamentalSnapshot,
+        (
+            FundamentalSnapshot.code.in_(codes),
+            FundamentalSnapshot.data_date <= day,
+            FundamentalSnapshot.report_period <= day,
+            FundamentalSnapshot.available_date <= day,
+        ),
+        (
+            FundamentalSnapshot.report_period.desc(),
+            FundamentalSnapshot.available_date.desc(),
+            FundamentalSnapshot.id.desc(),
+        ),
+    )
+
+    # 市场派生字段只对已有当日因子的研究股票加载，避免 all 范围读取全市场历史。
+    factor_codes = sorted(code_set & set(factors))
+    bars_by_code: dict[str, list[DailyBar]] = {}
+    if factor_codes:
+        start = day - timedelta(days=220)
+        bar_rows = db.execute(
+            select(DailyBar).where(
+                DailyBar.code.in_(factor_codes),
+                DailyBar.date >= start,
+                DailyBar.date <= day,
+            ).order_by(DailyBar.code, DailyBar.date)
+        ).scalars().all()
+        for bar in bar_rows:
+            bars_by_code.setdefault(bar.code, []).append(bar)
+
+    result = []
+    for code in codes:
+        stock = stocks.get(code)
+        factor = factors.get(code)
+        valuation = valuations.get(code)
+        fundamental = fundamentals.get(code)
+        bars = bars_by_code.get(code, [])
+        latest = bars[-1] if bars and bars[-1].date == day else None
+        close = latest.close if latest else None
+        pct_chg = None
+        high_dist = None
+        ma_bull = None
+        if latest and len(bars) >= 2 and bars[-2].close:
+            pct_chg = latest.close / bars[-2].close - 1
+        if latest:
+            high_60 = max(bar.high for bar in bars[-60:])
+            high_dist = latest.close / high_60 - 1 if high_60 else None
+        if latest and len(bars) >= 60:
+            ma20 = sum(bar.close for bar in bars[-20:]) / 20
+            ma60 = sum(bar.close for bar in bars[-60:]) / 60
+            ma_bull = latest.close > ma20 > ma60
+
+        values = {key: None for key in FILTER_FIELDS}
+        values["industry"] = stock.industry if stock else ""
+        name = stock.name if stock else ""
+        values["is_st"] = "ST" in name.upper() or "退" in name
+        values["listing_days"] = listing_days.get(code, 0)
+        if factor:
+            for field in (
+                "mom20", "mom60", "rsi14", "atr_pct", "vol_ratio5",
+                "ma20_slope", "amount_avg20",
+            ):
+                values[field] = getattr(factor, field)
+        values.update({
+            "pct_chg": pct_chg,
+            "high_dist": high_dist,
+            "ma_bull": ma_bull,
+            "close": close,
+        })
+        if valuation:
+            for field in ("pe_ttm", "pb", "ps_ttm", "dividend_yield",
+                          "total_market_cap"):
+                values[field] = getattr(valuation, field)
+        if fundamental:
+            for field in (
+                "roe", "revenue_yoy", "profit_yoy", "gross_margin",
+                "net_margin", "debt_ratio", "cashflow_ratio",
+            ):
+                values[field] = getattr(fundamental, field)
+        values.update({
+            "valuation_data_date": (
+                str(valuation.data_date) if valuation else None
+            ),
+            "valuation_available_date": (
+                str(valuation.available_date) if valuation else None
+            ),
+            "valuation_source": valuation.source if valuation else None,
+            "report_period": (
+                str(fundamental.report_period) if fundamental else None
+            ),
+            "fundamental_available_date": (
+                str(fundamental.available_date) if fundamental else None
+            ),
+            "fundamental_source": fundamental.source if fundamental else None,
+        })
+        result.append({
+            "code": code,
+            "name": name,
+            "industry": stock.industry if stock else "",
+            "values": values,
+        })
+    return result
+
+
+def structured_screen(db: Session, payload: dict[str, Any]) -> dict:
+    """技术面与基本面结构化组合筛选。"""
+    requested_day = payload.get("date")
+    if isinstance(requested_day, str):
+        try:
+            requested_day = date.fromisoformat(requested_day)
+        except ValueError as exc:
+            raise InvalidFilterError("date 必须是 YYYY-MM-DD") from exc
+    day = _latest_factor_date(db, requested_day)
+    if day is None:
+        day = requested_day or date.today()
+
+    universe = str(payload.get("universe") or "pool")
+    rows = _build_screen_rows(
+        db,
+        day,
+        universe,
+        allow_current_fallback=requested_day is None or requested_day >= date.today(),
+    )
+    evaluated = evaluate_conditions(rows, payload)
+    combined_count = len(evaluated["items"])
+    limit = int(payload.get("limit") or 100)
+    items = sorted(evaluated["items"], key=lambda row: row["code"])[:limit]
+    return {
+        "date": str(day),
+        "universe": universe,
+        "candidate_count": len(rows),
+        "total": combined_count,
+        "combined_count": combined_count,
+        "independent_counts": evaluated["independent_counts"],
+        "condition_counts": evaluated["condition_counts"],
+        "field_coverage": evaluated["field_coverage"],
+        "data_policy": {
+            "point_in_time": True,
+            "valuation_max_age_days": VALUATION_MAX_AGE_DAYS,
+        },
+        "items": items,
+    }

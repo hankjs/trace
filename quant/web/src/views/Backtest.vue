@@ -3,8 +3,10 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import type { EChartsCoreOption } from 'echarts/core'
 import { api, type BacktestResult, type SweepResult, type SweepMetrics, type WatchItem } from '../api'
+import { catalogEntry, loadCatalog, metricName, strategyName } from '../catalog'
 import { fmtPct, fmtPrice } from '../format'
 import EChart from '../components/EChart.vue'
+import StockSearchInput from '../components/StockSearchInput.vue'
 
 const route = useRoute()
 
@@ -14,6 +16,7 @@ const result = ref<BacktestResult | null>(null)
 const running = ref(false)
 const error = ref('')
 const runIdInput = ref('')
+const searchCode = ref('')
 
 /** 模式:single 单次回测 / sweep 参数扫描 */
 const mode = ref<'single' | 'sweep'>('single')
@@ -25,6 +28,9 @@ const form = reactive({
   start: '',
   end: '',
 })
+
+const strategyMeta = computed(() => catalogEntry('strategies', form.strategy))
+const strategyParams = computed(() => strategyMeta.value?.params ?? [])
 
 // ---- 参数扫描 ----
 
@@ -80,7 +86,7 @@ function metricOf(m: SweepMetrics, key: string): number | undefined {
 
 function paramsText(params: Record<string, number>): string {
   return Object.entries(params)
-    .map(([k, v]) => `${k}=${v}`)
+    .map(([k, v]) => `${strategyParams.value.find((item) => item.key === k)?.name ?? k}=${v}`)
     .join(', ')
 }
 
@@ -204,12 +210,12 @@ const metrics = computed(() => {
   const m = result.value?.metrics
   if (!m) return []
   return [
-    { label: '总收益', value: fmtPct(m.total_return), cls: m.total_return >= 0 ? 'text-up' : 'text-down' },
-    { label: '年化收益', value: fmtPct(m.annual_return), cls: m.annual_return >= 0 ? 'text-up' : 'text-down' },
-    { label: '最大回撤', value: fmtPct(m.max_drawdown), cls: 'text-down' },
-    { label: '胜率', value: fmtPct(m.win_rate), cls: 'text-text-primary' },
-    { label: '交易次数', value: String(m.trade_count), cls: 'text-text-primary' },
-    { label: '完整回合', value: String(m.round_trips), cls: 'text-text-primary' },
+    { label: metricName('total_return'), value: fmtPct(m.total_return), cls: m.total_return >= 0 ? 'text-up' : 'text-down' },
+    { label: metricName('annual_return'), value: fmtPct(m.annual_return), cls: m.annual_return >= 0 ? 'text-up' : 'text-down' },
+    { label: metricName('max_drawdown'), value: fmtPct(m.max_drawdown), cls: 'text-down' },
+    { label: metricName('win_rate'), value: fmtPct(m.win_rate), cls: 'text-text-primary' },
+    { label: metricName('trade_count'), value: String(m.trade_count), cls: 'text-text-primary' },
+    { label: metricName('round_trips'), value: String(m.round_trips), cls: 'text-text-primary' },
   ]
 })
 
@@ -217,6 +223,19 @@ function toggleCode(code: string) {
   const i = form.codes.indexOf(code)
   if (i >= 0) form.codes.splice(i, 1)
   else form.codes.push(code)
+}
+
+function addSearchCode() {
+  const code = searchCode.value.trim().toLowerCase()
+  if (code && !form.codes.includes(code)) form.codes.push(code)
+  searchCode.value = ''
+}
+
+function stockName(code: string): string {
+  return result.value?.stocks?.find((item) => item.code === code)?.name
+    || sweepResult.value?.stocks?.find((item) => item.code === code)?.name
+    || watchlist.value.find((item) => item.code === code)?.name
+    || '名称待同步'
 }
 
 function parsedCodes(): string[] {
@@ -261,7 +280,7 @@ async function loadRun() {
   error.value = ''
   const id = Number(runIdInput.value)
   if (!id) {
-    error.value = '请输入有效的 run_id'
+    error.value = '请输入有效的回测编号'
     return
   }
   running.value = true
@@ -275,6 +294,7 @@ async function loadRun() {
 }
 
 onMounted(async () => {
+  await loadCatalog()
   try {
     const [s, w] = await Promise.all([api.strategies(), api.watchlist()])
     strategies.value = s.strategies
@@ -295,7 +315,7 @@ onMounted(async () => {
 <template>
   <div class="space-y-6">
     <div class="flex items-center gap-4">
-      <h2 class="text-lg font-semibold">回测</h2>
+      <h2 class="text-base font-semibold">历史回测</h2>
       <div class="flex rounded-md border border-border text-sm">
         <button
           class="rounded-l-md px-3 py-1"
@@ -322,7 +342,7 @@ onMounted(async () => {
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">策略</span>
           <select v-model="form.strategy" class="rounded-md border border-border px-2 py-1.5">
-            <option v-for="s in strategies" :key="s" :value="s">{{ s }}</option>
+            <option v-for="s in strategies" :key="s" :value="s">{{ strategyName(s) }}</option>
           </select>
         </label>
         <label class="text-sm">
@@ -333,9 +353,14 @@ onMounted(async () => {
           <span class="mb-1 block text-xs text-text-tertiary">结束日期</span>
           <input v-model="form.end" type="date" class="rounded-md border border-border px-2 py-1.5" />
         </label>
-        <button type="submit" :disabled="running" class="rounded-md bg-accent px-4 py-1.5 text-sm text-white hover:bg-accent-hover disabled:opacity-50">
+        <button type="submit" :disabled="running" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50">
           {{ running ? '运行中…' : mode === 'single' ? '运行回测' : '开始扫描' }}
         </button>
+      </div>
+
+      <div v-if="strategyMeta" class="max-w-3xl text-xs leading-5 text-text-secondary">
+        <p>{{ strategyMeta.description }}</p>
+        <p v-if="strategyMeta.caveat" class="mt-1 text-text-tertiary">限制：{{ strategyMeta.caveat }}</p>
       </div>
 
       <div>
@@ -351,8 +376,12 @@ onMounted(async () => {
               : 'border-border text-text-secondary hover:bg-hover'"
             @click="toggleCode(w.code)"
           >
-            {{ w.name || w.code }}
+            {{ w.name || '名称待同步' }} · {{ w.code }}
           </button>
+        </div>
+        <div class="mb-2 flex items-end gap-2">
+          <StockSearchInput v-model="searchCode" label="搜索其他股票" />
+          <button type="button" :disabled="!searchCode" class="h-9 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-40" @click="addSearchCode">添加</button>
         </div>
         <input
           v-model="form.codesText"
@@ -368,7 +397,16 @@ onMounted(async () => {
         </div>
         <div class="space-y-2">
           <div v-for="(row, i) in gridRows" :key="i" class="flex items-center gap-2">
+            <select
+              v-if="strategyParams.length"
+              v-model="row.name"
+              class="w-48 rounded-md border border-border px-2 py-1.5 text-sm"
+            >
+              <option value="">选择参数</option>
+              <option v-for="parameter in strategyParams" :key="parameter.key" :value="parameter.key">{{ parameter.name }}</option>
+            </select>
             <input
+              v-else
               v-model="row.name"
               placeholder="参数名,如 fast"
               class="w-40 rounded-md border border-border px-2 py-1.5 text-sm"
@@ -393,7 +431,7 @@ onMounted(async () => {
 
     <div v-if="mode === 'single'" class="flex items-end gap-3 rounded-lg border border-border bg-surface-raised p-4">
       <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">查询历史回测 run_id</span>
+        <span class="mb-1 block text-xs text-text-tertiary">查询历史回测编号</span>
         <input v-model="runIdInput" type="number" min="1" class="w-32 rounded-md border border-border px-2 py-1.5" />
       </label>
       <button :disabled="running" class="rounded-md border border-border px-4 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50" @click="loadRun">
@@ -406,7 +444,7 @@ onMounted(async () => {
     <!-- 参数扫描结果 -->
     <template v-if="mode === 'sweep' && sweepResult">
       <div class="flex items-center gap-3 text-sm text-text-secondary">
-        <span>策略: <span class="font-medium text-text-primary">{{ sweepResult.strategy }}</span></span>
+        <span>策略: <span class="font-medium text-text-primary">{{ strategyName(sweepResult.strategy) }}</span></span>
         <span>{{ sweepResult.start }} ~ {{ sweepResult.end }}</span>
         <span>{{ sweepRows.length }} 组参数组合</span>
       </div>
@@ -417,12 +455,12 @@ onMounted(async () => {
             <tr class="border-b border-border text-left text-xs text-text-tertiary">
               <th class="px-4 py-2 font-medium">#</th>
               <th class="px-4 py-2 font-medium">参数</th>
-              <th class="px-4 py-2 text-right font-medium">总收益</th>
-              <th class="px-4 py-2 text-right font-medium">年化收益</th>
-              <th class="px-4 py-2 text-right font-medium">最大回撤</th>
-              <th class="px-4 py-2 text-right font-medium">夏普</th>
-              <th class="px-4 py-2 text-right font-medium">胜率</th>
-              <th class="px-4 py-2 text-right font-medium">交易次数</th>
+              <th class="px-4 py-2 text-right font-medium">{{ metricName('total_return') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ metricName('annual_return') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ metricName('max_drawdown') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ metricName('sharpe') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ metricName('win_rate') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ metricName('trade_count') }}</th>
             </tr>
           </thead>
           <tbody>
@@ -471,9 +509,9 @@ onMounted(async () => {
     <!-- 单次回测结果 -->
     <template v-if="mode === 'single' && result">
       <div class="flex items-center gap-3 text-sm text-text-secondary">
-        <span>run_id: <span class="font-medium text-text-primary">{{ result.run_id }}</span></span>
+        <span>回测编号：<span class="font-medium text-text-primary">{{ result.run_id }}</span></span>
         <template v-if="result.strategy">
-          <span>策略: {{ result.strategy }}</span>
+          <span>策略: {{ strategyName(result.strategy) }}</span>
           <span>{{ result.start }} ~ {{ result.end }}</span>
         </template>
       </div>
@@ -495,11 +533,11 @@ onMounted(async () => {
           <table class="w-full text-sm">
             <thead>
               <tr class="border-b border-border text-left text-xs text-text-tertiary">
-                <th class="px-4 py-2 font-medium">代码</th>
-                <th class="px-4 py-2 text-right font-medium">总收益</th>
-                <th class="px-4 py-2 text-right font-medium">交易次数</th>
-                <th class="px-4 py-2 text-right font-medium">回合</th>
-                <th class="px-4 py-2 text-right font-medium">胜率</th>
+                <th class="px-4 py-2 font-medium">股票</th>
+                <th class="px-4 py-2 text-right font-medium">{{ metricName('total_return') }}</th>
+                <th class="px-4 py-2 text-right font-medium">{{ metricName('trade_count') }}</th>
+                <th class="px-4 py-2 text-right font-medium">{{ metricName('round_trips') }}</th>
+                <th class="px-4 py-2 text-right font-medium">{{ metricName('win_rate') }}</th>
               </tr>
             </thead>
             <tbody>
@@ -508,7 +546,10 @@ onMounted(async () => {
                 :key="c"
                 class="border-b border-border-subtle last:border-0 hover:bg-hover"
               >
-                <td class="px-4 py-2">{{ c }}</td>
+                <td class="px-4 py-2">
+                  <div class="font-medium">{{ stockName(String(c)) }}</div>
+                  <div class="text-xs text-text-tertiary">{{ c }}</div>
+                </td>
                 <td class="px-4 py-2 text-right" :class="Number((v as Record<string, number>).total_return) >= 0 ? 'text-up' : 'text-down'">
                   {{ fmtPct(Number((v as Record<string, number>).total_return ?? 0)) }}
                 </td>

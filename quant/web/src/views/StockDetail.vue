@@ -15,6 +15,7 @@ const code = route.params.code as string
 const bars = ref<KlineBar[]>([])
 const signals = ref<SignalItem[]>([])
 const stockName = ref('')
+const industry = ref('')
 const lastPrice = ref<number | null>(null)
 const lastPct = ref<number | null>(null)
 const loading = ref(true)
@@ -56,7 +57,7 @@ const chartOption = computed<EChartsCoreOption>(() => {
 
   return {
     animation: false,
-    legend: { data: ['MA5', 'MA20'], top: 0, textStyle: { color: '#666' } },
+    legend: { data: ['5日平均线', '20日平均线'], top: 0, textStyle: { color: '#666' } },
     tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
     axisPointer: { link: [{ xAxisIndex: 'all' }] },
     grid: [
@@ -77,7 +78,7 @@ const chartOption = computed<EChartsCoreOption>(() => {
     ],
     series: [
       {
-        name: 'K线',
+        name: '日K线',
         type: 'candlestick',
         data: kdata,
         itemStyle: {
@@ -88,7 +89,7 @@ const chartOption = computed<EChartsCoreOption>(() => {
         },
       },
       {
-        name: 'MA5',
+        name: '5日平均线',
         type: 'line',
         data: ma(closes, 5),
         smooth: true,
@@ -96,7 +97,7 @@ const chartOption = computed<EChartsCoreOption>(() => {
         lineStyle: { width: 1, color: '#f0a030' },
       },
       {
-        name: 'MA20',
+        name: '20日平均线',
         type: 'line',
         data: ma(closes, 20),
         smooth: true,
@@ -147,7 +148,8 @@ async function loadAll() {
     bars.value = k.bars
     signals.value = sig.items
     const w = watch.items.find((i) => i.code === code)
-    stockName.value = w?.name ?? ''
+    stockName.value = k.name || w?.name || ''
+    industry.value = k.industry || w?.industry || ''
     const s = snap.items.find((i) => i.code === code)
     lastPrice.value = s?.price ?? (bars.value.length ? bars.value[bars.value.length - 1].close : null)
     lastPct.value = s?.pct_chg ?? null
@@ -195,9 +197,10 @@ onMounted(loadAll)
   <div class="space-y-4">
     <div class="flex flex-wrap items-center gap-4">
       <h2 class="text-lg font-semibold">
-        {{ stockName || code }}
+        {{ stockName || '名称待同步' }}
         <span class="ml-2 text-sm font-normal text-text-tertiary">{{ code }}</span>
       </h2>
+      <span v-if="industry" class="rounded bg-active px-2 py-1 text-xs text-text-secondary">{{ industry }}</span>
       <span v-if="lastPrice !== null" class="text-xl font-semibold" :class="pnlClass(lastPct)">
         {{ fmtPrice(lastPrice) }}
       </span>

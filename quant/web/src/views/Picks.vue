@@ -1,24 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { ChevronDown, ChevronUp } from 'lucide-vue-next'
 import { api, type PickItem } from '../api'
+import { catalogEntry, factorName, loadCatalog } from '../catalog'
 import { fmtBigAmount, fmtPct } from '../format'
 
-const date = ref(new Date().toISOString().slice(0, 10))
+const date = ref('')
 const items = ref<PickItem[]>([])
 const dropped = ref<(PickItem | string)[]>([])
 const loading = ref(true)
 const error = ref('')
 const expanded = ref<string | null>(null)
 
-const factorLabels: [string, string][] = [
-  ['mom20', '20日动量'],
-  ['mom60', '60日动量'],
-  ['rsi14', 'RSI14'],
-  ['atr_pct', 'ATR%'],
-  ['vol_ratio5', '量比5日'],
-  ['ma20_slope', 'MA20斜率'],
-  ['amount_avg20', '20日日均成交额'],
-]
+const factorKeys = ['mom20', 'mom60', 'rsi14', 'atr_pct', 'vol_ratio5', 'ma20_slope', 'amount_avg20']
 
 /** 新进标记:兼容 change='new' / is_new 两种契约 */
 function isNew(p: PickItem): boolean {
@@ -36,8 +30,9 @@ function droppedName(d: PickItem | string): string {
 function factorText(p: PickItem, key: string): string {
   const v = p.factors?.[key]
   if (v === null || v === undefined || Number.isNaN(v)) return '--'
-  if (key === 'amount_avg20') return fmtBigAmount(v)
-  if (key === 'rsi14' || key === 'vol_ratio5') return v.toFixed(2)
+  const entry = catalogEntry('factors', key)
+  if (entry?.input_scale === 100000000 || key === 'amount_avg20') return fmtBigAmount(v)
+  if (entry?.unit === '0-100' || entry?.unit === '倍' || key === 'rsi14' || key === 'vol_ratio5') return v.toFixed(2)
   return fmtPct(v)
 }
 
@@ -56,7 +51,9 @@ async function load() {
   error.value = ''
   expanded.value = null
   try {
-    const r = await api.picks(date.value || undefined)
+    const requestedDate = date.value
+    const r = await api.picks(requestedDate || undefined)
+    if (!requestedDate && r.date) date.value = r.date
     items.value = r.items ?? []
     dropped.value = r.dropped ?? []
   } catch (e) {
@@ -68,19 +65,25 @@ async function load() {
   }
 }
 
-onMounted(load)
+onMounted(async () => {
+  await loadCatalog()
+  await load()
+})
 </script>
 
 <template>
   <div class="space-y-4">
     <div class="flex flex-wrap items-end justify-between gap-3">
-      <h2 class="text-lg font-semibold">选股池</h2>
+      <div>
+        <h2 class="text-base font-semibold">系统候选</h2>
+        <p class="mt-1 text-xs text-text-tertiary">按每日量化评分生成，展开可查看各项指标。</p>
+      </div>
       <form class="flex items-end gap-3" @submit.prevent="load">
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">日期</span>
           <input v-model="date" type="date" class="rounded-md border border-border bg-surface-raised px-2 py-1.5" />
         </label>
-        <button type="submit" class="rounded-md bg-accent px-4 py-1.5 text-sm text-white hover:bg-accent-hover">
+        <button type="submit" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover">
           查询
         </button>
       </form>
@@ -95,30 +98,26 @@ onMounted(load)
           <thead>
             <tr class="border-b border-border text-left text-xs text-text-tertiary">
               <th class="px-4 py-2 font-medium">排名</th>
-              <th class="px-4 py-2 font-medium">代码</th>
-              <th class="px-4 py-2 font-medium">名称</th>
+              <th class="px-4 py-2 font-medium">股票</th>
               <th class="px-4 py-2 text-right font-medium">评分</th>
-              <th class="px-4 py-2 text-right font-medium">20日动量</th>
-              <th class="px-4 py-2 text-right font-medium">60日动量</th>
-              <th class="px-4 py-2 text-right font-medium">RSI14</th>
-              <th class="px-4 py-2 text-right font-medium">量比</th>
+              <th class="px-4 py-2 text-right font-medium">{{ factorName('mom20') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ factorName('mom60') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ factorName('rsi14') }}</th>
+              <th class="px-4 py-2 text-right font-medium">{{ factorName('vol_ratio5') }}</th>
               <th class="px-4 py-2 font-medium"></th>
             </tr>
           </thead>
           <tbody>
             <template v-for="p in items" :key="p.code">
               <tr
-                class="cursor-pointer border-b border-border-subtle hover:bg-hover"
-                @click="toggleExpand(p.code)"
+                class="border-b border-border-subtle hover:bg-hover"
               >
                 <td class="px-4 py-2 font-medium">{{ p.rank }}</td>
                 <td class="px-4 py-2">
                   <router-link :to="`/stock/${p.code}`" class="text-accent hover:underline" @click.stop>
-                    {{ p.code }}
+                    <span class="font-medium text-text-primary">{{ p.name || '名称待同步' }}</span>
+                    <span class="ml-2 text-xs text-text-tertiary">{{ p.code }}</span>
                   </router-link>
-                </td>
-                <td class="px-4 py-2">
-                  {{ p.name }}
                   <span
                     v-if="isNew(p)"
                     class="ml-1.5 rounded bg-down/10 px-1.5 py-0.5 text-xs font-medium text-down"
@@ -134,14 +133,24 @@ onMounted(load)
                 <td class="px-4 py-2 text-right">{{ factorText(p, 'rsi14') }}</td>
                 <td class="px-4 py-2 text-right">{{ factorText(p, 'vol_ratio5') }}</td>
                 <td class="px-4 py-2 text-right text-xs text-text-tertiary">
-                  {{ expanded === p.code ? '收起 ▲' : '因子 ▼' }}
+                  <button
+                    type="button"
+                    class="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-active hover:text-text-primary"
+                    :aria-expanded="expanded === p.code"
+                    :aria-controls="`pick-factors-${p.code}`"
+                    @click="toggleExpand(p.code)"
+                  >
+                    {{ expanded === p.code ? '收起' : '查看指标' }}
+                    <ChevronUp v-if="expanded === p.code" :size="14" />
+                    <ChevronDown v-else :size="14" />
+                  </button>
                 </td>
               </tr>
-              <tr v-if="expanded === p.code" class="border-b border-border-subtle bg-hover/50">
-                <td colspan="9" class="px-4 py-3">
+              <tr v-if="expanded === p.code" :id="`pick-factors-${p.code}`" class="border-b border-border-subtle bg-hover/50">
+                <td colspan="8" class="px-4 py-3">
                   <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
-                    <div v-for="[key, label] in factorLabels" :key="key" class="rounded-md border border-border bg-surface-raised p-2">
-                      <div class="text-xs text-text-tertiary">{{ label }}</div>
+                    <div v-for="key in factorKeys" :key="key" class="p-2">
+                      <div class="text-xs text-text-tertiary">{{ factorName(key) }}</div>
                       <div class="mt-0.5 text-sm font-medium">{{ factorText(p, key) }}</div>
                     </div>
                   </div>

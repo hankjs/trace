@@ -21,6 +21,15 @@ export function currentUsername(): string {
   return localStorage.getItem(USERNAME_KEY) ?? ''
 }
 
+export function normalizeStockCode(value: string): string | null {
+  const normalized = value.trim().toLowerCase()
+  if (/^(?:sh|sz|bj)\.\d{6}$/.test(normalized)) return normalized
+  if (!/^\d{6}$/.test(normalized)) return null
+  if (/^(?:4|8|92)/.test(normalized)) return `bj.${normalized}`
+  if (/^(?:6|9)/.test(normalized)) return `sh.${normalized}`
+  return `sz.${normalized}`
+}
+
 async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
   const token = getToken()
@@ -42,7 +51,9 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     } catch {
       /* 非 JSON 错误体 */
     }
-    throw new Error(msg)
+    const error = new Error(msg) as Error & { status?: number }
+    error.status = res.status
+    throw error
   }
   return res.json() as Promise<T>
 }
@@ -73,19 +84,29 @@ export interface WatchItem {
   industry: string
 }
 
+export interface StockSearchItem extends WatchItem {
+  is_watch?: boolean
+}
+
 export interface SignalItem {
   id: number
   code: string
+  name?: string
+  industry?: string
   date: string
   strategy: string
+  strategy_name?: string
   side: 'buy' | 'sell' | 'watch'
+  side_name?: string
   price: number
   reason: Record<string, unknown>
+  reason_text?: string
 }
 
 export interface Trade {
   id: number
   code: string
+  name?: string
   trade_date: string
   side: 'buy' | 'sell'
   price: number
@@ -96,6 +117,7 @@ export interface Trade {
 
 export interface Position {
   code: string
+  name?: string
   qty: number
   avg_cost: number
   last_price: number | null
@@ -126,10 +148,17 @@ export interface BacktestResult {
   run_id: number
   strategy?: string
   codes?: string[]
+  stocks?: StockRef[]
   start?: string
   end?: string
   metrics: BacktestMetrics
   equity: { date: string; equity: number }[]
+}
+
+export interface StockRef {
+  code: string
+  name: string
+  industry?: string
 }
 
 /** 选股池因子(字段以后端实际响应为准,全部可选) */
@@ -157,7 +186,7 @@ export interface PickItem {
 }
 
 export interface PicksResult {
-  date: string
+  date: string | null
   prev_date?: string | null
   items: PickItem[]
   /** 调出名单:可能是对象或纯代码字符串 */
@@ -167,7 +196,7 @@ export interface PicksResult {
 export interface ScreenerItem {
   code: string
   name: string
-  close: number
+  close?: number
   /** 涨跌幅:实际响应为 pct_chg,契约曾用 chg_pct,两者都兼容 */
   pct_chg?: number
   chg_pct?: number
@@ -177,6 +206,10 @@ export interface ScreenerItem {
   rsi14?: number
   vol_ratio5?: number
   amount_avg20?: number
+  industry?: string
+  matched_conditions?: string[]
+  match_reasons?: (string | ScreenerMatchReason)[]
+  values?: Record<string, unknown>
   [key: string]: unknown
 }
 
@@ -184,7 +217,124 @@ export interface ScreenerResult {
   date?: string
   total?: number
   count?: number
+  combined_count?: number
+  candidate_count?: number
+  field_coverage?: Record<string, number>
+  universe?: string
+  condition_counts?: Record<string, number> | ScreenerConditionCount[]
+  independent_counts?: Record<string, number>
+  data_policy?: {
+    point_in_time?: boolean
+    valuation_max_age_days?: number
+  }
   items: ScreenerItem[]
+}
+
+export interface ScreenerMatchReason {
+  condition_id: string
+  field: string
+  field_name?: string
+  actual: unknown
+  matched: boolean
+}
+
+export interface ScreenerConditionCount {
+  id: string
+  field: string
+  field_name?: string
+  matched: number
+  total?: number
+  available?: number
+}
+
+export type CatalogSection =
+  | 'factors'
+  | 'indicators'
+  | 'strategies'
+  | 'signals'
+  | 'backtest_metrics'
+  | 'filter_fields'
+
+export interface CatalogOption {
+  value: string | number | boolean
+  label: string
+}
+
+export interface CatalogEntry {
+  key: string
+  name: string
+  description: string
+  category?: string
+  unit?: string
+  direction?: string
+  formula?: string
+  caliber?: string
+  caveat?: string
+  limits?: string
+  source?: string
+  available?: boolean
+  kind?: string
+  kind_name?: string
+  params?: CatalogParameter[]
+  constraints?: string[]
+  data_type?: 'number' | 'integer' | 'boolean' | 'string' | 'select'
+  value_type?: 'number' | 'integer' | 'boolean' | 'string' | 'select'
+  input_scale?: number
+  operators?: string[]
+  options?: CatalogOption[]
+}
+
+export interface CatalogParameter {
+  key: string
+  name: string
+  description?: string
+  default?: number | string | boolean
+  value_type?: 'number' | 'integer' | 'boolean' | 'string'
+  unit?: string
+  minimum?: number
+  maximum?: number
+  step?: number
+}
+
+export interface CatalogPayload {
+  factors: CatalogEntry[]
+  indicators: CatalogEntry[]
+  strategies: CatalogEntry[]
+  signals: CatalogEntry[]
+  backtest_metrics: CatalogEntry[]
+  filter_fields: CatalogEntry[]
+}
+
+export type FilterLogic = 'and' | 'or'
+
+export interface ScreenerCondition {
+  id: string
+  field: string
+  operator: string
+  value: string | number | boolean | null
+  value2?: string | number | null
+  enabled: boolean
+}
+
+export interface ScreenerGroup {
+  id: string
+  logic: FilterLogic
+  conditions: ScreenerCondition[]
+}
+
+export interface StructuredScreenerRequest {
+  date?: string
+  logic: FilterLogic
+  groups: ScreenerGroup[]
+  limit?: number
+  universe?: 'pool' | 'hs300_zz500' | 'hs300' | 'zz500' | 'watchlist' | 'all'
+}
+
+export interface StrategyListResult {
+  strategies: string[]
+  items?: CatalogEntry[]
+  single?: string[]
+  portfolio?: string[]
 }
 
 export interface LeaderboardItem {
@@ -210,6 +360,7 @@ export interface SweepResultItem {
 export interface SweepResult {
   strategy: string
   codes: string[]
+  stocks?: StockRef[]
   start: string
   end: string
   results: SweepResultItem[]
@@ -227,13 +378,18 @@ export const api = {
     const params = new URLSearchParams({ code })
     if (start) params.set('start', start)
     if (end) params.set('end', end)
-    return request<{ code: string; count: number; bars: KlineBar[] }>(
+    return request<{ code: string; name?: string; industry?: string; count: number; bars: KlineBar[] }>(
       `/api/market/kline?${params}`
     )
   },
 
   snapshot() {
     return request<{ count: number; items: SnapshotItem[] }>('/api/market/snapshot')
+  },
+
+  stockSearch(query: string, limit = 10) {
+    const params = new URLSearchParams({ q: query, limit: String(limit) })
+    return request<{ count?: number; items: StockSearchItem[] }>(`/api/market/stocks?${params}`)
   },
 
   watchlist() {
@@ -284,7 +440,11 @@ export const api = {
   },
 
   strategies() {
-    return request<{ strategies: string[] }>('/api/backtest/strategies')
+    return request<StrategyListResult>('/api/backtest/strategies')
+  },
+
+  catalog() {
+    return request<Partial<CatalogPayload>>('/api/catalog')
   },
 
   runBacktest(body: { strategy: string; codes: string[]; start: string; end: string; params?: Record<string, unknown>; costs?: Record<string, unknown> }) {
@@ -323,6 +483,41 @@ export const api = {
     if (filters.high_dist_max !== undefined) params.set('high_dist_max', String(filters.high_dist_max))
     if (filters.amount_min !== undefined) params.set('amount_min', String(filters.amount_min))
     return request<ScreenerResult>(`/api/selection/screener?${params}`)
+  },
+
+  async structuredScreener(body: StructuredScreenerRequest) {
+    try {
+      return await request<ScreenerResult>('/api/selection/screener', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+    } catch (error) {
+      const status = (error as Error & { status?: number }).status
+      if (status !== 404 && status !== 405) throw error
+
+      const active = body.groups.flatMap((group) => group.conditions).filter((condition) => condition.enabled)
+      const legacy: {
+        pct_chg_min?: number
+        pct_chg_max?: number
+        vol_ratio_min?: number
+        ma_bull?: boolean
+        high_window?: number
+        high_dist_max?: number
+        amount_min?: number
+      } = {}
+      for (const condition of active) {
+        const value = Number(condition.value)
+        if (condition.field === 'pct_chg' && condition.operator === 'gte') legacy.pct_chg_min = value
+        else if (condition.field === 'pct_chg' && condition.operator === 'lte') legacy.pct_chg_max = value
+        else if (condition.field === 'vol_ratio5' && condition.operator === 'gte') legacy.vol_ratio_min = value
+        else if (condition.field === 'ma_bull' && condition.operator === 'eq') legacy.ma_bull = Boolean(condition.value)
+        else if (condition.field === 'high_window' && condition.operator === 'eq') legacy.high_window = value
+        else if (condition.field === 'high_dist' && condition.operator === 'lte') legacy.high_dist_max = value
+        else if (condition.field === 'amount_avg20' && condition.operator === 'gte') legacy.amount_min = value
+        else throw error
+      }
+      return api.screener(legacy)
+    }
   },
 
   leaderboard() {

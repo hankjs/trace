@@ -10,11 +10,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import admin, auth, backtest, market, portfolio, selection, signals, watchlist
-from .auth import require_user
+from .api import (admin, auth, backtest, catalog, market, portfolio, selection,
+                  signals, watchlist)
+from .auth import require_admin, require_user
 from .config import settings
 from .db import Base, engine
 from . import models  # noqa: F401 - 确保模型注册到 Base.metadata
+from .schema import upgrade_research_schema
 from .scheduler import start_scheduler, stop_scheduler
 
 logging.basicConfig(
@@ -27,6 +29,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(engine)
+    upgrade_research_schema(engine)
     logger.info("数据库表(quant_*)已就绪")
     start_scheduler()
     yield
@@ -47,13 +50,14 @@ app.include_router(auth.router)
 
 # 业务接口全部要求登录;/api/auth/login 与 /api/health 保持公开
 _auth = [Depends(require_user)]
+app.include_router(catalog.router, dependencies=_auth)
 app.include_router(market.router, dependencies=_auth)
 app.include_router(watchlist.router, dependencies=_auth)
 app.include_router(signals.router, dependencies=_auth)
 app.include_router(portfolio.router, dependencies=_auth)
 app.include_router(backtest.router, dependencies=_auth)
 app.include_router(selection.router, dependencies=_auth)
-app.include_router(admin.router, dependencies=_auth)
+app.include_router(admin.router, dependencies=[Depends(require_admin)])
 
 
 @app.get("/api/health")

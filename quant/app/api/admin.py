@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..backtest.evaluate import run_evaluation
-from ..data import ingest, universe
+from ..data import fundamentals, ingest, universe
 from ..db import SessionLocal, get_db
 from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
@@ -82,6 +82,47 @@ async def import_stocks():
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"股票列表导入失败: {e}")
     return {"imported": n}
+
+
+@router.post("/sync-fundamentals")
+async def sync_fundamentals_now(
+    codes: str | None = Query(
+        None, description="可选，逗号分隔代码；如 600519,sz.000001",
+    ),
+    universe_: str = Query("watchlist", alias="universe"),
+    max_codes: int = Query(100, ge=1, le=800),
+    include_valuation: bool = True,
+    include_financials: bool = True,
+    valuation_history: bool = Query(
+        False, description="回填东财历史估值；单股数据量较大，默认关闭",
+    ),
+):
+    """手动同步估值与财务指标；单只失败会在 failures 中返回，不中断任务。"""
+    explicit_codes = None
+    if codes is not None:
+        explicit_codes = [code for code in codes.split(",") if code.strip()]
+
+    def _job() -> dict:
+        with SessionLocal() as db:
+            return fundamentals.sync_fundamental_universe(
+                db,
+                universe=universe_,
+                codes=explicit_codes,
+                max_codes=max_codes,
+                include_valuation=include_valuation,
+                include_financials=include_financials,
+                valuation_history=valuation_history,
+            )
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _job)
+    except fundamentals.FundamentalSyncInProgressError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(500, f"基本面同步失败: {exc}") from exc
 
 
 @router.post("/sync-index-members")

@@ -1,149 +1,628 @@
 <script setup lang="ts">
-import { ref } from 'vue'
-import { api, type ScreenerItem } from '../api'
+import { computed, onMounted, ref } from 'vue'
+import { FolderOpen, Plus, Save, Search, Trash2 } from 'lucide-vue-next'
+import {
+  api,
+  type CatalogEntry,
+  type FilterLogic,
+  type ScreenerCondition,
+  type ScreenerGroup,
+  type ScreenerItem,
+  type ScreenerMatchReason,
+  type StructuredScreenerRequest,
+} from '../api'
+import { categoryLabels, operatorLabels, useCatalog } from '../catalog'
+import LoadingRows from '../components/LoadingRows.vue'
 import { fmtBigAmount, fmtPct, fmtPrice, pnlClass } from '../format'
 
+interface SavedScheme {
+  name: string
+  logic: FilterLogic
+  universe: StructuredScreenerRequest['universe']
+  groups: ScreenerGroup[]
+}
+
+const STORAGE_KEY = 'quant_screener_schemes_v1'
+const { catalog, load: loadCatalog } = useCatalog()
+const groups = ref<ScreenerGroup[]>([])
+const rootLogic = ref<FilterLogic>('and')
+const universe = ref<NonNullable<StructuredScreenerRequest['universe']>>('pool')
 const items = ref<ScreenerItem[]>([])
-const total = ref(0)
+const combinedCount = ref(0)
+const candidateCount = ref(0)
+const conditionCounts = ref<Record<string, number>>({})
+const fieldCoverage = ref<Record<string, number>>({})
 const resultDate = ref('')
+const valuationMaxAgeDays = ref(7)
 const searched = ref(false)
 const loading = ref(false)
 const error = ref('')
+const schemeName = ref('')
+const selectedScheme = ref('')
+const savedSchemes = ref<SavedScheme[]>(readSchemes())
+let sequence = 0
 
-/** 表单输入:涨跌幅和成交额用人类单位(%、亿),提交时换算 */
-const form = ref({
-  chgMin: '',
-  chgMax: '',
-  volRatioMin: '',
-  maBull: false,
-  nearHighDays: '',
-  highDistMax: '',
-  amountMinYi: '',
+const presets: { name: string; conditions: [string, string, string | boolean, string?][] }[] = [
+  { name: '成交活跃', conditions: [['amount_avg20', 'gte', '1'], ['vol_ratio5', 'gte', '1.2']] },
+  { name: '趋势稳健', conditions: [['mom20', 'gte', '0'], ['ma_bull', 'eq', true]] },
+  { name: '质量价值', conditions: [['pe_ttm', 'between', '0', '25'], ['roe', 'gte', '10']] },
+  { name: '财务稳健', conditions: [['roe', 'gte', '12'], ['debt_ratio', 'lte', '60']] },
+]
+
+const universeOptions: { value: NonNullable<StructuredScreenerRequest['universe']>; label: string }[] = [
+  { value: 'pool', label: '沪深300 + 中证500' },
+  { value: 'hs300', label: '沪深300' },
+  { value: 'zz500', label: '中证500' },
+  { value: 'watchlist', label: '我的自选股' },
+  { value: 'all', label: '全部A股' },
+]
+
+const groupedFields = computed(() => {
+  const map = new Map<string, CatalogEntry[]>()
+  for (const field of catalog.value.filter_fields) {
+    const category = field.category ?? 'basic'
+    const values = map.get(category) ?? []
+    values.push(field)
+    map.set(category, values)
+  }
+  return [...map.entries()].map(([key, fields]) => ({
+    key,
+    name: categoryLabels[key] ?? key,
+    fields,
+  }))
 })
 
-function num(s: string): number | undefined {
-  const v = Number(s)
-  return s.trim() !== '' && !Number.isNaN(v) ? v : undefined
+const activeConditions = computed(() => groups.value.flatMap((group) => group.conditions).filter((condition) => condition.enabled))
+const resultFields = computed(() => [...new Set(activeConditions.value.map((condition) => condition.field))].slice(0, 4))
+const missingDataFields = computed(() => [...new Set(
+  activeConditions.value
+    .filter((condition) => searched.value && fieldCoverage.value[condition.field] === 0)
+    .map((condition) => fieldOf(condition.field)?.name ?? condition.field)
+)])
+const partialDataFields = computed(() => [...new Set(
+  activeConditions.value
+    .filter((condition) => {
+      const coverage = fieldCoverage.value[condition.field]
+      return searched.value && typeof coverage === 'number' && coverage < candidateCount.value
+    })
+    .map((condition) => fieldOf(condition.field)?.name ?? condition.field)
+)])
+const usesValuation = computed(() => activeConditions.value.some(
+  (condition) => fieldOf(condition.field)?.category === 'valuation'
+))
+
+function nextId(prefix: string): string {
+  sequence += 1
+  return `${prefix}-${Date.now()}-${sequence}`
 }
 
-function chgPct(it: ScreenerItem): number | undefined {
-  return it.pct_chg ?? it.chg_pct
+function fieldOf(key: string): CatalogEntry | undefined {
+  return catalog.value.filter_fields.find((field) => field.key === key)
+}
+
+function defaultOperator(meta: CatalogEntry | undefined): string {
+  if ((meta?.data_type === 'number' || meta?.data_type === 'integer') && meta.operators?.includes('gte')) return 'gte'
+  if (meta?.operators?.includes('eq')) return 'eq'
+  return meta?.operators?.[0] ?? 'gte'
+}
+
+function newCondition(field = catalog.value.filter_fields[0]?.key ?? 'pct_chg'): ScreenerCondition {
+  const meta = fieldOf(field)
+  return {
+    id: nextId('condition'),
+    field,
+    operator: defaultOperator(meta),
+    value: meta?.data_type === 'boolean' ? true : '',
+    enabled: true,
+  }
+}
+
+function newGroup(): ScreenerGroup {
+  return {
+    id: nextId('group'),
+    logic: 'and',
+    conditions: [newCondition()],
+  }
+}
+
+function resetBuilder() {
+  groups.value = [newGroup()]
+  rootLogic.value = 'and'
+}
+
+function addGroup() {
+  groups.value.push(newGroup())
+}
+
+function removeGroup(index: number) {
+  groups.value.splice(index, 1)
+  if (!groups.value.length) groups.value.push(newGroup())
+}
+
+function addCondition(group: ScreenerGroup) {
+  group.conditions.push(newCondition())
+}
+
+function removeCondition(group: ScreenerGroup, index: number) {
+  group.conditions.splice(index, 1)
+  if (!group.conditions.length) group.conditions.push(newCondition())
+}
+
+function updateField(condition: ScreenerCondition) {
+  const meta = fieldOf(condition.field)
+  condition.operator = defaultOperator(meta)
+  condition.value = meta?.data_type === 'boolean' ? true : ''
+  condition.value2 = ''
+}
+
+function operatorsOf(condition: ScreenerCondition): string[] {
+  return fieldOf(condition.field)?.operators ?? ['gte', 'lte', 'eq']
+}
+
+function scaleValue(value: string | number | boolean | null | undefined, meta: CatalogEntry | undefined) {
+  if (meta?.data_type === 'boolean') return value === true || value === 'true'
+  if (meta?.data_type === 'number' || meta?.data_type === 'integer') {
+    const parsed = Number(value)
+    return Number.isNaN(parsed) ? value ?? null : parsed * (meta.input_scale ?? 1)
+  }
+  return value ?? null
+}
+
+function buildRequest(): StructuredScreenerRequest {
+  return {
+    logic: rootLogic.value,
+    universe: universe.value,
+    limit: 300,
+    groups: groups.value.map((group) => ({
+      id: group.id,
+      logic: group.logic,
+      conditions: group.conditions.map((condition) => {
+        const meta = fieldOf(condition.field)
+        return {
+          ...condition,
+          value: scaleValue(condition.value, meta),
+          value2: scaleValue(condition.value2, meta) as string | number | null,
+        }
+      }),
+    })),
+  }
+}
+
+function validate(): string {
+  if (!activeConditions.value.length) return '请至少启用一个筛选条件'
+  for (const condition of activeConditions.value) {
+    if (condition.operator === 'is_null' || condition.operator === 'not_null') continue
+    if (condition.value === '' || condition.value === null) return `请填写“${fieldOf(condition.field)?.name ?? condition.field}”的条件值`
+    if (condition.operator === 'between' && (condition.value2 === '' || condition.value2 === null || condition.value2 === undefined)) {
+      return `请填写“${fieldOf(condition.field)?.name ?? condition.field}”的区间上限`
+    }
+  }
+  return ''
 }
 
 async function search() {
+  const validation = validate()
+  if (validation) {
+    error.value = validation
+    return
+  }
   loading.value = true
   error.value = ''
   searched.value = true
   try {
-    const chgMin = num(form.value.chgMin)
-    const chgMax = num(form.value.chgMax)
-    const highDistMax = num(form.value.highDistMax)
-    const amountYi = num(form.value.amountMinYi)
-    const r = await api.screener({
-      pct_chg_min: chgMin !== undefined ? chgMin / 100 : undefined,
-      pct_chg_max: chgMax !== undefined ? chgMax / 100 : undefined,
-      vol_ratio_min: num(form.value.volRatioMin),
-      ma_bull: form.value.maBull || undefined,
-      high_window: num(form.value.nearHighDays),
-      high_dist_max: highDistMax !== undefined ? highDistMax / 100 : undefined,
-      amount_min: amountYi !== undefined ? amountYi * 1e8 : undefined,
-    })
-    items.value = r.items ?? []
-    total.value = r.total ?? r.count ?? items.value.length
-    resultDate.value = r.date ?? ''
-  } catch (e) {
+    const result = await api.structuredScreener(buildRequest())
+    items.value = result.items ?? []
+    combinedCount.value = result.combined_count ?? result.count ?? result.total ?? items.value.length
+    candidateCount.value = result.candidate_count ?? 0
+    if (result.independent_counts) conditionCounts.value = result.independent_counts
+    else if (Array.isArray(result.condition_counts)) {
+      conditionCounts.value = Object.fromEntries(result.condition_counts.map((entry) => [entry.id, entry.matched]))
+    } else conditionCounts.value = result.condition_counts ?? {}
+    fieldCoverage.value = result.field_coverage ?? {}
+    resultDate.value = result.date ?? ''
+    valuationMaxAgeDays.value = result.data_policy?.valuation_max_age_days ?? 7
+  } catch (caught) {
     items.value = []
-    total.value = 0
-    error.value = (e as Error).message
+    combinedCount.value = 0
+    candidateCount.value = 0
+    conditionCounts.value = {}
+    fieldCoverage.value = {}
+    error.value = (caught as Error).message
   } finally {
     loading.value = false
   }
 }
+
+function applyPreset(preset: typeof presets[number]) {
+  groups.value = [{
+    id: nextId('group'),
+    logic: 'and',
+    conditions: preset.conditions.map(([field, operator, value, value2]) => ({
+      id: nextId('condition'),
+      field,
+      operator,
+      value,
+      value2: value2 ?? '',
+      enabled: true,
+    })),
+  }]
+  rootLogic.value = 'and'
+  error.value = ''
+}
+
+function readSchemes(): SavedScheme[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
+function cloneGroups(value: ScreenerGroup[]): ScreenerGroup[] {
+  return JSON.parse(JSON.stringify(value)) as ScreenerGroup[]
+}
+
+function saveScheme() {
+  const name = schemeName.value.trim()
+  if (!name) {
+    error.value = '请先填写方案名称'
+    return
+  }
+  const scheme: SavedScheme = { name, logic: rootLogic.value, universe: universe.value, groups: cloneGroups(groups.value) }
+  const index = savedSchemes.value.findIndex((item) => item.name === name)
+  if (index >= 0) savedSchemes.value.splice(index, 1, scheme)
+  else savedSchemes.value.push(scheme)
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedSchemes.value))
+  selectedScheme.value = name
+  error.value = ''
+}
+
+function loadScheme() {
+  const scheme = savedSchemes.value.find((item) => item.name === selectedScheme.value)
+  if (!scheme) return
+  groups.value = cloneGroups(scheme.groups)
+  rootLogic.value = scheme.logic
+  universe.value = scheme.universe ?? 'pool'
+  schemeName.value = scheme.name
+  error.value = ''
+}
+
+function deleteScheme() {
+  if (!selectedScheme.value) return
+  savedSchemes.value = savedSchemes.value.filter((item) => item.name !== selectedScheme.value)
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedSchemes.value))
+  selectedScheme.value = ''
+  schemeName.value = ''
+}
+
+function conditionSummary(condition: ScreenerCondition): string {
+  const meta = fieldOf(condition.field)
+  if (condition.operator === 'is_null' || condition.operator === 'not_null') {
+    return `${meta?.name ?? condition.field} ${operatorLabels[condition.operator] ?? condition.operator}`
+  }
+  const unit = meta?.unit ? ` ${meta.unit}` : ''
+  const value = condition.value
+  const range = condition.operator === 'between' ? ` ${value}${unit} 到 ${condition.value2}${unit}` : ` ${String(value)}${unit}`
+  return `${meta?.name ?? condition.field} ${operatorLabels[condition.operator] ?? condition.operator}${range}`
+}
+
+function countFor(condition: ScreenerCondition): number | undefined {
+  const count = conditionCounts.value[condition.id] ?? conditionCounts.value[condition.field]
+  return typeof count === 'number' ? count : undefined
+}
+
+function coverageFor(condition: ScreenerCondition): number | undefined {
+  const coverage = fieldCoverage.value[condition.field]
+  return typeof coverage === 'number' ? coverage : undefined
+}
+
+function valueOf(item: ScreenerItem, field: string): unknown {
+  return item.values?.[field] ?? item[field]
+}
+
+function numericValue(item: ScreenerItem, field: string): number | undefined {
+  const value = valueOf(item, field)
+  return typeof value === 'number' ? value : undefined
+}
+
+function formatFieldValue(item: ScreenerItem, field: string): string {
+  const value = valueOf(item, field)
+  if (value === null || value === undefined || value === '') return '--'
+  const meta = fieldOf(field)
+  if (meta?.data_type === 'boolean') return value ? '是' : '否'
+  if (typeof value !== 'number') return String(value)
+  if (meta?.input_scale === 0.01) return fmtPct(value)
+  if (meta?.input_scale === 100000000) return fmtBigAmount(value)
+  if (meta?.unit === '倍') return value.toFixed(2)
+  return Number.isInteger(value) ? String(value) : value.toFixed(2)
+}
+
+function reasonActual(reason: ScreenerMatchReason): string {
+  const meta = fieldOf(reason.field)
+  const value = reason.actual
+  if (value === null || value === undefined) return '暂无数据'
+  if (meta?.data_type === 'boolean') return value ? '是' : '否'
+  if (typeof value !== 'number') return String(value)
+  if (meta?.input_scale === 0.01) return fmtPct(value)
+  if (meta?.input_scale === 100000000) return fmtBigAmount(value)
+  return Number.isInteger(value) ? String(value) : value.toFixed(2)
+}
+
+function matchReasons(item: ScreenerItem): string[] {
+  if (item.match_reasons?.length) {
+    return item.match_reasons
+      .filter((reason) => typeof reason === 'string' || reason.matched)
+      .map((reason) => typeof reason === 'string' ? reason : `${reason.field_name ?? fieldOf(reason.field)?.name ?? reason.field}：${reasonActual(reason)}`)
+  }
+  const matches = item.matched_conditions ?? []
+  return matches.map((match) => {
+    const condition = activeConditions.value.find((itemCondition) => itemCondition.id === match || itemCondition.field === match)
+    return condition ? conditionSummary(condition) : match
+  })
+}
+
+function dataBasis(item: ScreenerItem): string {
+  const parts: string[] = []
+  const valuationDate = item.values?.valuation_data_date
+  const reportPeriod = item.values?.report_period
+  if (valuationDate) parts.push(`估值 ${valuationDate}`)
+  if (reportPeriod) parts.push(`财报期 ${reportPeriod}`)
+  return parts.join(' · ')
+}
+
+function stockName(item: ScreenerItem): string {
+  return item.name || '名称待同步'
+}
+
+onMounted(async () => {
+  await loadCatalog()
+  resetBuilder()
+})
 </script>
 
 <template>
-  <div class="space-y-4">
-    <h2 class="text-lg font-semibold">条件筛选</h2>
+  <div class="space-y-5">
+    <section aria-labelledby="preset-heading">
+      <div class="flex flex-wrap items-end justify-between gap-3">
+        <label class="text-sm">
+          <span class="mb-1 block text-xs text-text-tertiary">研究范围</span>
+          <select v-model="universe" class="rounded-md border border-border px-2.5 py-1.5 text-sm">
+            <option v-for="option in universeOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
+        </label>
+        <div class="flex flex-wrap items-center gap-2">
+        <h2 id="preset-heading" class="mr-1 text-sm font-medium">快速方案</h2>
+        <button
+          v-for="preset in presets"
+          :key="preset.name"
+          type="button"
+          class="rounded-md border border-border bg-surface-raised px-2.5 py-1.5 text-xs text-text-secondary hover:border-accent hover:text-text-primary"
+          @click="applyPreset(preset)"
+        >
+          {{ preset.name }}
+        </button>
+        </div>
+      </div>
+    </section>
 
-    <form class="flex flex-wrap items-end gap-3 rounded-lg border border-border bg-surface-raised p-4" @submit.prevent="search">
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">涨跌幅下限 %</span>
-        <input v-model="form.chgMin" type="number" step="0.1" placeholder="-10" class="w-24 rounded-md border border-border px-2 py-1.5" />
-      </label>
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">涨跌幅上限 %</span>
-        <input v-model="form.chgMax" type="number" step="0.1" placeholder="10" class="w-24 rounded-md border border-border px-2 py-1.5" />
-      </label>
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">量比下限</span>
-        <input v-model="form.volRatioMin" type="number" step="0.1" min="0" placeholder="1.5" class="w-24 rounded-md border border-border px-2 py-1.5" />
-      </label>
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">N 日内接近新高</span>
-        <input v-model="form.nearHighDays" type="number" min="1" placeholder="60" class="w-28 rounded-md border border-border px-2 py-1.5" />
-      </label>
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">距新高幅度上限 %</span>
-        <input v-model="form.highDistMax" type="number" step="0.1" min="0" placeholder="5" class="w-28 rounded-md border border-border px-2 py-1.5" />
-      </label>
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">20日日均成交额下限(亿)</span>
-        <input v-model="form.amountMinYi" type="number" step="0.1" min="0" placeholder="1" class="w-36 rounded-md border border-border px-2 py-1.5" />
-      </label>
-      <label class="flex items-center gap-1.5 pb-1.5 text-sm text-text-secondary">
-        <input v-model="form.maBull" type="checkbox" class="accent-accent" />
-        均线多头
-      </label>
-      <button type="submit" :disabled="loading" class="rounded-md bg-accent px-4 py-1.5 text-sm text-white hover:bg-accent-hover disabled:opacity-50">
-        {{ loading ? '筛选中…' : '筛选' }}
-      </button>
-    </form>
+    <section class="rounded-md border border-border bg-surface-raised" aria-labelledby="builder-heading">
+      <div class="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
+        <div>
+          <h2 id="builder-heading" class="text-sm font-semibold">筛选条件</h2>
+          <p class="mt-0.5 text-xs text-text-tertiary">停用的条件不会参与计算，其他条件保持不变。</p>
+        </div>
+        <div v-if="groups.length > 1" class="flex items-center gap-2 text-xs">
+          <span class="text-text-tertiary">组与组之间</span>
+          <div class="flex rounded-md border border-border p-0.5">
+            <button type="button" class="rounded px-2 py-1" :class="rootLogic === 'and' ? 'bg-active font-medium text-accent' : 'text-text-secondary'" @click="rootLogic = 'and'">全部满足</button>
+            <button type="button" class="rounded px-2 py-1" :class="rootLogic === 'or' ? 'bg-active font-medium text-accent' : 'text-text-secondary'" @click="rootLogic = 'or'">任意满足</button>
+          </div>
+        </div>
+      </div>
 
-    <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
+      <div class="divide-y divide-border">
+        <div v-for="(group, groupIndex) in groups" :key="group.id" class="px-4 py-4">
+          <div class="mb-3 flex flex-wrap items-center gap-3">
+            <span class="text-xs font-semibold text-text-secondary">条件组 {{ groupIndex + 1 }}</span>
+            <div class="flex rounded-md border border-border p-0.5 text-xs">
+              <button type="button" class="rounded px-2 py-1" :class="group.logic === 'and' ? 'bg-active font-medium text-accent' : 'text-text-secondary'" @click="group.logic = 'and'">全部满足</button>
+              <button type="button" class="rounded px-2 py-1" :class="group.logic === 'or' ? 'bg-active font-medium text-accent' : 'text-text-secondary'" @click="group.logic = 'or'">任意满足</button>
+            </div>
+            <button
+              v-if="groups.length > 1"
+              type="button"
+              class="icon-button ml-auto !h-7 !w-7"
+              title="删除条件组"
+              @click="removeGroup(groupIndex)"
+            >
+              <Trash2 :size="15" />
+              <span class="sr-only">删除条件组</span>
+            </button>
+          </div>
 
-    <template v-if="searched && !loading && !error">
-      <p class="text-sm text-text-secondary">
-        共 <span class="font-medium text-text-primary">{{ total }}</span> 只
-        <span v-if="resultDate" class="text-text-tertiary">(数据日期 {{ resultDate }})</span>
-      </p>
+          <div class="space-y-2">
+            <div
+              v-for="(condition, conditionIndex) in group.conditions"
+              :key="condition.id"
+              class="grid items-center gap-2 rounded-md bg-surface-muted px-3 py-2 sm:grid-cols-[auto_minmax(150px,1.4fr)_minmax(110px,0.8fr)_minmax(130px,1fr)_auto]"
+              :class="condition.enabled ? '' : 'opacity-55'"
+            >
+              <label class="flex items-center" title="启用或停用此条件">
+                <input v-model="condition.enabled" type="checkbox" class="h-4 w-4 accent-accent" />
+                <span class="sr-only">启用条件</span>
+              </label>
 
-      <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
-        <table class="w-full text-sm">
+              <label>
+                <span class="sr-only">筛选字段</span>
+                <select v-model="condition.field" class="w-full rounded-md border border-border px-2 py-1.5 text-sm" @change="updateField(condition)">
+                  <optgroup v-for="category in groupedFields" :key="category.key" :label="category.name">
+                    <option v-for="field in category.fields" :key="field.key" :value="field.key" :disabled="field.available === false">
+                      {{ field.name }}{{ field.available === false ? '（数据待接入）' : '' }}
+                    </option>
+                  </optgroup>
+                </select>
+              </label>
+
+              <label>
+                <span class="sr-only">判断关系</span>
+                <select v-model="condition.operator" class="w-full rounded-md border border-border px-2 py-1.5 text-sm">
+                  <option v-for="operator in operatorsOf(condition)" :key="operator" :value="operator">{{ operatorLabels[operator] ?? operator }}</option>
+                </select>
+              </label>
+
+              <div class="flex items-center gap-1.5">
+                <span v-if="condition.operator === 'is_null' || condition.operator === 'not_null'" class="text-xs text-text-tertiary">无需填写数值</span>
+                <template v-else-if="fieldOf(condition.field)?.data_type === 'boolean'">
+                  <label class="w-full">
+                    <span class="sr-only">条件值</span>
+                    <select v-model="condition.value" class="w-full rounded-md border border-border px-2 py-1.5 text-sm">
+                      <option :value="true">是</option>
+                      <option :value="false">否</option>
+                    </select>
+                  </label>
+                </template>
+                <template v-else>
+                  <label class="min-w-0 flex-1">
+                    <span class="sr-only">条件值</span>
+                    <input
+                      v-model="condition.value"
+                      :type="['number', 'integer'].includes(fieldOf(condition.field)?.data_type ?? '') ? 'number' : 'text'"
+                      step="any"
+                      class="w-full rounded-md border border-border px-2 py-1.5 text-sm"
+                      :placeholder="fieldOf(condition.field)?.unit ? `数值（${fieldOf(condition.field)?.unit}）` : '数值'"
+                    />
+                  </label>
+                  <template v-if="condition.operator === 'between'">
+                    <span class="text-xs text-text-tertiary">到</span>
+                    <label class="min-w-0 flex-1">
+                      <span class="sr-only">区间上限</span>
+                      <input v-model="condition.value2" type="number" step="any" class="w-full rounded-md border border-border px-2 py-1.5 text-sm" placeholder="上限" />
+                    </label>
+                  </template>
+                </template>
+              </div>
+
+              <div class="flex items-center justify-end gap-2">
+                <span v-if="countFor(condition) !== undefined || coverageFor(condition) !== undefined" class="whitespace-nowrap text-right text-[11px] leading-4 text-text-tertiary">
+                  <span v-if="countFor(condition) !== undefined" class="block">单独命中 {{ countFor(condition) }} 只</span>
+                  <span v-if="coverageFor(condition) !== undefined" class="block">数据覆盖 {{ coverageFor(condition) }} / {{ candidateCount }}</span>
+                </span>
+                <button type="button" class="icon-button !h-7 !w-7" title="删除条件" @click="removeCondition(group, conditionIndex)">
+                  <Trash2 :size="14" />
+                  <span class="sr-only">删除条件</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <button type="button" class="mt-3 inline-flex items-center gap-1 text-xs text-accent hover:underline" @click="addCondition(group)">
+            <Plus :size="14" /> 添加条件
+          </button>
+        </div>
+      </div>
+
+      <div class="flex flex-wrap items-end justify-between gap-3 border-t border-border px-4 py-3">
+        <button type="button" class="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs text-text-secondary hover:bg-hover" @click="addGroup">
+          <Plus :size="14" /> 添加条件组
+        </button>
+        <div class="flex flex-wrap items-end gap-2">
+          <label>
+            <span class="mb-1 block text-[11px] text-text-tertiary">方案名称</span>
+            <input v-model="schemeName" class="w-32 rounded-md border border-border px-2 py-1.5 text-xs" placeholder="例如：我的低估值" />
+          </label>
+          <button type="button" class="icon-button border border-border" title="保存筛选方案" @click="saveScheme">
+            <Save :size="15" />
+            <span class="sr-only">保存筛选方案</span>
+          </button>
+          <template v-if="savedSchemes.length">
+            <label>
+              <span class="mb-1 block text-[11px] text-text-tertiary">已保存方案</span>
+              <select v-model="selectedScheme" class="w-36 rounded-md border border-border px-2 py-1.5 text-xs">
+                <option value="">选择方案</option>
+                <option v-for="scheme in savedSchemes" :key="scheme.name" :value="scheme.name">{{ scheme.name }}</option>
+              </select>
+            </label>
+            <button type="button" :disabled="!selectedScheme" class="icon-button border border-border disabled:opacity-40" title="载入筛选方案" @click="loadScheme">
+              <FolderOpen :size="15" />
+              <span class="sr-only">载入筛选方案</span>
+            </button>
+            <button type="button" :disabled="!selectedScheme" class="icon-button border border-border disabled:opacity-40" title="删除筛选方案" @click="deleteScheme">
+              <Trash2 :size="15" />
+              <span class="sr-only">删除筛选方案</span>
+            </button>
+          </template>
+          <button type="button" :disabled="loading" class="inline-flex h-9 items-center gap-1.5 rounded-md bg-accent px-4 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-50" @click="search">
+            <Search :size="16" /> {{ loading ? '筛选中' : '开始筛选' }}
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <p v-if="error" role="alert" class="rounded-md border border-up/30 bg-danger-soft px-4 py-2 text-sm text-up">{{ error }}</p>
+    <LoadingRows v-if="loading" :rows="5" />
+
+    <section v-else-if="searched && !error" aria-labelledby="result-heading">
+      <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+        <h2 id="result-heading" class="text-sm font-semibold">
+          组合命中 <span class="text-base text-accent">{{ combinedCount }}</span> 只
+          <span v-if="candidateCount" class="ml-1 font-normal text-text-tertiary">（研究范围 {{ candidateCount }} 只）</span>
+        </h2>
+        <span v-if="resultDate" class="text-xs text-text-tertiary">数据日期 {{ resultDate }}</span>
+      </div>
+
+      <div v-if="partialDataFields.length" class="mb-3 rounded-md border border-warning/30 bg-warning-soft px-3 py-2 text-xs leading-5 text-warning">
+        {{ partialDataFields.join('、') }} 尚未覆盖全部研究范围。缺少数据的股票不会命中对应条件<template v-if="usesValuation">；估值超过 {{ valuationMaxAgeDays }} 天也按缺少数据处理</template>。
+      </div>
+
+      <div v-if="items.length" class="overflow-x-auto rounded-md border border-border bg-surface-raised">
+        <table class="w-full min-w-[760px] text-sm">
           <thead>
             <tr class="border-b border-border text-left text-xs text-text-tertiary">
-              <th class="px-4 py-2 font-medium">代码</th>
-              <th class="px-4 py-2 font-medium">名称</th>
-              <th class="px-4 py-2 text-right font-medium">现价</th>
-              <th class="px-4 py-2 text-right font-medium">涨跌幅</th>
-              <th class="px-4 py-2 text-right font-medium">量比</th>
-              <th class="px-4 py-2 text-right font-medium">20日动量</th>
-              <th class="px-4 py-2 text-right font-medium">20日日均成交额</th>
+              <th class="px-4 py-2.5 font-medium">股票</th>
+              <th class="px-4 py-2.5 font-medium">行业</th>
+              <th class="px-4 py-2.5 text-right font-medium">最新价</th>
+              <th v-for="field in resultFields" :key="field" class="px-4 py-2.5 text-right font-medium">
+                {{ fieldOf(field)?.name ?? field }}
+              </th>
+              <th class="px-4 py-2.5 font-medium">命中原因</th>
             </tr>
           </thead>
           <tbody>
-            <tr
-              v-for="it in items"
-              :key="it.code"
-              class="border-b border-border-subtle last:border-0 hover:bg-hover"
-            >
-              <td class="px-4 py-2">
-                <router-link :to="`/stock/${it.code}`" class="text-accent hover:underline">
-                  {{ it.code }}
-                </router-link>
+            <tr v-for="item in items" :key="item.code" class="border-b border-border-subtle last:border-0 hover:bg-hover">
+              <td class="px-4 py-3">
+                <router-link :to="`/stock/${item.code}`" class="font-medium text-text-primary hover:text-accent">{{ stockName(item) }}</router-link>
+                <div class="mt-0.5 text-xs text-text-tertiary">{{ item.code }}</div>
               </td>
-              <td class="px-4 py-2">{{ it.name }}</td>
-              <td class="px-4 py-2 text-right">{{ fmtPrice(it.close) }}</td>
-              <td class="px-4 py-2 text-right" :class="pnlClass(chgPct(it))">{{ fmtPct(chgPct(it)) }}</td>
-              <td class="px-4 py-2 text-right">{{ it.vol_ratio5?.toFixed(2) ?? '--' }}</td>
-              <td class="px-4 py-2 text-right" :class="pnlClass(it.mom20)">{{ fmtPct(it.mom20) }}</td>
-              <td class="px-4 py-2 text-right">{{ fmtBigAmount(it.amount_avg20) }}</td>
+              <td class="px-4 py-3 text-text-secondary">{{ item.industry || '--' }}</td>
+              <td class="px-4 py-3 text-right" :class="pnlClass(numericValue(item, 'pct_chg'))">{{ fmtPrice(numericValue(item, 'close')) }}</td>
+              <td v-for="field in resultFields" :key="field" class="px-4 py-3 text-right tabular-nums">{{ formatFieldValue(item, field) }}</td>
+              <td class="max-w-sm px-4 py-3">
+                <div class="flex flex-wrap gap-1.5">
+                  <span v-for="reason in matchReasons(item)" :key="reason" class="rounded bg-info-soft px-1.5 py-0.5 text-xs text-text-secondary">{{ reason }}</span>
+                  <span v-if="!matchReasons(item).length" class="text-xs text-text-tertiary">符合当前组合</span>
+                </div>
+                <div v-if="dataBasis(item)" class="mt-1.5 text-[11px] text-text-tertiary">{{ dataBasis(item) }}</div>
+              </td>
             </tr>
           </tbody>
         </table>
-        <p v-if="!items.length" class="px-4 py-6 text-center text-sm text-text-tertiary">无匹配结果,试试放宽条件</p>
       </div>
-    </template>
 
-    <p v-else-if="!searched" class="text-sm text-text-tertiary">设置条件后点击"筛选"查询</p>
+      <div v-else class="rounded-md border border-dashed border-border px-5 py-10 text-center">
+        <template v-if="missingDataFields.length">
+          <p class="text-sm font-medium">所选指标尚无已同步数据</p>
+          <p class="mt-1 text-xs text-text-tertiary">{{ missingDataFields.join('、') }} 的数据覆盖为 0，请先确认数据同步状态。</p>
+        </template>
+        <template v-else>
+          <p class="text-sm font-medium">当前组合没有匹配股票</p>
+          <p class="mt-1 text-xs text-text-tertiary">可停用限制较强的条件，或改为“任意满足”。</p>
+        </template>
+      </div>
+    </section>
+
+    <div v-else-if="!searched" class="rounded-md border border-dashed border-border px-5 py-8 text-center text-sm text-text-tertiary">
+      设置并启用条件后开始筛选，结果会显示每条条件的作用。
+    </div>
   </div>
 </template>

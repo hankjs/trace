@@ -7,15 +7,31 @@ import './style.css'
 const router = createRouter({
   history: createWebHistory(),
   routes: [
-    { path: '/login', component: () => import('./views/Login.vue'), meta: { public: true } },
-    { path: '/', component: () => import('./views/Dashboard.vue') },
-    { path: '/stock/:code', component: () => import('./views/StockDetail.vue') },
-    { path: '/picks', component: () => import('./views/Picks.vue') },
-    { path: '/screener', component: () => import('./views/Screener.vue') },
-    { path: '/signals', component: () => import('./views/Signals.vue') },
-    { path: '/portfolio', component: () => import('./views/Portfolio.vue') },
-    { path: '/backtest', component: () => import('./views/Backtest.vue') },
-    { path: '/leaderboard', component: () => import('./views/Leaderboard.vue') },
+    { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { public: true } },
+    { path: '/', name: 'dashboard', component: () => import('./views/Dashboard.vue') },
+    { path: '/stock/:code', name: 'stock', component: () => import('./views/StockDetail.vue') },
+    { path: '/selection', name: 'selection', component: () => import('./views/SelectionWorkspace.vue') },
+    { path: '/signals', name: 'signals', component: () => import('./views/Signals.vue') },
+    { path: '/strategies', name: 'strategies', component: () => import('./views/StrategyWorkspace.vue') },
+    { path: '/portfolio', name: 'portfolio', component: () => import('./views/Portfolio.vue') },
+    { path: '/catalog', name: 'catalog', component: () => import('./views/Catalog.vue') },
+    {
+      path: '/picks',
+      redirect: (to) => ({ name: 'selection', query: { ...to.query, tab: 'picks' } }),
+    },
+    {
+      path: '/screener',
+      redirect: (to) => ({ name: 'selection', query: { ...to.query, tab: 'screener' } }),
+    },
+    {
+      path: '/backtest',
+      redirect: (to) => ({ name: 'strategies', query: { ...to.query, tab: 'backtest' } }),
+    },
+    {
+      path: '/leaderboard',
+      redirect: (to) => ({ name: 'strategies', query: { ...to.query, tab: 'leaderboard' } }),
+    },
+    { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })
 

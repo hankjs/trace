@@ -31,7 +31,8 @@ async function submit() {
 <template>
   <div class="flex min-h-[60vh] items-center justify-center">
     <form class="w-80 rounded-lg border border-border bg-surface-raised p-6" @submit.prevent="submit">
-      <h1 class="mb-6 text-center text-lg font-semibold">quant 量化看板</h1>
+      <h1 class="mb-1 text-center text-lg font-semibold text-accent">quant</h1>
+      <p class="mb-6 text-center text-sm text-text-secondary">量化研究决策工作台</p>
       <label class="mb-1 block text-sm text-text-secondary">用户名</label>
       <input
         v-model="username"
@@ -50,7 +51,7 @@ async function submit() {
       <button
         type="submit"
         :disabled="loading"
-        class="w-full rounded-md bg-accent px-4 py-1.5 text-sm text-white hover:bg-accent-hover disabled:opacity-50"
+        class="w-full rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
       >
         {{ loading ? '登录中…' : '登录' }}
       </button>

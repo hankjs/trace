@@ -35,10 +35,10 @@ def code_to_symbol(code: str) -> str:
 
 def symbol_to_code(symbol: str) -> str:
     """600519 -> sh.600519 / 000001 -> sz.000001"""
+    if symbol.startswith(("4", "8", "92")):
+        return f"bj.{symbol}"
     if symbol.startswith(("6", "9")):
         return f"sh.{symbol}"
-    if symbol.startswith(("4", "8")):
-        return f"bj.{symbol}"
     return f"sz.{symbol}"
 
 

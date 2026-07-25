@@ -5,9 +5,12 @@ from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from ..catalog import manual_trade_side_name
 from ..db import get_db
+from ..models import Stock
 from ..portfolio import positions as pos_svc
 from ..portfolio import trades as trade_svc
 
@@ -24,23 +27,51 @@ class TradeIn(BaseModel):
     note: str = ""
 
 
-def _trade_out(t) -> dict:
-    return {"id": t.id, "code": t.code, "trade_date": str(t.trade_date),
-            "side": t.side, "price": t.price, "qty": t.qty,
-            "fee": t.fee, "note": t.note}
+def _stock_map(db: Session, codes: list[str]) -> dict[str, Stock]:
+    if not codes:
+        return {}
+    unique_codes = list(dict.fromkeys(codes))
+    rows = db.execute(select(Stock).where(Stock.code.in_(unique_codes))).scalars().all()
+    return {row.code: row for row in rows}
+
+
+def _trade_out(t, stock: Stock | None = None) -> dict:
+    return {
+        "id": t.id,
+        "code": t.code,
+        "name": stock.name if stock else "",
+        "industry": stock.industry if stock else "",
+        "trade_date": str(t.trade_date),
+        "side": t.side,
+        "side_name": manual_trade_side_name(t.side),
+        "price": t.price,
+        "qty": t.qty,
+        "fee": t.fee,
+        "note": t.note,
+    }
 
 
 @router.get("/trades")
 def list_trades(code: str | None = None, db: Session = Depends(get_db)):
     rows = trade_svc.list_trades(db, code)
-    return {"count": len(rows), "items": [_trade_out(t) for t in rows]}
+    stocks = _stock_map(db, [t.code for t in rows])
+    return {
+        "count": len(rows),
+        "items": [_trade_out(t, stocks.get(t.code)) for t in rows],
+    }
 
 
 @router.post("/trades", status_code=201)
 def add_trade(body: TradeIn, db: Session = Depends(get_db)):
-    t = trade_svc.add_trade(db, body.code.lower(), body.trade_date, body.side,
+    code = body.code.strip().lower()
+    stock = db.get(Stock, code)
+    if stock is None:
+        raise HTTPException(
+            422, f"股票代码 {code or '（空）'} 不存在，请先从股票搜索结果中选择",
+        )
+    t = trade_svc.add_trade(db, code, body.trade_date, body.side,
                             body.price, body.qty, body.fee, body.note)
-    return _trade_out(t)
+    return _trade_out(t, stock)
 
 
 @router.delete("/trades/{trade_id}")
@@ -53,4 +84,10 @@ def delete_trade(trade_id: int, db: Session = Depends(get_db)):
 @router.get("/positions")
 def get_positions(db: Session = Depends(get_db)):
     """持仓:均价法成本 + 最新价浮动盈亏 + 汇总"""
-    return pos_svc.portfolio_summary(db)
+    summary = pos_svc.portfolio_summary(db)
+    stocks = _stock_map(db, [item["code"] for item in summary["positions"]])
+    for item in summary["positions"]:
+        stock = stocks.get(item["code"])
+        item["name"] = stock.name if stock else ""
+        item["industry"] = stock.industry if stock else ""
+    return summary

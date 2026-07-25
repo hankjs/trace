@@ -144,6 +144,56 @@ class FactorDaily(Base):
     amount_avg20: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
+class ValuationSnapshot(Base):
+    """每日估值快照。available_date 防止历史研究读取未来数据。"""
+
+    __tablename__ = "quant_valuation_snapshot"
+    __table_args__ = (
+        UniqueConstraint(
+            "code", "data_date", "available_date",
+            name="uq_valuation_code_date_available",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(16), index=True)
+    data_date: Mapped[date] = mapped_column(Date, index=True)
+    report_period: Mapped[date | None] = mapped_column(Date, nullable=True)
+    available_date: Mapped[date] = mapped_column(Date, index=True)
+    source: Mapped[str] = mapped_column(String(96))
+    pe_ttm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pb: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ps_ttm: Mapped[float | None] = mapped_column(Float, nullable=True)
+    dividend_yield: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_market_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class FundamentalSnapshot(Base):
+    """财务报告版本。修订值仅从其 available_date 起参与研究。"""
+
+    __tablename__ = "quant_fundamental_snapshot"
+    __table_args__ = (
+        UniqueConstraint(
+            "code", "report_period", "available_date",
+            name="uq_fundamental_code_period_available",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    code: Mapped[str] = mapped_column(String(16), index=True)
+    data_date: Mapped[date] = mapped_column(Date, index=True)
+    report_period: Mapped[date] = mapped_column(Date, index=True)
+    available_date: Mapped[date] = mapped_column(Date, index=True)
+    source: Mapped[str] = mapped_column(String(96))
+    roe: Mapped[float | None] = mapped_column(Float, nullable=True)
+    revenue_yoy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    profit_yoy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    gross_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    net_margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    debt_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+    cashflow_ratio: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 class Pick(Base):
     """每日选股池(Top N)。factors 为当日因子快照 JSON。"""
 

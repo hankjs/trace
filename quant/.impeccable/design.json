@@ -1,0 +1,224 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-07-24T19:25:51Z",
+  "title": "Design System: quant 量化研究决策工作台",
+  "extensions": {
+    "colorMeta": {
+      "research-cyan": {
+        "role": "primary",
+        "displayName": "研究青",
+        "canonical": "oklch(0.48 0.105 210)",
+        "tonalRamp": ["oklch(0.15 0.045 210)", "oklch(0.27 0.075 210)", "oklch(0.39 0.1 210)", "oklch(0.48 0.105 210)", "oklch(0.6 0.09 210)", "oklch(0.72 0.07 210)", "oklch(0.84 0.045 210)", "oklch(0.95 0.018 210)"]
+      },
+      "research-cyan-deep": {
+        "role": "primary",
+        "displayName": "深研究青",
+        "canonical": "oklch(0.41 0.11 210)",
+        "tonalRamp": ["oklch(0.15 0.05 210)", "oklch(0.25 0.08 210)", "oklch(0.35 0.105 210)", "oklch(0.41 0.11 210)", "oklch(0.55 0.095 210)", "oklch(0.69 0.07 210)", "oklch(0.83 0.045 210)", "oklch(0.95 0.018 210)"]
+      },
+      "paper-cool": {
+        "role": "neutral",
+        "displayName": "冷纸底",
+        "canonical": "oklch(0.978 0.005 228)",
+        "tonalRamp": ["oklch(0.15 0.008 228)", "oklch(0.27 0.008 228)", "oklch(0.39 0.008 228)", "oklch(0.52 0.007 228)", "oklch(0.65 0.007 228)", "oklch(0.77 0.006 228)", "oklch(0.88 0.006 228)", "oklch(0.978 0.005 228)"]
+      },
+      "paper-raised": {
+        "role": "neutral",
+        "displayName": "抬升纸面",
+        "canonical": "oklch(0.995 0.003 228)",
+        "tonalRamp": ["oklch(0.15 0.006 228)", "oklch(0.27 0.006 228)", "oklch(0.39 0.006 228)", "oklch(0.52 0.005 228)", "oklch(0.65 0.005 228)", "oklch(0.77 0.004 228)", "oklch(0.89 0.004 228)", "oklch(0.995 0.003 228)"]
+      },
+      "paper-muted": {
+        "role": "neutral",
+        "displayName": "静音纸面",
+        "canonical": "oklch(0.956 0.006 228)",
+        "tonalRamp": ["oklch(0.15 0.009 228)", "oklch(0.27 0.009 228)", "oklch(0.39 0.009 228)", "oklch(0.52 0.008 228)", "oklch(0.65 0.008 228)", "oklch(0.77 0.007 228)", "oklch(0.88 0.007 228)", "oklch(0.956 0.006 228)"]
+      },
+      "ink-primary": {
+        "role": "neutral",
+        "displayName": "主墨色",
+        "canonical": "oklch(0.23 0.018 228)",
+        "tonalRamp": ["oklch(0.15 0.015 228)", "oklch(0.23 0.018 228)", "oklch(0.35 0.017 228)", "oklch(0.48 0.015 228)", "oklch(0.61 0.013 228)", "oklch(0.73 0.011 228)", "oklch(0.84 0.009 228)", "oklch(0.95 0.006 228)"]
+      },
+      "ink-secondary": {
+        "role": "neutral",
+        "displayName": "次墨色",
+        "canonical": "oklch(0.45 0.018 228)",
+        "tonalRamp": ["oklch(0.15 0.015 228)", "oklch(0.27 0.017 228)", "oklch(0.39 0.018 228)", "oklch(0.45 0.018 228)", "oklch(0.59 0.015 228)", "oklch(0.72 0.012 228)", "oklch(0.84 0.009 228)", "oklch(0.95 0.006 228)"]
+      },
+      "ink-tertiary": {
+        "role": "neutral",
+        "displayName": "注释墨色",
+        "canonical": "oklch(0.61 0.014 228)",
+        "tonalRamp": ["oklch(0.15 0.013 228)", "oklch(0.27 0.014 228)", "oklch(0.39 0.014 228)", "oklch(0.51 0.014 228)", "oklch(0.61 0.014 228)", "oklch(0.73 0.012 228)", "oklch(0.84 0.009 228)", "oklch(0.95 0.006 228)"]
+      },
+      "rule": {
+        "role": "neutral",
+        "displayName": "分隔线",
+        "canonical": "oklch(0.89 0.009 228)",
+        "tonalRamp": ["oklch(0.15 0.01 228)", "oklch(0.27 0.01 228)", "oklch(0.39 0.01 228)", "oklch(0.52 0.01 228)", "oklch(0.65 0.01 228)", "oklch(0.77 0.009 228)", "oklch(0.89 0.009 228)", "oklch(0.95 0.006 228)"]
+      },
+      "rule-subtle": {
+        "role": "neutral",
+        "displayName": "细分隔线",
+        "canonical": "oklch(0.935 0.006 228)",
+        "tonalRamp": ["oklch(0.15 0.008 228)", "oklch(0.27 0.008 228)", "oklch(0.39 0.008 228)", "oklch(0.52 0.008 228)", "oklch(0.65 0.007 228)", "oklch(0.77 0.007 228)", "oklch(0.88 0.006 228)", "oklch(0.935 0.006 228)"]
+      },
+      "selected-soft": {
+        "role": "primary",
+        "displayName": "选中青雾",
+        "canonical": "oklch(0.91 0.027 210)",
+        "tonalRamp": ["oklch(0.15 0.024 210)", "oklch(0.27 0.028 210)", "oklch(0.39 0.03 210)", "oklch(0.52 0.03 210)", "oklch(0.65 0.03 210)", "oklch(0.77 0.029 210)", "oklch(0.91 0.027 210)", "oklch(0.95 0.018 210)"]
+      },
+      "info-soft": {
+        "role": "secondary",
+        "displayName": "信息蓝雾",
+        "canonical": "oklch(0.945 0.025 235)",
+        "tonalRamp": ["oklch(0.15 0.022 235)", "oklch(0.27 0.026 235)", "oklch(0.39 0.028 235)", "oklch(0.52 0.029 235)", "oklch(0.65 0.029 235)", "oklch(0.77 0.028 235)", "oklch(0.88 0.026 235)", "oklch(0.945 0.025 235)"]
+      },
+      "warning-ink": {
+        "role": "secondary",
+        "displayName": "校验琥珀",
+        "canonical": "oklch(0.43 0.095 65)",
+        "tonalRamp": ["oklch(0.15 0.04 65)", "oklch(0.27 0.07 65)", "oklch(0.43 0.095 65)", "oklch(0.55 0.09 65)", "oklch(0.66 0.075 65)", "oklch(0.77 0.055 65)", "oklch(0.87 0.035 65)", "oklch(0.95 0.018 65)"]
+      },
+      "warning-soft": {
+        "role": "secondary",
+        "displayName": "提示暖纸",
+        "canonical": "oklch(0.95 0.035 75)",
+        "tonalRamp": ["oklch(0.15 0.03 75)", "oklch(0.27 0.04 75)", "oklch(0.39 0.045 75)", "oklch(0.52 0.045 75)", "oklch(0.65 0.043 75)", "oklch(0.77 0.04 75)", "oklch(0.88 0.037 75)", "oklch(0.95 0.035 75)"]
+      },
+      "danger-soft": {
+        "role": "secondary",
+        "displayName": "风险红雾",
+        "canonical": "oklch(0.95 0.035 25)",
+        "tonalRamp": ["oklch(0.15 0.03 25)", "oklch(0.27 0.04 25)", "oklch(0.39 0.045 25)", "oklch(0.52 0.045 25)", "oklch(0.65 0.043 25)", "oklch(0.77 0.04 25)", "oklch(0.88 0.037 25)", "oklch(0.95 0.035 25)"]
+      },
+      "market-up": {
+        "role": "secondary",
+        "displayName": "上涨红",
+        "canonical": "oklch(0.55 0.2 25)",
+        "tonalRamp": ["oklch(0.15 0.07 25)", "oklch(0.27 0.12 25)", "oklch(0.4 0.17 25)", "oklch(0.55 0.2 25)", "oklch(0.66 0.17 25)", "oklch(0.76 0.12 25)", "oklch(0.86 0.07 25)", "oklch(0.95 0.025 25)"]
+      },
+      "market-down": {
+        "role": "secondary",
+        "displayName": "下跌绿",
+        "canonical": "oklch(0.55 0.15 155)",
+        "tonalRamp": ["oklch(0.15 0.055 155)", "oklch(0.27 0.09 155)", "oklch(0.4 0.13 155)", "oklch(0.55 0.15 155)", "oklch(0.66 0.13 155)", "oklch(0.76 0.095 155)", "oklch(0.86 0.06 155)", "oklch(0.95 0.022 155)"]
+      },
+      "on-accent": {
+        "role": "neutral",
+        "displayName": "青上近白",
+        "canonical": "oklch(0.985 0.004 210)",
+        "tonalRamp": ["oklch(0.15 0.006 210)", "oklch(0.27 0.006 210)", "oklch(0.39 0.006 210)", "oklch(0.52 0.005 210)", "oklch(0.65 0.005 210)", "oklch(0.77 0.005 210)", "oklch(0.89 0.004 210)", "oklch(0.985 0.004 210)"]
+      }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "页面标题", "purpose": "每页唯一主标题，建立当前研究任务。" },
+      "title": { "displayName": "区段标题", "purpose": "工作区、表格和结果分段标题。" },
+      "body": { "displayName": "正文与数据", "purpose": "表格、表单、按钮和解释文本。" },
+      "label": { "displayName": "字段注释", "purpose": "字段名、日期、代码、单位和辅助状态。" }
+    },
+    "shadows": [
+      { "name": "panel", "value": "0 8px 24px oklch(0.25 0.02 228 / 0.12)", "purpose": "搜索建议和临时浮层。" },
+      { "name": "drawer", "value": "-12px 0 40px oklch(0.2 0.02 228 / 0.18)", "purpose": "移动研究助手模态抽屉。" }
+    ],
+    "motion": [
+      { "name": "drawer-state", "value": "180ms cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "抽屉透明度和位移状态变化；减少动态效果时降为 0.01ms。" }
+    ],
+    "breakpoints": [
+      { "name": "sm", "value": "640px" },
+      { "name": "lg", "value": "1024px" },
+      { "name": "xl", "value": "1280px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "当前研究流程的主要提交动作。",
+      "html": "<button class=\"ds-button-primary\">开始筛选</button>",
+      "css": ".ds-button-primary { height: 36px; padding: 6px 16px; border: 0; border-radius: 6px; background: var(--color-accent, oklch(0.48 0.105 210)); color: var(--color-on-accent, oklch(0.985 0.004 210)); font: 500 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; transition: background 180ms cubic-bezier(0.16,1,0.3,1); } .ds-button-primary:hover { background: var(--color-accent-hover, oklch(0.41 0.11 210)); } .ds-button-primary:focus-visible { outline: 2px solid var(--color-accent, oklch(0.48 0.105 210)); outline-offset: 2px; }"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "查询、载入和非主要研究动作。",
+      "html": "<button class=\"ds-button-secondary\">查询</button>",
+      "css": ".ds-button-secondary { height: 36px; padding: 6px 12px; border: 1px solid var(--color-border, oklch(0.89 0.009 228)); border-radius: 6px; background: var(--color-surface-raised, oklch(0.995 0.003 228)); color: var(--color-text-secondary, oklch(0.45 0.018 228)); font: 400 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; } .ds-button-secondary:hover { background: var(--color-hover, oklch(0.955 0.008 220)); color: var(--color-text-primary, oklch(0.23 0.018 228)); } .ds-button-secondary:focus-visible { outline: 2px solid var(--color-accent, oklch(0.48 0.105 210)); outline-offset: 2px; }"
+    },
+    {
+      "name": "Labeled Input",
+      "kind": "input",
+      "refersTo": "input",
+      "description": "带中文可见标签的紧凑研究参数输入。",
+      "html": "<label class=\"ds-field\"><span>股票</span><input placeholder=\"输入中文名称或代码\"></label>",
+      "css": ".ds-field { display: grid; gap: 4px; color: var(--color-text-tertiary, oklch(0.61 0.014 228)); font: 500 12px/1.35 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; } .ds-field input { width: 240px; height: 36px; padding: 6px 8px; border: 1px solid var(--color-border, oklch(0.89 0.009 228)); border-radius: 6px; background: var(--color-surface-raised, oklch(0.995 0.003 228)); color: var(--color-text-primary, oklch(0.23 0.018 228)); font-size: 14px; } .ds-field input:focus-visible { outline: 2px solid var(--color-accent, oklch(0.48 0.105 210)); outline-offset: 2px; }"
+    },
+    {
+      "name": "Workspace Tabs",
+      "kind": "nav",
+      "refersTo": "nav-active",
+      "description": "同一研究任务内切换系统候选、组合筛选等视图。",
+      "html": "<nav class=\"ds-tabs\" aria-label=\"工作区视图\"><button class=\"ds-tab ds-tab-active\">系统候选</button><button class=\"ds-tab\">组合筛选</button></nav>",
+      "css": ".ds-tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--color-border, oklch(0.89 0.009 228)); } .ds-tab { position: relative; padding: 0 0 10px; border: 0; background: transparent; color: var(--color-text-secondary, oklch(0.45 0.018 228)); font: 400 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; } .ds-tab:hover { color: var(--color-text-primary, oklch(0.23 0.018 228)); } .ds-tab:focus-visible { outline: 2px solid var(--color-accent, oklch(0.48 0.105 210)); outline-offset: 2px; } .ds-tab-active { color: var(--color-accent, oklch(0.48 0.105 210)); font-weight: 500; } .ds-tab-active::after { content: ''; position: absolute; right: 0; bottom: 0; left: 0; height: 2px; background: var(--color-accent, oklch(0.48 0.105 210)); }"
+    },
+    {
+      "name": "Match Reason Chip",
+      "kind": "chip",
+      "description": "以中文说明股票命中的筛选条件。",
+      "html": "<span class=\"ds-reason-chip\">滚动市盈率：18.52</span>",
+      "css": ".ds-reason-chip { display: inline-flex; padding: 2px 6px; border-radius: 4px; background: var(--color-info-soft, oklch(0.945 0.025 235)); color: var(--color-text-secondary, oklch(0.45 0.018 228)); font: 400 12px/1.35 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; }"
+    },
+    {
+      "name": "Research Data Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "扁平、带边框的表格或研究工具容器。",
+      "html": "<section class=\"ds-panel\"><header>数据状态</header><dl><div><dt>系统候选</dt><dd>30 只</dd></div><div><dt>数据日期</dt><dd>2026-07-24</dd></div></dl></section>",
+      "css": ".ds-panel { width: 420px; overflow: hidden; border: 1px solid var(--color-border, oklch(0.89 0.009 228)); border-radius: 6px; background: var(--color-surface-raised, oklch(0.995 0.003 228)); color: var(--color-text-primary, oklch(0.23 0.018 228)); font: 400 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; } .ds-panel header { padding: 12px 16px; border-bottom: 1px solid var(--color-border, oklch(0.89 0.009 228)); font-weight: 600; } .ds-panel dl { display: grid; grid-template-columns: 1fr 1fr; margin: 0; } .ds-panel dl div { padding: 16px; border-right: 1px solid var(--color-border-subtle, oklch(0.935 0.006 228)); } .ds-panel dl div:last-child { border-right: 0; } .ds-panel dt { color: var(--color-text-tertiary, oklch(0.61 0.014 228)); font-size: 12px; } .ds-panel dd { margin: 4px 0 0; font-weight: 600; }"
+    },
+    {
+      "name": "Coverage Warning",
+      "kind": "custom",
+      "description": "筛选数据未覆盖完整研究范围时的口径提示。",
+      "html": "<p class=\"ds-coverage-warning\"><strong>数据覆盖 36 / 800</strong><br>缺少或过期数据的股票不会命中对应条件。</p>",
+      "css": ".ds-coverage-warning { max-width: 520px; margin: 0; padding: 8px 12px; border: 1px solid color-mix(in oklch, var(--color-warning, oklch(0.43 0.095 65)) 30%, transparent); border-radius: 6px; background: var(--color-warning-soft, oklch(0.95 0.035 75)); color: var(--color-warning, oklch(0.43 0.095 65)); font: 400 12px/1.65 -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif; } .ds-coverage-warning strong { font-weight: 600; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "每日研究台账",
+    "overview": "界面像一份每天都会打开、逐项核对的专业研究台账。它应清晰、克制、可信：中文结论先出现，英文 key 和专业参数按需展开；数据日期、覆盖范围、命中原因和限制始终靠近结果。\n\n这是高信息密度的工作界面，不是金融营销页面。布局依靠明确层级、细分隔线和紧凑表格组织关系，少量青色只标记当前选择和主要动作。功能可以专业，但用户不应被内部字段、原始 JSON 或一次性堆叠的大表单挡在门外。",
+    "keyCharacteristics": [
+      "中文优先，固定词典是跨页面唯一命名来源。",
+      "日频研究、模拟回测和手工记账边界清楚可见。",
+      "表格与分段工作区承载密集信息，教学内容在右侧或移动抽屉渐进展开。",
+      "数据状态不只用颜色表达，同时提供文字、日期、覆盖数和原因。"
+    ],
+    "rules": [
+      { "name": "The Research Focus Rule", "body": "研究青只用于主要动作、当前选择、链接和焦点，不超过单屏视觉面积的约 10%。", "section": "colors" },
+      { "name": "The Market Semantics Rule", "body": "红绿只表达 A 股涨跌或明确风险状态，任何状态都必须有中文文字、图标或数值符号作为第二通道。", "section": "colors" },
+      { "name": "The Fixed Scale Rule", "body": "产品字号固定为 12、14、16、18、20px 的紧凑层级，不按视口流体缩放，字距始终为 0。", "section": "typography" },
+      { "name": "The Flat Research Rule", "body": "页面区段与表格在静止状态依靠背景和边框分层；只有浮层、抽屉和明确覆盖关系可以使用阴影。", "section": "elevation" }
+    ],
+    "dos": [
+      "Do 让所有股票先显示中文名称，代码以 12px 注释文字紧邻展示。",
+      "Do 从固定中英文字典读取指标、策略、信号和回测指标名称，英文 key 仅作专业补充。",
+      "Do 在筛选、信号和回测结果附近展示数据日期、覆盖范围、命中原因与限制。",
+      "Do 使用 1px 分隔线、6px 圆角、12–16px 内边距和固定字号保持高密度但可扫读。",
+      "Do 为加载、空结果、缺失数据、错误、禁用和键盘焦点提供完整状态。",
+      "Do 明确写出日频研究、模拟回测与外部手工交易的产品边界。"
+    ],
+    "donts": [
+      "Don't 直接暴露英文内部字段、原始 JSON 原因或没有中文解释的复杂参数。",
+      "Don't 把所有能力堆进同一张表单；用工作区、条件组和渐进展开组织任务。",
+      "Don't 使用营销型金融视觉、夸张收益表达、交易诱导，或任何自动和半自动下单暗示。",
+      "Don't 用装饰性卡片、大面积颜色、渐变文字、玻璃效果或装饰动效掩盖信息关系。",
+      "Don't 在卡片中再嵌套卡片，也不要给普通页面区段添加漂浮阴影。",
+      "Don't 只用红绿颜色表达状态，或让鼠标成为展开、关闭和选择的唯一方式。",
+      "Don't 使用超过 1px 的彩色侧边条作为提醒或卡片装饰。"
+    ]
+  }
+}

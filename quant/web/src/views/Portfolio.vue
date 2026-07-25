@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { api, type PortfolioSummary, type Trade } from '../api'
+import PageHeader from '../components/PageHeader.vue'
+import StockSearchInput from '../components/StockSearchInput.vue'
 import { fmtAmount, fmtPrice, fmtQty, fmtSigned, pnlClass } from '../format'
 
 const summary = ref<PortfolioSummary | null>(null)
@@ -20,6 +22,10 @@ const form = reactive({
   fee: '',
   note: '',
 })
+
+function nameOf(code: string, name?: string): string {
+  return name || nameMap.value[code] || '名称待同步'
+}
 
 async function load() {
   loading.value = true
@@ -84,7 +90,7 @@ onMounted(load)
 
 <template>
   <div class="space-y-6">
-    <h2 class="text-lg font-semibold">持仓</h2>
+    <PageHeader title="我的持仓" description="记录已在外部交易软件中完成的成交，并查看持仓估值。" />
 
     <p v-if="error" class="rounded-md border border-up/30 bg-up/5 px-4 py-2 text-sm text-up">{{ error }}</p>
     <p v-if="loading" class="text-sm text-text-tertiary">加载中…</p>
@@ -115,8 +121,7 @@ onMounted(load)
           <table class="w-full text-sm">
             <thead>
               <tr class="border-b border-border text-left text-xs text-text-tertiary">
-                <th class="px-4 py-2 font-medium">代码</th>
-                <th class="px-4 py-2 font-medium">名称</th>
+                <th class="px-4 py-2 font-medium">股票</th>
                 <th class="px-4 py-2 text-right font-medium">数量</th>
                 <th class="px-4 py-2 text-right font-medium">成本价</th>
                 <th class="px-4 py-2 text-right font-medium">最新价</th>
@@ -132,9 +137,9 @@ onMounted(load)
                 class="border-b border-border-subtle last:border-0 hover:bg-hover"
               >
                 <td class="px-4 py-2">
-                  <router-link :to="`/stock/${p.code}`" class="text-accent hover:underline">{{ p.code }}</router-link>
+                  <router-link :to="`/stock/${p.code}`" class="font-medium hover:text-accent">{{ nameOf(p.code, p.name) }}</router-link>
+                  <div class="text-xs text-text-tertiary">{{ p.code }}</div>
                 </td>
-                <td class="px-4 py-2">{{ nameMap[p.code] ?? '' }}</td>
                 <td class="px-4 py-2 text-right">{{ fmtQty(p.qty) }}</td>
                 <td class="px-4 py-2 text-right">{{ fmtPrice(p.avg_cost) }}</td>
                 <td class="px-4 py-2 text-right">{{ fmtPrice(p.last_price) }}</td>
@@ -149,12 +154,12 @@ onMounted(load)
       </section>
 
       <section>
-        <h3 class="mb-2 text-base font-semibold">记账</h3>
+        <div class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+          <h3 class="text-base font-semibold">手工记账</h3>
+          <span class="text-xs text-text-tertiary">这里只记录已完成的成交，不会提交订单</span>
+        </div>
         <form class="flex flex-wrap items-end gap-3 rounded-lg border border-border bg-surface-raised p-4" @submit.prevent="submit">
-          <label class="text-sm">
-            <span class="mb-1 block text-xs text-text-tertiary">代码</span>
-            <input v-model="form.code" required placeholder="sh.600519" class="w-32 rounded-md border border-border px-2 py-1.5" />
-          </label>
+          <StockSearchInput v-model="form.code" label="股票" required />
           <label class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">日期</span>
             <input v-model="form.trade_date" required type="date" class="rounded-md border border-border px-2 py-1.5" />
@@ -182,8 +187,8 @@ onMounted(load)
             <span class="mb-1 block text-xs text-text-tertiary">备注</span>
             <input v-model="form.note" class="w-40 rounded-md border border-border px-2 py-1.5" />
           </label>
-          <button type="submit" :disabled="submitting" class="rounded-md bg-accent px-4 py-1.5 text-sm text-white hover:bg-accent-hover disabled:opacity-50">
-            {{ submitting ? '提交中…' : '添加' }}
+          <button type="submit" :disabled="submitting" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50">
+            {{ submitting ? '保存中…' : '保存记录' }}
           </button>
           <p v-if="formError" class="w-full text-sm text-up">{{ formError }}</p>
         </form>
@@ -197,7 +202,7 @@ onMounted(load)
               <tr class="border-b border-border text-left text-xs text-text-tertiary">
                 <th class="px-4 py-2 font-medium">ID</th>
                 <th class="px-4 py-2 font-medium">日期</th>
-                <th class="px-4 py-2 font-medium">代码</th>
+                <th class="px-4 py-2 font-medium">股票</th>
                 <th class="px-4 py-2 font-medium">方向</th>
                 <th class="px-4 py-2 text-right font-medium">价格</th>
                 <th class="px-4 py-2 text-right font-medium">数量</th>
@@ -214,7 +219,10 @@ onMounted(load)
               >
                 <td class="px-4 py-2 text-text-tertiary">{{ t.id }}</td>
                 <td class="px-4 py-2">{{ t.trade_date }}</td>
-                <td class="px-4 py-2">{{ t.code }}</td>
+                <td class="px-4 py-2">
+                  <span class="font-medium">{{ nameOf(t.code, t.name) }}</span>
+                  <div class="text-xs text-text-tertiary">{{ t.code }}</div>
+                </td>
                 <td class="px-4 py-2">
                   <span :class="t.side === 'buy' ? 'text-up' : 'text-down'" class="font-medium">
                     {{ t.side === 'buy' ? '买入' : '卖出' }}

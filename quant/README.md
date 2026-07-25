@@ -1,110 +1,238 @@
-# quant — A股日频量化信息系统
+# quant - A股日频研究决策工作台
 
-纯信息系统:只做日频行情、指标、选股、信号、手工记账与回测,
-**不连接券商、不提交订单、不做任何自动交易**。
-系统给出的信号和候选股票仅供决策参考;所有真实交易均由用户人工确认,
-并在外部交易软件中手动执行。系统内的成交记录也只用于手工记账和持仓复盘。
-与主仓库 server 零代码耦合,仅共用同一个 MySQL 数据库,表名全部 `quant_` 前缀。
+面向个人投资者的日频量化研究与决策支持系统。它把行情、技术指标、基本面、
+选股、策略提示、模拟回测和手工记账组织成一条可理解、可追溯的研究流程。
+
+系统只提供信息和模拟结果：**不连接券商、不提交订单、不提供自动或半自动交易**。
+所有真实买卖、仓位和风险决策均由用户确认，并在外部交易应用中手工执行；
+`quant_trade` 只是已完成交易的手工账本。
+
+## 研究工作流
+
+1. 在“今日研究”确认行情、候选池和提示的数据日期。
+2. 查看每日 Top 30 候选，或用技术面、估值、财务和行业条件组合筛选股票。
+3. 查看每只股票命中的条件，以及策略为何给出入场、退出或继续观察提示。
+4. 用历史回测、参数扫描和策略排行检查收益、回撤、胜率与交易频率。
+5. 用户自行判断并在外部应用交易；需要复盘时再手工记录成交和持仓。
+
+前端提供“今日研究、选股、信号提醒、策略研究、我的持仓、研究词典”等工作区。
+指标、策略、信号和回测指标的中文名称及限制来自后端固定字典
+`GET /api/catalog`，英文 key 只作为稳定的内部标识。
+
+当前筛选器是结构化条件构建器，支持条件启停、AND/OR 分组、独立命中数量和浏览器本地方案保存。
+**自然语言选股尚未实现**，不会把用户句子转换成筛选条件。
 
 ## 系统边界
 
-- 系统工作频率为日频:策略信号以日线收盘数据计算,默认假设次一交易日执行。
-- 盘中快照只用于展示参考价格和持仓估值,不用于盘中自动决策或下单。
-- 回测成交均为模拟结果,不代表真实委托、成交或可实现收益。
-- 系统不保存券商交易凭证,不接入交易柜台,不提供自动或半自动下单能力。
-- 买入、卖出、仓位调整和风险处置均由用户自行判断并手动操作。
+- 策略只消费日线；T 日收盘形成的回测信号在 T+1 日开盘模拟成交。
+- 盘中快照只用于页面展示和持仓估值，不用于盘中策略或交易执行。
+- 回测包含费用和滑点假设，但历史模拟不代表真实可成交价格或未来收益。
+- 策略提示是研究状态变化，不是买卖指令。
+- 法定节假日没有单独交易日历，任务会因当日没有行情数据而自然空跑。
 
-## 环境准备
+## 环境与启动
 
-```bash
-cd quant
-uv sync          # 自动创建 venv 并安装依赖(requires-python: >=3.11,<3.14)
-```
-
-数据库连接默认读取仓库根目录 `config.toml` 的 `[server].database_url`
-(`mysql://` 自动转为 `mysql+pymysql://`)。如需覆盖,编辑本目录的 `config.toml` 的 `[quant]` 段。
-
-## 启动
+Python 要求 `>=3.11,<3.14`：
 
 ```bash
-uv run uvicorn app.main:app --port 8100
-# 开发热重载: uv run uvicorn app.main:app --port 8100 --reload
+uv sync
+uv run uvicorn app.main:app --port 8100 --reload
 ```
 
-启动时自动 `create_all` 建表(`quant_stock / quant_daily_bar / quant_snapshot /
-quant_signal / quant_trade / quant_backtest_run / quant_backtest_equity`),
-并启动 APScheduler:
+Swagger UI：`http://localhost:8100/docs`。
 
-- 交易日(周一~周五)16:30:baostock 盘后日线增量 + akshare 对账 + 策略信号计算
-- 交易日盘中 9:30–15:00 每 30 分钟:akshare 快照落 `quant_snapshot`
+数据库和 JWT 默认读取上级仓库 `config.toml` 的 `[server].database_url` 与
+`[server].jwt_secret`；本目录 `config.toml` 的 `[quant]` 可覆盖
+`database_url`、`jwt_secret`、`cors_origins`、`snapshot_retention_days` 和
+`backfill_start`。配置文件均不得提交。
 
-法定节假日不做专门日历判断:盘后任务会因当日无数据而自然空跑。
+后端启动时会通过 SQLAlchemy 创建缺失的 `quant_*` 表，并幂等升级本功能新增的
+估值/财报版本唯一键，然后启动下述自动调度任务。
 
-## 数据回填
+除 `/api/health` 和 `/api/auth/login` 外，业务接口需要：
+
+```text
+Authorization: Bearer <token>
+```
+
+前端开发需要同时运行后端：
 
 ```bash
-# 回填单只股票(默认从 config 的 backfill_start 起到今天)
-curl -X POST "http://localhost:8100/api/admin/backfill?code=sh.600519&start=2024-01-01"
-
-# 导入全市场股票列表(可选)
-curl -X POST "http://localhost:8100/api/admin/import-stocks"
-
-# 加入自选 + 手动跑一次信号
-curl -X POST "http://localhost:8100/api/watchlist" \
-  -H "Content-Type: application/json" -d '{"code":"sh.600519","name":"贵州茅台"}'
-curl -X POST "http://localhost:8100/api/admin/run-signals"
+cd web
+pnpm install
+pnpm dev       # http://localhost:5173，/api 代理到 localhost:8100
 ```
 
-数据口径:baostock 前复权价(`adjustflag=2`)落 `open/high/low/close`,
-不复权收盘价落 `raw_close`;策略、回测、信号全部跑在前复权序列上。
+生产构建：
 
-数据源降级:akshare 东财接口(`stock_zh_a_spot_em` / `stock_zh_a_hist`)
-在部分网络下会被断连,快照与日线对账会自动降级为新浪源
-(`stock_zh_a_spot` / `stock_zh_a_daily`,较慢,快照约 20~30 秒)。
+```bash
+cd web
+pnpm build     # 严格 TypeScript 检查并输出 web/dist
+```
+
+`web/dist` 存在时由 FastAPI 直接托管；它是生成目录，不要手工编辑。
+
+## 数据与防前视
+
+行情以 baostock 前复权数据写入 `open/high/low/close`，不复权收盘写入
+`raw_close`；策略、因子、信号和回测统一使用前复权序列。自选股日线会使用
+AkShare 做对账，东财接口不可用时部分行情能力会降级到新浪。
+
+主要数据表：
+
+| 表 | 内容 |
+|---|---|
+| `quant_stock`、`quant_index_member` | 股票基础资料和沪深300/中证500成分历史 |
+| `quant_daily_bar`、`quant_snapshot` | 前复权日线和展示用盘中快照 |
+| `quant_factor_daily`、`quant_pick` | 每日技术因子和 Top 30 候选 |
+| `quant_valuation_snapshot` | PE(TTM)、PB、PS(TTM)、股息率、总市值 |
+| `quant_fundamental_snapshot` | ROE、收入/利润增长、毛利率、净利率、负债率、现金流质量 |
+| `quant_signal` | 单标的策略提示及结构化原因 |
+| `quant_strategy_eval` | 周度策略批量评估 |
+| `quant_backtest_run`、`quant_backtest_equity` | 回测参数、指标和净值曲线 |
+| `quant_trade` | 用户手工录入的外部已完成成交 |
+
+估值和财务快照同时保存 `data_date`、报告期、`available_date` 与来源；同一报告期
+后续修订会按新的 `available_date` 保留为独立版本，不覆盖当时已经公开的旧值。
+历史筛选只读取 `available_date <= 研究日` 的记录，未到披露/可用日的财务报告不会
+提前进入结果，避免用后来发布的数据研究过去。没有可靠公告日期的降级数据以同步日
+作为 `available_date`，宁可少用历史数据，也不引入未来信息。历史估值源失败时不会
+降级为当前快照；结构化筛选只接受研究日前 7 个自然日内的估值，更旧记录按缺失处理。
+
+自动估值和财务任务优先同步自选与最近候选，最多 30 只，并不代表默认 800 只指数池
+已经完整覆盖。筛选页会逐条件显示覆盖数量并警告不完整范围；需要扩大覆盖时，由管理员
+通过下述接口按明确 `universe` 和 `max_codes` 分批同步。
+
+手动同步接口仅允许 JWT 中 `can_admin=true` 的管理员调用。示例：
+
+```bash
+# 显式股票；也可使用 universe=watchlist|pool|hs300|zz500|all
+curl -X POST \
+  'http://localhost:8100/api/admin/sync-fundamentals?codes=600519,sz.000001&max_codes=20' \
+  -H 'Authorization: Bearer <token>'
+
+# 单股历史估值数据量较大，默认不启用
+curl -X POST \
+  'http://localhost:8100/api/admin/sync-fundamentals?codes=600519&valuation_history=true' \
+  -H 'Authorization: Bearer <token>'
+```
+
+## 组合筛选
+
+`POST /api/selection/screener` 支持基础信息、技术面和基本面字段，字段、单位、
+输入换算和允许的操作符以 `/api/catalog` 的 `filter_fields` 为准。支持的研究范围包括
+`pool`、`hs300_zz500`、`hs300`、`zz500`、`watchlist` 和 `all`。
+
+```json
+{
+  "date": "2026-07-24",
+  "universe": "pool",
+  "logic": "and",
+  "groups": [
+    {
+      "id": "quality_value",
+      "logic": "and",
+      "conditions": [
+        {"id": "pe", "field": "pe_ttm", "operator": "between", "value": 0, "value_to": 25},
+        {"id": "roe", "field": "roe", "operator": "gte", "value": 0.15}
+      ]
+    },
+    {
+      "id": "trend",
+      "logic": "and",
+      "conditions": [
+        {"id": "ma", "field": "ma_bull", "operator": "eq", "value": true}
+      ]
+    }
+  ],
+  "limit": 100
+}
+```
+
+响应包含组合命中数量、每条条件的独立命中数量、每只股票的字段值、命中/未命中
+条件和财务数据可用日期；缺少历史指数成分时会明确报错，不会用当前成分替代。
+旧的 `GET /api/selection/screener` 简单筛选接口仍保留兼容。
+`is_st` 依据 `quant_stock` 当前名称近似判断；历史筛选不能还原研究日当时的风险警示
+名称，因此不应把它视为完整的历史 ST 状态数据。
+
+## 内置策略与回测
+
+系统注册 6 个策略：
+
+| key | 中文名称 | 类型 |
+|---|---|---|
+| `ma_cross` | 双均线趋势策略 | 单只股票 |
+| `breakout` | 价格突破策略 | 单只股票 |
+| `mean_reversion` | 上升趋势中的超跌反弹策略 | 单只股票 |
+| `volume_breakout` | 缩量整理后的放量突破策略 | 单只股票 |
+| `momentum_rotation` | 强势股票轮动策略 | 股票组合 |
+| `multifactor_hold` | 多指标综合评分持有策略 | 股票组合 |
+
+默认参数和参数范围由 `/api/catalog` 与 `/api/backtest/strategies` 返回。
+回测默认费用为双边佣金万 2.5、卖出印花税 0.05%、滑点万 1，可在 `costs`
+中覆盖。单标的策略支持参数网格扫描；策略排行读取最近一轮批量评估。
 
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/health` | 健康检查 |
-| GET | `/api/market/kline?code=&start=&end=` | K线(前复权) |
-| GET | `/api/market/snapshot` | 自选股最新价(快照优先,否则最近收盘) |
+| GET | `/api/health` | 无需登录的健康检查 |
+| POST/GET | `/api/auth/login`、`/api/auth/me` | 登录与当前用户 |
+| GET | `/api/catalog` | 固定中文指标、筛选字段、策略、信号和回测指标字典 |
+| GET | `/api/market/stocks?q=&limit=` | 按中文名、六位代码或标准代码搜索股票；空查询只返回自选 |
+| GET | `/api/market/kline`、`/api/market/snapshot` | 日线和自选股最新展示价格 |
 | GET/POST/DELETE | `/api/watchlist`、`/api/watchlist/{code}` | 自选股管理 |
-| GET | `/api/signals?date=&code=&strategy=&side=` | 信号查询 |
+| GET | `/api/selection/picks` | 每日 Top 30 候选及新进/调出 |
+| GET/POST | `/api/selection/screener` | 简单筛选兼容接口 / 结构化组合筛选 |
+| GET | `/api/signals` | 带股票中文名、策略中文名和中文原因的提示查询 |
 | GET/POST/DELETE | `/api/portfolio/trades`、`/api/portfolio/trades/{id}` | 手工成交记账 |
-| GET | `/api/portfolio/positions` | 持仓(均价法成本、浮动盈亏) |
-| GET | `/api/backtest/strategies` | 可选策略列表 |
-| POST | `/api/backtest` | 发起回测(同步执行并落库) |
-| GET | `/api/backtest/{id}` | 回测结果(含净值曲线) |
-| POST | `/api/admin/backfill?code=&start=` | 手动历史回填 |
-| POST | `/api/admin/run-signals?date=` | 手动信号计算 |
-| POST | `/api/admin/snapshot` | 手动抓一次快照 |
-| POST | `/api/admin/import-stocks` | 导入股票列表 |
+| GET | `/api/portfolio/positions` | 均价成本、参考市值与盈亏 |
+| GET | `/api/backtest/strategies`、`/api/backtest/leaderboard` | 策略目录和评估排行 |
+| POST | `/api/backtest`、`/api/backtest/sweep` | 同步回测和单标的参数扫描 |
+| GET | `/api/backtest/{id}` | 已保存回测和净值曲线 |
+| POST | `/api/admin/backfill`、`/api/admin/import-stocks` | 管理员：日线回填和股票资料导入 |
+| POST | `/api/admin/sync-index-members` | 管理员：同步沪深300和中证500成分 |
+| POST | `/api/admin/sync-fundamentals` | 管理员：同步估值与财务数据，同进程任务互斥 |
+| POST | `/api/admin/run-selection`、`/api/admin/run-signals`、`/api/admin/run-eval`、`/api/admin/snapshot` | 管理员：手动触发研究任务 |
 
-交互式文档:`http://localhost:8100/docs`
+## 自动调度
 
-## 内置策略
+APScheduler 使用 `Asia/Shanghai` 时区：
 
-- `ma_cross`:双均线金叉/死叉(默认 MA5/MA20,`params: {"fast":5,"slow":20}`)
-- `breakout`:N 日突破(默认 20 日新高入场、10 日新低出场,`params: {"entry":20,"exit":10}`)
+- 周一至周五 16:30：串行执行股票池/自选日线增量、因子与 Top 30 选股、
+  自选加候选的单标的策略提示；周五追加近一年策略批量评估。
+- 周一至周五 9:30-15:00 每 30 分钟：仅采集自选股盘中快照。
+- 每月 1 日 09:00：同步沪深300和中证500成分名录。
+- 周一至周五 18:30：同步自选加最近候选的估值快照，最多 30 只。
+- 每月 2 日 19:00：同步同一有限范围的财务报告。
 
-回测规则:信号次日开盘价成交;费用默认佣金万 2.5 双边 + 卖出印花税 0.05% +
-滑点万 1(可在请求 `costs` 中覆盖);多标的资金等分。
+## 验证与目录
 
-## 目录结构
-
+```bash
+uv run pytest tests/
+cd web && pnpm build
+curl http://localhost:8100/api/health
 ```
-quant/
-├── pyproject.toml / config.toml / README.md
-└── app/
-    ├── main.py            # FastAPI 入口
-    ├── config.py          # 读根 config.toml + 本目录覆盖
-    ├── db.py / models.py  # SQLAlchemy(quant_* 表)
-    ├── scheduler.py       # APScheduler 定时任务
-    ├── data/              # baostock / akshare 客户端 + 入库/对账
-    ├── indicators/        # MA/EMA/MACD/RSI/ATR/量比(纯 pandas)
-    ├── strategy/          # 策略引擎 + ma_cross / breakout
-    ├── portfolio/         # 记账 + 持仓推导
-    ├── backtest/          # 日频向量化回测
-    └── api/               # FastAPI 路由
+
+```text
+app/
+├── api/                 # FastAPI 路由
+├── data/                # 行情、指数成分、估值和财务数据采集
+├── factors/             # 每日技术因子
+├── indicators/          # MA、EMA、MACD、RSI、ATR、量比
+├── selection/           # Top 30 pipeline 与结构化筛选器
+├── strategy/strategies/ # 6 个单标的/组合策略
+├── backtest/            # vectorbt 回测、参数扫描和批量评估
+├── portfolio/           # 手工成交和持仓推导
+├── catalog.py           # 固定中英文字典与用户说明
+├── models.py            # quant_* SQLAlchemy 模型
+├── schema.py            # 本功能新增研究表的幂等结构升级
+├── scheduler.py         # 自动研究任务
+└── main.py              # FastAPI 入口与前端静态托管
+
+web/src/
+├── views/               # 页面工作区
+├── components/          # 可复用界面组件
+├── catalog.ts           # 目录加载与前端降级文案
+└── api.ts               # API 与共享 TypeScript 类型
 ```

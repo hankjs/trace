@@ -1,27 +1,56 @@
 """选股相关接口:每日 Top N 候选池、条件筛选器。"""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date as Date
+from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..models import Pick, Stock
-from ..selection.screener import screen
+from ..selection.screener import InvalidFilterError, screen, structured_screen
 
 router = APIRouter(prefix="/api/selection", tags=["selection"])
 
 
-def _prev_pick_date(db: Session, day: date) -> date | None:
+class FilterCondition(BaseModel):
+    id: str | None = None
+    field: str
+    operator: str
+    value: Any | None = None
+    value_to: Any | None = Field(
+        default=None,
+        validation_alias=AliasChoices("value_to", "value2"),
+    )
+    enabled: bool = True
+
+
+class FilterGroup(BaseModel):
+    id: str | None = None
+    logic: Literal["and", "or"] = "and"
+    conditions: list[FilterCondition] = Field(default_factory=list)
+
+
+class StructuredScreenerRequest(BaseModel):
+    date: Date | None = None
+    logic: Literal["and", "or"] = "and"
+    conditions: list[FilterCondition] = Field(default_factory=list)
+    groups: list[FilterGroup] = Field(default_factory=list)
+    limit: int = Field(default=100, ge=1, le=500)
+    universe: str = "pool"
+
+
+def _prev_pick_date(db: Session, day: Date) -> Date | None:
     return db.execute(
         select(func.max(Pick.date)).where(Pick.date < day)
     ).scalar()
 
 
 @router.get("/picks")
-def get_picks(date_: date | None = Query(None, alias="date"),
+def get_picks(date_: Date | None = Query(None, alias="date"),
               db: Session = Depends(get_db)):
     """某日 Top N 选股池,标注新进/调出(对比前一有池交易日)"""
     day = date_ or db.execute(select(func.max(Pick.date))).scalar()
@@ -60,7 +89,7 @@ def get_picks(date_: date | None = Query(None, alias="date"),
 
 
 @router.get("/screener")
-def get_screener(date_: date | None = Query(None, alias="date"),
+def get_screener(date_: Date | None = Query(None, alias="date"),
                  pct_chg_min: float | None = None,
                  pct_chg_max: float | None = None,
                  vol_ratio_min: float | None = None,
@@ -75,3 +104,13 @@ def get_screener(date_: date | None = Query(None, alias="date"),
                   vol_ratio_min=vol_ratio_min, ma_bull=ma_bull,
                   high_dist_max=high_dist_max, high_window=high_window,
                   amount_min=amount_min, limit=limit)
+
+
+@router.post("/screener")
+def post_screener(request: StructuredScreenerRequest,
+                  db: Session = Depends(get_db)):
+    """结构化组合筛选；组内及组间均支持 AND/OR。"""
+    try:
+        return structured_screen(db, request.model_dump())
+    except InvalidFilterError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
