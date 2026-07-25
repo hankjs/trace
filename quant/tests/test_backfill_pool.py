@@ -9,8 +9,10 @@ from scripts.backfill_pool import _done_codes
 
 
 def _bar(row_id: int, code: str, day: date) -> DailyBar:
+    # quant_daily_bar 换 (code, date) 自然主键后已无代理 id 列;
+    # row_id 仍留在签名里,只为不改各调用处的可读编号
     return DailyBar(
-        id=row_id, code=code, date=day, open=10, high=10, low=10,
+        code=code, date=day, open=10, high=10, low=10,
         close=10, raw_close=10, volume=1, amount=10,
     )
 

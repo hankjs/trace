@@ -30,7 +30,14 @@ def authenticate(db: Session, username: str, password: str) -> dict | None:
     ).mappings().first()
     if row is None:
         return None
-    if not bcrypt.checkpw(password.encode(), row["password_hash"].encode()):
+    # bcrypt 5.0 对超 72 字节密码抛 ValueError(不再静默截断);Rust 侧
+    # bcrypt::verify(...).unwrap_or(false) 等效于校验失败。这里同样吞成失败,
+    # 保证两端一致地返回 401 而非本进程 500。
+    try:
+        ok = bcrypt.checkpw(password.encode(), row["password_hash"].encode())
+    except ValueError:
+        return None
+    if not ok:
         return None
     return {
         "id": row["id"],
@@ -59,9 +66,9 @@ def require_user(request: Request) -> dict:
         raise HTTPException(401, "未登录")
     token = auth[len("Bearer "):]
     try:
-        # The shared Rust service historically emitted a numeric `sub`. New
-        # tokens use the JWT-standard string form, while verification remains
-        # compatible with existing cross-service tokens.
+        # 共享 users.id 是 VARCHAR(36) UUID,sub 始终是字符串 UUID。
+        # verify_sub=False 仅关闭 PyJWT 对 sub 必须为字符串的强校验,
+        # 以兼容极少数历史遗留的数字 sub token;取值逻辑见 user_id_from_claims。
         claims = jwt.decode(
             token,
             settings.jwt_secret,
@@ -89,12 +96,15 @@ def require_client(request: Request) -> dict:
     return claims
 
 
-def user_id_from_claims(claims: dict) -> int:
-    """提取共享 users.id，拒绝缺失或非法 subject 的 token。"""
-    try:
-        user_id = int(claims.get("sub"))
-    except (TypeError, ValueError) as exc:
-        raise HTTPException(401, "登录凭证缺少有效用户标识") from exc
-    if user_id <= 0:
+def user_id_from_claims(claims: dict) -> str:
+    """提取共享 users.id(VARCHAR(36) UUID 字符串),拒绝缺失或空 subject 的 token。
+
+    历史遗留的数字 sub 也一并接受(转为字符串),但真实库中 sub 均为 UUID。
+    """
+    sub = claims.get("sub")
+    if sub is None:
+        raise HTTPException(401, "登录凭证缺少有效用户标识")
+    user_id = str(sub).strip()
+    if not user_id:
         raise HTTPException(401, "登录凭证缺少有效用户标识")
     return user_id

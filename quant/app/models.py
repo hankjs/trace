@@ -12,6 +12,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -19,6 +20,35 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
+
+
+def _money(precision: int, scale: int) -> Numeric:
+    """价格/金额列:数据库侧 DECIMAL(精确存储),Python 侧 float。
+
+    MySQL `Float` 是单精度(约 7 位有效数字),positions.py 累加 `price*qty + fee`
+    再除法求均价时,六位数持仓的精度损失超过展示用的 round(4)。改 DECIMAL 后
+    存储不再截断。
+
+    `asdecimal=False` 是刻意选择(见 logs/decisions-migrate.md D3):驱动仍返回
+    float(float64,15~16 位有效数字),避免 Decimal 与 float 混算在下游
+    ingest.py 重锚阈值 / positions.py / 回测 pandas / JSON 响应里抛 TypeError
+    或改变响应格式。那些文件属 data 与 pool 的 scope,本次不动。
+    """
+    return Numeric(precision, scale, asdecimal=False)
+
+
+_PRICE = _money(12, 4)      # 单价:A 股最小报价单位 0.01,前复权价留 4 位小数
+_SHARES = _money(20, 2)     # 成交量/成交额:amount 可达千亿
+_TRADE_QTY = _money(18, 4)  # 手工账本数量与手续费
+_PCT = _money(9, 4)         # 涨跌幅
+_EQUITY = _money(18, 8)     # 回测净值:累计乘除需高小数位
+_MARKET_CAP = _money(20, 2)  # 总市值
+
+# 自增主键:MySQL 上渲染 BIGINT AUTO_INCREMENT(全市场日频最终超 21 亿行,
+# Integer 会溢出);sqlite 上必须渲染成 INTEGER —— sqlite 只把
+# "INTEGER PRIMARY KEY" 当作 rowid 别名并自增,写 BIGINT 会让插入时
+# id 拿不到自增值而触发 NOT NULL 失败。测试库是 sqlite,靠 variant 抹平差异。
+_BIG_PK = BigInteger().with_variant(Integer, "sqlite")
 
 
 class Stock(Base):
@@ -30,6 +60,9 @@ class Stock(Base):
     name: Mapped[str] = mapped_column(String(64), default="")
     industry: Mapped[str] = mapped_column(String(64), default="")
     is_watch: Mapped[bool] = mapped_column(Boolean, default=False)
+    list_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    delist_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    is_st: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class WatchlistItem(Base):
@@ -37,27 +70,31 @@ class WatchlistItem(Base):
 
     __tablename__ = "quant_watchlist"
 
-    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
     code: Mapped[str] = mapped_column(String(16), primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class DailyBar(Base):
-    """日线。open/high/low/close 为前复权价,raw_close 为不复权收盘价。"""
+    """日线。open/high/low/close 为前复权价,raw_close 为不复权收盘价。
+
+    自然主键 (code, date):行按 (code,date) 聚簇,区间扫描顺序命中。
+    删去原代理自增 id、冗余的 ix_quant_daily_bar_code(与主键前缀重复)
+    与 uq_daily_bar_code_date(换自然主键后与 PK 重复)。
+    保留 ix_quant_daily_bar_date:跨股票按单日查询(选股/因子)需要。
+    """
 
     __tablename__ = "quant_daily_bar"
-    __table_args__ = (UniqueConstraint("code", "date", name="uq_daily_bar_code_date"),)
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(16), index=True)
-    date: Mapped[date] = mapped_column(Date, index=True)
-    open: Mapped[float] = mapped_column(Float)
-    high: Mapped[float] = mapped_column(Float)
-    low: Mapped[float] = mapped_column(Float)
-    close: Mapped[float] = mapped_column(Float)
-    raw_close: Mapped[float | None] = mapped_column(Float, nullable=True)
-    volume: Mapped[float] = mapped_column(Float, default=0)
-    amount: Mapped[float] = mapped_column(Float, default=0)
+    code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    date: Mapped[date] = mapped_column(Date, primary_key=True, index=True)
+    open: Mapped[float] = mapped_column(_PRICE)
+    high: Mapped[float] = mapped_column(_PRICE)
+    low: Mapped[float] = mapped_column(_PRICE)
+    close: Mapped[float] = mapped_column(_PRICE)
+    raw_close: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
+    volume: Mapped[float] = mapped_column(_SHARES, default=0)
+    amount: Mapped[float] = mapped_column(_SHARES, default=0)
 
 
 class Snapshot(Base):
@@ -65,13 +102,13 @@ class Snapshot(Base):
 
     __tablename__ = "quant_snapshot"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, index=True)
-    price: Mapped[float] = mapped_column(Float)
-    pct_chg: Mapped[float | None] = mapped_column(Float, nullable=True)
-    volume: Mapped[float | None] = mapped_column(Float, nullable=True)
-    amount: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float] = mapped_column(_PRICE)
+    pct_chg: Mapped[float | None] = mapped_column(_PCT, nullable=True)
+    volume: Mapped[float | None] = mapped_column(_SHARES, nullable=True)
+    amount: Mapped[float | None] = mapped_column(_SHARES, nullable=True)
 
 
 class Signal(Base):
@@ -82,12 +119,12 @@ class Signal(Base):
         UniqueConstraint("code", "date", "strategy", "side", name="uq_signal"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     date: Mapped[date] = mapped_column(Date, index=True)
     strategy: Mapped[str] = mapped_column(String(64), index=True)
     side: Mapped[str] = mapped_column(String(8))
-    price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    price: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
     reason: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
@@ -96,14 +133,14 @@ class Trade(Base):
 
     __tablename__ = "quant_trade"
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     trade_date: Mapped[date] = mapped_column(Date)
     side: Mapped[str] = mapped_column(String(8))  # buy / sell
-    price: Mapped[float] = mapped_column(Float)
-    qty: Mapped[float] = mapped_column(Float)
-    fee: Mapped[float] = mapped_column(Float, default=0)
+    price: Mapped[float] = mapped_column(_PRICE)
+    qty: Mapped[float] = mapped_column(_TRADE_QTY)
+    fee: Mapped[float] = mapped_column(_TRADE_QTY, default=0)
     note: Mapped[str] = mapped_column(Text, default="")
 
 
@@ -113,9 +150,11 @@ class BacktestRun(Base):
     __tablename__ = "quant_backtest_run"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     strategy: Mapped[str] = mapped_column(String(64))
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    costs: Mapped[dict | None] = mapped_column(JSON, nullable=True)  # 回测复现:固化当时费率
+    pool_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 回测所用股票池
     codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
     start: Mapped[date] = mapped_column(Date)
     end: Mapped[date] = mapped_column(Date)
@@ -131,7 +170,7 @@ class IndexMember(Base):
         UniqueConstraint("index_name", "code", "in_date", name="uq_index_member"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     index_name: Mapped[str] = mapped_column(String(16), index=True)  # hs300 / zz500
     code: Mapped[str] = mapped_column(String(16), index=True)
     in_date: Mapped[date] = mapped_column(Date)
@@ -144,8 +183,9 @@ class FactorDaily(Base):
     __tablename__ = "quant_factor_daily"
     __table_args__ = (UniqueConstraint("code", "date", name="uq_factor_code_date"),)
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(16), index=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    # code 不再单独建索引:与 uq_factor_code_date(code,date) 前缀完全冗余
+    code: Mapped[str] = mapped_column(String(16))
     date: Mapped[date] = mapped_column(Date, index=True)
     mom20: Mapped[float | None] = mapped_column(Float, nullable=True)
     mom60: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -167,7 +207,8 @@ class ValuationSnapshot(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # 全市场日频最终会超 21 亿行,Integer 主键会溢出(REVIEW 五)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     data_date: Mapped[date] = mapped_column(Date, index=True)
     report_period: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -177,7 +218,7 @@ class ValuationSnapshot(Base):
     pb: Mapped[float | None] = mapped_column(Float, nullable=True)
     ps_ttm: Mapped[float | None] = mapped_column(Float, nullable=True)
     dividend_yield: Mapped[float | None] = mapped_column(Float, nullable=True)
-    total_market_cap: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_market_cap: Mapped[float | None] = mapped_column(_MARKET_CAP, nullable=True)
 
 
 class FundamentalSnapshot(Base):
@@ -191,7 +232,7 @@ class FundamentalSnapshot(Base):
         ),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     data_date: Mapped[date] = mapped_column(Date, index=True)
     report_period: Mapped[date] = mapped_column(Date, index=True)
@@ -212,8 +253,9 @@ class Pick(Base):
     __tablename__ = "quant_pick"
     __table_args__ = (UniqueConstraint("date", "code", name="uq_pick_date_code"),)
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    date: Mapped[date] = mapped_column(Date, index=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    # date 不再单独建索引:与 uq_pick_date_code(date,code) 前缀完全冗余
+    date: Mapped[date] = mapped_column(Date)
     code: Mapped[str] = mapped_column(String(16), index=True)
     score: Mapped[float] = mapped_column(Float)
     rank: Mapped[int] = mapped_column(Integer)
@@ -229,6 +271,8 @@ class StrategyEval(Base):
     strategy: Mapped[str] = mapped_column(String(64), index=True)
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     scope: Mapped[str] = mapped_column(String(64), index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    pool_id: Mapped[int | None] = mapped_column(Integer, nullable=True)  # 评估所用股票池
     start: Mapped[date] = mapped_column(Date)
     end: Mapped[date] = mapped_column(Date)
     metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
@@ -243,9 +287,47 @@ class BacktestEquity(Base):
         UniqueConstraint("run_id", "date", name="uq_bt_equity_run_date"),
     )
 
-    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     run_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("quant_backtest_run.id"), index=True
     )
     date: Mapped[date] = mapped_column(Date)
-    equity: Mapped[float] = mapped_column(Float)
+    equity: Mapped[float] = mapped_column(_EQUITY)
+
+
+class Pool(Base):
+    """股票池定义。kind: index(动态查指数成分)/ all(全市场按上市退市ST过滤)/ static(直查成员)。
+
+    user_id NULL 表示系统级预置池;非空则按共享 users.id 隔离。
+    """
+
+    __tablename__ = "quant_pool"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_pool_user_name"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(String(16), index=True)  # index / all / static
+    ref: Mapped[str | None] = mapped_column(String(32), nullable=True)  # 如 hs300_zz500
+    user_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(64), default="")
+    min_list_days: Mapped[int] = mapped_column(Integer, default=60)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class PoolMember(Base):
+    """静态池成员。只存代码,无日期(已定,带幸存者偏差由调用方知情)。"""
+
+    __tablename__ = "quant_pool_member"
+
+    pool_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_pool.id"), primary_key=True
+    )
+    code: Mapped[str] = mapped_column(String(16), primary_key=True)
+
+
+class TradeCalendar(Base):
+    """交易日历。采集逻辑由 agent-data 实现,此处仅建表。"""
+
+    __tablename__ = "quant_trade_calendar"
+
+    date: Mapped[date] = mapped_column(Date, primary_key=True)
+    is_open: Mapped[bool] = mapped_column(Boolean, default=True)
