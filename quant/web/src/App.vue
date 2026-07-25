@@ -6,6 +6,7 @@ import {
   BookOpen,
   BriefcaseBusiness,
   FlaskConical,
+  Layers,
   LayoutDashboard,
   ListFilter,
   LogOut,
@@ -28,6 +29,7 @@ function logout() {
 const nav = [
   { to: { name: 'dashboard' }, name: 'dashboard', label: '今日研究', icon: LayoutDashboard },
   { to: { name: 'selection' }, name: 'selection', label: '选股', icon: ListFilter },
+  { to: { name: 'pools' }, name: 'pools', label: '股票池', icon: Layers },
   { to: { name: 'signals' }, name: 'signals', label: '信号提醒', icon: Bell },
   { to: { name: 'strategies' }, name: 'strategies', label: '策略研究', icon: FlaskConical },
   { to: { name: 'portfolio' }, name: 'portfolio', label: '我的持仓', icon: BriefcaseBusiness },
@@ -82,6 +84,16 @@ const guides: Record<string, ResearchGuide> = {
       { term: '已实现盈亏', explanation: '根据手工录入的卖出记录计算的盈亏。' },
     ],
     note: '记录不是订单，系统不会连接券商或执行交易。',
+  },
+  pools: {
+    title: '股票池提示',
+    summary: '股票池决定选股和回测的研究范围。预置池按成分变动历史逐日解析，自定义池只保存当前名单。',
+    concepts: [
+      { term: '动态解析', explanation: '按每个交易日当时的成分或上市状态确定池内股票，历史口径准确。' },
+      { term: '幸存者偏差', explanation: '只用今天仍存在的股票回测过去，已退市或被剔除的股票缺失，结果偏乐观。' },
+    ],
+    steps: ['选择或新建股票池', '粘贴代码批量导入成员', '在选股和回测页选用该池'],
+    note: '自定义池不含成员历史，做历史回测时优先使用预置池。',
   },
   catalog: {
     title: '词典阅读提示',

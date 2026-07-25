@@ -14,9 +14,9 @@ const expanded = ref<string | null>(null)
 
 const factorKeys = ['mom20', 'mom60', 'rsi14', 'atr_pct', 'vol_ratio5', 'ma20_slope', 'amount_avg20']
 
-/** 新进标记:兼容 change='new' / is_new 两种契约 */
+/** 新进标记:后端以 change='new' 表示 */
 function isNew(p: PickItem): boolean {
-  return p.change === 'new' || p.is_new === true
+  return p.change === 'new'
 }
 
 function droppedCode(d: PickItem | string): string {
