@@ -282,7 +282,7 @@ def test_pool_member_has_no_date_column(migrated_db):
 
 def test_trade_calendar_shape(migrated_db):
     columns = _columns(migrated_db, "quant_trade_calendar")
-    assert set(columns) == {"date", "is_open"}
+    assert set(columns) == {"date", "is_open", "source"}
     pk = inspect(migrated_db).get_pk_constraint("quant_trade_calendar")
     assert pk["constrained_columns"] == ["date"]
 

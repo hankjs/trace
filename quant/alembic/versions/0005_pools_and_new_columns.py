@@ -41,11 +41,13 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["pool_id"], ["quant_pool.id"]),
     )
 
-    # 交易日历:采集逻辑由 agent-data 实现,此处仅建表
+    # 交易日历:采集逻辑在 app/data/trade_calendar.py
     op.create_table(
         "quant_trade_calendar",
         sa.Column("date", sa.Date(), primary_key=True, nullable=False),
         sa.Column("is_open", sa.Boolean(), nullable=False),
+        sa.Column("source", sa.String(16), nullable=False,
+                  server_default="baostock"),
     )
 
     # quant_stock:全A point-in-time 过滤依据(退市股标记而非删除)

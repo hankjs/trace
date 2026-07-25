@@ -325,9 +325,10 @@ class PoolMember(Base):
 
 
 class TradeCalendar(Base):
-    """交易日历。采集逻辑由 agent-data 实现,此处仅建表。"""
+    """交易日历。采集逻辑在 app/data/trade_calendar.py。"""
 
     __tablename__ = "quant_trade_calendar"
 
     date: Mapped[date] = mapped_column(Date, primary_key=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
+    source: Mapped[str] = mapped_column(String(16), default="baostock")
