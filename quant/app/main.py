@@ -1,4 +1,12 @@
-"""FastAPI 入口:启动时建表(create_all)+ 启动定时任务。"""
+"""FastAPI 入口:启动时校验 Alembic 版本 + 抢到互斥锁的实例启动定时任务。
+
+建表与改表**不再在启动时进行**。原先的两种做法都有问题:
+声明式建表从不 ALTER 既有表,模型改动会被静默忽略;
+手写 ALTER 每条语句一个事务,多副本同时启动会并发 DDL 竞态。
+
+现由 Alembic 管理,部署流程需在启动前执行 `alembic upgrade head`,
+启动时只校验版本(见 app/migrations.py)。
+"""
 from __future__ import annotations
 
 import logging
@@ -14,10 +22,11 @@ from .api import (admin, auth, backtest, catalog, market, portfolio, selection,
                   signals, watchlist)
 from .auth import require_admin, require_client
 from .config import settings
-from .db import Base, engine
+from .db import engine
 from . import models  # noqa: F401 - 确保模型注册到 Base.metadata
-from .schema import upgrade_research_schema
+from .migrations import check_schema_version
 from .scheduler import start_scheduler, stop_scheduler
+from .scheduler_lock import acquire_scheduler_slot, release_scheduler_slot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,12 +37,16 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    Base.metadata.create_all(engine)
-    upgrade_research_schema(engine)
-    logger.info("数据库表(quant_*)已就绪")
-    start_scheduler()
+    check_schema_version(engine)
+    # 多 worker / 多副本部署时只有一个实例运行定时任务,
+    # 否则会重复抓取写入(REVIEW 问题 6)
+    owns_scheduler = acquire_scheduler_slot()
+    if owns_scheduler:
+        start_scheduler()
     yield
-    stop_scheduler()
+    if owns_scheduler:
+        stop_scheduler()
+        release_scheduler_slot()
 
 
 app = FastAPI(title="quant - A股日频量化信息系统", lifespan=lifespan)

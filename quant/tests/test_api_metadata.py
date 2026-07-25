@@ -45,7 +45,7 @@ def _seed_stock_and_bar(db: Session) -> None:
         code="sh.600519", name="贵州茅台", industry="白酒", is_watch=False,
     ))
     db.add(DailyBar(
-        id=1, code="sh.600519", date=date(2026, 7, 24),
+        code="sh.600519", date=date(2026, 7, 24),
         open=1400.0, high=1420.0, low=1390.0, close=1410.0,
         raw_close=1410.0, volume=1000.0, amount=1_410_000.0,
     ))

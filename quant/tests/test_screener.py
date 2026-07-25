@@ -108,12 +108,12 @@ def test_structured_screen_excludes_not_yet_available_report() -> None:
         ))
         db.add_all([
             DailyBar(
-                id=1, code="sh.600001", date=date(2025, 1, 9),
+                code="sh.600001", date=date(2025, 1, 9),
                 open=10, high=10.5, low=9.8, close=10, raw_close=10,
                 volume=100, amount=1000,
             ),
             DailyBar(
-                id=2, code="sh.600001", date=day,
+                code="sh.600001", date=day,
                 open=10, high=11, low=9.9, close=11, raw_close=11,
                 volume=120, amount=1200,
             ),

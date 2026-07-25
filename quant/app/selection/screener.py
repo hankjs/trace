@@ -407,7 +407,7 @@ def _build_screen_rows(
         )).scalars()
     }
     listing_days = dict(db.execute(
-        select(DailyBar.code, func.count(DailyBar.id)).where(
+        select(DailyBar.code, func.count()).where(
             DailyBar.code.in_(codes),
             DailyBar.date <= day,
         ).group_by(DailyBar.code)
