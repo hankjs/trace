@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import scheduler
-from app.data.compat import TradeCalendar
+from app.models import TradeCalendar
 from app.db import Base
 from app.models import DailyBar, IndexMember
 

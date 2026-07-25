@@ -11,7 +11,7 @@ from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from ..models import DailyBar, Snapshot, Stock, WatchlistItem
-from . import akshare_client, baostock_client, compat  # noqa: F401 - compat 补齐列
+from . import akshare_client, baostock_client
 from .clock import naive_now_cst, today_cst
 
 logger = logging.getLogger(__name__)

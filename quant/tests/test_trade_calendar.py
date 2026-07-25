@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.data import calendar as trade_calendar
-from app.data.compat import TradeCalendar
+from app.models import TradeCalendar
 from app.db import Base
 
 

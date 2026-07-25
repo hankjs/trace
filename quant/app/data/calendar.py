@@ -4,8 +4,8 @@
 兜底,兜底不干净:节假日会拿节前旧 bar 去和 akshare 对账(`ingest.py`
 `last.iloc[-1]`),刷出成批假告警(REVIEW §3.4)。
 
-表结构由 agent-migrate 负责(`quant_trade_calendar`),本模块只写采集与查询;
-在其落地前由 `app/data/compat.py` 提供等价映射。
+表结构见 `app/models.py` 的 `TradeCalendar`(quant_trade_calendar),
+本模块只写采集与查询。
 """
 from __future__ import annotations
 
@@ -15,9 +15,9 @@ from datetime import date, timedelta
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from ..models import TradeCalendar
 from . import baostock_client
 from .clock import today_cst
-from .compat import TradeCalendar
 
 logger = logging.getLogger(__name__)
 
