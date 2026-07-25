@@ -153,3 +153,77 @@ class _nullcontext:
 
     def __exit__(self, *exc):
         return False
+
+
+def _bar(code: str, day: date, close: float, raw_close: float):
+    from app.models import DailyBar
+    return DailyBar(code=code, date=day, open=close, high=close, low=close,
+                    close=close, raw_close=raw_close, volume=1000, amount=1000)
+
+
+def test_audit_detects_preexisting_scale_error_that_self_check_cannot(db):
+    """权威因子能发现**既存**错乱——这是自比对做不到的。
+
+    detect_reanchor 是「库中反推因子 vs 新拉反推因子」的自比对,两边都来自
+    close/raw_close。若某股入库时历史就已错乱,两边会一致地错下去,检测不出。
+    权威因子是独立基准。
+    """
+    # 权威因子:2020-06-24 起 fore_factor = 0.856267
+    ingest.upsert_adjust_factors(db, "sh.600519", _factors([
+        ("sh.600519", date(2020, 6, 24), 0.856267, 6.566931),
+    ]))
+    # 库中价格的隐含系数是 0.5,与权威值严重不符(既存错乱)
+    db.add(_bar("sh.600519", date(2021, 3, 1), close=50.0, raw_close=100.0))
+    db.commit()
+
+    verdict = ingest.audit_scale_against_factors(db, "sh.600519")
+
+    assert verdict.reanchored is True
+    assert verdict.reason == "authoritative_mismatch"
+    assert "权威因子" in (verdict.detail or "")
+
+
+def test_audit_passes_when_stored_scale_matches_authority(db):
+    """库中系数与权威因子一致时放行。"""
+    ingest.upsert_adjust_factors(db, "sh.600519", _factors([
+        ("sh.600519", date(2020, 6, 24), 0.856267, 6.566931),
+    ]))
+    db.add(_bar("sh.600519", date(2021, 3, 1),
+                close=85.6267, raw_close=100.0))   # 系数正好 0.856267
+    db.commit()
+
+    verdict = ingest.audit_scale_against_factors(db, "sh.600519")
+
+    assert verdict.reanchored is False
+    assert verdict.reason == "authoritative_match"
+
+
+def test_audit_degrades_when_factor_table_has_no_data(db):
+    """因子表缺该股数据时返回 no_factors,调用方降级到自比对。
+
+    不能因为缺基准就假定尺度正确。
+    """
+    db.add(_bar("sh.600519", date(2021, 3, 1), close=50.0, raw_close=100.0))
+    db.commit()
+
+    verdict = ingest.audit_scale_against_factors(db, "sh.600519")
+
+    assert verdict.reanchored is False
+    assert verdict.reason == "no_factors"
+
+
+def test_audit_uses_factor_effective_on_the_bar_date(db):
+    """取 divid_operate_date <= bar 日期的最后一个因子,不是最新因子。"""
+    ingest.upsert_adjust_factors(db, "sh.600519", _factors([
+        ("sh.600519", date(2020, 6, 24), 0.856267, 6.566931),
+        ("sh.600519", date(2025, 6, 26), 0.960527, 7.366525),
+    ]))
+    # bar 在 2021 年:生效因子应是 0.856267 而非 0.960527
+    db.add(_bar("sh.600519", date(2021, 3, 1),
+                close=85.6267, raw_close=100.0))
+    db.commit()
+
+    verdict = ingest.audit_scale_against_factors(db, "sh.600519")
+
+    assert verdict.reanchored is False
+    assert "0.856267" in (verdict.detail or "")

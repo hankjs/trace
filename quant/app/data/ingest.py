@@ -340,6 +340,61 @@ def _factor(close: float | None, raw_close: float | None) -> float | None:
     return c / r
 
 
+def audit_scale_against_factors(db: Session, code: str) -> ReanchorVerdict:
+    """用 quant_adjust_factor 的**权威**因子核对库中历史的复权尺度。
+
+    为什么需要它:`detect_reanchor` 是「库中反推因子 vs 新拉反推因子」的
+    自比对,两边都来自 close/raw_close。若某股入库时历史就已错乱,两边会
+    一致地错下去 —— 拿反推值当基准是循环论证,检测不出既存的错乱。
+
+    这里换成独立基准:库中 close/raw_close 反推的因子,应当等于权威因子表
+    在该日生效的值(前复权基准为最新日,故取 divid_operate_date <= 该日的
+    最后一个 fore_factor)。不等即说明库中价格的尺度与权威因子对不上。
+
+    返回 `no_factors` 表示因子表还没这只股票的数据,调用方应降级到
+    `detect_reanchor`(不能因为缺基准就假定尺度正确)。
+    """
+    factors = db.execute(
+        select(AdjustFactor.divid_operate_date, AdjustFactor.fore_factor)
+        .where(AdjustFactor.code == code)
+        .order_by(AdjustFactor.divid_operate_date)
+    ).all()
+    if not factors:
+        return ReanchorVerdict(False, "no_factors")
+
+    # 取库中最新一根有 raw_close 的 bar 核对:前复权基准是最新日,
+    # 该日的因子应当等于最后一个除权日的 fore_factor。
+    row = db.execute(
+        select(DailyBar.date, DailyBar.close, DailyBar.raw_close)
+        .where(DailyBar.code == code, DailyBar.raw_close.is_not(None))
+        .order_by(DailyBar.date.desc()).limit(1)
+    ).first()
+    if row is None:
+        return ReanchorVerdict(False, "no_history")
+
+    stored_factor = _factor(row.close, row.raw_close)
+    if stored_factor is None:
+        return ReanchorVerdict(False, "unverifiable")
+
+    # 该 bar 日期生效的权威因子
+    effective = None
+    for divid_date, fore in factors:
+        if divid_date <= row.date:
+            effective = float(fore)
+        else:
+            break
+    if effective is None or effective <= 0:
+        # 该 bar 早于首个除权日,权威因子未覆盖,无从核对
+        return ReanchorVerdict(False, "no_factors")
+
+    dev = abs(stored_factor - effective) / effective
+    detail = (f"{row.date} 库中系数 {stored_factor:.6f} vs "
+              f"权威因子 {effective:.6f}")
+    if dev > REANCHOR_TOLERANCE:
+        return ReanchorVerdict(True, "authoritative_mismatch", detail)
+    return ReanchorVerdict(False, "authoritative_match", detail)
+
+
 def detect_reanchor(db: Session, code: str, df: pd.DataFrame) -> ReanchorVerdict:
     """判定本批数据与库中历史是否处于同一前复权尺度。
 
@@ -426,11 +481,22 @@ def _upsert_with_reanchor_check(db: Session, code: str, df: pd.DataFrame,
     """upsert 前检测前复权重锚,必要时全量回填。
 
     baostock 前复权价在分红送转后会回溯调整全部历史,只增量更新最近几天
-    会让新旧数据处于不同复权尺度,产生假跳空。判定见 `detect_reanchor`。
+    会让新旧数据处于不同复权尺度,产生假跳空。
+
+    两层检测,权威基准优先:
+    1. `audit_scale_against_factors`:库中历史与 quant_adjust_factor 的权威
+       因子核对。能发现**既存**的错乱 —— 这是自比对做不到的(两边都从
+       close/raw_close 反推,一致地错下去也检测不出);
+    2. `detect_reanchor`:库中反推因子 vs 本批反推因子。能发现**本次**增量
+       引入的错乱。因子表缺该股数据时(no_factors)这是唯一手段。
     """
     if df.empty:
         return 0
-    verdict = detect_reanchor(db, code, df)
+
+    # 先用权威因子查既存错乱:它为真时本批数据本身可能是对的,
+    # 但库中历史已经歪了,必须全量重拉。
+    audit = audit_scale_against_factors(db, code)
+    verdict = audit if audit.reanchored else detect_reanchor(db, code, df)
     if not verdict.reanchored:
         return upsert_bars(db, code, df)
 
