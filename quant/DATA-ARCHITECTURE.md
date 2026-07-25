@@ -138,10 +138,26 @@ join 与乘法。当前选择的是渐进方案：读取路径不动，先建立
 `static` 池只存代码不存日期，所以用它回测历史区间**带幸存者偏差**。这是已接受的
 取舍（对手挑的池子符合直觉），前端在池编辑页与回测结果页各有一处标注。
 
-**实现现状（截至本文档编写时）**：`pool_id` 只贯通到 `/api/backtest`。
-`/api/selection/screener` 与 `/api/selection/*` 后端仍接受 `universe` 字符串
-（`pool` / `hs300_zz500` / `hs300` / `zz500` / `watchlist` / `all`），前端 `api.ts`
-已改用 `pool_id`。**这是一处未收口的不一致**，文档不应把设计意图写成已实现。
+### 已收口的实现
+
+`pool_id` 已贯通 `/api/backtest` 与 `/api/selection/screener`，解析统一走
+`universe.resolve_pool`。早先 `screener.py` 有一套独立的 `universe` 字符串分支
+（`pool` / `hs300_zz500` / `hs300` / `zz500` / `watchlist` / `all`），与
+`universe.py` 各自实现 `in_date`/`out_date` 条件，两处会漂移；更隐蔽的是它的
+`universe='all'` 是**全表无过滤**，与 `kind='all'`（剔 ST/退市/新股）同名不同义。
+
+`watchlist` 不是一种 `kind` 而是独立开关 `watchlist_only`：自选是用户关系不是
+股票池，做成池会引入「自选变化时池成员如何同步」的新问题。
+
+### 空结果必须与数据缺口区分
+
+`kind='index'` 解析为空时，若查询日早于名录最早 `in_date`，抛
+`MissingIndexHistoryError` 而非返回空池。理由是两种成因的用户解读完全不同：
+返回空池会被读成「这天没有符合条件的股票」，而真相是**成分数据没回填到那么早**。
+这个护栏在池抽象收口时曾一度丢失（旧代码的 `allow_current_fallback` 分支被删除
+后未补），是收口过程中发现并补回的。
+
+`kind='all'` / `'static'` 不做此判断 —— 它们返回空可能是合法结果。
 
 ## 6. 迁移与 Schema 管理
 

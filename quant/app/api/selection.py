@@ -41,7 +41,11 @@ class StructuredScreenerRequest(BaseModel):
     conditions: list[FilterCondition] = Field(default_factory=list)
     groups: list[FilterGroup] = Field(default_factory=list)
     limit: int = Field(default=100, ge=1, le=500)
-    universe: str = "pool"
+    # 股票池。缺省落系统默认池(全A),与前端 pools.ts 的 defaultPool 同口径。
+    pool_id: int | None = None
+    # 自选不是池而是用户关系:把它做成池会引入「自选变化时池成员如何同步」
+    # 的新问题,故保留为独立开关。与 pool_id 互斥,置 true 时优先。
+    watchlist_only: bool = False
 
 
 def _prev_pick_date(db: Session, day: Date) -> Date | None:

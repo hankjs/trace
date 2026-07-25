@@ -22,7 +22,8 @@ from sqlalchemy.orm import Session
 
 from ..auth import require_client, user_id_from_claims
 from ..data.universe import (DEFAULT_MIN_LIST_DAYS, INDEX_NAMES,
-                             IncompleteListingDataError, resolve_pool,
+                             IncompleteListingDataError,
+                             MissingIndexHistoryError, resolve_pool,
                              resolve_pool_during)
 from ..db import get_db
 from ..models import Pool, PoolMember, Stock
@@ -158,6 +159,10 @@ def _resolved(call) -> list[str]:
         return call()
     except IncompleteListingDataError as exc:
         # 全A 口径缺 list_date 时宁可报错也不返回半个池子(见 universe.all_market_pool)
+        raise HTTPException(422, str(exc)) from exc
+    except MissingIndexHistoryError as exc:
+        # 指数名录未覆盖查询日:静默返回空池会让用户误读为「这天没有符合
+        # 条件的股票」,而真相是成分数据没回填到那么早
         raise HTTPException(422, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc

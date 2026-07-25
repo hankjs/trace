@@ -10,11 +10,11 @@ from datetime import date, timedelta
 from typing import Any
 
 import pandas as pd
+from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..catalog import FILTER_FIELDS
-from ..data.universe import current_pool, pool_at
 from ..models import (
     DailyBar,
     FactorDaily,
@@ -344,48 +344,51 @@ def evaluate_conditions(rows: list[dict[str, Any]], payload: dict[str, Any]) -> 
     }
 
 
-def _codes_for_universe(
+def codes_for_pool(
     db: Session,
-    universe: str,
     day: date,
     *,
-    allow_current_fallback: bool,
-    user_id: int | None,
+    pool_id: int | None,
+    watchlist_only: bool,
+    user_id: str | None,
 ) -> list[str]:
-    universe = universe.lower()
-    if universe == "all":
-        return [r[0] for r in db.execute(select(Stock.code).order_by(Stock.code)).all()]
-    if universe == "watchlist":
+    """筛选范围解析:统一走 universe.resolve_pool,不在此重写任何池口径。
+
+    早先这里是一套 `universe` 字符串分支(pool/hs300_zz500/hs300/zz500/
+    watchlist/all),与 `universe.py` 各自实现 in_date/out_date 条件,两处会
+    漂移;且它的 `universe='all'` 是全表无过滤,与 `kind='all'`(剔 ST/退市/
+    新股)语义不同,同名不同义。现已统一。
+
+    `watchlist_only` 是独立开关而非一种 kind:自选是用户关系不是池,做成池会
+    引入「自选变化时池成员如何同步」的新问题。
+    """
+    if watchlist_only:
         if user_id is None:
             return []
         return [r[0] for r in db.execute(
             select(WatchlistItem.code).where(WatchlistItem.user_id == user_id)
             .order_by(WatchlistItem.code)
         ).all()]
-    if universe in {"hs300", "zz500"}:
-        # 单指数 point-in-time 口径统一走 universe.py,不在这里重写
-        # in_date/out_date 条件(重复实现会各自漂移)
-        codes = pool_at(db, day, index_name=universe)
-        if codes:
-            return codes
-        if allow_current_fallback:
-            return current_pool(db, index_name=universe)
-        raise InvalidFilterError(
-            f"{day} 缺少 {universe} 历史成分，请先回填指数成分数据"
-        )
-    if universe not in {"pool", "hs300_zz500"}:
-        raise InvalidFilterError(
-            "universe 只能是 pool、hs300_zz500、hs300、zz500、watchlist 或 all"
-        )
-    codes = pool_at(db, day)
-    if codes:
-        return codes
-    if allow_current_fallback:
-        return current_pool(db)
-    raise InvalidFilterError(
-        f"{day} 缺少沪深300和中证500历史成分，"
-        "不能用当前成分替代，请先回填指数成分数据"
-    )
+
+    from ..api.pools import default_pool, get_pool_or_404, resolve_pool_codes
+
+    if pool_id is None:
+        pool = default_pool(db)
+        if pool is None:
+            raise InvalidFilterError(
+                "系统缺少预置股票池，请先执行 alembic upgrade head")
+    elif user_id is None:
+        raise InvalidFilterError("指定股票池需要登录")
+    else:
+        pool = get_pool_or_404(db, pool_id, user_id)
+    try:
+        return resolve_pool_codes(db, pool, day)
+    except HTTPException as exc:
+        # resolve_pool_codes 面向 API 层,把数据完整性问题抛成 HTTPException(422);
+        # 筛选层统一用 InvalidFilterError,由 post_screener 再转 422。
+        if exc.status_code == 422:
+            raise InvalidFilterError(str(exc.detail)) from exc
+        raise
 
 
 def _latest_rows_by_code(
@@ -413,13 +416,13 @@ def _latest_rows_by_code(
 def _build_screen_rows(
     db: Session,
     day: date,
-    universe: str,
     *,
-    allow_current_fallback: bool,
-    user_id: int | None,
+    pool_id: int | None,
+    watchlist_only: bool,
+    user_id: str | None,
 ) -> list[dict[str, Any]]:
-    codes = _codes_for_universe(
-        db, universe, day, allow_current_fallback=allow_current_fallback,
+    codes = codes_for_pool(
+        db, day, pool_id=pool_id, watchlist_only=watchlist_only,
         user_id=user_id,
     )
     if not codes:
@@ -578,12 +581,13 @@ def structured_screen(db: Session, payload: dict[str, Any],
     if day is None:
         day = requested_day or date.today()
 
-    universe = str(payload.get("universe") or "pool")
+    pool_id = payload.get("pool_id")
+    watchlist_only = bool(payload.get("watchlist_only"))
     rows = _build_screen_rows(
         db,
         day,
-        universe,
-        allow_current_fallback=requested_day is None or requested_day >= date.today(),
+        pool_id=None if pool_id is None else int(pool_id),
+        watchlist_only=watchlist_only,
         user_id=user_id,
     )
     evaluated = evaluate_conditions(rows, payload)
@@ -592,7 +596,8 @@ def structured_screen(db: Session, payload: dict[str, Any],
     items = sorted(evaluated["items"], key=lambda row: row["code"])[:limit]
     return {
         "date": str(day),
-        "universe": universe,
+        "pool_id": pool_id,
+        "watchlist_only": watchlist_only,
         "candidate_count": len(rows),
         "total": combined_count,
         "combined_count": combined_count,

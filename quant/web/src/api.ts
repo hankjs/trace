@@ -381,6 +381,11 @@ export interface StructuredScreenerRequest {
   limit?: number
   /** 股票池 id;不传由后端取默认池(全部A股) */
   pool_id?: number
+  /**
+   * 只筛自选。自选是用户关系而非股票池,做成池会引入「自选变化时池成员
+   * 如何同步」的问题,故为独立开关。置 true 时后端忽略 pool_id。
+   */
+  watchlist_only?: boolean
 }
 
 export interface StrategyListResult {

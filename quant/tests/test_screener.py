@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.db import Base
 from app.models import (
+    Pool,
     DailyBar,
     FactorDaily,
     FundamentalSnapshot,
@@ -33,6 +34,22 @@ def _condition(field: str, operator: str, value=None, value_to=None) -> dict:
         "value_to": value_to,
         "enabled": True,
     }
+
+
+def _seed_pools(db) -> None:
+    """建预置池:pool_id=None 走 default_pool(kind='all'),pool_id=1 为指数池。
+
+    id 固定:1=index(沪深300+中证500)、2=all(全A)。default_pool 优先取
+    kind='all',故 pool_id 缺省时命中 id=2。min_list_days=0 让测试数据
+    不被新股规则剔除。
+    """
+    db.add_all([
+        Pool(id=1, kind="index", ref="hs300_zz500", user_id=None,
+             name="沪深300+中证500", min_list_days=0),
+        Pool(id=2, kind="all", ref=None, user_id=None,
+             name="全部A股", min_list_days=0),
+    ])
+    db.flush()
 
 
 @pytest.mark.parametrize(
@@ -100,7 +117,9 @@ def test_structured_screen_excludes_not_yet_available_report() -> None:
     Base.metadata.create_all(engine)
     day = date(2025, 1, 10)
     with Session(engine) as db:
-        db.add(Stock(code="sh.600001", name="测试股份", industry="制造"))
+        _seed_pools(db)
+        db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
+                     list_date=date(2020, 1, 1)))
         db.add(FactorDaily(
             id=1, code="sh.600001", date=day, mom20=0.05, mom60=0.08,
             rsi14=55, atr_pct=0.02, vol_ratio5=1.2,
@@ -145,7 +164,7 @@ def test_structured_screen_excludes_not_yet_available_report() -> None:
                 {**_condition("pe_ttm", "lte", 20), "id": "pe_limit"},
             ],
             "groups": [],
-            "universe": "all",
+            "pool_id": None,
             "limit": 20,
         })
 
@@ -162,7 +181,9 @@ def test_structured_screen_uses_revision_only_after_available_date() -> None:
     before_revision = date(2025, 1, 10)
     after_revision = date(2025, 2, 10)
     with Session(engine) as db:
-        db.add(Stock(code="sh.600001", name="测试股份", industry="制造"))
+        _seed_pools(db)
+        db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
+                     list_date=date(2020, 1, 1)))
         db.add_all([
             FactorDaily(id=1, code="sh.600001", date=before_revision),
             FactorDaily(id=2, code="sh.600001", date=after_revision),
@@ -185,7 +206,7 @@ def test_structured_screen_uses_revision_only_after_available_date() -> None:
             "logic": "and",
             "conditions": [_condition("roe", "not_null")],
             "groups": [],
-            "universe": "all",
+            "pool_id": None,
         }
         before = structured_screen(db, {**payload, "date": before_revision})
         after = structured_screen(db, {**payload, "date": after_revision})
@@ -200,20 +221,41 @@ def test_historical_pool_without_membership_history_fails_explicitly() -> None:
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
-        db.add(Stock(code="sh.600001", name="测试股份", industry="制造"))
+        _seed_pools(db)
+        db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
+                     list_date=date(2020, 1, 1)))
         db.add(IndexMember(
             id=1, index_name="hs300", code="sh.600001",
             in_date=date(2025, 1, 1),
         ))
         db.commit()
 
+        # pool_id 指定非默认池时需要 user_id(预置池对所有登录用户可见)
         with pytest.raises(InvalidFilterError, match="缺少.*历史成分"):
             structured_screen(db, {
                 "date": date(2024, 1, 10),
                 "logic": "and",
                 "conditions": [_condition("roe", "not_null")],
                 "groups": [],
-                "universe": "pool",
+                "pool_id": 1,
+            }, user_id="test-user")
+
+
+def test_explicit_pool_requires_login() -> None:
+    """指定 pool_id 必须登录:否则无法判断该池是否属于调用者(池可见性)。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        _seed_pools(db)
+        db.commit()
+
+        with pytest.raises(InvalidFilterError, match="需要登录"):
+            structured_screen(db, {
+                "date": date(2025, 1, 10),
+                "logic": "and",
+                "conditions": [],
+                "groups": [],
+                "pool_id": 1,
             })
 
 
@@ -222,7 +264,9 @@ def test_stale_valuation_is_treated_as_missing() -> None:
     Base.metadata.create_all(engine)
     day = date(2025, 1, 10)
     with Session(engine) as db:
-        db.add(Stock(code="sh.600001", name="测试股份", industry="制造"))
+        _seed_pools(db)
+        db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
+                     list_date=date(2020, 1, 1)))
         db.add(FactorDaily(id=1, code="sh.600001", date=day))
         db.add(ValuationSnapshot(
             code="sh.600001", data_date=date(2025, 1, 2),
@@ -236,7 +280,7 @@ def test_stale_valuation_is_treated_as_missing() -> None:
             "logic": "and",
             "conditions": [_condition("pe_ttm", "not_null")],
             "groups": [],
-            "universe": "all",
+            "pool_id": None,
         })
 
     assert result["combined_count"] == 0

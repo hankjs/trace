@@ -296,6 +296,10 @@ def static_pool(db: Session, pool_id: int) -> list[str]:
     ).all())
 
 
+class MissingIndexHistoryError(RuntimeError):
+    """指数成分名录未覆盖到查询日,`kind='index'` 无法可信解析。"""
+
+
 def resolve_pool(db: Session, day: date, *, kind: str = "all",
                  index_name: str | None = None, pool_id: int | None = None,
                  min_list_days: int = DEFAULT_MIN_LIST_DAYS,
@@ -315,7 +319,25 @@ def resolve_pool(db: Session, day: date, *, kind: str = "all",
     if kind not in POOL_KINDS:
         raise ValueError(f"未知池类型: {kind},可选: {', '.join(POOL_KINDS)}")
     if kind == "index":
-        return pool_at(db, day, index_name=index_name)
+        codes = pool_at(db, day, index_name=index_name)
+        if codes:
+            return codes
+        # 空结果有两种成因,必须区分:名录确实没有该日成分(数据缺口),还是
+        # 该日全部成分都已调出(几乎不可能)。前者返回空池会让用户以为
+        # 「这天没有符合条件的股票」,而真相是成分数据没回填到那么早 ——
+        # 静默的空结果比报错危险(REVIEW §3.1 同类问题)。
+        earliest = db.execute(
+            select(func.min(IndexMember.in_date)).where(
+                *( (IndexMember.index_name == index_name,) if index_name else () )
+            )
+        ).scalar()
+        if earliest is None or day < earliest:
+            raise MissingIndexHistoryError(
+                f"{day} 缺少{index_name or '指数'}历史成分"
+                f"(名录最早 {earliest or '无数据'}),"
+                f"不能用当前成分替代,请先回填指数成分数据"
+            )
+        return codes
     if kind == "static":
         if pool_id is None:
             raise ValueError("kind='static' 必须提供 pool_id")

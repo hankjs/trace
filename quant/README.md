@@ -146,18 +146,16 @@ curl -X POST \
 ## 组合筛选
 
 `POST /api/selection/screener` 支持基础信息、技术面和基本面字段，字段、单位、
-输入换算和允许的操作符以 `/api/catalog` 的 `filter_fields` 为准。支持的研究范围包括
-`pool`、`hs300_zz500`、`hs300`、`zz500`、`watchlist` 和 `all`。
-
-> **注意实现现状**：股票池已抽象为 `pool_id` + `kind` 分派（见
-> [`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) 第 5 节），但目前只贯通到
-> `/api/backtest`。筛选与选股接口后端仍接受上面这组 `universe` 字符串，而前端
-> `api.ts` 已改用 `pool_id` —— 这是一处**未收口的不一致**。
+输入换算和允许的操作符以 `/api/catalog` 的 `filter_fields` 为准。研究范围由
+`pool_id` 指定（不传取系统默认池「全部A股」）；`watchlist_only=true` 时只筛自选
+——自选是用户关系而非股票池，做成池会引入「自选变化时池成员如何同步」的问题，
+故保留为独立开关。池的解析口径见
+[`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) 第 5 节。
 
 ```json
 {
   "date": "2026-07-24",
-  "universe": "pool",
+  "pool_id": 2,
   "logic": "and",
   "groups": [
     {
