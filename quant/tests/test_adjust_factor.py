@@ -241,8 +241,11 @@ def test_derive_factors_keeps_only_change_points(db):
     ])
     out = ingest.derive_adjust_factors(bars)
 
-    assert list(out["divid_operate_date"]) == [date(2024, 1, 2), date(2024, 6, 3)]
-    assert out["fore_factor"].tolist() == pytest.approx([0.9, 0.95])
+    # 两个变化点 + 末行锚点(2024-06-04):锚点让审计核对最新 bar 时精确,
+    # 见 derive_adjust_factors 关于小额分红被阈值漏记的说明。
+    assert list(out["divid_operate_date"]) == [
+        date(2024, 1, 2), date(2024, 6, 3), date(2024, 6, 4)]
+    assert out["fore_factor"].tolist() == pytest.approx([0.9, 0.95, 0.95])
 
 
 def test_derive_factors_ignores_decimal_rounding_noise(db):
@@ -259,8 +262,10 @@ def test_derive_factors_ignores_decimal_rounding_noise(db):
     ])
     out = ingest.derive_adjust_factors(bars)
 
-    # 三行的因子都是 0.98839x,只差在第 6 位 —— 只该有 1 行
-    assert len(out) == 1
+    # 三行的因子都是 0.98839x,只差在第 6 位:噪声不产出变化点。
+    # 结果是首行 + 末行锚点两行,中间那行被正确忽略。
+    assert list(out["divid_operate_date"]) == [date(2024, 1, 2), date(2024, 1, 4)]
+    assert out["fore_factor"].tolist() == pytest.approx([0.98839, 0.98839], rel=1e-4)
 
 
 def test_derive_factors_skips_unusable_rows(db):

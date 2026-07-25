@@ -322,6 +322,11 @@ def backfill(db: Session, code: str, start: date | str, end: date | str | None =
 REANCHOR_TOLERANCE = 0.001
 # 无 raw_close 可用时退化为 close 直接比对的阈值(同尺度下应完全相等)
 CLOSE_FALLBACK_TOLERANCE = 0.001
+# 自算因子(source='sina',北交所)的审计容差。必须比权威值宽:
+# 它从 close/raw_close 反推,精度受 DECIMAL(12,4) 限制(低价股噪声 P99
+# 约 0.19%),且低于 FACTOR_CHANGE_TOLERANCE 的小额分红不会被记录。
+# 代价明确:自算源只保证检出 >1% 的尺度错乱,小额分红漏记不报警。
+DERIVED_FACTOR_TOLERANCE = 0.012
 
 
 class ReanchorVerdict:
@@ -392,6 +397,23 @@ def derive_adjust_factors(df: pd.DataFrame) -> pd.DataFrame:
         if prev is None or abs(factor - prev) / prev > FACTOR_CHANGE_TOLERANCE:
             rows.append({"divid_operate_date": r.date, "fore_factor": factor})
             prev = factor
+
+    # 末行锚点:额外存最新交易日的实际因子。
+    #
+    # 为什么需要它:单一相对阈值无法干净分离低价股的舍入噪声与小额分红。
+    # 实测 bj.920000 在 2026-05-25 有次真实除权(0.99474 -> 1.0),相对变化
+    # 仅 0.53%,低于 1% 阈值被当噪声丢掉 —— 于是因子表最后一行停在一年前,
+    # 审计核对最新 bar 时取到过时因子,误报「尺度错乱」(实测 87/330 只)。
+    # DECIMAL(12,4) 对低价股的噪声 P99 约 0.19%,与小额分红信号量级重叠,
+    # 调阈值只是在「漏报噪声」和「漏报除权」之间换一头错。
+    #
+    # 锚点让审计最常做的操作(核对最新 bar)变精确;中间日期的小额除权仍
+    # 可能漏记,故自算因子只保证检出 >1% 的尺度错乱,见 audit 的分源容差。
+    last = usable.iloc[-1]
+    last_factor = float(last.close) / float(last.raw_close)
+    if not rows or rows[-1]["divid_operate_date"] != last.date:
+        rows.append({"divid_operate_date": last.date,
+                     "fore_factor": last_factor})
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -471,12 +493,20 @@ def audit_scale_against_factors(db: Session, code: str) -> ReanchorVerdict:
     `detect_reanchor`(不能因为缺基准就假定尺度正确)。
     """
     factors = db.execute(
-        select(AdjustFactor.divid_operate_date, AdjustFactor.fore_factor)
+        select(AdjustFactor.divid_operate_date, AdjustFactor.fore_factor,
+               AdjustFactor.source)
         .where(AdjustFactor.code == code)
         .order_by(AdjustFactor.divid_operate_date)
     ).all()
     if not factors:
         return ReanchorVerdict(False, "no_factors")
+
+    # 容差按来源区分:baostock 是权威 6 位小数值,可用严格阈值;'sina' 是
+    # 从 close/raw_close 自算的,精度受 DECIMAL(12,4) 限制,且小额分红可能
+    # 未被记录(见 derive_adjust_factors 的末行锚点说明)。对它用严格阈值
+    # 会大量误报,故放宽 —— 代价是自算源只保证检出 >1% 的尺度错乱。
+    is_derived = any(src == "sina" for _, _, src in factors)
+    tolerance = DERIVED_FACTOR_TOLERANCE if is_derived else REANCHOR_TOLERANCE
 
     # 取库中最新一根有 raw_close 的 bar 核对:前复权基准是最新日,
     # 该日的因子应当等于最后一个除权日的 fore_factor。
@@ -492,21 +522,22 @@ def audit_scale_against_factors(db: Session, code: str) -> ReanchorVerdict:
     if stored_factor is None:
         return ReanchorVerdict(False, "unverifiable")
 
-    # 该 bar 日期生效的权威因子
+    # 该 bar 日期生效的因子
     effective = None
-    for divid_date, fore in factors:
+    for divid_date, fore, _src in factors:
         if divid_date <= row.date:
             effective = float(fore)
         else:
             break
     if effective is None or effective <= 0:
-        # 该 bar 早于首个除权日,权威因子未覆盖,无从核对
+        # 该 bar 早于首个除权日,因子未覆盖,无从核对
         return ReanchorVerdict(False, "no_factors")
 
     dev = abs(stored_factor - effective) / effective
+    src_label = "自算因子" if is_derived else "权威因子"
     detail = (f"{row.date} 库中系数 {stored_factor:.6f} vs "
-              f"权威因子 {effective:.6f}")
-    if dev > REANCHOR_TOLERANCE:
+              f"{src_label} {effective:.6f}")
+    if dev > tolerance:
         return ReanchorVerdict(True, "authoritative_mismatch", detail)
     return ReanchorVerdict(False, "authoritative_match", detail)
 
