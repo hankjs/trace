@@ -176,7 +176,7 @@ def _sharpe_ratio(rets: pd.Series, risk_free: float = RISK_FREE_RATE
     if not std > 0:
         return None
     excess = float(rets.mean()) - risk_free / TRADING_DAYS
-    return round(excess / std * np.sqrt(TRADING_DAYS), 4)
+    return round(float(excess / std * np.sqrt(TRADING_DAYS)), 4)
 
 
 def _metrics_from_equity(eq: pd.Series, pf: vbt.Portfolio,
@@ -202,6 +202,40 @@ def _to_price_matrix(dfs: dict[str, pd.DataFrame], col: str,
     ).reindex(idx)
 
 
+def _limit_pct(code: str) -> float:
+    """按板块返回涨跌停幅度。创业板(sz.30)/科创板(sh.688)为 20%,其余 10%。
+
+    ST 股实为 5%,但库内无 point-in-time 的 ST 标记(quant_stock.is_st 是当前
+    状态),用它回填历史会引入前视,故 ST 一律按 10% 处理——偏保守方向。
+    """
+    bare = code.split(".")[-1]
+    if bare.startswith("30") or bare.startswith("688"):
+        return 0.20
+    return 0.10
+
+
+def _limit_up_mask(dfs: dict[str, pd.DataFrame], idx: pd.DatetimeIndex
+                   ) -> pd.DataFrame:
+    """标记"当日开盘即涨停、买不进"的 (bar, code)。
+
+    open 与前收都取前复权价:同一复权序列内比值即真实涨幅,除权造成的跳变
+    对两者同向作用。留 0.5% 容差吸收四舍五入与复权残差,避免误判。
+
+    突破/动量策略常在大涨次日入场,而那天开盘往往一字板买不到——不拦就是
+    方向固定向上的系统性虚增。
+    """
+    mask = pd.DataFrame(False, index=idx, columns=list(dfs))
+    for code, df in dfs.items():
+        if code not in mask.columns or not len(df):
+            continue
+        d = df.set_index("date")
+        prev_close = d["close"].shift(1)
+        ratio = d["open"] / prev_close.where(prev_close > 0)
+        hit = (ratio >= 1 + _limit_pct(code) * 0.995).fillna(False)
+        mask[code] = hit.reindex(idx, fill_value=False).fillna(False).astype(bool)
+    return mask
+
+
 def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
                   costs: dict, start: date) -> dict[str, dict]:
     """vectorbt 批量单标的回测:同一组 entries/exits 矩阵一次跑完。
@@ -214,6 +248,8 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
     注意判定用的是 start 之前那根 bar 而非窗口首日:窗口首日的仓位是用当日
     收盘价算出来的,若拿它去当日开盘成交就等于用了当天才知道的信号
     (前视偏差)。与 _portfolio_sim 的"先 shift 再截断"同一口径。
+
+    入场当日开盘一字涨停的,该笔**丢弃不顺延**(见 decisions D6)。
 
     返回 {code: {"metrics": ..., "equity": Series}}
     """
@@ -237,6 +273,11 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
             e.iloc[0] = True
         entries[code] = e
         exits[code] = x
+
+    # 开盘一字涨停买不进:该笔入场丢弃(不顺延)
+    blocked = _limit_up_mask(dfs, idx).reindex(columns=close.columns,
+                                               fill_value=False)
+    entries = entries & ~blocked
 
     pf = vbt.Portfolio.from_signals(
         close, entries, exits, price=open_,
@@ -296,15 +337,22 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     per_code = {c: r["metrics"] for c, r in results.items()}
     curves = [r["equity"] for r in results.values()]
 
-    # 每只标的各自从同一初始资金 1.0 开始，缺失起点按现金处理，再等权合成。
-    aligned = pd.concat(curves, axis=1).ffill().fillna(1.0)
+    # 每只标的各自从初始资金 1.0 开始,再等权合成。
+    # 起点尚无数据的标的用 NaN 而非 1.0:填 1.0 等于把它当"净值恰好不变的
+    # 现金"计入分母,会把等权平均系统性拉向零收益。mean(skipna) 只对当时
+    # 真实存在的标的取平均,标的陆续上市时分母随之变化。
+    aligned = pd.concat(curves, axis=1).ffill()
     combo = aligned.mean(axis=1)
     metrics = _combo_metrics(combo, per_code)
 
     result: dict = {
         "strategy": strategy,
-        "params": params or {},
-        "codes": codes,
+        # params 存**实际生效**的全量参数(_validate_params 已合并默认值),
+        # 不是用户显式填写的子集:默认值一改历史结果就无法复现
+        "params": params,
+        # codes 存剔除数据不足标的后的实际样本;requested_codes 留存请求列表
+        "codes": list(results),
+        "requested_codes": codes,
         "start": str(start),
         "end": str(end),
         "costs": costs,
@@ -404,8 +452,10 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
 
     result: dict = {
         "strategy": strategy,
-        "params": params or {},
-        "codes": codes,
+        # 同 run_backtest:params 为实际生效的全量参数,codes 为实际样本
+        "params": params,
+        "codes": list(pool_dfs),
+        "requested_codes": codes,
         "start": str(start),
         "end": str(end),
         "costs": costs,
@@ -453,9 +503,20 @@ def _weighted_win_rate(per_code: dict[str, dict]) -> float | None:
 
 def _save_run(db: Session, result: dict, start: date, end: date,
               combo: pd.Series, user_id: int | None = None) -> None:
-    run = BacktestRun(strategy=result["strategy"], params=result["params"],
-                      codes=result["codes"], start=start, end=end,
-                      metrics=result["metrics"], user_id=user_id)
+    """落库一次回测。costs 快照与实际样本一并存,否则费率/默认参数一改,
+    历史结果就无法审计复现。"""
+    fields = dict(
+        strategy=result["strategy"], params=result["params"],
+        codes=result["codes"], start=start, end=end,
+        metrics=result["metrics"], user_id=user_id,
+    )
+    # costs 列由 agent-migrate 增加;尚未上线时降级把快照并入 params,
+    # 保证复现信息不丢(列到位后自动走上面的专列)
+    if hasattr(BacktestRun, "costs"):
+        fields["costs"] = result["costs"]
+    else:
+        fields["params"] = {**result["params"], "_costs": result["costs"]}
+    run = BacktestRun(**fields)
     db.add(run)
     db.flush()
     db.execute(

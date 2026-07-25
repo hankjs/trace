@@ -8,6 +8,39 @@ from sqlalchemy.orm import Session
 
 from ..models import Trade
 
+QTY_EPS = 1e-9  # 浮点持仓比较容差
+
+
+class OversellError(ValueError):
+    """卖出数量超过该时点持仓,会造成负持仓。"""
+
+
+def _assert_no_negative_position(trades: list[Trade]) -> None:
+    """校验整条时间序列:任一时点该标的的持仓都不得为负。
+
+    不能只看"当前持仓够不够":补录一笔历史卖出会让它之后的成交重新排序,
+    中间某个时点可能已经透支。因此按 (trade_date, id) 重放整条序列。
+    """
+    running = 0.0
+    for t in trades:
+        if t.side == "buy":
+            running += t.qty
+            continue
+        if t.qty > running + QTY_EPS:
+            raise OversellError(
+                f"{t.code} 在 {t.trade_date} 卖出 {t.qty:g} 股,"
+                f"但该时点仅持有 {running:g} 股,会造成负持仓"
+            )
+        running -= t.qty
+
+
+def _trades_for_check(db: Session, user_id: int, code: str) -> list[Trade]:
+    """取该用户该标的的全部成交,按 (日期, id) 升序——重放校验的口径。"""
+    return list(db.execute(
+        select(Trade).where(Trade.user_id == user_id, Trade.code == code)
+        .order_by(Trade.trade_date, Trade.id)
+    ).scalars().all())
+
 
 def add_trade(db: Session, user_id: int, code: str, trade_date: date, side: str,
               price: float, qty: float, fee: float = 0.0,
@@ -21,6 +54,15 @@ def add_trade(db: Session, user_id: int, code: str, trade_date: date, side: str,
     t = Trade(user_id=user_id, code=code, trade_date=trade_date, side=side, price=price,
               qty=qty, fee=fee, note=note)
     db.add(t)
+    # 在同一事务内 flush 后连同已有成交重放校验:超卖直接回滚拒绝。
+    # 此前 positions.py 用 min(卖出量, 持仓量) 静默截断,库里留着 200 股的
+    # 成交、盈亏只算 100 股,两边永久不一致;对零持仓的卖出更是凭空消失。
+    try:
+        db.flush()
+        _assert_no_negative_position(_trades_for_check(db, user_id, code))
+    except Exception:
+        db.rollback()
+        raise
     db.commit()
     db.refresh(t)
     return t
@@ -40,6 +82,14 @@ def delete_trade(db: Session, user_id: int, trade_id: int) -> bool:
     )).scalar_one_or_none()
     if t is None:
         return False
+    code = t.code
     db.delete(t)
+    # 删掉一笔买入会让它之后的卖出失去支撑,同样要校验整条序列
+    try:
+        db.flush()
+        _assert_no_negative_position(_trades_for_check(db, user_id, code))
+    except Exception:
+        db.rollback()
+        raise
     db.commit()
     return True

@@ -24,10 +24,12 @@ from app.backtest.engine import (
     MIN_STAT_BARS,
     TRADING_DAYS,
     _batch_single,
+    _combo_metrics,
     _equity_statistics,
     _held_before,
-    _metrics_from_equity,
+    _limit_pct,
     _portfolio_sim,
+    _sharpe_ratio,
     _validate_costs,
     _validate_params,
 )
@@ -291,3 +293,146 @@ def test_held_before_reads_the_bar_preceding_start():
     assert _held_before(pos, idx[2]) is False   # 翻仓当日:起点前是 0
     assert _held_before(pos, idx[3]) is True    # 起点前一根已是 1
     assert _held_before(pos, idx[0]) is False   # 无起点前历史
+
+
+# ---------------------------------------------------------------------------
+# §3.4 指标口径:242 年化基数 / 真峰谷回撤 / 无风险利率 / 短序列
+# ---------------------------------------------------------------------------
+
+
+def test_annual_return_uses_242_trading_days():
+    """242 bar 涨 20% -> 年化 ≈0.20(252 基数下报 0.2091)。"""
+    eq = pd.Series(np.linspace(1.0, 1.2, TRADING_DAYS),
+                   index=pd.date_range("2024-01-01", periods=TRADING_DAYS))
+
+    _, annual, _, _ = _equity_statistics(eq)
+
+    assert annual == pytest.approx(0.20, abs=1e-6)
+    # 旧的 252 基数会把同一序列报成 0.2091
+    assert annual != pytest.approx(0.2091, abs=1e-4)
+
+
+def test_max_drawdown_is_true_peak_to_trough():
+    """净值 [0.5,0.4] 的真实峰谷是 -0.20,旧口径从初始资金起算报 -0.6。"""
+    eq = pd.Series([0.5, 0.4], index=pd.date_range("2024-01-01", periods=2))
+
+    _, _, max_dd, _ = _equity_statistics(eq)
+
+    assert max_dd == pytest.approx(-0.20, abs=1e-9)
+    assert max_dd != pytest.approx(-0.6, abs=1e-3)
+
+
+def test_max_drawdown_measures_from_the_highest_peak():
+    """涨到 2.0 再跌到 1.5:回撤 -0.25(从峰值 2.0 起算,不是从初始 1.0)。"""
+    eq = pd.Series([1.0, 2.0, 1.5], index=pd.date_range("2024-01-01", periods=3))
+
+    _, _, max_dd, _ = _equity_statistics(eq)
+
+    assert max_dd == pytest.approx(-0.25, abs=1e-9)
+
+
+def test_short_series_returns_none_for_annualised_metrics():
+    """短于 20 bar 的序列:年化与夏普返回 None,不再报 252/3 次方的天文数字。"""
+    eq = pd.Series([1.0, 1.05, 1.1], index=pd.date_range("2024-01-01", periods=3))
+
+    total, annual, max_dd, rets = _equity_statistics(eq)
+
+    assert annual is None
+    assert total == pytest.approx(0.10, abs=1e-9)   # 总收益仍然给
+    assert max_dd == pytest.approx(0.0, abs=1e-9)
+    assert _sharpe_ratio(rets) is None
+    # 边界:恰好 20 bar 时开始给年化
+    eq20 = pd.Series(np.linspace(1.0, 1.1, MIN_STAT_BARS),
+                     index=pd.date_range("2024-01-01", periods=MIN_STAT_BARS))
+    assert _equity_statistics(eq20)[1] is not None
+
+
+def test_empty_equity_series_raises_instead_of_indexerror():
+    """空序列给出明确错误,而不是裸 IndexError。"""
+    with pytest.raises(ValueError, match="净值序列为空"):
+        _equity_statistics(pd.Series(dtype=float))
+
+
+def test_sharpe_subtracts_risk_free_rate():
+    """夏普引入无风险利率:rf>0 时必须低于 rf=0 的信息比率。"""
+    rng = np.random.default_rng(42)
+    rets = pd.Series(rng.normal(0.001, 0.01, 120),
+                     index=pd.date_range("2024-01-01", periods=120))
+
+    zero_rf = _sharpe_ratio(rets, 0.0)
+    with_rf = _sharpe_ratio(rets, 0.03)
+
+    assert zero_rf is not None and with_rf is not None
+    assert with_rf < zero_rf
+    # 差额 = (rf/242)/std*sqrt(242),可解析验证
+    expected_gap = (0.03 / TRADING_DAYS) / float(rets.std()) * np.sqrt(TRADING_DAYS)
+    assert zero_rf - with_rf == pytest.approx(expected_gap, abs=1e-4)
+
+
+def test_combo_win_rate_is_weighted_by_trade_count():
+    """组合胜率按回合交易数加权:2 笔全胜不该把 100 笔 40% 的整体拉到 70%。"""
+    per_code = {
+        "few":  {"win_rate": 1.0, "round_trips": 2, "trade_count": 4},
+        "many": {"win_rate": 0.4, "round_trips": 98, "trade_count": 196},
+    }
+    combo = pd.Series(np.linspace(1.0, 1.1, 30),
+                      index=pd.date_range("2024-01-01", periods=30))
+
+    m = _combo_metrics(combo, per_code)
+
+    # 加权:(1.0*2 + 0.4*98)/100 = 0.412;算术平均会报 0.70
+    assert m["win_rate"] == pytest.approx(0.412, abs=1e-4)
+    assert m["win_rate"] != pytest.approx(0.70, abs=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# §3.9 涨跌停可成交性
+# ---------------------------------------------------------------------------
+
+
+def test_entry_blocked_when_opening_at_limit_up():
+    """入场当日开盘一字涨停:该笔不成交(丢弃不顺延)。"""
+    start = date(2024, 1, 1)
+    n = 40
+    opens = [10.0] * n
+    closes = [10.0] * n
+    # bar 19 收盘暴涨触发信号 -> bar 20 入场,而 bar 20 开盘一字涨停
+    closes[19] = 11.0
+    for i in range(20, n):
+        opens[i] = 12.1   # 相对前收 11.0 涨 10%,一字板
+        closes[i] = 12.1
+    df = _mk_df_ohlc(start, opens, closes)
+    pos = pd.Series([0] * 19 + [1] * (n - 19), index=df.index)
+
+    res = _batch_single({"X": df}, {"X": pos}, DEFAULT_COSTS,
+                        df["date"].iloc[1])["X"]
+
+    assert res["metrics"]["trade_count"] == 0  # 买不进
+    assert res["metrics"]["total_return"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_entry_allowed_when_open_below_limit_up():
+    """同样的信号,开盘只涨 5%(未涨停)时必须正常成交——不能一律拦掉。"""
+    start = date(2024, 1, 1)
+    n = 40
+    opens = [10.0] * n
+    closes = [10.0] * n
+    closes[19] = 11.0
+    for i in range(20, n):
+        opens[i] = 11.55   # 相对前收 11.0 涨 5%
+        closes[i] = 11.55
+    df = _mk_df_ohlc(start, opens, closes)
+    pos = pd.Series([0] * 19 + [1] * (n - 19), index=df.index)
+
+    res = _batch_single({"X": df}, {"X": pos}, DEFAULT_COSTS,
+                        df["date"].iloc[1])["X"]
+
+    assert res["metrics"]["trade_count"] == 1
+
+
+def test_limit_pct_is_20_for_chinext_and_star_board():
+    """创业板/科创板 20%,主板 10%:同一 15% 开盘缺口只拦主板。"""
+    assert _limit_pct("sz.300750") == 0.20
+    assert _limit_pct("sh.688111") == 0.20
+    assert _limit_pct("sh.600519") == 0.10
+    assert _limit_pct("sz.000001") == 0.10

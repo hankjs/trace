@@ -1,15 +1,19 @@
-"""股票池:沪深300 + 中证500 成分股名录维护与查询。
+"""股票池:成分名录维护 + 按 kind 的统一池解析入口。
 
 - sync_index_members: 从 baostock 同步成分股,增量维护 in_date/out_date;
-- current_pool: 当前在册股票代码列表(去重);
+- resolve_pool: **统一入口**,按 kind 分派(index / all / static);
+- current_pool / pool_at: 指数口径的当前与历史时点成分;
 - 成分股同时 upsert 到 quant_stock(拿名称,供 ST 过滤用),不动 is_watch。
+
+任何需要"某天的股票池"的调用方都应走 resolve_pool / pool_at,不要自己
+重写 in_date/out_date 条件——重复实现会各自漂移(已修掉两处)。
 """
 from __future__ import annotations
 
 import logging
 from datetime import date, timedelta
 
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from ..models import IndexMember, Stock
@@ -17,6 +21,10 @@ from . import baostock_client
 from .ingest import upsert_stock
 
 logger = logging.getLogger(__name__)
+
+# 池类型。index=指数成分(point-in-time);all=全A;static=静态名单
+POOL_KINDS = ("index", "all", "static")
+DEFAULT_MIN_LIST_DAYS = 60  # 新股上市未满此天数不入池(池属性默认值)
 
 INDEX_NAMES = ("hs300", "zz500")
 
@@ -189,3 +197,89 @@ def pool_during(db: Session, start: date, end: date) -> list[str]:
         ).distinct()
     ).all()
     return sorted(r[0] for r in rows)
+
+
+def _has_listing_columns() -> bool:
+    """quant_stock 是否已有 list_date/delist_date/is_st 三列。
+
+    这三列由 agent-migrate 增加。未到位时 kind='all' 只能退化为全表,
+    调用方会收到明确告警(见 all_market_pool)。
+    """
+    return all(hasattr(Stock, name)
+               for name in ("list_date", "delist_date", "is_st"))
+
+
+def all_market_pool(db: Session, day: date,
+                    min_list_days: int = DEFAULT_MIN_LIST_DAYS) -> list[str]:
+    """全A 口径:剔除新股、已退市、ST。
+
+    条件:`list_date <= day - min_list_days`
+      AND `(delist_date IS NULL OR delist_date > day)`
+      AND `NOT is_st`
+
+    注意 `list_date` 未回填完整会**静默漏票**(NULL 不满足 <= 比较),
+    因此这里统计 `list_date IS NULL` 的数量并在超过阈值时告警——
+    `kind='all'` 下 `allow_current_fallback` 那种"缺历史成分"的护栏失效了
+    (全A 任意历史日都能解析),漏票是新的失败模式,必须有可观测性。
+    """
+    if not _has_listing_columns():
+        logger.warning(
+            "quant_stock 缺 list_date/delist_date/is_st,kind='all' 退化为全表"
+            "(未剔除新股/退市/ST);待 schema 就绪后自动生效")
+        return [r[0] for r in db.execute(
+            select(Stock.code).order_by(Stock.code)).all()]
+
+    cutoff = day - timedelta(days=min_list_days)
+    total = db.execute(select(func.count()).select_from(Stock)).scalar() or 0
+    missing = db.execute(
+        select(func.count()).select_from(Stock)
+        .where(Stock.list_date.is_(None))
+    ).scalar() or 0
+    if missing:
+        logger.warning(
+            "kind='all' 解析 %s: %d/%d 只股票缺 list_date,这些票会被静默漏掉,"
+            "请回填上市日期", day, missing, total)
+
+    rows = db.execute(
+        select(Stock.code).where(
+            Stock.list_date.is_not(None),
+            Stock.list_date <= cutoff,
+            or_(Stock.delist_date.is_(None), Stock.delist_date > day),
+            or_(Stock.is_st.is_(None), Stock.is_st.is_(False)),
+        ).order_by(Stock.code)
+    ).all()
+    return [r[0] for r in rows]
+
+
+def static_pool(db: Session, pool_id: int) -> list[str]:
+    """静态名单池:直查 quant_pool_member(无历史,已接受该偏差)。"""
+    from ..models import PoolMember  # 延迟导入:该表由 agent-migrate 新增
+
+    return sorted(r[0] for r in db.execute(
+        select(PoolMember.code).where(PoolMember.pool_id == pool_id).distinct()
+    ).all())
+
+
+def resolve_pool(db: Session, day: date, *, kind: str = "all",
+                 index_name: str | None = None, pool_id: int | None = None,
+                 min_list_days: int = DEFAULT_MIN_LIST_DAYS) -> list[str]:
+    """统一池解析入口:按 kind 分派为 day 当日的代码列表。
+
+    | kind    | 规则 |
+    |---------|------|
+    | index   | quant_index_member 的 in_date <= day < out_date(point-in-time) |
+    | all     | 全A 剔除新股/退市/ST(见 all_market_pool) |
+    | static  | quant_pool_member 直查(无历史) |
+
+    默认 kind='all'(全A)。index 口径可用 index_name 限定单指数,
+    为 None 时取全部指数并集(即原沪深300+中证500 的 pool_at 语义)。
+    """
+    if kind not in POOL_KINDS:
+        raise ValueError(f"未知池类型: {kind},可选: {', '.join(POOL_KINDS)}")
+    if kind == "index":
+        return pool_at(db, day, index_name=index_name)
+    if kind == "static":
+        if pool_id is None:
+            raise ValueError("kind='static' 必须提供 pool_id")
+        return static_pool(db, pool_id)
+    return all_market_pool(db, day, min_list_days=min_list_days)

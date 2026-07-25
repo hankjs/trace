@@ -96,9 +96,9 @@ def get_screener(date_: Date | None = Query(None, alias="date"),
                  vol_ratio_min: float | None = None,
                  ma_bull: bool = False,
                  high_dist_max: float | None = None,
-                 high_window: int = 60,
+                 high_window: int = Query(60, ge=1, le=750),
                  amount_min: float | None = None,
-                 limit: int = Query(100, le=500),
+                 limit: int = Query(100, ge=1, le=500),
                  db: Session = Depends(get_db)):
     """条件筛选:涨幅区间/量比下限/均线多头/距 N 日新高/成交额下限"""
     return screen(db, day=date_, pct_chg_min=pct_chg_min, pct_chg_max=pct_chg_max,

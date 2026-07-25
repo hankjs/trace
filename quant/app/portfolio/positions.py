@@ -56,9 +56,14 @@ def _compute_book(db: Session, user_id: int) -> dict[str, dict]:
             avg = p["cost"] / p["qty"] if p["qty"] > 0 else 0.0
             sell_qty = min(t.qty, p["qty"])
             if sell_qty < t.qty:
-                logger.warning(
-                    "卖出数量超过持仓 %s: 委托 %.0f,持仓 %.0f,按持仓截断",
-                    t.code, t.qty, p["qty"])
+                # 写入层(trades.add_trade)已拒绝超卖,走到这里说明库里存着
+                # 早于该校验的历史脏数据。仍按持仓截断以免负持仓,但要显式
+                # 标记,不能只留一行日志让差异静默消失。
+                p["oversold_qty"] = p.get("oversold_qty", 0.0) + (t.qty - sell_qty)
+                logger.error(
+                    "卖出数量超过持仓 %s @ %s: 委托 %.0f,持仓 %.0f,"
+                    "按持仓截断(疑似写入校验前的历史脏数据)",
+                    t.code, t.trade_date, t.qty, p["qty"])
             # 手续费按实际卖出数量分摊,截断部分不计费
             fee_alloc = t.fee * sell_qty / t.qty if t.qty > 0 else 0.0
             p["realized"] += (t.price - avg) * sell_qty - fee_alloc
@@ -90,6 +95,11 @@ def compute_positions(db: Session, user_id: int) -> list[dict]:
             ),
             "realized_pnl": round(p["realized"], 2),
         }
+        if p.get("oversold_qty"):
+            # 历史脏数据留痕:前端/审计能看到这只股票的成交与持仓口径不一致
+            item["data_warning"] = (
+                f"存在超卖成交 {p['oversold_qty']:g} 股,已按持仓截断"
+            )
         positions.append(item)
     return positions
 

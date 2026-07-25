@@ -18,7 +18,8 @@ router = APIRouter(prefix="/api/signals", tags=["signals"])
 @router.get("")
 def list_signals(date_: date | None = Query(None, alias="date"),
                  code: str | None = None, strategy: str | None = None,
-                 side: str | None = None, limit: int = Query(200, le=1000),
+                 side: str | None = None,
+                 limit: int = Query(200, ge=1, le=1000),
                  db: Session = Depends(get_db)):
     q = (select(Signal, Stock)
          .outerjoin(Stock, Stock.code == Signal.code)

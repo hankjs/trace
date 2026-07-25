@@ -363,22 +363,13 @@ def _codes_for_universe(
             .order_by(WatchlistItem.code)
         ).all()]
     if universe in {"hs300", "zz500"}:
-        codes = [r[0] for r in db.execute(
-            select(IndexMember.code).where(
-                IndexMember.index_name == universe,
-                IndexMember.in_date <= day,
-                (IndexMember.out_date.is_(None)) | (IndexMember.out_date > day),
-            ).distinct().order_by(IndexMember.code)
-        ).all()]
+        # 单指数 point-in-time 口径统一走 universe.py,不在这里重写
+        # in_date/out_date 条件(重复实现会各自漂移)
+        codes = pool_at(db, day, index_name=universe)
         if codes:
             return codes
         if allow_current_fallback:
-            return [r[0] for r in db.execute(
-                select(IndexMember.code).where(
-                    IndexMember.index_name == universe,
-                    IndexMember.out_date.is_(None),
-                ).distinct().order_by(IndexMember.code)
-            ).all()]
+            return current_pool(db, index_name=universe)
         raise InvalidFilterError(
             f"{day} 缺少 {universe} 历史成分，请先回填指数成分数据"
         )

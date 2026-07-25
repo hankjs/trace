@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 
 from ..data.universe import current_pool, pool_at, pool_during
 from ..models import FactorDaily, StrategyEval
-from ..selection.pipeline import score_row
+from ..selection.pipeline import score_cross_section
 from ..strategy.strategies import (PORTFOLIO_STRATEGIES, REGISTRY,
                                    SINGLE_STRATEGIES)
 from .engine import (DEFAULT_COSTS, SINGLE_WARMUP_DAYS, _batch_single,
@@ -47,12 +47,14 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
     rows = db.execute(
         select(FactorDaily).where(FactorDaily.date == fdate)
     ).scalars().all()
-    scored = []
-    for r in rows:
-        s = score_row({k: getattr(r, k) for k in
-                       ("mom20", "mom60", "ma20_slope", "vol_ratio5")})
-        if s is not None:
-            scored.append((s, r.code))
+    # 截面标准化打分:量纲统一,单因子缺失按截面中位数填充而不丢整只
+    scores = score_cross_section([
+        {"code": r.code,
+         **{k: getattr(r, k) for k in
+            ("mom20", "mom60", "ma20_slope", "vol_ratio5")}}
+        for r in rows
+    ])
+    scored = [(s, code) for code, s in scores.items() if s is not None]
     scored.sort(key=lambda t: (-t[0], t[1]))
     return [c for _, c in scored[:n]]
 
