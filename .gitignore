@@ -33,3 +33,6 @@ logs/
 # Test
 coverage/
 .claude/worktrees/
+
+# Coordinator 的 agent 隔离工作树
+.worktrees/
