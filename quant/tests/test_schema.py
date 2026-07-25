@@ -57,7 +57,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0006_user_id_not_null"}
+    assert heads == {"0007_adjust_factor"}
     assert current_heads(migrated_db) == heads
 
 
@@ -65,6 +65,7 @@ def test_all_expected_tables_exist(migrated_db):
     tables = set(inspect(migrated_db).get_table_names())
     assert tables == {
         "alembic_version",
+        "quant_adjust_factor",
         "quant_backtest_equity",
         "quant_backtest_run",
         "quant_daily_bar",

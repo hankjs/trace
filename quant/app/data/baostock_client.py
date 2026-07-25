@@ -213,3 +213,47 @@ def fetch_stock_basic() -> pd.DataFrame:
     for col in ("type", "status"):
         df[col] = df[col].astype(str).str.strip() if col in df.columns else ""
     return df[cols]
+
+
+def fetch_adjust_factors(code: str, start: date | str | None = None,
+                         end: date | str | None = None) -> pd.DataFrame:
+    """拉取复权因子(权威值,按除权日稀疏返回)。
+
+    baostock query_adjust_factor 返回 code / dividOperateDate /
+    foreAdjustFactor / backAdjustFactor / adjustFactor。
+
+    为什么要采权威值而不是从库里 close/raw_close 反推:反推只能反推出库里
+    **已有**的数据,若某股历史本身已错乱,反推的因子会连同错误一起继承,
+    拿它当重锚检测基准就是循环论证(见 alembic 0007 的 docstring)。
+
+    返回 DataFrame: code, divid_operate_date(date), fore_factor, back_factor
+    """
+    start_s = start.isoformat() if isinstance(start, (date, datetime)) else (start or "")
+    end_s = end.isoformat() if isinstance(end, (date, datetime)) else (end or "")
+
+    with _ensure_session():
+        rs = bs.query_adjust_factor(code=code, start_date=start_s, end_date=end_s)
+        if rs.error_code != "0":
+            raise RuntimeError(
+                f"baostock 复权因子查询失败 {code}: {rs.error_code} {rs.error_msg}"
+            )
+        rows = []
+        while (rs.error_code == "0") & rs.next():
+            rows.append(rs.get_row_data())
+        df = pd.DataFrame(rows, columns=rs.fields)
+
+    cols = ["code", "divid_operate_date", "fore_factor", "back_factor"]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df = df.rename(columns={"dividOperateDate": "divid_operate_date",
+                            "foreAdjustFactor": "fore_factor",
+                            "backAdjustFactor": "back_factor"})
+    df["divid_operate_date"] = pd.to_datetime(
+        df["divid_operate_date"], errors="coerce").dt.date
+    for col in ("fore_factor", "back_factor"):
+        if col not in df.columns:
+            df[col] = None
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    # 除权日或前因子缺失的行无法使用
+    df = df.dropna(subset=["divid_operate_date", "fore_factor"])
+    return df[cols]

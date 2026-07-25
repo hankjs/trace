@@ -124,6 +124,35 @@ async def backfill_list_dates_now():
         raise HTTPException(502, f"list_date 回填失败: {e}")
 
 
+@router.post("/sync-adjust-factors")
+async def sync_adjust_factors_now(
+    codes: str | None = Query(
+        None, description="可选，逗号分隔代码；缺省为全市场"),
+    start: date = Query(date(2015, 1, 1), description="因子起始日"),
+    sleep_per_code: float = Query(0.0, ge=0, le=2,
+                                  description="每只间隔秒数，全市场采集建议 0.2"),
+):
+    """采集复权因子权威值(quant_adjust_factor)。
+
+    因子按除权日稀疏返回,整轮比日线回填轻得多。用途是给重锚检测一个
+    **独立**基准——从 close/raw_close 反推只能反推出库里已有的数据,
+    历史若已错乱,反推值会继承错误,拿它当基准是循环论证。
+    """
+    code_list = ([c.strip() for c in codes.split(",") if c.strip()]
+                 if codes else None)
+
+    def _job() -> dict:
+        with SessionLocal() as db:
+            return ingest.sync_adjust_factors(
+                db, codes=code_list, start=start, sleep_per_code=sleep_per_code)
+
+    loop = asyncio.get_running_loop()
+    try:
+        return await loop.run_in_executor(None, _job)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"复权因子采集失败: {e}")
+
+
 @router.post("/sync-fundamentals")
 async def sync_fundamentals_now(
     codes: str | None = Query(

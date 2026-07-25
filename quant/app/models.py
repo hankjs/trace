@@ -43,6 +43,10 @@ _TRADE_QTY = _money(18, 4)  # 手工账本数量与手续费
 _PCT = _money(9, 4)         # 涨跌幅
 _EQUITY = _money(18, 8)     # 回测净值:累计乘除需高小数位
 _MARKET_CAP = _money(20, 2)  # 总市值
+# 复权因子:baostock 权威值给 6 位小数(如 0.792993 / 6.081667),
+# 精度必须高于 _PRICE —— 用 close/raw_close 两个 4 位小数相除只能得到
+# 约 4~5 位有效精度,那是反推的固有损失,权威值不该再被截断。
+_ADJ_FACTOR = _money(16, 6)
 
 # 自增主键:MySQL 上渲染 BIGINT AUTO_INCREMENT(全市场日频最终超 21 亿行,
 # Integer 会溢出);sqlite 上必须渲染成 INTEGER —— sqlite 只把
@@ -95,6 +99,32 @@ class DailyBar(Base):
     raw_close: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
     volume: Mapped[float] = mapped_column(_SHARES, default=0)
     amount: Mapped[float] = mapped_column(_SHARES, default=0)
+
+
+class AdjustFactor(Base):
+    """复权因子(baostock query_adjust_factor 的权威值,只增不改)。
+
+    为什么独立成表:`quant_daily_bar` 的 open/high/low/close 是**前复权价**,
+    每次分红送转 baostock 会回溯重写全部历史,而 raw_close/volume/amount 是
+    永不改写的事实。一张表里混了两种生命周期,增量更新在原理上就不安全
+    (新尺度 bar 接到旧尺度历史 = 假跳空,REVIEW §3.1)。
+
+    因子按除权日稀疏存储:实测 sh.600519 的 2808 行日线只对应 16 个除权日,
+    全市场约 4 万行。
+
+    为什么采集权威值而不是从 close/raw_close 反推:反推只能反推出库里**已有**
+    的数据,若某股历史本身已错乱,反推的因子会连同错误一起继承,拿它当检测
+    基准就是循环论证。权威值是独立的第三方基准。
+    """
+
+    __tablename__ = "quant_adjust_factor"
+
+    code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    # baostock 字段名 dividOperateDate:除权除息日
+    divid_operate_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    fore_factor: Mapped[float] = mapped_column(_ADJ_FACTOR)   # foreAdjustFactor
+    back_factor: Mapped[float | None] = mapped_column(        # backAdjustFactor
+        _ADJ_FACTOR, nullable=True)
 
 
 class Snapshot(Base):

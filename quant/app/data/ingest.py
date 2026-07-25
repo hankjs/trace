@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -10,7 +11,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from ..models import DailyBar, Snapshot, Stock, WatchlistItem
+from ..models import AdjustFactor, DailyBar, Snapshot, Stock, WatchlistItem
 from . import akshare_client, baostock_client
 from .clock import naive_now_cst, today_cst
 
@@ -217,6 +218,81 @@ def upsert_bars(db: Session, code: str, df: pd.DataFrame) -> int:
     db.execute(stmt)
     db.commit()
     return len(rows)
+
+
+def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame) -> int:
+    """复权因子 upsert(code + divid_operate_date 主键)。
+
+    因子是权威事实,理论上只增不改;但 baostock 偶有修订,故用 upsert
+    而非 insert-ignore,让修订能覆盖旧值。
+    """
+    if df.empty:
+        return 0
+    rows = [
+        {
+            "code": code,
+            "divid_operate_date": r.divid_operate_date,
+            "fore_factor": float(r.fore_factor),
+            "back_factor": (None if pd.isna(r.back_factor)
+                            else float(r.back_factor)),
+        }
+        for r in df.itertuples()
+    ]
+    updated_cols = ("fore_factor", "back_factor")
+    if db.get_bind().dialect.name == "sqlite":
+        stmt = sqlite_insert(AdjustFactor).values(rows)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[AdjustFactor.code, AdjustFactor.divid_operate_date],
+            set_={c: getattr(stmt.excluded, c) for c in updated_cols},
+        )
+    else:
+        stmt = mysql_insert(AdjustFactor).values(rows)
+        stmt = stmt.on_duplicate_key_update(
+            **{c: getattr(stmt.inserted, c) for c in updated_cols}
+        )
+    db.execute(stmt)
+    db.commit()
+    return len(rows)
+
+
+def sync_adjust_factors(db: Session, codes: list[str] | None = None,
+                        start: date | str = "2015-01-01",
+                        end: date | str | None = None,
+                        sleep_per_code: float = 0.0) -> dict:
+    """全市场复权因子采集。
+
+    因子按除权日稀疏返回(实测 sh.600519 的 2808 行日线只对应 17 个除权日),
+    所以整轮采集比日线回填轻得多。
+
+    空响应视为「该股无分红送转」,不清空已有数据 —— 数据源抖动不该被当成
+    「因子被撤销」(同 sync_index_members 对空响应的处理)。
+    """
+    end = end or today_cst()
+    if codes is None:
+        codes = [r[0] for r in db.execute(select(Stock.code)).all()]
+    total = upserted = empty = failed = 0
+    failed_codes: list[str] = []
+    with baostock_client.login_session():
+        for code in codes:
+            total += 1
+            try:
+                df = baostock_client.fetch_adjust_factors(code, start, end)
+            except Exception:  # noqa: BLE001
+                logger.warning("复权因子采集失败 %s", code, exc_info=True)
+                failed += 1
+                failed_codes.append(code)
+                db.rollback()
+                continue
+            if df.empty:
+                empty += 1
+            else:
+                upserted += upsert_adjust_factors(db, code, df)
+            if sleep_per_code:
+                time.sleep(sleep_per_code)
+    logger.info("复权因子采集: %d 只,写入 %d 行,无分红 %d 只,失败 %d 只",
+                total, upserted, empty, failed)
+    return {"total": total, "upserted": upserted, "empty": empty,
+            "failed": failed, "failed_codes": failed_codes[:20]}
 
 
 def backfill(db: Session, code: str, start: date | str, end: date | str | None = None) -> int:
