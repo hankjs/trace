@@ -139,3 +139,46 @@ def fetch_daily_bar(code: str, day: date) -> dict | None:
     except Exception:
         logger.warning("东财日线不可用 %s,降级为新浪源", code)
         return _retry(lambda: _daily_bar_sina(code, day), retries=2, delay=1.5)
+
+
+def fetch_bj_daily_bars(code: str, start: date, end: date) -> pd.DataFrame:
+    """北交所日线(新浪源),同时返回前复权价与不复权收盘价。
+
+    baostock 完全不覆盖北交所(`bj.` 前缀报 10004011,换 `sh.`/`sz.` 前缀
+    参数校验虽通过但返回 0 行),故这批标的只能走 akshare。见 alembic 0008。
+
+    新浪源同时提供 adjust='' 与 adjust='qfq',两者相除即得复权因子;实测
+    末行因子为 1.0,说明与 baostock 同为「最新日为基准的前复权」口径,
+    两个来源的数据放同一张 quant_daily_bar 不会混口径。
+
+    返回列与 baostock_client.fetch_daily_bars 一致:
+    date, open, high, low, close(前复权), raw_close(不复权), volume, amount
+    """
+    symbol = code.replace(".", "")          # bj.920000 -> bj920000
+    s, e = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
+    cols = ["date", "open", "high", "low", "close", "raw_close",
+            "volume", "amount"]
+
+    qfq = _retry(lambda: ak.stock_zh_a_daily(
+        symbol=symbol, start_date=s, end_date=e, adjust="qfq"))
+    raw = _retry(lambda: ak.stock_zh_a_daily(
+        symbol=symbol, start_date=s, end_date=e, adjust=""))
+    if qfq is None or qfq.empty:
+        return pd.DataFrame(columns=cols)
+
+    qfq = qfq.copy()
+    qfq["date"] = pd.to_datetime(qfq["date"]).dt.date
+    out = qfq[["date", "open", "high", "low", "close", "volume", "amount"]].copy()
+
+    if raw is not None and not raw.empty:
+        raw = raw.copy()
+        raw["date"] = pd.to_datetime(raw["date"]).dt.date
+        out = out.merge(
+            raw[["date", "close"]].rename(columns={"close": "raw_close"}),
+            on="date", how="left")
+    else:
+        # 拿不到不复权价时留空:下游重锚检测会退化为 close 比对,
+        # 但不能假造 raw_close(那会让因子计算出错)
+        out["raw_close"] = None
+
+    return out[cols]

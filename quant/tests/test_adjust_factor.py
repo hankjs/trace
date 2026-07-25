@@ -227,3 +227,110 @@ def test_audit_uses_factor_effective_on_the_bar_date(db):
 
     assert verdict.reanchored is False
     assert "0.856267" in (verdict.detail or "")
+
+
+def test_derive_factors_keeps_only_change_points(db):
+    """自算因子按变化点稀疏化,与 baostock 按除权日返回的形态一致。"""
+    bars = pd.DataFrame([
+        # 因子恒为 0.9:只该产出 1 行(首行)
+        {"date": date(2024, 1, 2), "close": 9.0, "raw_close": 10.0},
+        {"date": date(2024, 1, 3), "close": 18.0, "raw_close": 20.0},
+        # 因子跳到 0.95:除权,再产出 1 行
+        {"date": date(2024, 6, 3), "close": 19.0, "raw_close": 20.0},
+        {"date": date(2024, 6, 4), "close": 28.5, "raw_close": 30.0},
+    ])
+    out = ingest.derive_adjust_factors(bars)
+
+    assert list(out["divid_operate_date"]) == [date(2024, 1, 2), date(2024, 6, 3)]
+    assert out["fore_factor"].tolist() == pytest.approx([0.9, 0.95])
+
+
+def test_derive_factors_ignores_decimal_rounding_noise(db):
+    """DECIMAL(12,4) 的舍入噪声不得被当成除权。
+
+    close 与 raw_close 都只有 4 位小数,相除会在第 6 位抖动。实测阈值
+    1e-4 与 1e-3 结果几乎相同(1563 vs 1530 个变化点),说明真实除权的
+    跳变远大于噪声。
+    """
+    bars = pd.DataFrame([
+        {"date": date(2024, 1, 2), "close": 6.5926, "raw_close": 6.6700},
+        {"date": date(2024, 1, 3), "close": 7.0572, "raw_close": 7.1400},
+        {"date": date(2024, 1, 4), "close": 6.8891, "raw_close": 6.9700},
+    ])
+    out = ingest.derive_adjust_factors(bars)
+
+    # 三行的因子都是 0.98839x,只差在第 6 位 —— 只该有 1 行
+    assert len(out) == 1
+
+
+def test_derive_factors_skips_unusable_rows(db):
+    """raw_close 缺失或零价的行不能参与因子计算。"""
+    bars = pd.DataFrame([
+        {"date": date(2024, 1, 2), "close": 9.0, "raw_close": None},
+        {"date": date(2024, 1, 3), "close": 0.0, "raw_close": 10.0},
+        {"date": date(2024, 1, 4), "close": 9.5, "raw_close": 10.0},
+    ])
+    out = ingest.derive_adjust_factors(bars)
+
+    assert list(out["divid_operate_date"]) == [date(2024, 1, 4)]
+
+
+def test_source_column_distinguishes_authority_from_derived(db):
+    """source 必须能区分权威值与自算值,否则审计结论会被悄悄稀释。"""
+    ingest.upsert_adjust_factors(db, "sh.600519", _factors([
+        ("sh.600519", date(2020, 6, 24), 0.856267, 6.566931),
+    ]))
+    ingest.upsert_adjust_factors(
+        db, "bj.920000",
+        _factors([("bj.920000", date(2023, 5, 8), 0.942579, None)]),
+        source="sina")
+
+    assert db.get(AdjustFactor, ("sh.600519", date(2020, 6, 24))).source == "baostock"
+    assert db.get(AdjustFactor, ("bj.920000", date(2023, 5, 8))).source == "sina"
+
+
+def test_baostock_sync_skips_beijing_codes(db, monkeypatch):
+    """baostock 不覆盖北交所,默认采集必须跳过,不白发注定失败的请求。"""
+    from app.models import Stock as _Stock
+    db.add(_Stock(code="bj.920000"))
+    db.commit()
+    seen: list[str] = []
+
+    monkeypatch.setattr(ingest.baostock_client, "login_session",
+                        lambda: _nullcontext())
+    monkeypatch.setattr(ingest.baostock_client, "fetch_adjust_factors",
+                        lambda code, start, end: seen.append(code) or _factors([]))
+
+    ingest.sync_adjust_factors(db)
+
+    assert "bj.920000" not in seen
+    assert sorted(seen) == ["sh.600519", "sz.000001"]
+
+
+def test_derive_factors_survives_low_price_rounding_noise(db):
+    """低价股的舍入噪声不得被当成除权 —— 这个坑被高价股掩盖过。
+
+    close/raw_close 各只有 4 位小数,噪声大小取决于**股价量级**:
+    - 茅台(1300 元):相邻因子相对变化约 1e-06,阈值 1e-4 看似够用
+    - bj.920000(约 10 元):P50=2.1e-04, P90=1.1e-03, P99=1.9e-03 全是噪声
+
+    实测用 1e-4 阈值跑 bj.920000 的 1353 行日线,产出 898 个「除权日」
+    (压缩比 1.5:1,而茅台是 175:1),而真实除权只有 4 次。
+    """
+    # 模拟低价股:因子真值恒为 0.772,但 4 位小数相除后在 1e-4~1e-3 抖动
+    noisy = [
+        (date(2021, 3, 1), 7.7200, 10.0000),   # 0.772000
+        (date(2021, 3, 2), 8.5029, 11.0100),   # 0.772289
+        (date(2021, 3, 3), 6.9508, 9.0000),    # 0.772311
+        (date(2021, 3, 4), 7.4112, 9.6000),    # 0.772000
+        # 真实除权:跳到 0.9425(相对变化 22%,远超噪声)
+        (date(2021, 6, 17), 9.4250, 10.0000),
+    ]
+    bars = pd.DataFrame(
+        [{"date": d, "close": c, "raw_close": r} for d, c, r in noisy])
+
+    out = ingest.derive_adjust_factors(bars)
+
+    # 只该有首行 + 那次真实除权,不该有 4 个假除权日
+    assert list(out["divid_operate_date"]) == [date(2021, 3, 1), date(2021, 6, 17)]
+    assert out["fore_factor"].tolist() == pytest.approx([0.772, 0.9425], rel=1e-3)

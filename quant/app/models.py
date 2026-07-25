@@ -125,6 +125,11 @@ class AdjustFactor(Base):
     fore_factor: Mapped[float] = mapped_column(_ADJ_FACTOR)   # foreAdjustFactor
     back_factor: Mapped[float | None] = mapped_column(        # backAdjustFactor
         _ADJ_FACTOR, nullable=True)
+    # 'baostock' = query_adjust_factor 的权威值;
+    # 'sina' = 北交所自算(baostock 不覆盖北交所,见 alembic 0008)。
+    # 自算值精度受 close/raw_close 的 DECIMAL(12,4) 限制,约 4~5 位有效,
+    # 故审计时它的可信度低于权威值 —— 用 source 区分,不要混为一谈。
+    source: Mapped[str] = mapped_column(String(16), default="baostock")
 
 
 class Snapshot(Base):

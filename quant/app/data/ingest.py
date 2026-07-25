@@ -220,11 +220,16 @@ def upsert_bars(db: Session, code: str, df: pd.DataFrame) -> int:
     return len(rows)
 
 
-def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame) -> int:
+def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame,
+                          source: str = "baostock") -> int:
     """复权因子 upsert(code + divid_operate_date 主键)。
 
     因子是权威事实,理论上只增不改;但 baostock 偶有修订,故用 upsert
     而非 insert-ignore,让修订能覆盖旧值。
+
+    source 区分可信度:'baostock' 是 query_adjust_factor 的权威 6 位小数值;
+    'sina' 是北交所从 close/raw_close 自算的,精度受 DECIMAL(12,4) 限制
+    (约 4~5 位有效)。审计时两者不可混为一谈,见 alembic 0008。
     """
     if df.empty:
         return 0
@@ -235,10 +240,11 @@ def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame) -> int:
             "fore_factor": float(r.fore_factor),
             "back_factor": (None if pd.isna(r.back_factor)
                             else float(r.back_factor)),
+            "source": source,
         }
         for r in df.itertuples()
     ]
-    updated_cols = ("fore_factor", "back_factor")
+    updated_cols = ("fore_factor", "back_factor", "source")
     if db.get_bind().dialect.name == "sqlite":
         stmt = sqlite_insert(AdjustFactor).values(rows)
         stmt = stmt.on_conflict_do_update(
@@ -269,7 +275,14 @@ def sync_adjust_factors(db: Session, codes: list[str] | None = None,
     """
     end = end or today_cst()
     if codes is None:
-        codes = [r[0] for r in db.execute(select(Stock.code)).all()]
+        # 跳过北交所:baostock 完全不覆盖(bj. 前缀直接报 10004011),
+        # 不跳会白发 330 次注定失败的请求。它们的因子由 sync_bj_market
+        # 从 close/raw_close 自算并标 source='sina'(见 alembic 0008)。
+        codes = [
+            r[0] for r in db.execute(
+                select(Stock.code).where(Stock.code.not_like(f"{BJ_PREFIX}%"))
+            ).all()
+        ]
     total = upserted = empty = failed = 0
     failed_codes: list[str] = []
     with baostock_client.login_session():
@@ -338,6 +351,109 @@ def _factor(close: float | None, raw_close: float | None) -> float | None:
     if not (c > 0 and r > 0):
         return None
     return c / r
+
+
+BJ_PREFIX = "bj."          # 北交所:baostock 不覆盖,走 akshare 新浪源
+# 因子变化判定阈值。必须远大于 DECIMAL(12,4) 的舍入噪声,而噪声大小取决于
+# **股价量级**:close/raw_close 各只有 4 位小数,低价股的相对精度差得多。
+# 实测 bj.920000(股价约 10 元)相邻因子的相对变化:
+#   P50 = 2.1e-04, P90 = 1.1e-03, P99 = 1.9e-03  ← 全是噪声
+#   真实除权 4 次,跳变量级 1.4e-02 ~ 2.2e-01     ← 相差两个数量级
+# 早先用茅台(1300 元)验证时噪声只有 1e-06,故 1e-4 看似够用 —— 那是被高价股
+# 掩盖的错误结论,对低价股会把噪声全当成除权(实测产出 898 个假除权日)。
+FACTOR_CHANGE_TOLERANCE = 0.01
+
+
+def is_bj_code(code: str) -> bool:
+    """北交所代码。baostock 完全不覆盖(见 alembic 0008)。"""
+    return code.startswith(BJ_PREFIX)
+
+
+def derive_adjust_factors(df: pd.DataFrame) -> pd.DataFrame:
+    """从 close/raw_close 反推因子,只保留变化点(除权日)。
+
+    因子在除权日之间是常数,故按变化点稀疏化 —— 与 baostock 按除权日返回的
+    形态一致。阈值 1e-4 而非 0:close 与 raw_close 都是 DECIMAL(12,4),两个
+    4 位小数相除会在小数第 6 位抖动,那是舍入噪声不是除权
+    (实测真实除权的因子跳变远大于此,1e-4 与 1e-3 结果几乎相同)。
+    """
+    cols = ["divid_operate_date", "fore_factor"]
+    if df.empty or "raw_close" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    usable = df.dropna(subset=["close", "raw_close"]).sort_values("date")
+    usable = usable[(usable["close"] > 0) & (usable["raw_close"] > 0)]
+    if usable.empty:
+        return pd.DataFrame(columns=cols)
+
+    rows: list[dict] = []
+    prev: float | None = None
+    for r in usable.itertuples():
+        factor = float(r.close) / float(r.raw_close)
+        if prev is None or abs(factor - prev) / prev > FACTOR_CHANGE_TOLERANCE:
+            rows.append({"divid_operate_date": r.date, "fore_factor": factor})
+            prev = factor
+    return pd.DataFrame(rows, columns=cols)
+
+
+def backfill_bj(db: Session, code: str, start: date,
+                end: date | None = None) -> dict:
+    """北交所单只回填:日线 + 自算因子。
+
+    baostock 不覆盖北交所,故不能走 safe_backfill 的重锚检查路径(它依赖
+    baostock 权威因子)。这里自算因子并标记 source='sina',让审计能区分
+    可信度 —— 自算值精度受 DECIMAL(12,4) 限制,低于权威值。
+    """
+    end = end or today_cst()
+    df = akshare_client.fetch_bj_daily_bars(code, start, end)
+    if df.empty:
+        return {"code": code, "bars": 0, "factors": 0}
+    bars = upsert_bars(db, code, df)
+    factors = derive_adjust_factors(df)
+    n_factors = 0
+    if not factors.empty:
+        factors = factors.assign(code=code, back_factor=None)
+        n_factors = upsert_adjust_factors(db, code, factors, source="sina")
+    return {"code": code, "bars": bars, "factors": n_factors}
+
+
+def sync_bj_market(db: Session, start: date | str = "2015-01-01",
+                   end: date | None = None,
+                   sleep_per_code: float = 1.0) -> dict:
+    """全部北交所标的的日线与因子采集。
+
+    新浪源比 baostock 更容易限流(实测东财接口整段不可用时新浪仍可用,
+    但也需退避),故默认每只间隔 1 秒。
+    """
+    if isinstance(start, str):
+        start = date.fromisoformat(start)
+    codes = [
+        r[0] for r in db.execute(
+            select(Stock.code).where(Stock.code.like(f"{BJ_PREFIX}%"))
+            .order_by(Stock.code)
+        ).all()
+    ]
+    total = bars = factors = empty = failed = 0
+    failed_codes: list[str] = []
+    for code in codes:
+        total += 1
+        try:
+            r = backfill_bj(db, code, start, end)
+        except Exception:  # noqa: BLE001
+            logger.warning("北交所回填失败 %s", code, exc_info=True)
+            failed += 1
+            failed_codes.append(code)
+            db.rollback()
+            continue
+        if r["bars"] == 0:
+            empty += 1
+        bars += r["bars"]
+        factors += r["factors"]
+        if sleep_per_code:
+            time.sleep(sleep_per_code)
+    logger.info("北交所采集: %d 只,日线 %d 行,因子 %d 行,无数据 %d 只,失败 %d 只",
+                total, bars, factors, empty, failed)
+    return {"total": total, "bars": bars, "factors": factors,
+            "empty": empty, "failed": failed, "failed_codes": failed_codes[:20]}
 
 
 def audit_scale_against_factors(db: Session, code: str) -> ReanchorVerdict:

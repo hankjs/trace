@@ -57,7 +57,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0007_adjust_factor"}
+    assert heads == {"0008_adjust_factor_source"}
     assert current_heads(migrated_db) == heads
 
 
