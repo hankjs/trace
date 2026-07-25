@@ -21,7 +21,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.backtest.engine import (
     DEFAULT_COSTS,
+    MIN_STAT_BARS,
+    TRADING_DAYS,
     _batch_single,
+    _equity_statistics,
+    _held_before,
+    _metrics_from_equity,
     _portfolio_sim,
     _validate_costs,
     _validate_params,
@@ -34,6 +39,19 @@ def _mk_df(start: date, prices: list[float]) -> pd.DataFrame:
     return pd.DataFrame({
         "date": dates, "open": prices, "high": prices, "low": prices,
         "close": prices, "raw_close": prices,
+        "volume": 1e6, "amount": 1e7,
+    })
+
+
+def _mk_df_ohlc(start: date, opens: list[float],
+                closes: list[float]) -> pd.DataFrame:
+    """open 与 close 可不同的合成行情(用于暴露"当日开盘成交当日收盘信号")。"""
+    dates = [start + timedelta(days=i) for i in range(len(closes))]
+    return pd.DataFrame({
+        "date": dates, "open": opens,
+        "high": [max(o, c) for o, c in zip(opens, closes)],
+        "low": [min(o, c) for o, c in zip(opens, closes)],
+        "close": closes, "raw_close": closes,
         "volume": 1e6, "amount": 1e7,
     })
 
@@ -91,7 +109,9 @@ def test_stamp_tax_in_simulation():
     start = date(2024, 1, 1)
     df = _mk_df(start, [10.0] * 40)
     pos = pd.Series([1] * 20 + [0] * 20, index=df.index)  # 一买一卖
-    bt_start = df["date"].iloc[0]
+    # 起点取 bar 1:bar 0 已持仓 -> 属"起点前已持仓",首日合成建仓。
+    # (起点若取 bar 0 则起点前无历史,不存在已持仓的证据,不该成交)
+    bt_start = df["date"].iloc[1]
 
     taxed = _batch_single({"X": df}, {"X": pos}, DEFAULT_COSTS, bt_start)
     free = _batch_single({"X": df}, {"X": pos},
@@ -108,13 +128,33 @@ def test_stamp_tax_in_simulation():
 def test_initial_entry_cost_is_in_total_return_and_drawdown():
     start = date(2024, 1, 1)
     df = _mk_df(start, [10.0] * 40)
+    # 同上:起点取 bar 1,bar 0 的持仓构成"起点前已持仓"的证据
+    res = _batch_single(
+        {"X": df}, {"X": pd.Series([1] * 40)}, DEFAULT_COSTS,
+        df["date"].iloc[1],
+    )["X"]
+
+    assert res["metrics"]["total_return"] == pytest.approx(-0.00035, abs=1e-4)
+    # D1 新口径:回撤是净值自身峰谷。首日建仓成本是一次性台阶下移,
+    # 之后再无从峰值回落,故回撤≈0(旧口径以初始资金 1.0 播种峰值报 -0.00035)
+    assert res["metrics"]["max_drawdown"] == pytest.approx(0.0, abs=1e-9)
+    assert res["equity"].iat[0] < 1.0
+
+
+def test_no_synthetic_entry_without_prior_bar():
+    """起点前完全无历史时不合成建仓(与 _portfolio_sim 的 shift 口径一致)。
+
+    _portfolio_sim 在 bt_idx[0] == weights.index[0] 时 shift 出 NaN,当日不下单;
+    单标的路径同理:没有"起点前已持仓"的证据就不该凭空成交。
+    """
+    start = date(2024, 1, 1)
+    df = _mk_df(start, [10.0] * 40)
     res = _batch_single(
         {"X": df}, {"X": pd.Series([1] * 40)}, DEFAULT_COSTS, start,
     )["X"]
 
-    assert res["metrics"]["total_return"] == pytest.approx(-0.00035, abs=1e-4)
-    assert res["metrics"]["max_drawdown"] == pytest.approx(-0.00035, abs=1e-4)
-    assert res["equity"].iat[0] < 1.0
+    assert res["metrics"]["trade_count"] == 0
+    assert res["metrics"]["total_return"] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_costs_and_strategy_params_are_validated():
@@ -166,3 +206,88 @@ def test_dynamic_eligibility_excludes_inactive_stock_from_ranking():
     )
 
     assert weights.iloc[-1].to_dict() == {"inactive": 0.0, "active": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# §3.3 P0:提前一天建仓(lookahead / entry_before_start)
+#
+# 复现场景(brief §3.3 给的权威证据):
+#   bar 29 之前仓位 0、bar 30 起为 1;bar 30 open=10 close=20。
+#   窗口起点正好落在 bar 30 时,旧实现看"窗口首日仓位==1"就用 bar 30 的
+#   **开盘价 10** 建仓,而这个 1 是 bar 30 **收盘价 20** 算出来的信号 ——
+#   等于当天开盘就知道了当天要涨 100%,total_return 虚增到 ≈0.9993。
+#   修好后 bar 30 不该成交,建仓要等 T+1(bar 31),total_return≈-0.0003。
+# ---------------------------------------------------------------------------
+
+_LOOKAHEAD_BARS = 60
+_FLIP_AT = 30  # 仓位由 0 翻 1 的那根 bar
+
+
+def _lookahead_fixture() -> tuple[pd.DataFrame, pd.Series, date]:
+    """构造上述场景:翻仓那根 bar 当天暴涨(open=10 close=20),其余走平。"""
+    start = date(2024, 1, 1)
+    opens = [10.0] * _LOOKAHEAD_BARS
+    closes = [10.0] * _LOOKAHEAD_BARS
+    closes[_FLIP_AT] = 20.0          # 翻仓日收盘暴涨(信号就是它算出来的)
+    for i in range(_FLIP_AT + 1, _LOOKAHEAD_BARS):
+        opens[i] = 20.0              # 之后价格停在 20,T+1 建仓买不到便宜货
+        closes[i] = 20.0
+    df = _mk_df_ohlc(start, opens, closes)
+    pos = pd.Series([0] * _FLIP_AT + [1] * (_LOOKAHEAD_BARS - _FLIP_AT),
+                    index=df.index)
+    return df, pos, df["date"].iloc[_FLIP_AT]
+
+
+def test_no_entry_before_start_on_same_day_flip():
+    """窗口首日恰好由 0 翻 1:不得用当日开盘价成交当日收盘才产生的信号。"""
+    df, pos, bt_start = _lookahead_fixture()
+
+    m = _batch_single({"X": df}, {"X": pos}, DEFAULT_COSTS, bt_start)["X"]["metrics"]
+
+    # 修复前:0.9993(open=10 买入 -> close=20,凭空一倍)
+    assert m["total_return"] != pytest.approx(0.9993, abs=1e-3)
+    # 修复后:首日不成交,T+1 以 open=20 建仓后走平,只剩建仓成本
+    assert m["total_return"] == pytest.approx(-0.00035, abs=1e-4)
+    assert m["trade_count"] == 1
+
+
+def test_entry_before_start_still_synthesised_when_truly_held():
+    """起点前一根 bar 已持仓:仍要合成首日建仓(修 P0 不能把真持仓丢掉)。"""
+    df, pos, _ = _lookahead_fixture()
+    # 起点推后一根:bar 30 已持仓,bar 31 起点 -> 属于"起点前已持仓"
+    bt_start = df["date"].iloc[_FLIP_AT + 1]
+
+    res = _batch_single({"X": df}, {"X": pos}, DEFAULT_COSTS, bt_start)["X"]
+    # 首日 open=20 合成建仓,之后走平 -> 只有建仓成本,但必须真的建了仓
+    assert res["metrics"]["trade_count"] == 1
+    assert res["equity"].iat[0] < 1.0
+
+
+def test_batch_single_window_start_matches_earlier_start_prefix():
+    """同一策略同一数据,窗口起点前移不应改变"起点当日是否成交"的判定。
+
+    起点落在翻仓日(bar 30)与起点更早(bar 20)时,bar 30 都不该有成交:
+    修复前前者 total_return≈0.9993、后者≈-0.0003,两者矛盾正是 P0 的指纹。
+    """
+    df, pos, flip_day = _lookahead_fixture()
+
+    at_flip = _batch_single({"X": df}, {"X": pos}, DEFAULT_COSTS, flip_day)["X"]
+    earlier = _batch_single(
+        {"X": df}, {"X": pos}, DEFAULT_COSTS, df["date"].iloc[20],
+    )["X"]
+
+    assert at_flip["metrics"]["total_return"] == pytest.approx(
+        earlier["metrics"]["total_return"], abs=1e-6,
+    )
+    assert at_flip["metrics"]["trade_count"] == earlier["metrics"]["trade_count"]
+
+
+def test_held_before_reads_the_bar_preceding_start():
+    """_held_before 直接单测:看的必须是 start 之前那根 bar。"""
+    idx = pd.DatetimeIndex([date(2024, 1, 1) + timedelta(days=i) for i in range(4)])
+    # 前两天空仓,后两天持仓
+    pos = pd.Series([0.0, 0.0, 1.0, 1.0], index=idx)
+
+    assert _held_before(pos, idx[2]) is False   # 翻仓当日:起点前是 0
+    assert _held_before(pos, idx[3]) is True    # 起点前一根已是 1
+    assert _held_before(pos, idx[0]) is False   # 无起点前历史

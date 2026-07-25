@@ -138,27 +138,32 @@ def rebuild_index_members(db: Session, index_name: str, start: date,
             "intervals": len(intervals), "sync": sync}
 
 
-def current_pool(db: Session) -> list[str]:
-    """当前在册股票代码列表(跨指数去重,按代码排序)"""
-    rows = db.execute(
-        select(IndexMember.code).where(IndexMember.out_date.is_(None)).distinct()
-    ).all()
-    return sorted(r[0] for r in rows)
+def current_pool(db: Session, index_name: str | None = None) -> list[str]:
+    """当前在册股票代码列表(按代码排序)。
+
+    index_name 为 None 时跨全部指数去重;给定时只取该指数。
+    """
+    q = select(IndexMember.code).where(IndexMember.out_date.is_(None))
+    if index_name is not None:
+        q = q.where(IndexMember.index_name == index_name)
+    return sorted(r[0] for r in db.execute(q.distinct()).all())
 
 
-def pool_at(db: Session, day: date) -> list[str]:
+def pool_at(db: Session, day: date, index_name: str | None = None) -> list[str]:
     """day 当日在册的股票代码列表(按 in_date/out_date 还原历史成分)。
 
     用于回测选股,避免用当前成分池回测历史引入幸存者偏差。
     注意:返回的是 day 这一时点的静态快照,回测区间内后续的成分变动不体现。
+    index_name 为 None 时跨全部指数去重;给定时只取该指数(单指数口径统一走
+    这里,不要在调用方重写 in_date/out_date 条件)。
     """
-    rows = db.execute(
-        select(IndexMember.code).where(
-            IndexMember.in_date <= day,
-            (IndexMember.out_date.is_(None)) | (IndexMember.out_date > day),
-        ).distinct()
-    ).all()
-    return sorted(r[0] for r in rows)
+    q = select(IndexMember.code).where(
+        IndexMember.in_date <= day,
+        (IndexMember.out_date.is_(None)) | (IndexMember.out_date > day),
+    )
+    if index_name is not None:
+        q = q.where(IndexMember.index_name == index_name)
+    return sorted(r[0] for r in db.execute(q.distinct()).all())
 
 
 def membership_intervals(db: Session, codes: list[str], start: date,
