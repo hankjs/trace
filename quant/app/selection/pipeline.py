@@ -14,7 +14,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..data.ingest import load_bars_df
-from ..data.universe import current_pool
+from ..data.universe import current_pool, pool_at
 from ..factors import FACTOR_COLUMNS, MIN_BARS, factor_frame
 from ..models import DailyBar, FactorDaily, Pick, Stock
 
@@ -95,7 +95,10 @@ def run_selection(db: Session, day: date | None = None,
                   top_n: int = TOP_N, codes: list[str] | None = None) -> dict:
     """跑一天选股:过滤 -> 打分 -> Top N 落 quant_pick。返回汇总。"""
     day = day or date.today()
-    codes = codes or current_pool(db)
+    if codes is None:
+        codes = pool_at(db, day)
+        if not codes and day >= date.today():
+            codes = current_pool(db)
     if not codes:
         raise ValueError("股票池为空,请先同步成分股")
 

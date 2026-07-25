@@ -14,7 +14,7 @@ import numpy as np
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..data.universe import current_pool, pool_at
+from ..data.universe import current_pool, pool_at, pool_during
 from ..models import FactorDaily, StrategyEval
 from ..selection.pipeline import score_row
 from ..strategy.strategies import (PORTFOLIO_STRATEGIES, REGISTRY,
@@ -95,10 +95,9 @@ def run_evaluation(db: Session, day: date | None = None,
     """跑一轮批量评估并落库 quant_strategy_eval"""
     end = day or date.today()
     start = end - timedelta(days=period_days)
-    # 选股与成分池都取回测起点的时点数据,避免前视/幸存者偏差。
-    # 残余近似:回测区间内成分变动不随时间推进(引擎 codes 为静态列表)。
+    # 单标的样本取起点时点；组合池使用区间成分并集和逐日 eligibility。
     top_codes = top_scored_codes(db, TOP_SAMPLE, as_of=start)
-    pool = pool_at(db, start)
+    pool = pool_during(db, start, end)
     logger.info("批量评估 [%s, %s]: 单标的样本 %d 只,组合池 %d 只",
                 start, end, len(top_codes), len(pool))
 
@@ -118,7 +117,9 @@ def run_evaluation(db: Session, day: date | None = None,
 
     for name in PORTFOLIO_STRATEGIES:
         try:
-            res = run_backtest(db, name, pool, start, end, save=False)
+            res = run_backtest(
+                db, name, pool, start, end, save=False, dynamic_universe=True,
+            )
             metrics = res["metrics"]
         except Exception as e:  # noqa: BLE001
             logger.exception("评估失败 %s", name)

@@ -19,7 +19,14 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.backtest.engine import DEFAULT_COSTS, _batch_single, _portfolio_sim
+from app.backtest.engine import (
+    DEFAULT_COSTS,
+    _batch_single,
+    _portfolio_sim,
+    _validate_costs,
+    _validate_params,
+)
+from app.strategy.strategies import momentum_rotation
 
 
 def _mk_df(start: date, prices: list[float]) -> pd.DataFrame:
@@ -96,3 +103,66 @@ def test_stamp_tax_in_simulation():
     # 平价一买一卖必亏(双边佣金+滑点+印花税),且胜率口径来自同一模拟
     assert taxed["X"]["metrics"]["total_return"] < 0
     assert taxed["X"]["metrics"]["win_rate"] == 0.0
+
+
+def test_initial_entry_cost_is_in_total_return_and_drawdown():
+    start = date(2024, 1, 1)
+    df = _mk_df(start, [10.0] * 40)
+    res = _batch_single(
+        {"X": df}, {"X": pd.Series([1] * 40)}, DEFAULT_COSTS, start,
+    )["X"]
+
+    assert res["metrics"]["total_return"] == pytest.approx(-0.00035, abs=1e-4)
+    assert res["metrics"]["max_drawdown"] == pytest.approx(-0.00035, abs=1e-4)
+    assert res["equity"].iat[0] < 1.0
+
+
+def test_costs_and_strategy_params_are_validated():
+    with pytest.raises(ValueError, match="commission"):
+        _validate_costs({"commission": -0.01})
+    with pytest.raises(ValueError, match="未知费用"):
+        _validate_costs({"rebate": 0.01})
+    with pytest.raises(ValueError, match="fast 必须小于 slow"):
+        _validate_params("ma_cross", {"fast": 20, "slow": 5})
+    with pytest.raises(ValueError, match="不支持参数"):
+        _validate_params("ma_cross", {"future_window": 3})
+
+
+def test_portfolio_stamp_tax_is_applied_to_actual_sell_order():
+    start = date(2024, 1, 1)
+    dfs = {
+        "A": _mk_df(start, [10.0] * 40),
+        "B": _mk_df(start, [10.0] * 40),
+    }
+    idx = pd.DatetimeIndex(dfs["A"]["date"])
+    weights = pd.DataFrame(0.0, index=idx, columns=["A", "B"])
+    weights.loc[idx[:20], "A"] = 1.0
+    weights.loc[idx[20:], "B"] = 1.0
+
+    sim = _portfolio_sim(weights, dfs, idx, DEFAULT_COSTS)
+    orders = sim["pf"].orders.records_readable
+    sell = orders[orders["Side"] == "Sell"].iloc[0]
+
+    assert sell["Fees"] / (sell["Size"] * sell["Price"]) == pytest.approx(
+        DEFAULT_COSTS["commission"] + DEFAULT_COSTS["stamp_tax"], rel=1e-6,
+    )
+
+
+def test_dynamic_eligibility_excludes_inactive_stock_from_ranking():
+    start = date(2024, 1, 1)
+    n = 80
+    dfs = {
+        "inactive": _mk_df(start, [10 + i * 0.2 for i in range(n)]),
+        "active": _mk_df(start, [10 + i * 0.1 for i in range(n)]),
+    }
+    idx = pd.DatetimeIndex(dfs["active"]["date"])
+    eligibility = pd.DataFrame(
+        {"inactive": [False] * n, "active": [True] * n}, index=idx,
+    )
+
+    weights = momentum_rotation.target_weights(
+        list(dfs["active"]["date"]), dfs, {"top_n": 1},
+        eligibility=eligibility,
+    )
+
+    assert weights.iloc[-1].to_dict() == {"inactive": 0.0, "active": 1.0}

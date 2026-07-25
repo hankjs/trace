@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import math
 from datetime import date, timedelta
 
 import numpy as np
@@ -33,6 +34,8 @@ import vectorbt as vbt
 from sqlalchemy.orm import Session
 
 from ..data.ingest import load_bars_df
+from ..data.universe import membership_intervals
+from ..catalog import STRATEGIES
 from ..models import BacktestEquity, BacktestRun
 from ..strategy.strategies import REGISTRY, strategy_kind
 
@@ -65,26 +68,76 @@ def _signal_fee_matrix(entries: pd.DataFrame, exits: pd.DataFrame,
     return fees
 
 
-def _order_fee_matrix(w_exec: pd.DataFrame, costs: dict) -> np.ndarray:
-    """from_orders 的按单费率矩阵:目标权重较上次下降视为卖出,加印花税。
+def _validate_costs(costs: dict | None) -> dict[str, float]:
+    allowed = set(DEFAULT_COSTS)
+    supplied = costs or {}
+    unknown = set(supplied) - allowed
+    if unknown:
+        raise ValueError(f"未知费用参数: {', '.join(sorted(unknown))}")
+    result = {**DEFAULT_COSTS, **supplied}
+    limits = {"commission": 0.05, "stamp_tax": 0.05, "slippage": 0.10}
+    for key, maximum in limits.items():
+        value = result[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} 必须是数字")
+        value = float(value)
+        if not math.isfinite(value) or not 0 <= value <= maximum:
+            raise ValueError(f"{key} 必须在 0 到 {maximum} 之间")
+        result[key] = value
+    return result
 
-    方向按目标权重变化近似判定(targetpercent 的实际成交方向还受现金约束);
-    关键是税费进入现金核算,净值/胜率/后续仓位规模口径一致。
-    """
-    prev = w_exec.ffill().shift(1)
-    is_sell = (w_exec < prev).fillna(False).to_numpy()
-    fees = np.full(w_exec.shape, costs["commission"], dtype=float)
-    fees[is_sell] += costs["stamp_tax"]
-    return fees
+
+def _validate_params(strategy: str, params: dict | None) -> dict:
+    supplied = params or {}
+    metadata = {item["key"]: item for item in STRATEGIES[strategy]["params"]}
+    unknown = set(supplied) - set(metadata)
+    if unknown:
+        raise ValueError(f"{strategy} 不支持参数: {', '.join(sorted(unknown))}")
+    normalized = {}
+    for key, value in supplied.items():
+        spec = metadata[key]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"参数 {key} 必须是数字")
+        number = float(value)
+        if not math.isfinite(number):
+            raise ValueError(f"参数 {key} 必须是有限数字")
+        if spec["value_type"] == "integer":
+            if not number.is_integer():
+                raise ValueError(f"参数 {key} 必须是整数")
+            normalized[key] = int(number)
+        else:
+            normalized[key] = number
+        if not spec["minimum"] <= number <= spec["maximum"]:
+            raise ValueError(
+                f"参数 {key} 必须在 {spec['minimum']} 到 {spec['maximum']} 之间"
+            )
+    merged = {
+        item["key"]: normalized.get(item["key"], item["default"])
+        for item in metadata.values()
+    }
+    if strategy == "ma_cross" and merged["fast"] >= merged["slow"]:
+        raise ValueError("参数 fast 必须小于 slow")
+    if strategy == "mean_reversion" and merged["rsi_buy"] >= merged["rsi_sell"]:
+        raise ValueError("参数 rsi_buy 必须小于 rsi_sell")
+    if strategy == "momentum_rotation" and merged["w_mom20"] + merged["w_mom60"] <= 0:
+        raise ValueError("动量权重之和必须大于 0")
+    return normalized
+
+
+def _equity_statistics(eq: pd.Series, initial_cash: float = 1.0) -> tuple[float, float, float, pd.Series]:
+    """从初始资金起算收益、年化、回撤和逐日收益，包含首日成交成本。"""
+    total_return = float(eq.iat[-1] / initial_cash - 1)
+    annual = float((eq.iat[-1] / initial_cash) ** (252 / max(len(eq), 1)) - 1)
+    running_max = eq.cummax().clip(lower=initial_cash)
+    max_dd = float((eq / running_max - 1).min())
+    rets = eq.pct_change()
+    rets.iloc[0] = eq.iat[0] / initial_cash - 1
+    return total_return, annual, max_dd, rets.dropna()
 
 
 def _metrics_from_equity(eq: pd.Series, pf: vbt.Portfolio) -> dict:
     """从净值序列 + Portfolio 计算指标(费用已在撮合内扣除,口径一致)"""
-    total_return = float(eq.iat[-1] / eq.iat[0] - 1)
-    n_days = len(eq)
-    annual = float((eq.iat[-1] / eq.iat[0]) ** (252 / max(n_days, 1)) - 1)
-    max_dd = float((eq / eq.cummax() - 1).min())
-    rets = eq.pct_change().dropna()
+    total_return, annual, max_dd, rets = _equity_statistics(eq)
     sharpe = None
     if len(rets) > 2 and float(rets.std()) > 0:
         sharpe = round(float(rets.mean() / rets.std() * np.sqrt(252)), 4)
@@ -158,7 +211,9 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
 
 def run_backtest(db: Session, strategy: str, codes: list[str],
                  start: date, end: date, params: dict | None = None,
-                 costs: dict | None = None, save: bool = True) -> dict:
+                 costs: dict | None = None, save: bool = True,
+                 dynamic_universe: bool = False,
+                 user_id: int | None = None) -> dict:
     """跑回测并(默认)落库。多标的时资金等分,组合净值为各标的净值平均。
 
     组合策略(KIND=portfolio)走 target_weights + vectorbt 组合回测。
@@ -166,10 +221,14 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     mod = REGISTRY.get(strategy)
     if mod is None:
         raise ValueError(f"未知策略: {strategy},可选: {list(REGISTRY)}")
-    costs = {**DEFAULT_COSTS, **(costs or {})}
+    costs = _validate_costs(costs)
+    params = _validate_params(strategy, params)
 
     if strategy_kind(strategy) == "portfolio":
-        return _run_portfolio(db, strategy, codes, start, end, params, costs, save)
+        return _run_portfolio(
+            db, strategy, codes, start, end, params, costs, save,
+            dynamic_universe=dynamic_universe, user_id=user_id,
+        )
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
     dfs: dict[str, pd.DataFrame] = {}
@@ -189,9 +248,9 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
     per_code = {c: r["metrics"] for c, r in results.items()}
     curves = [r["equity"] for r in results.values()]
 
-    # 组合净值:各标的归一化后等权平均
-    norm = [c / c.iloc[0] for c in curves]
-    combo = pd.concat(norm, axis=1).ffill().mean(axis=1)
+    # 每只标的各自从同一初始资金 1.0 开始，缺失起点按现金处理，再等权合成。
+    aligned = pd.concat(curves, axis=1).ffill().fillna(1.0)
+    combo = aligned.mean(axis=1)
     metrics = _combo_metrics(combo, per_code)
 
     result: dict = {
@@ -208,7 +267,7 @@ def run_backtest(db: Session, strategy: str, codes: list[str],
         ],
     }
     if save:
-        _save_run(db, result, start, end, combo)
+        _save_run(db, result, start, end, combo, user_id=user_id)
     return result
 
 
@@ -234,19 +293,35 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
         np.repeat(changed.to_numpy()[:, None], w_exec.shape[1], axis=1),
         index=w_exec.index, columns=w_exec.columns))
 
-    pf = vbt.Portfolio.from_orders(
+    commission_fees = np.full(w_exec.shape, costs["commission"], dtype=float)
+    probe = vbt.Portfolio.from_orders(
         close, size=w_orders, size_type="targetpercent", price=open_,
-        init_cash=1.0, fees=_order_fee_matrix(w_exec, costs),
+        init_cash=1.0, fees=commission_fees,
         slippage=costs["slippage"], cash_sharing=True, group_by=True,
         call_seq="auto", freq="1D",
     )
+    fees = commission_fees.copy()
+    if costs["stamp_tax"]:
+        for order in probe.orders.records_readable.to_dict("records"):
+            if order["Side"] == "Sell":
+                row = w_exec.index.get_loc(order["Timestamp"])
+                col = w_exec.columns.get_loc(order["Column"])
+                fees[row, col] += costs["stamp_tax"]
+        pf = vbt.Portfolio.from_orders(
+            close, size=w_orders, size_type="targetpercent", price=open_,
+            init_cash=1.0, fees=fees, slippage=costs["slippage"],
+            cash_sharing=True, group_by=True, call_seq="auto", freq="1D",
+        )
+    else:
+        pf = probe
     eq = pf.value().dropna()
     return {"equity": eq, "metrics": _metrics_from_equity(eq, pf), "pf": pf}
 
 
 def _run_portfolio(db: Session, strategy: str, codes: list[str],
                    start: date, end: date, params: dict | None,
-                   costs: dict, save: bool) -> dict:
+                   costs: dict, save: bool, *, dynamic_universe: bool,
+                   user_id: int | None) -> dict:
     """组合策略回测:target_weights -> T+1 开盘按目标权重调仓。"""
     mod = REGISTRY[strategy]
     warmup_start = start - timedelta(days=PORTFOLIO_WARMUP_DAYS)
@@ -260,7 +335,18 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
         raise ValueError("所有标的都数据不足,无法回测")
 
     all_dates = sorted({d for df in pool_dfs.values() for d in df["date"]})
-    weights_full = mod.target_weights(all_dates, pool_dfs, params)
+    eligibility = None
+    if dynamic_universe:
+        idx = pd.DatetimeIndex(all_dates)
+        eligibility = pd.DataFrame(False, index=idx, columns=pool_dfs)
+        for member in membership_intervals(db, list(pool_dfs), warmup_start, end):
+            active = idx.date >= member.in_date
+            if member.out_date is not None:
+                active &= idx.date < member.out_date
+            eligibility.loc[active, member.code] = True
+    weights_full = mod.target_weights(
+        all_dates, pool_dfs, params, eligibility=eligibility,
+    )
     bt_idx = pd.DatetimeIndex([d for d in all_dates if start <= d <= end])
     if len(bt_idx) < 3:
         raise ValueError("回测区间交易日不足")
@@ -282,15 +368,12 @@ def _run_portfolio(db: Session, strategy: str, codes: list[str],
         ],
     }
     if save:
-        _save_run(db, result, start, end, eq)
+        _save_run(db, result, start, end, eq, user_id=user_id)
     return result
 
 
 def _combo_metrics(combo: pd.Series, per_code: dict[str, dict]) -> dict:
-    total_return = float(combo.iat[-1] - 1)
-    annual = float(combo.iat[-1] ** (252 / max(len(combo), 1)) - 1)
-    max_dd = float((combo / combo.cummax() - 1).min())
-    rets = combo.pct_change().dropna()
+    total_return, annual, max_dd, rets = _equity_statistics(combo)
     sharpe = None
     if len(rets) > 2 and float(rets.std()) > 0:
         sharpe = round(float(rets.mean() / rets.std() * np.sqrt(252)), 4)
@@ -308,10 +391,10 @@ def _combo_metrics(combo: pd.Series, per_code: dict[str, dict]) -> dict:
 
 
 def _save_run(db: Session, result: dict, start: date, end: date,
-              combo: pd.Series) -> None:
+              combo: pd.Series, user_id: int | None = None) -> None:
     run = BacktestRun(strategy=result["strategy"], params=result["params"],
                       codes=result["codes"], start=start, end=end,
-                      metrics=result["metrics"])
+                      metrics=result["metrics"], user_id=user_id)
     db.add(run)
     db.flush()
     db.execute(
@@ -332,15 +415,20 @@ def run_sweep(db: Session, strategy: str, codes: list[str],
         raise ValueError(f"未知策略: {strategy}")
     if strategy_kind(strategy) != "single":
         raise ValueError("参数扫描目前只支持单标的策略")
-    costs = {**DEFAULT_COSTS, **(costs or {})}
+    costs = _validate_costs(costs)
     if not param_grid:
         raise ValueError("param_grid 不能为空")
 
     keys = list(param_grid)
-    combos = [dict(zip(keys, vals))
-              for vals in itertools.product(*(param_grid[k] for k in keys))]
-    if len(combos) > 200:
-        raise ValueError(f"参数组合过多({len(combos)}),上限 200")
+    for key, values in param_grid.items():
+        if not isinstance(values, list) or not values:
+            raise ValueError(f"参数 {key} 的候选值必须是非空数组")
+    count = math.prod(len(param_grid[key]) for key in keys)
+    if count > 200:
+        raise ValueError(f"参数组合过多({count}),上限 200")
+    combos = []
+    for vals in itertools.product(*(param_grid[k] for k in keys)):
+        combos.append(_validate_params(strategy, dict(zip(keys, vals))))
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
     full_dfs: dict[str, pd.DataFrame] = {}  # 含预热段,信号在完整序列上计算

@@ -34,7 +34,7 @@ def _latest_prices(db: Session, codes: list[str]) -> dict[str, tuple[float, str]
     return prices
 
 
-def _compute_book(db: Session) -> dict[str, dict]:
+def _compute_book(db: Session, user_id: int) -> dict[str, dict]:
     """按 code 聚合所有成交,均价法推导 {code: {qty, cost, realized}}。
 
     买入:总成本 += price*qty + fee
@@ -42,7 +42,8 @@ def _compute_book(db: Session) -> dict[str, dict]:
     数量与成本按比例扣减。已清仓的 code 也保留,供汇总已实现盈亏用。
     """
     trades = db.execute(
-        select(Trade).order_by(Trade.trade_date, Trade.id)
+        select(Trade).where(Trade.user_id == user_id)
+        .order_by(Trade.trade_date, Trade.id)
     ).scalars().all()
 
     book: dict[str, dict] = {}
@@ -66,9 +67,9 @@ def _compute_book(db: Session) -> dict[str, dict]:
     return book
 
 
-def compute_positions(db: Session) -> list[dict]:
+def compute_positions(db: Session, user_id: int) -> list[dict]:
     """当前持仓列表(仅仍有持仓的股票)"""
-    book = _compute_book(db)
+    book = _compute_book(db, user_id)
     holding_codes = [c for c, p in book.items() if p["qty"] > 1e-9]
     prices = _latest_prices(db, holding_codes)
 
@@ -93,9 +94,9 @@ def compute_positions(db: Session) -> list[dict]:
     return positions
 
 
-def portfolio_summary(db: Session) -> dict:
-    book = _compute_book(db)
-    positions = compute_positions(db)
+def portfolio_summary(db: Session, user_id: int) -> dict:
+    book = _compute_book(db, user_id)
+    positions = compute_positions(db, user_id)
     return {
         "positions": positions,
         "total_market_value": round(

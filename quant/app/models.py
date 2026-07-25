@@ -32,6 +32,16 @@ class Stock(Base):
     is_watch: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class WatchlistItem(Base):
+    """用户自选股。股票资料共享，自选关系按共享 users.id 隔离。"""
+
+    __tablename__ = "quant_watchlist"
+
+    user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    code: Mapped[str] = mapped_column(String(16), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
 class DailyBar(Base):
     """日线。open/high/low/close 为前复权价,raw_close 为不复权收盘价。"""
 
@@ -87,6 +97,7 @@ class Trade(Base):
     __tablename__ = "quant_trade"
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     trade_date: Mapped[date] = mapped_column(Date)
     side: Mapped[str] = mapped_column(String(8))  # buy / sell
@@ -102,6 +113,7 @@ class BacktestRun(Base):
     __tablename__ = "quant_backtest_run"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
     strategy: Mapped[str] = mapped_column(String(64))
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     codes: Mapped[list | None] = mapped_column(JSON, nullable=True)

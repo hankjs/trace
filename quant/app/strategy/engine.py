@@ -15,7 +15,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from ..data.ingest import load_bars_df
-from ..models import Signal, Stock
+from ..models import Signal, WatchlistItem
 from .strategies import REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def run_signals(db: Session, day: date | None = None,
     day = day or date.today()
     if codes is None:
         codes = [r[0] for r in db.execute(
-            select(Stock.code).where(Stock.is_watch.is_(True))).all()]
+            select(WatchlistItem.code).distinct()).all()]
     if strategies is None:
         strategies = {n: {} for n, m in REGISTRY.items() if m.KIND == "single"}
 

@@ -79,3 +79,22 @@ def require_admin(request: Request) -> dict:
     if claims.get("can_admin") not in (True, 1):
         raise HTTPException(403, "需要管理员权限")
     return claims
+
+
+def require_client(request: Request) -> dict:
+    """业务接口要求客户端或管理员权限。"""
+    claims = require_user(request)
+    if claims.get("can_client") not in (True, 1) and claims.get("can_admin") not in (True, 1):
+        raise HTTPException(403, "没有量化研究系统访问权限")
+    return claims
+
+
+def user_id_from_claims(claims: dict) -> int:
+    """提取共享 users.id，拒绝缺失或非法 subject 的 token。"""
+    try:
+        user_id = int(claims.get("sub"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(401, "登录凭证缺少有效用户标识") from exc
+    if user_id <= 0:
+        raise HTTPException(401, "登录凭证缺少有效用户标识")
+    return user_id

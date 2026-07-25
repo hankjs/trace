@@ -25,6 +25,7 @@ _VERSIONED_UNIQUES = (
 
 def upgrade_research_schema(engine: Engine) -> None:
     """允许估值和财报按 available_date 保留历史修订版本。"""
+    _ensure_owner_columns(engine)
     for table, legacy_name, target_name, columns in _VERSIONED_UNIQUES:
         inspector = inspect(engine)
         if not inspector.has_table(table):
@@ -56,3 +57,26 @@ def upgrade_research_schema(engine: Engine) -> None:
         with engine.begin() as connection:
             connection.exec_driver_sql(statement)
         logger.info("数据库结构已升级: %s.%s", table, target_name)
+
+
+def _ensure_owner_columns(engine: Engine) -> None:
+    """给既有手工账本和回测记录补充可空所有者列。"""
+    for table in ("quant_trade", "quant_backtest_run"):
+        inspector = inspect(engine)
+        if not inspector.has_table(table):
+            continue
+        columns = {item["name"] for item in inspector.get_columns(table)}
+        if "user_id" not in columns:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"ALTER TABLE `{table}` ADD COLUMN `user_id` BIGINT NULL"
+                )
+            logger.info("数据库结构已升级: %s.user_id", table)
+        inspector = inspect(engine)
+        indexes = {item["name"] for item in inspector.get_indexes(table)}
+        index_name = f"ix_{table}_user_id"
+        if index_name not in indexes:
+            with engine.begin() as connection:
+                connection.exec_driver_sql(
+                    f"CREATE INDEX `{index_name}` ON `{table}` (`user_id`)"
+                )

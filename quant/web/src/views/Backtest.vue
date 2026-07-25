@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import type { EChartsCoreOption } from 'echarts/core'
 import { api, type BacktestResult, type SweepResult, type SweepMetrics, type WatchItem } from '../api'
@@ -31,6 +31,20 @@ const form = reactive({
 
 const strategyMeta = computed(() => catalogEntry('strategies', form.strategy))
 const strategyParams = computed(() => strategyMeta.value?.params ?? [])
+const isPortfolio = computed(() => strategyMeta.value?.kind === 'portfolio')
+const parameterValues = reactive<Record<string, number>>({})
+
+function resetParameterValues() {
+  for (const key of Object.keys(parameterValues)) delete parameterValues[key]
+  for (const parameter of strategyParams.value) {
+    if (typeof parameter.default === 'number') parameterValues[parameter.key] = parameter.default
+  }
+}
+
+watch(() => form.strategy, () => {
+  resetParameterValues()
+  if (isPortfolio.value && mode.value === 'sweep') mode.value = 'single'
+})
 
 // ---- 参数扫描 ----
 
@@ -253,7 +267,7 @@ async function run() {
     error.value = '请选择策略'
     return
   }
-  if (!codes.length) {
+  if (!codes.length && !isPortfolio.value) {
     error.value = '请至少选择一个股票代码'
     return
   }
@@ -268,6 +282,7 @@ async function run() {
       codes,
       start: form.start,
       end: form.end,
+      params: { ...parameterValues },
     })
   } catch (e) {
     error.value = (e as Error).message
@@ -325,7 +340,8 @@ onMounted(async () => {
           单次回测
         </button>
         <button
-          class="rounded-r-md px-3 py-1"
+          class="rounded-r-md px-3 py-1 disabled:cursor-not-allowed disabled:opacity-40"
+          :disabled="isPortfolio"
           :class="mode === 'sweep' ? 'bg-active font-medium text-text-primary' : 'text-text-secondary hover:bg-hover'"
           @click="mode = 'sweep'"
         >
@@ -363,8 +379,30 @@ onMounted(async () => {
         <p v-if="strategyMeta.caveat" class="mt-1 text-text-tertiary">限制：{{ strategyMeta.caveat }}</p>
       </div>
 
+      <div v-if="mode === 'single' && strategyParams.length" class="border-t border-border-subtle pt-3">
+        <span class="mb-2 block text-xs font-medium text-text-secondary">策略参数</span>
+        <div class="flex flex-wrap gap-3">
+          <label v-for="parameter in strategyParams" :key="parameter.key" class="text-sm">
+            <span class="mb-1 block text-xs text-text-tertiary">
+              {{ parameter.name }}<template v-if="parameter.unit">（{{ parameter.unit }}）</template>
+            </span>
+            <input
+              v-model.number="parameterValues[parameter.key]"
+              type="number"
+              :min="parameter.minimum"
+              :max="parameter.maximum"
+              :step="parameter.step ?? 'any'"
+              required
+              class="w-32 rounded-md border border-border px-2 py-1.5"
+            />
+          </label>
+        </div>
+      </div>
+
       <div>
-        <span class="mb-1 block text-xs text-text-tertiary">股票(点击选择自选股,或逗号分隔输入)</span>
+        <span class="mb-1 block text-xs text-text-tertiary">
+          {{ isPortfolio ? '股票（留空则使用区间内动态指数成分）' : '股票（点击选择自选股，或逗号分隔输入）' }}
+        </span>
         <div class="mb-2 flex flex-wrap gap-2">
           <button
             v-for="w in watchlist"

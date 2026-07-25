@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..catalog import manual_trade_side_name
+from ..auth import require_client, user_id_from_claims
 from ..db import get_db
 from ..models import Stock
 from ..portfolio import positions as pos_svc
@@ -52,8 +53,9 @@ def _trade_out(t, stock: Stock | None = None) -> dict:
 
 
 @router.get("/trades")
-def list_trades(code: str | None = None, db: Session = Depends(get_db)):
-    rows = trade_svc.list_trades(db, code)
+def list_trades(code: str | None = None, db: Session = Depends(get_db),
+                claims: dict = Depends(require_client)):
+    rows = trade_svc.list_trades(db, user_id_from_claims(claims), code)
     stocks = _stock_map(db, [t.code for t in rows])
     return {
         "count": len(rows),
@@ -62,29 +64,33 @@ def list_trades(code: str | None = None, db: Session = Depends(get_db)):
 
 
 @router.post("/trades", status_code=201)
-def add_trade(body: TradeIn, db: Session = Depends(get_db)):
+def add_trade(body: TradeIn, db: Session = Depends(get_db),
+              claims: dict = Depends(require_client)):
     code = body.code.strip().lower()
     stock = db.get(Stock, code)
     if stock is None:
         raise HTTPException(
             422, f"股票代码 {code or '（空）'} 不存在，请先从股票搜索结果中选择",
         )
-    t = trade_svc.add_trade(db, code, body.trade_date, body.side,
+    t = trade_svc.add_trade(db, user_id_from_claims(claims), code,
+                            body.trade_date, body.side,
                             body.price, body.qty, body.fee, body.note)
     return _trade_out(t, stock)
 
 
 @router.delete("/trades/{trade_id}")
-def delete_trade(trade_id: int, db: Session = Depends(get_db)):
-    if not trade_svc.delete_trade(db, trade_id):
+def delete_trade(trade_id: int, db: Session = Depends(get_db),
+                 claims: dict = Depends(require_client)):
+    if not trade_svc.delete_trade(db, user_id_from_claims(claims), trade_id):
         raise HTTPException(404, f"成交记录 {trade_id} 不存在")
     return {"deleted": trade_id}
 
 
 @router.get("/positions")
-def get_positions(db: Session = Depends(get_db)):
+def get_positions(db: Session = Depends(get_db),
+                  claims: dict = Depends(require_client)):
     """持仓:均价法成本 + 最新价浮动盈亏 + 汇总"""
-    summary = pos_svc.portfolio_summary(db)
+    summary = pos_svc.portfolio_summary(db, user_id_from_claims(claims))
     stocks = _stock_map(db, [item["code"] for item in summary["positions"]])
     for item in summary["positions"]:
         stock = stocks.get(item["code"])

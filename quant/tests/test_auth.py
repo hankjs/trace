@@ -11,7 +11,13 @@ from starlette.requests import Request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.auth import create_token, require_admin, require_user
+from app.auth import (
+    create_token,
+    require_admin,
+    require_client,
+    require_user,
+    user_id_from_claims,
+)
 from app.config import settings
 
 
@@ -68,3 +74,22 @@ def test_require_admin_accepts_admin_user():
         "can_client": True,
     })
     assert require_admin(_request(token))["username"] == "admin"
+
+
+def test_require_client_rejects_user_without_product_permission():
+    token = create_token({
+        "id": 9,
+        "username": "disabled",
+        "can_admin": False,
+        "can_client": False,
+    })
+    with pytest.raises(HTTPException) as exc_info:
+        require_client(_request(token))
+    assert exc_info.value.status_code == 403
+
+
+def test_user_id_accepts_string_and_legacy_numeric_subjects():
+    assert user_id_from_claims({"sub": "42"}) == 42
+    assert user_id_from_claims({"sub": 42}) == 42
+    with pytest.raises(HTTPException):
+        user_id_from_claims({"sub": "invalid"})

@@ -5,14 +5,15 @@ from copy import deepcopy
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..backtest.engine import run_backtest, run_sweep
 from ..backtest.evaluate import leaderboard
+from ..auth import require_client, user_id_from_claims
 from ..catalog import STRATEGIES, strategy_name
-from ..data.universe import current_pool
+from ..data.universe import pool_at, pool_during
 from ..db import get_db
 from ..models import BacktestEquity, BacktestRun, Stock
 from ..strategy.strategies import PORTFOLIO_STRATEGIES, REGISTRY, SINGLE_STRATEGIES
@@ -22,20 +23,20 @@ router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
 class BacktestIn(BaseModel):
     strategy: str
-    codes: list[str] = []  # 组合策略可留空(默认当前股票池)
+    codes: list[str] = Field(default_factory=list, max_length=800)  # 可留空用动态池
     start: date
     end: date
-    params: dict = {}
-    costs: dict = {}  # 可选覆盖 commission / stamp_tax / slippage
+    params: dict = Field(default_factory=dict)
+    costs: dict = Field(default_factory=dict)  # 可选覆盖费用
 
 
 class SweepIn(BaseModel):
     strategy: str
-    codes: list[str]
+    codes: list[str] = Field(max_length=800)
     start: date
     end: date
     param_grid: dict  # {参数名: [候选值]},笛卡尔积逐组回测
-    costs: dict = {}
+    costs: dict = Field(default_factory=dict)
 
 
 def _stock_items(db: Session, codes: list[str] | None) -> list[dict]:
@@ -98,27 +99,43 @@ def get_leaderboard(db: Session = Depends(get_db)):
 
 
 @router.post("", status_code=201)
-def create_backtest(body: BacktestIn, db: Session = Depends(get_db)):
+def create_backtest(body: BacktestIn, db: Session = Depends(get_db),
+                    claims: dict = Depends(require_client)):
     if body.strategy not in REGISTRY:
         raise HTTPException(400, f"未知策略 {body.strategy},可选: {sorted(REGISTRY)}")
     if body.start >= body.end:
         raise HTTPException(400, "start 必须早于 end")
-    codes = [c.lower() for c in body.codes]
-    if body.strategy in PORTFOLIO_STRATEGIES and not codes:
-        codes = current_pool(db)
+    codes = list(dict.fromkeys(c.lower() for c in body.codes))
+    dynamic_universe = body.strategy in PORTFOLIO_STRATEGIES and not codes
+    if dynamic_universe:
+        if not pool_at(db, body.start):
+            raise HTTPException(
+                400, "回测起点缺少历史指数成分，请先运行成分历史回填",
+            )
+        codes = pool_during(db, body.start, body.end)
+        if not codes:
+            raise HTTPException(
+                400, "回测区间缺少历史指数成分，请先运行成分历史回填",
+            )
     if not codes:
         raise HTTPException(400, "codes 不能为空")
     try:
         result = run_backtest(db, body.strategy, codes,
-                              body.start, body.end, body.params, body.costs)
+                              body.start, body.end, body.params, body.costs,
+                              dynamic_universe=dynamic_universe,
+                              user_id=user_id_from_claims(claims))
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _decorate_result(result, db)
 
 
 @router.get("/{run_id}")
-def get_backtest(run_id: int, db: Session = Depends(get_db)):
-    run = db.get(BacktestRun, run_id)
+def get_backtest(run_id: int, db: Session = Depends(get_db),
+                 claims: dict = Depends(require_client)):
+    run = db.execute(select(BacktestRun).where(
+        BacktestRun.id == run_id,
+        BacktestRun.user_id == user_id_from_claims(claims),
+    )).scalar_one_or_none()
     if run is None:
         raise HTTPException(404, f"回测 {run_id} 不存在")
     equity = db.execute(

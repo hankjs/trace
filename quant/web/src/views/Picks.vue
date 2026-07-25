@@ -3,7 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { ChevronDown, ChevronUp } from 'lucide-vue-next'
 import { api, type PickItem } from '../api'
 import { catalogEntry, factorName, loadCatalog } from '../catalog'
-import { fmtBigAmount, fmtPct } from '../format'
+import { fmtBigAmount, fmtPct, localDateISO } from '../format'
 
 const date = ref('')
 const items = ref<PickItem[]>([])
@@ -41,7 +41,7 @@ function toggleExpand(code: string) {
 }
 
 const emptyText = computed(() =>
-  date.value >= new Date().toISOString().slice(0, 10)
+  date.value >= localDateISO()
     ? '今日还未生成选股池(交易日 17:00 生成)'
     : '该日期无选股池数据'
 )

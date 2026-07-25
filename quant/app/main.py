@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .api import (admin, auth, backtest, catalog, market, portfolio, selection,
                   signals, watchlist)
-from .auth import require_admin, require_user
+from .auth import require_admin, require_client
 from .config import settings
 from .db import Base, engine
 from . import models  # noqa: F401 - 确保模型注册到 Base.metadata
@@ -49,7 +49,7 @@ app.add_middleware(
 app.include_router(auth.router)
 
 # 业务接口全部要求登录;/api/auth/login 与 /api/health 保持公开
-_auth = [Depends(require_user)]
+_auth = [Depends(require_client)]
 app.include_router(catalog.router, dependencies=_auth)
 app.include_router(market.router, dependencies=_auth)
 app.include_router(watchlist.router, dependencies=_auth)

@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
+from ..auth import require_client, user_id_from_claims
 from ..models import Pick, Stock
 from ..selection.screener import InvalidFilterError, screen, structured_screen
 
@@ -108,9 +109,12 @@ def get_screener(date_: Date | None = Query(None, alias="date"),
 
 @router.post("/screener")
 def post_screener(request: StructuredScreenerRequest,
-                  db: Session = Depends(get_db)):
+                  db: Session = Depends(get_db),
+                  claims: dict = Depends(require_client)):
     """结构化组合筛选；组内及组间均支持 AND/OR。"""
     try:
-        return structured_screen(db, request.model_dump())
+        return structured_screen(
+            db, request.model_dump(), user_id=user_id_from_claims(claims),
+        )
     except InvalidFilterError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

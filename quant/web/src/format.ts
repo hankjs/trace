@@ -43,3 +43,11 @@ export function pnlClass(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(v) || v === 0) return 'text-text-secondary'
   return v > 0 ? 'text-up' : 'text-down'
 }
+
+/** 浏览器本地日期，避免中国时区凌晨被 UTC ISO 字符串回退一天。 */
+export function localDateISO(value = new Date()): string {
+  const year = value.getFullYear()
+  const month = String(value.getMonth() + 1).padStart(2, '0')
+  const day = String(value.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}

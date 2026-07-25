@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session
 
 from ..models import IndexMember, Stock
@@ -156,6 +156,31 @@ def pool_at(db: Session, day: date) -> list[str]:
         select(IndexMember.code).where(
             IndexMember.in_date <= day,
             (IndexMember.out_date.is_(None)) | (IndexMember.out_date > day),
+        ).distinct()
+    ).all()
+    return sorted(r[0] for r in rows)
+
+
+def membership_intervals(db: Session, codes: list[str], start: date,
+                         end: date) -> list[IndexMember]:
+    """返回与区间重叠的成分记录，供动态股票池回测构造逐日可选掩码。"""
+    if not codes:
+        return []
+    return list(db.execute(
+        select(IndexMember).where(
+            IndexMember.code.in_(codes),
+            IndexMember.in_date <= end,
+            or_(IndexMember.out_date.is_(None), IndexMember.out_date > start),
+        )
+    ).scalars().all())
+
+
+def pool_during(db: Session, start: date, end: date) -> list[str]:
+    """返回区间内任一时点属于沪深300或中证500的股票并集。"""
+    rows = db.execute(
+        select(IndexMember.code).where(
+            IndexMember.in_date <= end,
+            or_(IndexMember.out_date.is_(None), IndexMember.out_date > start),
         ).distinct()
     ).all()
     return sorted(r[0] for r in rows)

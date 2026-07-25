@@ -3,7 +3,7 @@ import { onMounted, reactive, ref } from 'vue'
 import { api, type PortfolioSummary, type Trade } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
-import { fmtAmount, fmtPrice, fmtQty, fmtSigned, pnlClass } from '../format'
+import { fmtAmount, fmtPrice, fmtQty, fmtSigned, localDateISO, pnlClass } from '../format'
 
 const summary = ref<PortfolioSummary | null>(null)
 const trades = ref<Trade[]>([])
@@ -15,7 +15,7 @@ const submitting = ref(false)
 
 const form = reactive({
   code: '',
-  trade_date: new Date().toISOString().slice(0, 10),
+  trade_date: localDateISO(),
   side: 'buy',
   price: '',
   qty: '',

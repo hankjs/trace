@@ -46,8 +46,15 @@ Swagger UI：`http://localhost:8100/docs`。
 `database_url`、`jwt_secret`、`cors_origins`、`snapshot_retention_days` 和
 `backfill_start`。配置文件均不得提交。
 
-后端启动时会通过 SQLAlchemy 创建缺失的 `quant_*` 表，并幂等升级本功能新增的
-估值/财报版本唯一键，然后启动下述自动调度任务。
+后端启动时会通过 SQLAlchemy 创建缺失的 `quant_*` 表，并幂等升级估值/财报版本
+唯一键以及用户所有者字段，然后启动下述自动调度任务。
+
+从旧版共享自选和账本升级时，旧数据默认保持未归属并对普通用户不可见。确认目标用户
+的 `users.id` 后，显式执行一次：
+
+```bash
+uv run python scripts/claim_legacy_user_data.py --user-id 1
+```
 
 除 `/api/health` 和 `/api/auth/login` 外，业务接口需要：
 
@@ -83,14 +90,15 @@ AkShare 做对账，东财接口不可用时部分行情能力会降级到新浪
 | 表 | 内容 |
 |---|---|
 | `quant_stock`、`quant_index_member` | 股票基础资料和沪深300/中证500成分历史 |
+| `quant_watchlist` | 按共享 `users.id` 隔离的用户自选关系 |
 | `quant_daily_bar`、`quant_snapshot` | 前复权日线和展示用盘中快照 |
 | `quant_factor_daily`、`quant_pick` | 每日技术因子和 Top 30 候选 |
 | `quant_valuation_snapshot` | PE(TTM)、PB、PS(TTM)、股息率、总市值 |
 | `quant_fundamental_snapshot` | ROE、收入/利润增长、毛利率、净利率、负债率、现金流质量 |
 | `quant_signal` | 单标的策略提示及结构化原因 |
 | `quant_strategy_eval` | 周度策略批量评估 |
-| `quant_backtest_run`、`quant_backtest_equity` | 回测参数、指标和净值曲线 |
-| `quant_trade` | 用户手工录入的外部已完成成交 |
+| `quant_backtest_run`、`quant_backtest_equity` | 按用户隔离的回测参数、指标和净值曲线 |
+| `quant_trade` | 按用户隔离的外部已完成成交手工记录 |
 
 估值和财务快照同时保存 `data_date`、报告期、`available_date` 与来源；同一报告期
 后续修订会按新的 `available_date` 保留为独立版本，不覆盖当时已经公开的旧值。
@@ -170,7 +178,9 @@ curl -X POST \
 
 默认参数和参数范围由 `/api/catalog` 与 `/api/backtest/strategies` 返回。
 回测默认费用为双边佣金万 2.5、卖出印花税 0.05%、滑点万 1，可在 `costs`
-中覆盖。单标的策略支持参数网格扫描；策略排行读取最近一轮批量评估。
+中覆盖；收益和回撤从初始资金起算，包含首日建仓成本。组合策略留空 `codes` 时，
+使用回测区间内的历史指数成分，并按每个交易日的在册状态决定可选股票，不使用当前
+成分替代历史。单标的策略支持参数网格扫描；策略排行读取最近一轮批量评估。
 
 ## API 一览
 
@@ -200,7 +210,8 @@ curl -X POST \
 APScheduler 使用 `Asia/Shanghai` 时区：
 
 - 周一至周五 16:30：串行执行股票池/自选日线增量、因子与 Top 30 选股、
-  自选加候选的单标的策略提示；周五追加近一年策略批量评估。
+  自选加候选的单标的策略提示；周五追加近一年策略批量评估。任一股票行情更新失败时，
+  当晚流水线中止，不发布基于部分股票的候选结果。
 - 周一至周五 9:30-15:00 每 30 分钟：仅采集自选股盘中快照。
 - 每月 1 日 09:00：同步沪深300和中证500成分名录。
 - 周一至周五 18:30：同步自选加最近候选的估值快照，最多 30 只。

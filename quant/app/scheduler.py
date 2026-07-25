@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, time as dtime
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import func, select
@@ -26,48 +27,59 @@ from .backtest.evaluate import run_evaluation
 from .config import settings
 from .data import baostock_client, fundamentals, ingest, universe
 from .db import SessionLocal
-from .models import Pick, Stock
+from .models import Pick, WatchlistItem
 from .selection.pipeline import run_selection
 from .strategy.engine import run_signals
 
 logger = logging.getLogger(__name__)
 
 scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
+
+
+def _now() -> datetime:
+    return datetime.now(SHANGHAI_TZ)
 
 
 def _is_weekday(d: date | None = None) -> bool:
-    d = d or datetime.now().date()
+    d = d or _now().date()
     return d.weekday() < 5  # 周一~周五;法定节假日由"当日无数据"兜底
 
 
 def _watch_codes() -> list[str]:
     with SessionLocal() as db:
         return [r[0] for r in db.execute(
-            select(Stock.code).where(Stock.is_watch.is_(True))).all()]
+            select(WatchlistItem.code).distinct()).all()]
 
 
-def job_daily_bars() -> None:
+def job_daily_bars() -> dict:
     """盘后:池内日线增量(baostock 单登录会话)+ 自选股增量并对账"""
     if not _is_weekday():
         logger.info("非工作日,跳过盘后任务")
-        return
+        return {"skipped": True, "succeeded": 0, "failed": []}
     with SessionLocal() as db:
         pool = universe.current_pool(db)
         watch = _watch_codes()
         watch_set = set(watch)
         logger.info("盘后日线开始: 池内 %d 只,自选 %d 只", len(pool), len(watch))
+        succeeded = 0
+        failed: list[str] = []
         # 800 只复用一次 baostock 登录,避免逐只 login/logout 拖慢任务
         with baostock_client.login_session():
             for code in pool:
                 try:
                     # 池内只走 baostock(逐只 akshare 对账太慢);自选才对账
                     ingest.ingest_daily(db, code, reconcile=code in watch_set)
+                    succeeded += 1
                 except Exception:  # noqa: BLE001 - 单只失败不影响其他
+                    failed.append(code)
                     logger.exception("盘后日线失败 %s", code)
         for code in watch_set - set(pool):
             try:
                 ingest.ingest_daily(db, code, reconcile=True)
+                succeeded += 1
             except Exception:  # noqa: BLE001
+                failed.append(code)
                 logger.exception("盘后日线失败 %s", code)
         try:
             n = ingest.cleanup_snapshots(db, settings.snapshot_retention_days)
@@ -75,48 +87,68 @@ def job_daily_bars() -> None:
                 logger.info("清理过期快照 %d 条", n)
         except Exception:  # noqa: BLE001
             logger.exception("快照清理失败")
+        return {
+            "skipped": False,
+            "requested": len(set(pool) | watch_set),
+            "succeeded": succeeded,
+            "failed": sorted(set(failed)),
+        }
 
 
-def job_factors_and_selection() -> None:
+def job_factors_and_selection() -> dict | None:
     """17:00 因子 + 选股"""
     if not _is_weekday():
-        return
+        return None
     with SessionLocal() as db:
         try:
             result = run_selection(db)
             logger.info("选股完成: %s", result)
+            return result
         except Exception:  # noqa: BLE001
             logger.exception("选股任务失败")
+            return None
 
 
-def job_signals() -> None:
+def job_signals() -> dict | None:
     """17:05 信号:自选股 + 当日选股池股票"""
     if not _is_weekday():
-        return
+        return None
     with SessionLocal() as db:
         try:
             picks = [r[0] for r in db.execute(
-                select(Pick.code).where(Pick.date == date.today())).all()]
+                select(Pick.code).where(Pick.date == _now().date())).all()]
             codes = sorted(set(_watch_codes()) | set(picks))
             result = run_signals(db, codes=codes)
             logger.info("信号计算完成: %s", result)
+            return result
         except Exception:  # noqa: BLE001
             logger.exception("信号计算失败")
+            return None
 
 
 def job_evening_pipeline() -> None:
     """16:30 盘后流水线:日线 -> 因子+选股 -> 信号 ->(周五)批量评估。
 
     串行执行,下游任务只在数据完整后才开始;子任务各自带 weekday 判断
-    与异常隔离,单个环节失败不影响后续环节继续尝试。
+    与异常隔离,任一行情更新或下游阶段失败都会中止后续发布。
     """
     if not _is_weekday():
         logger.info("非工作日,跳过盘后流水线")
         return
-    job_daily_bars()
-    job_factors_and_selection()
-    job_signals()
-    if datetime.now().weekday() == 4:  # 周五
+    bars = job_daily_bars()
+    if bars["failed"]:
+        logger.error(
+            "盘后流水线中止: %d 只行情更新失败，不发布部分选股结果: %s",
+            len(bars["failed"]), bars["failed"][:20],
+        )
+        return
+    if job_factors_and_selection() is None:
+        logger.error("盘后流水线中止: 选股阶段失败")
+        return
+    if job_signals() is None:
+        logger.error("盘后流水线中止: 信号阶段失败")
+        return
+    if _now().weekday() == 4:  # 周五
         job_weekly_eval()
 
 
@@ -144,7 +176,7 @@ def job_sync_index_members() -> None:
 
 def _fundamental_codes(db: Session) -> list[str]:
     watch = [r[0] for r in db.execute(
-        select(Stock.code).where(Stock.is_watch.is_(True)).order_by(Stock.code)
+        select(WatchlistItem.code).distinct().order_by(WatchlistItem.code)
     ).all()]
     latest_pick_date = db.execute(select(func.max(Pick.date))).scalar()
     picks = []
@@ -184,7 +216,7 @@ def job_sync_fundamentals() -> None:
 
 def job_intraday_snapshot() -> None:
     """盘中快照:仅在交易日的 9:30-15:00 执行"""
-    now = datetime.now()
+    now = _now()
     if not _is_weekday(now.date()):
         return
     if not (dtime(9, 30) <= now.time() <= dtime(15, 0)):

@@ -2,7 +2,8 @@
 
 两类契约:
 - 单标的(KIND="single"): positions(df, params) -> pd.Series[0/1]
-- 组合(KIND="portfolio"): target_weights(dates, pool_dfs, params) -> DataFrame(行日期×列股票)
+- 组合(KIND="portfolio"): target_weights(dates, pool_dfs, params, eligibility=None)
+  -> DataFrame(行日期×列股票)，eligibility 为动态成分股可选掩码。
 
 单标的策略可选实现 watch(df, params) -> dict | None,临近触发时给出预警原因。
 新增策略:实现对应契约并在 REGISTRY 注册。

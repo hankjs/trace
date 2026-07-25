@@ -14,7 +14,8 @@ DEFAULT_PARAMS = {"top_n": 10, "w_mom20": 0.6, "w_mom60": 0.4}
 
 
 def target_weights(dates, pool_dfs: dict[str, pd.DataFrame],
-                   params: dict | None = None) -> pd.DataFrame:
+                   params: dict | None = None,
+                   eligibility: pd.DataFrame | None = None) -> pd.DataFrame:
     """返回目标权重矩阵:行=交易日,列=股票,值∈[0,1]。"""
     p = {**DEFAULT_PARAMS, **(params or {})}
     top_n = int(p["top_n"])
@@ -32,14 +33,18 @@ def target_weights(dates, pool_dfs: dict[str, pd.DataFrame],
     rebalance = week.ne(week.shift()).to_numpy()
 
     weights = pd.DataFrame(0.0, index=idx, columns=close.columns)
+    eligible = (eligibility.reindex(index=idx, columns=close.columns).fillna(False)
+                if eligibility is not None
+                else pd.DataFrame(True, index=idx, columns=close.columns))
     cur = pd.Series(0.0, index=close.columns)
     for i in range(len(idx)):
         if rebalance[i]:
-            s = score.iloc[i].dropna()
+            s = score.iloc[i].where(eligible.iloc[i]).dropna()
             top = s.nlargest(top_n)
             cur = pd.Series(0.0, index=close.columns)
             if len(top):
-                cur.loc[top.index] = 1.0 / top_n
+                cur.loc[top.index] = 1.0 / len(top)
+        cur = cur.where(eligible.iloc[i], 0.0)
         broken = (close.iloc[i] < ma20.iloc[i]).fillna(False)
         weights.iloc[i] = cur.where(~broken, 0.0)
     return weights

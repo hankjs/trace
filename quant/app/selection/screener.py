@@ -22,6 +22,7 @@ from ..models import (
     IndexMember,
     Stock,
     ValuationSnapshot,
+    WatchlistItem,
 )
 
 logger = logging.getLogger(__name__)
@@ -310,13 +311,17 @@ def _codes_for_universe(
     day: date,
     *,
     allow_current_fallback: bool,
+    user_id: int | None,
 ) -> list[str]:
     universe = universe.lower()
     if universe == "all":
         return [r[0] for r in db.execute(select(Stock.code).order_by(Stock.code)).all()]
     if universe == "watchlist":
+        if user_id is None:
+            return []
         return [r[0] for r in db.execute(
-            select(Stock.code).where(Stock.is_watch.is_(True)).order_by(Stock.code)
+            select(WatchlistItem.code).where(WatchlistItem.user_id == user_id)
+            .order_by(WatchlistItem.code)
         ).all()]
     if universe in {"hs300", "zz500"}:
         codes = [r[0] for r in db.execute(
@@ -381,9 +386,11 @@ def _build_screen_rows(
     universe: str,
     *,
     allow_current_fallback: bool,
+    user_id: int | None,
 ) -> list[dict[str, Any]]:
     codes = _codes_for_universe(
         db, universe, day, allow_current_fallback=allow_current_fallback,
+        user_id=user_id,
     )
     if not codes:
         return []
@@ -528,7 +535,8 @@ def _build_screen_rows(
     return result
 
 
-def structured_screen(db: Session, payload: dict[str, Any]) -> dict:
+def structured_screen(db: Session, payload: dict[str, Any],
+                      user_id: int | None = None) -> dict:
     """技术面与基本面结构化组合筛选。"""
     requested_day = payload.get("date")
     if isinstance(requested_day, str):
@@ -546,6 +554,7 @@ def structured_screen(db: Session, payload: dict[str, Any]) -> dict:
         day,
         universe,
         allow_current_fallback=requested_day is None or requested_day >= date.today(),
+        user_id=user_id,
     )
     evaluated = evaluate_conditions(rows, payload)
     combined_count = len(evaluated["items"])

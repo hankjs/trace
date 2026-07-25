@@ -1,7 +1,7 @@
 """股票池历史回填:池内全部股票 3 年前复权日线。
 
 特性:
-- 断点续跑:已有 >=600 条且最近日期在 10 天内的 code 直接跳过;
+- 断点续跑:最早日线已覆盖请求起点且最近日期在 10 天内的 code 直接跳过;
 - 失败重试:单只最多 3 次,间隔递增;单只失败不影响整体;
 - baostock 限速友好:全程复用一次登录,每只间隔 sleep。
 
@@ -32,7 +32,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger("backfill_pool")
 
-MIN_BARS = 600          # 3 年约 730 个交易日,留些余量
 RECENT_DAYS = 10        # 最近数据在此天数内视为已完成
 RETRY = 3
 SLEEP_PER_CODE = 0.3    # 限速友好
@@ -42,11 +41,15 @@ def _done_codes(db, start: date) -> set[str]:
     """已回填完成的 code:3 年窗口内条数 >= MIN_BARS 且最近日期足够新"""
     cutoff = date.today() - timedelta(days=RECENT_DAYS)
     rows = db.execute(
-        select(DailyBar.code, func.count(), func.max(DailyBar.date))
+        select(DailyBar.code, func.min(DailyBar.date), func.max(DailyBar.date))
         .where(DailyBar.date >= start)
         .group_by(DailyBar.code)
     ).all()
-    return {r[0] for r in rows if r[1] >= MIN_BARS and r[2] >= cutoff}
+    start_tolerance = start + timedelta(days=RECENT_DAYS)
+    return {
+        code for code, first_day, last_day in rows
+        if first_day <= start_tolerance and last_day >= cutoff
+    }
 
 
 def main() -> None:
@@ -63,9 +66,18 @@ def main() -> None:
                         help="本进程分片序号 0..N-1(交错切分,负载均衡)")
     args = parser.parse_args()
 
+    if args.years <= 0:
+        parser.error("--years 必须大于 0")
+    if args.shards <= 0:
+        parser.error("--shards 必须大于 0")
+    if not 0 <= args.shard < args.shards:
+        parser.error("--shard 必须在 0 到 --shards-1 之间")
+
     Base.metadata.create_all(engine)
     start = (date.fromisoformat(args.start) if args.start
              else date.today() - timedelta(days=args.years * 365))
+    if start > date.today():
+        parser.error("回填起点不能晚于今天")
 
     with SessionLocal() as db:
         if args.all:

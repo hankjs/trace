@@ -15,7 +15,8 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import FundamentalSnapshot, IndexMember, Stock, ValuationSnapshot
+from ..models import (FundamentalSnapshot, IndexMember, Stock,
+                      ValuationSnapshot, WatchlistItem)
 from . import akshare_client
 from .universe import current_pool
 
@@ -483,7 +484,7 @@ def _universe_codes(db: Session, universe: str) -> list[str]:
     universe = universe.lower()
     if universe == "watchlist":
         return [r[0] for r in db.execute(
-            select(Stock.code).where(Stock.is_watch.is_(True)).order_by(Stock.code)
+            select(WatchlistItem.code).distinct().order_by(WatchlistItem.code)
         ).all()]
     if universe == "pool":
         return current_pool(db)

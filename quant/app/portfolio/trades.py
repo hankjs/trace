@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from ..models import Trade
 
 
-def add_trade(db: Session, code: str, trade_date: date, side: str,
+def add_trade(db: Session, user_id: int, code: str, trade_date: date, side: str,
               price: float, qty: float, fee: float = 0.0,
               note: str = "") -> Trade:
     if side not in ("buy", "sell"):
@@ -18,7 +18,7 @@ def add_trade(db: Session, code: str, trade_date: date, side: str,
         raise ValueError("price / qty 必须为正数")
     if fee < 0:
         raise ValueError("fee 不能为负")
-    t = Trade(code=code, trade_date=trade_date, side=side, price=price,
+    t = Trade(user_id=user_id, code=code, trade_date=trade_date, side=side, price=price,
               qty=qty, fee=fee, note=note)
     db.add(t)
     db.commit()
@@ -26,15 +26,18 @@ def add_trade(db: Session, code: str, trade_date: date, side: str,
     return t
 
 
-def list_trades(db: Session, code: str | None = None) -> list[Trade]:
-    q = select(Trade).order_by(Trade.trade_date, Trade.id)
+def list_trades(db: Session, user_id: int, code: str | None = None) -> list[Trade]:
+    q = (select(Trade).where(Trade.user_id == user_id)
+         .order_by(Trade.trade_date, Trade.id))
     if code:
         q = q.where(Trade.code == code)
     return list(db.execute(q).scalars().all())
 
 
-def delete_trade(db: Session, trade_id: int) -> bool:
-    t = db.get(Trade, trade_id)
+def delete_trade(db: Session, user_id: int, trade_id: int) -> bool:
+    t = db.execute(select(Trade).where(
+        Trade.id == trade_id, Trade.user_id == user_id,
+    )).scalar_one_or_none()
     if t is None:
         return False
     db.delete(t)

@@ -9,7 +9,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
-from ..models import DailyBar, Snapshot, Stock
+from ..models import DailyBar, Snapshot, Stock, WatchlistItem
 from . import akshare_client, baostock_client
 
 logger = logging.getLogger(__name__)
@@ -161,7 +161,7 @@ def ingest_snapshot(db: Session, codes: list[str] | None = None) -> int:
         df = df[df["code"].isin(codes)]
     else:
         watch = {r[0] for r in db.execute(
-            select(Stock.code).where(Stock.is_watch.is_(True))).all()}
+            select(WatchlistItem.code).distinct()).all()}
         df = df[df["code"].isin(watch)]
     rows = [
         {"code": r.code, "ts": r.ts, "price": float(r.price),
