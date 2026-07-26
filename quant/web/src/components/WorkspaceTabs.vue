@@ -17,15 +17,15 @@ const emit = defineEmits<{
 
 <template>
   <div class="border-b border-border" role="tablist" aria-label="工作区视图">
-    <div class="flex gap-5 overflow-x-auto">
+    <div class="flex gap-1 overflow-x-auto">
       <button
         v-for="tab in tabs"
         :key="tab.key"
         type="button"
         role="tab"
         :aria-selected="active === tab.key"
-        class="relative shrink-0 pb-2.5 text-sm transition-colors"
-        :class="active === tab.key ? 'font-medium text-accent' : 'text-text-secondary hover:text-text-primary'"
+        class="relative shrink-0 px-3 py-2 text-sm transition-colors"
+        :class="active === tab.key ? 'font-medium text-accent' : 'text-text-secondary hover:bg-hover hover:text-text-primary'"
         @click="emit('change', tab.key)"
       >
         {{ tab.label }}

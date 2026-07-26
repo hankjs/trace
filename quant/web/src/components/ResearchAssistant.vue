@@ -7,7 +7,8 @@ const props = defineProps<{
   guide: ResearchGuide
 }>()
 
-const collapsed = ref(localStorage.getItem('quant_guide_collapsed') === 'true')
+const storedCollapsed = localStorage.getItem('quant_guide_collapsed')
+const collapsed = ref(storedCollapsed === null ? true : storedCollapsed === 'true')
 const mobileOpen = ref(false)
 const mobileTrigger = ref<HTMLButtonElement | null>(null)
 const mobileDialog = ref<HTMLElement | null>(null)
@@ -75,13 +76,13 @@ onBeforeUnmount(() => {
 
 <template>
   <aside
-    class="sticky top-20 hidden h-fit shrink-0 rounded-md border border-border bg-surface-raised xl:block"
-    :class="collapsed ? 'w-11' : 'w-72'"
+    class="sticky top-16 hidden max-h-[calc(100vh-80px)] h-fit shrink-0 overflow-y-auto rounded border border-border bg-surface-raised xl:block"
+    :class="collapsed ? 'w-10' : 'w-64'"
     aria-label="研究助手"
   >
     <button
       type="button"
-      class="flex h-10 w-full items-center justify-center text-text-tertiary hover:bg-hover hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent"
+      class="flex h-9 w-full items-center justify-center text-text-tertiary hover:bg-hover hover:text-text-primary focus-visible:outline-2 focus-visible:outline-accent"
       :title="collapsed ? '展开研究助手' : '收起研究助手'"
       @click="collapsed = !collapsed"
     >
@@ -90,21 +91,21 @@ onBeforeUnmount(() => {
       <span class="sr-only">{{ collapsed ? '展开研究助手' : '收起研究助手' }}</span>
     </button>
 
-    <div v-if="!collapsed" class="border-t border-border px-4 py-4">
+    <div v-if="!collapsed" class="border-t border-border px-3 py-3">
       <div class="mb-3 flex items-center gap-2">
         <Lightbulb :size="17" class="text-accent" />
         <h2 class="text-sm font-semibold">{{ guide.title }}</h2>
       </div>
       <p class="text-sm leading-6 text-text-secondary">{{ guide.summary }}</p>
 
-      <dl v-if="guide.concepts?.length" class="mt-5 space-y-3">
+      <dl v-if="guide.concepts?.length" class="mt-4 space-y-3">
         <div v-for="concept in guide.concepts" :key="concept.term">
           <dt class="text-xs font-medium text-text-primary">{{ concept.term }}</dt>
           <dd class="mt-0.5 text-xs leading-5 text-text-tertiary">{{ concept.explanation }}</dd>
         </div>
       </dl>
 
-      <ol v-if="guide.steps?.length" class="mt-5 space-y-3">
+      <ol v-if="guide.steps?.length" class="mt-4 space-y-2.5">
         <li v-for="(step, index) in guide.steps" :key="step" class="flex gap-2.5 text-xs leading-5 text-text-secondary">
           <span class="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-active text-[11px] font-medium text-accent">
             {{ index + 1 }}
@@ -113,7 +114,7 @@ onBeforeUnmount(() => {
         </li>
       </ol>
 
-      <p v-if="guide.note" class="mt-5 rounded-md bg-warning-soft px-3 py-2 text-xs leading-5 text-warning">
+      <p v-if="guide.note" class="mt-4 rounded bg-warning-soft px-3 py-2 text-xs leading-5 text-warning">
         {{ guide.note }}
       </p>
     </div>

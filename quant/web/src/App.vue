@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
+  Activity,
   Bell,
   BookOpen,
   BriefcaseBusiness,
@@ -10,31 +11,68 @@ import {
   LayoutDashboard,
   ListFilter,
   LogOut,
+  Menu,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Search,
+  ShieldCheck,
+  X,
 } from 'lucide-vue-next'
 import { clearAuth, currentUsername, getToken } from './api'
 import { loadCatalog } from './catalog'
 import ResearchAssistant from './components/ResearchAssistant.vue'
+import StockSearchInput from './components/StockSearchInput.vue'
 import type { ResearchGuide } from './guides'
 
 const route = useRoute()
 const router = useRouter()
 const isLoginPage = computed(() => route.name === 'login')
 const username = computed(() => currentUsername())
+const mobileNavOpen = ref(false)
+const sidebarCollapsed = ref(localStorage.getItem('quant_sidebar_collapsed') === 'true')
+const stockCode = ref('')
 
 function logout() {
   clearAuth()
   router.push('/login')
 }
 
-const nav = [
-  { to: { name: 'dashboard' }, name: 'dashboard', label: '今日研究', icon: LayoutDashboard },
-  { to: { name: 'selection' }, name: 'selection', label: '选股', icon: ListFilter },
-  { to: { name: 'pools' }, name: 'pools', label: '股票池', icon: Layers },
-  { to: { name: 'signals' }, name: 'signals', label: '信号提醒', icon: Bell },
-  { to: { name: 'strategies' }, name: 'strategies', label: '策略研究', icon: FlaskConical },
-  { to: { name: 'portfolio' }, name: 'portfolio', label: '我的持仓', icon: BriefcaseBusiness },
-  { to: { name: 'catalog' }, name: 'catalog', label: '研究词典', icon: BookOpen },
+function openStock() {
+  if (!stockCode.value) return
+  void router.push({ name: 'stock', params: { code: stockCode.value } })
+  stockCode.value = ''
+}
+
+function toggleSidebar() {
+  sidebarCollapsed.value = !sidebarCollapsed.value
+  localStorage.setItem('quant_sidebar_collapsed', String(sidebarCollapsed.value))
+}
+
+const navGroups = [
+  {
+    label: '行情研究',
+    items: [
+      { to: { name: 'dashboard' }, name: 'dashboard', label: '行情总览', icon: LayoutDashboard },
+      { to: { name: 'selection' }, name: 'selection', label: '选股中心', icon: ListFilter },
+      { to: { name: 'signals' }, name: 'signals', label: '信号提醒', icon: Bell },
+    ],
+  },
+  {
+    label: '研究工具',
+    items: [
+      { to: { name: 'pools' }, name: 'pools', label: '股票池', icon: Layers },
+      { to: { name: 'strategies' }, name: 'strategies', label: '策略研究', icon: FlaskConical },
+      { to: { name: 'portfolio' }, name: 'portfolio', label: '持仓记录', icon: BriefcaseBusiness },
+      { to: { name: 'catalog' }, name: 'catalog', label: '研究词典', icon: BookOpen },
+    ],
+  },
 ]
+
+const today = new Intl.DateTimeFormat('zh-CN', {
+  month: '2-digit',
+  day: '2-digit',
+  weekday: 'short',
+}).format(new Date())
 
 const guides: Record<string, ResearchGuide> = {
   dashboard: {
@@ -118,52 +156,163 @@ const guides: Record<string, ResearchGuide> = {
 
 const guide = computed(() => guides[String(route.name)] ?? guides.dashboard)
 
+watch(() => route.fullPath, () => {
+  mobileNavOpen.value = false
+})
+
+watch(mobileNavOpen, (open) => {
+  document.body.style.overflow = open ? 'hidden' : ''
+})
+
 onMounted(() => {
   if (getToken()) void loadCatalog()
+})
+
+onBeforeUnmount(() => {
+  document.body.style.overflow = ''
 })
 </script>
 
 <template>
-  <div class="min-h-screen">
-    <header v-if="!isLoginPage" class="sticky top-0 z-40 border-b border-border bg-surface-raised/95 backdrop-blur-sm">
-      <div class="mx-auto flex max-w-[1600px] flex-wrap items-center gap-x-6 px-4 py-2.5 lg:flex-nowrap lg:px-6">
-        <router-link to="/" class="flex shrink-0 items-baseline gap-2 py-1">
-          <span class="text-lg font-semibold text-accent">quant</span>
-          <span class="text-sm font-medium text-text-primary">量化研究决策工作台</span>
-        </router-link>
-        <nav class="order-3 mt-2 flex w-full gap-1 overflow-x-auto text-sm lg:order-none lg:mt-0 lg:w-auto" aria-label="主导航">
-          <router-link
-            v-for="item in nav"
-            :key="item.name"
-            :to="item.to"
-            class="flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-text-secondary hover:bg-hover hover:text-text-primary"
-            active-class="!bg-active !text-accent font-medium"
-          >
-            <component :is="item.icon" :size="15" />
-            {{ item.label }}
-          </router-link>
-        </nav>
-        <div class="ml-auto flex items-center gap-2 text-sm">
-          <span class="hidden text-text-tertiary sm:inline">{{ username }}</span>
-          <button
-            class="icon-button"
-            title="退出登录"
-            @click="logout"
-          >
-            <LogOut :size="17" />
-            <span class="sr-only">退出登录</span>
-          </button>
-        </div>
-      </div>
-    </header>
-    <main
-      class="mx-auto max-w-[1600px] px-4 py-5 lg:px-6 lg:py-6"
-      :class="isLoginPage ? '' : 'flex items-start gap-6'"
+  <main v-if="isLoginPage" class="min-h-screen">
+    <router-view />
+  </main>
+
+  <div v-else class="flex min-h-screen bg-surface">
+    <aside
+      class="sticky top-0 hidden h-screen shrink-0 flex-col border-r border-border bg-workbench lg:flex"
+      :class="sidebarCollapsed ? 'w-[58px]' : 'w-[176px]'"
     >
-      <div class="min-w-0 flex-1">
-        <router-view />
+      <router-link to="/" class="flex h-12 items-center gap-2.5 border-b border-border px-3">
+        <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-accent text-on-accent">
+          <Activity :size="17" />
+        </span>
+        <span v-if="!sidebarCollapsed" class="min-w-0">
+          <span class="block text-sm font-semibold leading-4">Quant</span>
+          <span class="block truncate text-[10px] leading-4 text-text-tertiary">A股研究终端</span>
+        </span>
+      </router-link>
+
+      <nav class="min-h-0 flex-1 overflow-y-auto px-2 py-3" aria-label="主导航">
+        <section v-for="group in navGroups" :key="group.label" class="mb-4 last:mb-0">
+          <h2 v-if="!sidebarCollapsed" class="mb-1 px-2 text-[10px] font-medium text-text-tertiary">{{ group.label }}</h2>
+          <div class="space-y-0.5">
+            <router-link
+              v-for="item in group.items"
+              :key="item.name"
+              :to="item.to"
+              class="flex h-9 items-center gap-2.5 rounded px-2 text-sm text-text-secondary hover:bg-hover hover:text-text-primary"
+              active-class="!bg-active !text-accent font-medium"
+              :title="sidebarCollapsed ? item.label : undefined"
+            >
+              <component :is="item.icon" :size="16" class="shrink-0" />
+              <span v-if="!sidebarCollapsed" class="truncate">{{ item.label }}</span>
+            </router-link>
+          </div>
+        </section>
+      </nav>
+
+      <div class="border-t border-border p-2">
+        <div v-if="!sidebarCollapsed" class="mb-2 flex items-start gap-2 rounded bg-surface-muted px-2 py-2 text-[10px] leading-4 text-text-tertiary">
+          <ShieldCheck :size="14" class="mt-0.5 shrink-0 text-accent" />
+          <span>仅提供日频研究<br />交易均在外部手工完成</span>
+        </div>
+        <button
+          type="button"
+          class="icon-button w-full"
+          :title="sidebarCollapsed ? '展开导航' : '收起导航'"
+          @click="toggleSidebar"
+        >
+          <PanelLeftOpen v-if="sidebarCollapsed" :size="17" />
+          <PanelLeftClose v-else :size="17" />
+          <span class="sr-only">{{ sidebarCollapsed ? '展开导航' : '收起导航' }}</span>
+        </button>
       </div>
-      <ResearchAssistant v-if="!isLoginPage" :guide="guide" />
-    </main>
+    </aside>
+
+    <div class="min-w-0 flex-1">
+      <header class="sticky top-0 z-30 flex h-12 items-center gap-3 border-b border-border bg-surface-raised/95 px-3 backdrop-blur-sm lg:px-4">
+        <button type="button" class="icon-button lg:!hidden" title="打开导航" @click="mobileNavOpen = true">
+          <Menu :size="19" />
+          <span class="sr-only">打开导航</span>
+        </button>
+
+        <form class="flex min-w-0 max-w-md flex-1 items-center" @submit.prevent="openStock">
+          <StockSearchInput
+            v-model="stockCode"
+            hide-label
+            placeholder="输入股票名称或代码"
+            input-class="!h-8 !w-full !rounded-r-none !border-r-0 !py-1"
+            class="min-w-0 flex-1"
+          />
+          <button
+            type="submit"
+            class="flex h-8 w-9 shrink-0 items-center justify-center rounded-r border border-border bg-surface-muted text-text-secondary hover:bg-hover hover:text-text-primary"
+            title="打开个股研究"
+          >
+            <Search :size="15" />
+            <span class="sr-only">打开个股研究</span>
+          </button>
+        </form>
+
+        <div class="ml-auto hidden items-center gap-3 text-xs text-text-tertiary xl:flex">
+          <span>{{ today }}</span>
+          <span class="h-3 w-px bg-border" />
+          <span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-down" />日频研究模式</span>
+        </div>
+
+        <span class="hidden max-w-24 truncate text-xs text-text-tertiary md:block">{{ username }}</span>
+        <button class="icon-button shrink-0" title="退出登录" @click="logout">
+          <LogOut :size="17" />
+          <span class="sr-only">退出登录</span>
+        </button>
+      </header>
+
+      <main class="flex min-w-0 items-start gap-3 p-3 lg:gap-4 lg:p-4">
+        <div class="min-w-0 flex-1">
+          <router-view />
+        </div>
+        <ResearchAssistant :guide="guide" />
+      </main>
+    </div>
+
+    <Transition name="nav-drawer">
+      <div v-if="mobileNavOpen" class="fixed inset-0 z-50 lg:hidden" @keydown.esc="mobileNavOpen = false">
+        <button class="absolute inset-0 bg-overlay" aria-label="关闭导航" @click="mobileNavOpen = false" />
+        <aside class="absolute inset-y-0 left-0 flex w-[min(84vw,290px)] flex-col bg-workbench shadow-panel">
+          <div class="flex h-12 items-center justify-between border-b border-border px-3">
+            <router-link to="/" class="flex items-center gap-2.5">
+              <span class="flex h-7 w-7 items-center justify-center rounded bg-accent text-on-accent"><Activity :size="17" /></span>
+              <span>
+                <span class="block text-sm font-semibold leading-4">Quant</span>
+                <span class="block text-[10px] leading-4 text-text-tertiary">A股研究终端</span>
+              </span>
+            </router-link>
+            <button type="button" class="icon-button" title="关闭导航" @click="mobileNavOpen = false">
+              <X :size="18" />
+              <span class="sr-only">关闭导航</span>
+            </button>
+          </div>
+          <nav class="flex-1 overflow-y-auto px-3 py-4" aria-label="移动端主导航">
+            <section v-for="group in navGroups" :key="group.label" class="mb-5">
+              <h2 class="mb-1 px-2 text-xs font-medium text-text-tertiary">{{ group.label }}</h2>
+              <router-link
+                v-for="item in group.items"
+                :key="item.name"
+                :to="item.to"
+                class="flex h-10 items-center gap-3 rounded px-2 text-sm text-text-secondary hover:bg-hover hover:text-text-primary"
+                active-class="!bg-active !text-accent font-medium"
+              >
+                <component :is="item.icon" :size="17" />
+                {{ item.label }}
+              </router-link>
+            </section>
+          </nav>
+          <div class="border-t border-border p-3 text-xs leading-5 text-text-tertiary">
+            仅提供日频研究与模拟回测，实际交易由用户在外部应用中手工完成。
+          </div>
+        </aside>
+      </div>
+    </Transition>
   </div>
 </template>

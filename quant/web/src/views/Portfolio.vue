@@ -98,20 +98,20 @@ onMounted(load)
     <LoadingRows v-if="loading" :rows="5" />
 
     <template v-else-if="summary">
-      <section class="grid grid-cols-1 gap-3 sm:grid-cols-3">
-        <div class="rounded-lg border border-border bg-surface-raised p-4">
+      <section class="grid overflow-hidden rounded-md border border-border bg-surface-raised sm:grid-cols-3">
+        <div class="border-b border-border-subtle p-4 sm:border-b-0 sm:border-r">
           <div class="text-xs text-text-tertiary">总市值</div>
-          <div class="mt-1 text-xl font-semibold">{{ fmtAmount(summary.total_market_value) }}</div>
+          <div class="mt-1 text-lg font-semibold">{{ fmtAmount(summary.total_market_value) }}</div>
         </div>
-        <div class="rounded-lg border border-border bg-surface-raised p-4">
+        <div class="border-b border-border-subtle p-4 sm:border-b-0 sm:border-r">
           <div class="text-xs text-text-tertiary">总浮动盈亏</div>
-          <div class="mt-1 text-xl font-semibold" :class="pnlClass(summary.total_unrealized_pnl)">
+          <div class="mt-1 text-lg font-semibold" :class="pnlClass(summary.total_unrealized_pnl)">
             {{ fmtSigned(summary.total_unrealized_pnl) }}
           </div>
         </div>
-        <div class="rounded-lg border border-border bg-surface-raised p-4">
+        <div class="p-4">
           <div class="text-xs text-text-tertiary">总已实现盈亏</div>
-          <div class="mt-1 text-xl font-semibold" :class="pnlClass(summary.total_realized_pnl)">
+          <div class="mt-1 text-lg font-semibold" :class="pnlClass(summary.total_realized_pnl)">
             {{ fmtSigned(summary.total_realized_pnl) }}
           </div>
         </div>

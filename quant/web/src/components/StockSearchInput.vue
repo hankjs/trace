@@ -7,10 +7,14 @@ withDefaults(defineProps<{
   label?: string
   placeholder?: string
   required?: boolean
+  hideLabel?: boolean
+  inputClass?: string
 }>(), {
   label: '股票',
   placeholder: '输入中文名称或代码',
   required: false,
+  hideLabel: false,
+  inputClass: '',
 })
 
 const model = defineModel<string>({ required: true })
@@ -144,7 +148,7 @@ defineExpose({ focus: focusInput })
 
 <template>
   <label class="relative block text-sm">
-    <span class="mb-1 block text-xs text-text-tertiary">{{ label }}</span>
+    <span v-if="!hideLabel" class="mb-1 block text-xs text-text-tertiary">{{ label }}</span>
     <span class="relative block">
       <Search :size="15" class="pointer-events-none absolute left-2.5 top-2.5 text-text-tertiary" />
       <input
@@ -159,6 +163,7 @@ defineExpose({ focus: focusInput })
         :aria-controls="listId"
         :aria-activedescendant="activeId"
         class="w-56 rounded-md border border-border py-1.5 pl-8 pr-2 text-sm"
+        :class="inputClass"
         @focus="query.trim() && (open = true)"
         @blur="onBlur"
         @keydown="onKeydown"
