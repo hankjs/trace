@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
+from collections.abc import Iterator
 from datetime import date, timedelta
 from typing import Any
 
@@ -28,6 +30,20 @@ logger = logging.getLogger(__name__)
 
 VALUATION_MAX_AGE_DAYS = 7
 MAX_HIGH_WINDOW = 750  # 约 3 年交易日,防止无上界的窗口打爆查询区间
+CODE_BATCH_SIZE = 500
+
+FACTOR_VALUE_FIELDS = {
+    "mom20", "mom60", "rsi14", "atr_pct", "vol_ratio5",
+    "ma20_slope", "amount_avg20",
+}
+MARKET_VALUE_FIELDS = {"pct_chg", "high_dist", "ma_bull"}
+VALUATION_VALUE_FIELDS = {
+    "pe_ttm", "pb", "ps_ttm", "dividend_yield", "total_market_cap",
+}
+FUNDAMENTAL_VALUE_FIELDS = {
+    "roe", "revenue_yoy", "profit_yoy", "gross_margin", "net_margin",
+    "debt_ratio", "cashflow_ratio",
+}
 
 
 class InvalidFilterError(ValueError):
@@ -344,6 +360,139 @@ def evaluate_conditions(rows: list[dict[str, Any]], payload: dict[str, Any]) -> 
     }
 
 
+def _active_fields(payload: dict[str, Any]) -> set[str]:
+    """返回实际参与计算的字段。
+
+    这里只决定需要加载哪些数据；条件合法性仍由 evaluate_conditions
+    统一校验，避免出现两套规则。
+    """
+    fields: set[str] = set()
+    for condition in payload.get("conditions") or []:
+        if condition.get("enabled", True):
+            fields.add(str(condition.get("field", "")))
+    for group in payload.get("groups") or []:
+        for condition in group.get("conditions") or []:
+            if condition.get("enabled", True):
+                fields.add(str(condition.get("field", "")))
+    return fields
+
+
+def _batches(codes: list[str]) -> Iterator[list[str]]:
+    for index in range(0, len(codes), CODE_BATCH_SIZE):
+        yield codes[index:index + CODE_BATCH_SIZE]
+
+
+def _listing_days_by_code(
+    db: Session, codes: list[str], day: date,
+) -> dict[str, int]:
+    """按票分批统计库内交易日数。
+
+    全 A 约 5300 个 code 同时放进 IN 条件时，MySQL 会在千万行日线上
+    生成过大的单次聚合查询。只有用户选了 listing_days 时才调用
+    本函数，并利用 (code, date) 主键分批做范围扫描。
+    """
+    counts: dict[str, int] = {}
+    for batch in _batches(codes):
+        counts.update(dict(db.execute(
+            select(DailyBar.code, func.count()).where(
+                DailyBar.code.in_(batch),
+                DailyBar.date <= day,
+            ).group_by(DailyBar.code)
+        ).all()))
+    return counts
+
+
+def _load_stocks(db: Session, codes: list[str]) -> dict[str, Stock]:
+    rows: dict[str, Stock] = {}
+    for batch in _batches(codes):
+        rows.update({
+            row.code: row
+            for row in db.execute(
+                select(Stock).where(Stock.code.in_(batch))
+            ).scalars()
+        })
+    return rows
+
+
+def _load_factors(
+    db: Session, codes: list[str], day: date,
+) -> dict[str, FactorDaily]:
+    rows: dict[str, FactorDaily] = {}
+    for batch in _batches(codes):
+        rows.update({
+            row.code: row
+            for row in db.execute(select(FactorDaily).where(
+                FactorDaily.date == day,
+                FactorDaily.code.in_(batch),
+            )).scalars()
+        })
+    return rows
+
+
+def _market_values_by_code(
+    db: Session,
+    codes: list[str],
+    day: date,
+    *,
+    market_fields: set[str],
+) -> dict[str, dict[str, float | bool | None]]:
+    """流式计算筛选与结果展示所需的行情字段。
+
+    收盘价作为结果固定列，即使未选行情条件也只读当日一行。
+    需要涨跌幅、新高距离或均线时才读历史窗口，且每批流式消费
+    查询结果，每只票最多保留 60 根必要列，不构造百万级 ORM 对象。
+    """
+    if not codes:
+        return {}
+    start = day if not market_fields else day - timedelta(days=220)
+    values_by_code: dict[str, dict[str, float | bool | None]] = {}
+
+    def save_values(
+        code: str | None,
+        bars: deque[tuple[date, float, float]],
+    ) -> None:
+        if code is None or not bars or bars[-1][0] != day:
+            return
+        close = bars[-1][1]
+        values: dict[str, float | bool | None] = {"close": close}
+        if "pct_chg" in market_fields:
+            previous = bars[-2][1] if len(bars) >= 2 else None
+            values["pct_chg"] = (
+                close / previous - 1 if previous else None
+            )
+        if "high_dist" in market_fields:
+            high_60 = max(bar[2] for bar in bars)
+            values["high_dist"] = close / high_60 - 1 if high_60 else None
+        if "ma_bull" in market_fields:
+            values["ma_bull"] = None
+            if len(bars) >= 60:
+                closes = [bar[1] for bar in bars]
+                ma20 = sum(closes[-20:]) / 20
+                ma60 = sum(closes) / 60
+                values["ma_bull"] = close > ma20 > ma60
+        values_by_code[code] = values
+
+    for batch in _batches(codes):
+        rows = db.execute(
+            select(DailyBar.code, DailyBar.date, DailyBar.close,
+                   DailyBar.high).where(
+                DailyBar.code.in_(batch),
+                DailyBar.date >= start,
+                DailyBar.date <= day,
+            ).order_by(DailyBar.code, DailyBar.date)
+        ).yield_per(1000)
+        current_code: str | None = None
+        recent: deque[tuple[date, float, float]] = deque(maxlen=60)
+        for code, bar_day, close, high in rows:
+            if current_code is not None and code != current_code:
+                save_values(current_code, recent)
+                recent.clear()
+            current_code = code
+            recent.append((bar_day, float(close), float(high)))
+        save_values(current_code, recent)
+    return values_by_code
+
+
 def codes_for_pool(
     db: Session,
     day: date,
@@ -420,6 +569,7 @@ def _build_screen_rows(
     pool_id: int | None,
     watchlist_only: bool,
     user_id: str | None,
+    active_fields: set[str],
 ) -> list[dict[str, Any]]:
     codes = codes_for_pool(
         db, day, pool_id=pool_id, watchlist_only=watchlist_only,
@@ -428,71 +578,57 @@ def _build_screen_rows(
     if not codes:
         return []
     code_set = set(codes)
-    stocks = {
-        row.code: row
-        for row in db.execute(select(Stock).where(Stock.code.in_(codes))).scalars()
-    }
-    factors = {
-        row.code: row
-        for row in db.execute(select(FactorDaily).where(
-            FactorDaily.date == day,
-            FactorDaily.code.in_(codes),
-        )).scalars()
-    }
-    listing_days = dict(db.execute(
-        select(DailyBar.code, func.count()).where(
-            DailyBar.code.in_(codes),
-            DailyBar.date <= day,
-        ).group_by(DailyBar.code)
-    ).all())
-
-    valuation_cutoff = day - timedelta(days=VALUATION_MAX_AGE_DAYS)
-    valuations = _latest_rows_by_code(
-        db,
-        ValuationSnapshot,
-        (
-            ValuationSnapshot.code.in_(codes),
-            ValuationSnapshot.data_date >= valuation_cutoff,
-            ValuationSnapshot.data_date <= day,
-            ValuationSnapshot.available_date <= day,
-        ),
-        (
-            ValuationSnapshot.data_date.desc(),
-            ValuationSnapshot.available_date.desc(),
-            ValuationSnapshot.id.desc(),
-        ),
+    stocks = _load_stocks(db, codes)
+    factors = _load_factors(db, codes, day)
+    listing_days = (
+        _listing_days_by_code(db, codes, day)
+        if "listing_days" in active_fields else {}
     )
 
-    fundamentals = _latest_rows_by_code(
-        db,
-        FundamentalSnapshot,
-        (
-            FundamentalSnapshot.code.in_(codes),
-            FundamentalSnapshot.data_date <= day,
-            FundamentalSnapshot.report_period <= day,
-            FundamentalSnapshot.available_date <= day,
-        ),
-        (
-            FundamentalSnapshot.report_period.desc(),
-            FundamentalSnapshot.available_date.desc(),
-            FundamentalSnapshot.id.desc(),
-        ),
-    )
+    valuations = {}
+    if active_fields & VALUATION_VALUE_FIELDS:
+        valuation_cutoff = day - timedelta(days=VALUATION_MAX_AGE_DAYS)
+        valuations = _latest_rows_by_code(
+            db,
+            ValuationSnapshot,
+            (
+                ValuationSnapshot.code.in_(codes),
+                ValuationSnapshot.data_date >= valuation_cutoff,
+                ValuationSnapshot.data_date <= day,
+                ValuationSnapshot.available_date <= day,
+            ),
+            (
+                ValuationSnapshot.data_date.desc(),
+                ValuationSnapshot.available_date.desc(),
+                ValuationSnapshot.id.desc(),
+            ),
+        )
 
-    # 市场派生字段只对已有当日因子的研究股票加载，避免 all 范围读取全市场历史。
+    fundamentals = {}
+    if active_fields & FUNDAMENTAL_VALUE_FIELDS:
+        fundamentals = _latest_rows_by_code(
+            db,
+            FundamentalSnapshot,
+            (
+                FundamentalSnapshot.code.in_(codes),
+                FundamentalSnapshot.data_date <= day,
+                FundamentalSnapshot.report_period <= day,
+                FundamentalSnapshot.available_date <= day,
+            ),
+            (
+                FundamentalSnapshot.report_period.desc(),
+                FundamentalSnapshot.available_date.desc(),
+                FundamentalSnapshot.id.desc(),
+            ),
+        )
+
+    # 市场派生字段只对已有当日因子的研究股票加载。未使用行情
+    # 条件时只读当日收盘价，不再为全 A 加载 220 天历史。
     factor_codes = sorted(code_set & set(factors))
-    bars_by_code: dict[str, list[DailyBar]] = {}
-    if factor_codes:
-        start = day - timedelta(days=220)
-        bar_rows = db.execute(
-            select(DailyBar).where(
-                DailyBar.code.in_(factor_codes),
-                DailyBar.date >= start,
-                DailyBar.date <= day,
-            ).order_by(DailyBar.code, DailyBar.date)
-        ).scalars().all()
-        for bar in bar_rows:
-            bars_by_code.setdefault(bar.code, []).append(bar)
+    market_fields = active_fields & MARKET_VALUE_FIELDS
+    market_values = _market_values_by_code(
+        db, factor_codes, day, market_fields=market_fields,
+    )
 
     result = []
     for code in codes:
@@ -500,38 +636,22 @@ def _build_screen_rows(
         factor = factors.get(code)
         valuation = valuations.get(code)
         fundamental = fundamentals.get(code)
-        bars = bars_by_code.get(code, [])
-        latest = bars[-1] if bars and bars[-1].date == day else None
-        close = latest.close if latest else None
-        pct_chg = None
-        high_dist = None
-        ma_bull = None
-        if latest and len(bars) >= 2 and bars[-2].close:
-            pct_chg = latest.close / bars[-2].close - 1
-        if latest:
-            high_60 = max(bar.high for bar in bars[-60:])
-            high_dist = latest.close / high_60 - 1 if high_60 else None
-        if latest and len(bars) >= 60:
-            ma20 = sum(bar.close for bar in bars[-20:]) / 20
-            ma60 = sum(bar.close for bar in bars[-60:]) / 60
-            ma_bull = latest.close > ma20 > ma60
+        market = market_values.get(code, {})
 
         values = {key: None for key in FILTER_FIELDS}
         values["industry"] = stock.industry if stock else ""
         name = stock.name if stock else ""
         values["is_st"] = "ST" in name.upper() or "退" in name
-        values["listing_days"] = listing_days.get(code, 0)
+        if "listing_days" in active_fields:
+            values["listing_days"] = listing_days.get(code, 0)
         if factor:
-            for field in (
-                "mom20", "mom60", "rsi14", "atr_pct", "vol_ratio5",
-                "ma20_slope", "amount_avg20",
-            ):
+            for field in FACTOR_VALUE_FIELDS & active_fields:
                 values[field] = getattr(factor, field)
         values.update({
-            "pct_chg": pct_chg,
-            "high_dist": high_dist,
-            "ma_bull": ma_bull,
-            "close": close,
+            "pct_chg": market.get("pct_chg"),
+            "high_dist": market.get("high_dist"),
+            "ma_bull": market.get("ma_bull"),
+            "close": market.get("close"),
         })
         if valuation:
             for field in ("pe_ttm", "pb", "ps_ttm", "dividend_yield",
@@ -569,7 +689,7 @@ def _build_screen_rows(
 
 
 def structured_screen(db: Session, payload: dict[str, Any],
-                      user_id: int | None = None) -> dict:
+                      user_id: str | None = None) -> dict:
     """技术面与基本面结构化组合筛选。"""
     requested_day = payload.get("date")
     if isinstance(requested_day, str):
@@ -583,12 +703,14 @@ def structured_screen(db: Session, payload: dict[str, Any],
 
     pool_id = payload.get("pool_id")
     watchlist_only = bool(payload.get("watchlist_only"))
+    active_fields = _active_fields(payload)
     rows = _build_screen_rows(
         db,
         day,
         pool_id=None if pool_id is None else int(pool_id),
         watchlist_only=watchlist_only,
         user_id=user_id,
+        active_fields=active_fields,
     )
     evaluated = evaluate_conditions(rows, payload)
     combined_count = len(evaluated["items"])

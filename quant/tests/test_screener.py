@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import app.selection.screener as screener
 from app.db import Base
 from app.models import (
     SYSTEM_OWNER_ID,
@@ -287,3 +288,74 @@ def test_stale_valuation_is_treated_as_missing() -> None:
     assert result["combined_count"] == 0
     assert result["field_coverage"] == {"pe_ttm": 0}
     assert result["data_policy"]["valuation_max_age_days"] == 7
+
+
+def test_structured_screen_skips_listing_history_when_unused(monkeypatch) -> None:
+    """普通筛选不应为了未使用的上市天数扫描全部日线。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2025, 1, 10)
+
+    def fail_if_called(*args, **kwargs):
+        raise AssertionError("未使用 listing_days 时不应统计历史日线")
+
+    monkeypatch.setattr(screener, "_listing_days_by_code", fail_if_called)
+    with Session(engine) as db:
+        _seed_pools(db)
+        db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
+                     list_date=date(2020, 1, 1)))
+        db.add(FactorDaily(id=1, code="sh.600001", date=day, mom20=0.05))
+        db.add(DailyBar(
+            code="sh.600001", date=day,
+            open=10, high=11, low=9.9, close=10.5, raw_close=10.5,
+            volume=120, amount=1200,
+        ))
+        db.commit()
+
+        result = structured_screen(db, {
+            "date": day,
+            "logic": "and",
+            "conditions": [_condition("industry", "eq", "制造")],
+            "groups": [],
+            "pool_id": None,
+        })
+
+    assert result["combined_count"] == 1
+    assert result["items"][0]["values"]["close"] == pytest.approx(10.5)
+    assert result["items"][0]["values"]["listing_days"] is None
+
+
+def test_structured_screen_counts_listing_days_when_requested() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2025, 1, 10)
+    with Session(engine) as db:
+        _seed_pools(db)
+        db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
+                     list_date=date(2020, 1, 1)))
+        db.add(FactorDaily(id=1, code="sh.600001", date=day))
+        db.add_all([
+            DailyBar(
+                code="sh.600001", date=date(2025, 1, 9),
+                open=10, high=10.5, low=9.8, close=10, raw_close=10,
+                volume=100, amount=1000,
+            ),
+            DailyBar(
+                code="sh.600001", date=day,
+                open=10, high=11, low=9.9, close=11, raw_close=11,
+                volume=120, amount=1200,
+            ),
+        ])
+        db.commit()
+
+        result = structured_screen(db, {
+            "date": day,
+            "logic": "and",
+            "conditions": [_condition("listing_days", "gte", 2)],
+            "groups": [],
+            "pool_id": None,
+        })
+
+    assert result["combined_count"] == 1
+    assert result["field_coverage"] == {"listing_days": 1}
+    assert result["items"][0]["values"]["listing_days"] == 2
