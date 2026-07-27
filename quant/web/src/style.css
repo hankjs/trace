@@ -78,12 +78,22 @@ body {
   transition: background-color 180ms cubic-bezier(0.16, 1, 0.3, 1), color 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-::selection {
-  background: oklch(0.85 0.07 210);
+#app {
+  min-height: 100vh;
 }
 
-html.dark ::selection {
-  background: oklch(0.42 0.09 210);
+.app-shell {
+  isolation: isolate;
+}
+
+@supports (height: 100dvh) {
+  .app-shell {
+    height: 100dvh;
+  }
+}
+
+::selection {
+  background: var(--color-active);
 }
 
 button,
@@ -135,6 +145,14 @@ select:disabled {
 .icon-button:hover {
   background: var(--color-hover);
   color: var(--color-text-primary);
+}
+
+.icon-button:active {
+  background: var(--color-active);
+}
+
+.icon-button:disabled {
+  opacity: 0.45;
 }
 
 .drawer-enter-active,

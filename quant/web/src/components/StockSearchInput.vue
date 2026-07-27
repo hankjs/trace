@@ -174,7 +174,7 @@ defineExpose({ focus: focusInput })
       v-if="open"
       :id="listId"
       role="listbox"
-      class="absolute left-0 top-full z-30 mt-1 max-h-64 w-72 overflow-y-auto rounded-md border border-border bg-surface-raised shadow-panel"
+      class="absolute left-0 top-full z-30 mt-1 max-h-64 w-72 overflow-y-auto rounded-md bg-surface-raised shadow-panel"
     >
       <p v-if="loading" class="px-3 py-2 text-xs text-text-tertiary">正在搜索</p>
       <button

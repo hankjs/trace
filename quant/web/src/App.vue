@@ -6,6 +6,7 @@ import {
   Bell,
   BookOpen,
   BriefcaseBusiness,
+  Database,
   FlaskConical,
   Layers,
   LayoutDashboard,
@@ -33,6 +34,7 @@ const username = computed(() => currentUsername())
 const mobileNavOpen = ref(false)
 const sidebarCollapsed = ref(localStorage.getItem('quant_sidebar_collapsed') === 'true')
 const stockCode = ref('')
+const stockSearch = ref<{ focus: () => void } | null>(null)
 
 function logout() {
   clearAuth()
@@ -48,6 +50,11 @@ function openStock() {
 function toggleSidebar() {
   sidebarCollapsed.value = !sidebarCollapsed.value
   localStorage.setItem('quant_sidebar_collapsed', String(sidebarCollapsed.value))
+}
+
+function expandSidebarForGuide() {
+  sidebarCollapsed.value = false
+  localStorage.setItem('quant_sidebar_collapsed', 'false')
 }
 
 const navGroups = [
@@ -70,6 +77,24 @@ const navGroups = [
     ],
   },
 ]
+
+const routeTitles: Record<string, string> = {
+  dashboard: '行情总览',
+  watchlist: '自选股',
+  selection: '选股中心',
+  signals: '信号提醒',
+  pools: '股票池',
+  strategies: '策略研究',
+  portfolio: '持仓记录',
+  catalog: '研究词典',
+  stock: '个股研究',
+}
+
+const currentRouteTitle = computed(() => routeTitles[String(route.name)] ?? '研究工作台')
+const currentRouteSection = computed(() => {
+  const routeName = String(route.name)
+  return navGroups.find((group) => group.items.some((item) => item.name === routeName))?.label ?? '行情研究'
+})
 
 const today = new Intl.DateTimeFormat('zh-CN', {
   month: '2-digit',
@@ -169,6 +194,13 @@ const guides: Record<string, ResearchGuide> = {
 
 const guide = computed(() => guides[String(route.name)] ?? guides.dashboard)
 
+function onGlobalKeydown(event: KeyboardEvent) {
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+    event.preventDefault()
+    void stockSearch.value?.focus()
+  }
+}
+
 watch(() => route.fullPath, () => {
   mobileNavOpen.value = false
 })
@@ -179,53 +211,62 @@ watch(mobileNavOpen, (open) => {
 
 onMounted(() => {
   if (getToken()) void loadCatalog()
+  document.addEventListener('keydown', onGlobalKeydown)
 })
 
 onBeforeUnmount(() => {
   document.body.style.overflow = ''
+  document.removeEventListener('keydown', onGlobalKeydown)
 })
 </script>
 
 <template>
-  <main v-if="isLoginPage" class="min-h-screen">
+  <div v-if="isLoginPage" class="min-h-screen">
     <router-view />
-  </main>
+  </div>
 
-  <div v-else class="flex min-h-screen bg-surface">
+  <div v-else class="app-shell flex h-screen min-h-[480px] overflow-hidden bg-surface">
     <aside
-      class="sticky top-0 hidden h-screen shrink-0 flex-col border-r border-border bg-workbench lg:flex"
-      :class="sidebarCollapsed ? 'w-[58px]' : 'w-[176px]'"
+      class="hidden h-full shrink-0 flex-col border-r border-border bg-workbench transition-[width] duration-200 lg:flex"
+      :class="sidebarCollapsed ? 'w-[52px]' : 'w-[208px]'"
     >
-      <router-link to="/" class="flex h-12 items-center gap-2.5 border-b border-border px-3">
+      <router-link to="/" class="flex h-11 shrink-0 items-center gap-2.5 border-b border-border px-3">
         <span class="flex h-7 w-7 shrink-0 items-center justify-center rounded bg-accent text-on-accent">
           <Activity :size="17" />
         </span>
         <span v-if="!sidebarCollapsed" class="min-w-0">
-          <span class="block text-sm font-semibold leading-4">Quant</span>
-          <span class="block truncate text-[10px] leading-4 text-text-tertiary">A股研究终端</span>
+          <span class="block text-sm font-semibold leading-4">Trace Quant</span>
+          <span class="block truncate text-[10px] leading-4 text-text-tertiary">日频研究工作台</span>
         </span>
       </router-link>
 
-      <nav class="min-h-0 flex-1 overflow-y-auto px-2 py-3" aria-label="主导航">
-        <section v-for="group in navGroups" :key="group.label" class="mb-4 last:mb-0">
+      <nav class="min-h-0 flex-1 overflow-y-auto px-2 py-2.5" aria-label="主导航">
+        <section v-for="group in navGroups" :key="group.label" class="mb-3.5 last:mb-0">
           <h2 v-if="!sidebarCollapsed" class="mb-1 px-2 text-[10px] font-medium text-text-tertiary">{{ group.label }}</h2>
           <div class="space-y-0.5">
             <router-link
               v-for="item in group.items"
               :key="item.name"
               :to="item.to"
-              class="flex h-9 items-center gap-2.5 rounded px-2 text-sm text-text-secondary hover:bg-hover hover:text-text-primary"
-              active-class="!bg-active !text-accent font-medium"
+              class="group flex h-8 items-center gap-2.5 rounded px-2 text-[13px] text-text-secondary transition-colors hover:bg-hover hover:text-text-primary"
+              active-class="!bg-active !text-text-primary font-medium"
               :title="sidebarCollapsed ? item.label : undefined"
             >
-              <component :is="item.icon" :size="16" class="shrink-0" />
+              <component :is="item.icon" :size="15" class="shrink-0 group-[.router-link-active]:text-accent" />
               <span v-if="!sidebarCollapsed" class="truncate">{{ item.label }}</span>
             </router-link>
           </div>
         </section>
       </nav>
 
-      <div class="border-t border-border p-2">
+      <ResearchAssistant
+        variant="desktop"
+        :guide="guide"
+        :sidebar-collapsed="sidebarCollapsed"
+        @expand-sidebar="expandSidebarForGuide"
+      />
+
+      <div class="shrink-0 border-t border-border p-2">
         <div v-if="!sidebarCollapsed" class="mb-2 flex items-start gap-2 rounded bg-surface-muted px-2 py-2 text-[10px] leading-4 text-text-tertiary">
           <ShieldCheck :size="14" class="mt-0.5 shrink-0 text-accent" />
           <span>仅提供日频研究<br />交易均在外部手工完成</span>
@@ -243,24 +284,31 @@ onBeforeUnmount(() => {
       </div>
     </aside>
 
-    <div class="min-w-0 flex-1">
-      <header class="sticky top-0 z-30 flex h-12 items-center gap-3 border-b border-border bg-surface-raised/95 px-3 backdrop-blur-sm lg:px-4">
+    <div class="flex min-w-0 flex-1 flex-col">
+      <header class="z-30 flex h-11 shrink-0 items-center gap-2 border-b border-border bg-workbench px-2.5 lg:px-3">
         <button type="button" class="icon-button lg:!hidden" title="打开导航" @click="mobileNavOpen = true">
           <Menu :size="19" />
           <span class="sr-only">打开导航</span>
         </button>
 
-        <form class="flex min-w-0 max-w-md flex-1 items-center" @submit.prevent="openStock">
+        <div class="hidden min-w-0 items-center gap-1.5 text-xs sm:flex lg:w-52">
+          <span class="truncate text-text-tertiary">{{ currentRouteSection }}</span>
+          <span class="text-border">/</span>
+          <strong class="truncate font-medium text-text-primary">{{ currentRouteTitle }}</strong>
+        </div>
+
+        <form class="mx-auto flex min-w-0 max-w-md flex-1 items-center" role="search" @submit.prevent="openStock">
           <StockSearchInput
+            ref="stockSearch"
             v-model="stockCode"
             hide-label
-            placeholder="输入股票名称或代码"
-            input-class="!h-8 !w-full !rounded-r-none !border-r-0 !py-1"
+            placeholder="搜索股票名称或代码"
+            input-class="!h-8 !w-full !rounded-r-none !border-r-0 !bg-surface-raised !py-1"
             class="min-w-0 flex-1"
           />
           <button
             type="submit"
-            class="flex h-8 w-9 shrink-0 items-center justify-center rounded-r border border-border bg-surface-muted text-text-secondary hover:bg-hover hover:text-text-primary"
+            class="flex h-8 w-9 shrink-0 items-center justify-center rounded-r border border-border bg-surface-muted text-text-secondary transition-colors hover:bg-hover hover:text-text-primary"
             title="打开个股研究"
           >
             <Search :size="15" />
@@ -268,7 +316,7 @@ onBeforeUnmount(() => {
           </button>
         </form>
 
-        <div class="ml-auto hidden items-center gap-3 text-xs text-text-tertiary xl:flex">
+        <div class="ml-auto hidden items-center gap-2.5 text-xs text-text-tertiary 2xl:flex">
           <span>{{ today }}</span>
           <span class="h-3 w-px bg-border" />
           <span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-down" />日频研究模式</span>
@@ -282,24 +330,37 @@ onBeforeUnmount(() => {
         </button>
       </header>
 
-      <main class="flex min-w-0 items-start gap-3 p-3 lg:gap-4 lg:p-4">
-        <div class="min-w-0 flex-1">
-          <router-view />
+      <div class="flex min-h-0 min-w-0 flex-1">
+        <main class="min-w-0 flex-1 overflow-y-auto bg-surface">
+          <div class="min-h-full p-3 lg:p-4">
+            <router-view />
+          </div>
+        </main>
+      </div>
+
+      <footer class="flex h-6 shrink-0 items-center justify-between gap-3 border-t border-border bg-workbench px-3 text-[10px] text-text-tertiary">
+        <div class="flex min-w-0 items-center gap-3">
+          <span class="inline-flex items-center gap-1.5 text-text-secondary">
+            <Database :size="11" /> 日频数据
+          </span>
+          <span class="hidden truncate sm:inline">当前工作区：{{ currentRouteTitle }}</span>
         </div>
-        <ResearchAssistant :guide="guide" />
-      </main>
+        <span class="shrink-0">研究与模拟 · 外部手工决策</span>
+      </footer>
     </div>
+
+    <ResearchAssistant variant="mobile" :guide="guide" />
 
     <Transition name="nav-drawer">
       <div v-if="mobileNavOpen" class="fixed inset-0 z-50 lg:hidden" @keydown.esc="mobileNavOpen = false">
         <button class="absolute inset-0 bg-overlay" aria-label="关闭导航" @click="mobileNavOpen = false" />
         <aside class="absolute inset-y-0 left-0 flex w-[min(84vw,290px)] flex-col bg-workbench shadow-panel">
-          <div class="flex h-12 items-center justify-between border-b border-border px-3">
+          <div class="flex h-11 items-center justify-between border-b border-border px-3">
             <router-link to="/" class="flex items-center gap-2.5">
               <span class="flex h-7 w-7 items-center justify-center rounded bg-accent text-on-accent"><Activity :size="17" /></span>
               <span>
-                <span class="block text-sm font-semibold leading-4">Quant</span>
-                <span class="block text-[10px] leading-4 text-text-tertiary">A股研究终端</span>
+                <span class="block text-sm font-semibold leading-4">Trace Quant</span>
+                <span class="block text-[10px] leading-4 text-text-tertiary">日频研究工作台</span>
               </span>
             </router-link>
             <button type="button" class="icon-button" title="关闭导航" @click="mobileNavOpen = false">
