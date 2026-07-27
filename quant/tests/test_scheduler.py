@@ -172,3 +172,46 @@ def test_session_poison_isolated_failing_code_does_not_break_rest(monkeypatch):
     for code in codes[10:]:
         assert code in stored, f"{code} 未入库,Session 中毒未被隔离"
     assert bad not in stored
+
+
+def test_valuation_job_uses_one_market_batch(monkeypatch):
+    maker = _memory_sessionmaker()
+    day = date(2026, 7, 24)
+    calls: list[date] = []
+
+    monkeypatch.setattr(scheduler, "SessionLocal", maker)
+    monkeypatch.setattr(scheduler, "_is_trading_day", lambda *_: True)
+    monkeypatch.setattr(
+        scheduler.fundamentals,
+        "sync_market_valuations",
+        lambda db, value: calls.append(value) or {"upserted": 5000},
+    )
+
+    result = scheduler.job_sync_valuations(day)
+
+    assert calls == [day]
+    assert result == {"upserted": 5000}
+
+
+def test_financial_job_refreshes_recent_market_periods(monkeypatch):
+    maker = _memory_sessionmaker()
+    day = date(2026, 7, 27)
+    captured: list[list[date]] = []
+
+    monkeypatch.setattr(scheduler, "SessionLocal", maker)
+    monkeypatch.setattr(
+        scheduler.fundamentals,
+        "sync_market_financials",
+        lambda db, periods: captured.append(periods) or {"upserted": 20000},
+    )
+
+    result = scheduler.job_sync_fundamentals(day)
+
+    assert captured == [[
+        date(2025, 6, 30),
+        date(2025, 9, 30),
+        date(2025, 12, 31),
+        date(2026, 3, 31),
+        date(2026, 6, 30),
+    ]]
+    assert result == {"upserted": 20000}

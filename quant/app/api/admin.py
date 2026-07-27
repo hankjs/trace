@@ -142,7 +142,10 @@ async def sync_fundamentals_now(
         None, description="可选，逗号分隔代码；如 600519,sz.000001",
     ),
     universe_: str = Query("watchlist", alias="universe"),
-    max_codes: int = Query(100, ge=1, le=800),
+    max_codes: int = Query(
+        30, ge=1, le=30,
+        description="逐股手动同步最多 30 只；全市场初始化使用低频批量脚本",
+    ),
     include_valuation: bool = True,
     include_financials: bool = True,
     valuation_history: bool = Query(

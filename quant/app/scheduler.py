@@ -11,8 +11,8 @@
 - 每月 1 日 08:30  交易日历同步(quant_trade_calendar)
 - 每月 1 日 09:00  成分股名录同步(quant_index_member)
 - 每周六 08:00    全市场名录同步(改名/ST/退市标记)
-- 交易日 18:30  自选+最近候选估值快照(最多 30 只，独立于主流水线)
-- 每月 2 日 19:00  同一范围财务报告同步
+- 交易日 18:30  全市场估值快照(东财千行小页，通常约 6 次请求)
+- 每周六 09:00    全市场最近 5 个报告期财务指标(通常约 40 次请求)
 - 盘中 9:30-15:00 每 30 分钟:akshare 快照落 quant_snapshot(仍只采自选)
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ import logging
 from datetime import date, datetime, time as dtime
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .backtest.evaluate import run_evaluation
@@ -245,44 +245,33 @@ def job_sync_stock_list() -> dict | None:
             return None
 
 
-def _fundamental_codes(db: Session) -> list[str]:
-    watch = [r[0] for r in db.execute(
-        select(WatchlistItem.code).distinct().order_by(WatchlistItem.code)
-    ).all()]
-    latest_pick_date = db.execute(select(func.max(Pick.date))).scalar()
-    picks = []
-    if latest_pick_date:
-        picks = [r[0] for r in db.execute(
-            select(Pick.code).where(Pick.date == latest_pick_date)
-            .order_by(Pick.rank)
-        ).all()]
-    return list(dict.fromkeys([*watch, *picks]))[:30]
-
-
-def job_sync_valuations() -> None:
-    """盘后同步有限研究标的的当前估值，不阻塞 16:30 主流水线。"""
-    if not _is_trading_day():
-        return
+def job_sync_valuations(day: date | None = None) -> dict | None:
+    """盘后以全市场分页接口同步估值，避免逐股请求触发限流。"""
+    day = day or _now().date()
+    if not _is_trading_day(day):
+        return None
     with SessionLocal() as db:
         try:
-            result = fundamentals.sync_fundamentals(
-                db, _fundamental_codes(db), include_financials=False,
-            )
+            result = fundamentals.sync_market_valuations(db, day)
             logger.info("估值同步完成: %s", result)
+            return result
         except Exception:  # noqa: BLE001
             logger.exception("估值同步失败")
+            return None
 
 
-def job_sync_fundamentals() -> None:
-    """每月同步有限研究标的的财务报告。"""
+def job_sync_fundamentals(day: date | None = None) -> dict | None:
+    """每周刷新全市场最近报告期，捕获新披露与财报修订。"""
+    day = day or _now().date()
+    periods = fundamentals.recent_report_periods(day, count=5)
     with SessionLocal() as db:
         try:
-            result = fundamentals.sync_fundamentals(
-                db, _fundamental_codes(db), include_valuation=False,
-            )
+            result = fundamentals.sync_market_financials(db, periods)
             logger.info("财务指标同步完成: %s", result)
+            return result
         except Exception:  # noqa: BLE001
             logger.exception("财务指标同步失败")
+            return None
 
 
 def job_intraday_snapshot() -> None:
@@ -332,7 +321,7 @@ def start_scheduler() -> BackgroundScheduler:
     )
     scheduler.add_job(
         job_sync_fundamentals, "cron",
-        day=2, hour=19, minute=0,
+        day_of_week="sat", hour=9, minute=0,
         id="sync_fundamentals", replace_existing=True,
         max_instances=1, coalesce=True,
     )
@@ -343,8 +332,8 @@ def start_scheduler() -> BackgroundScheduler:
     )
     scheduler.start()
     logger.info("scheduler 已启动: 16:30 盘后流水线(日线->因子+选股->信号,"
-                "周五加评估);交易日 18:30 有限估值同步;每月 1 日交易日历+"
-                "成分同步;每周六名录同步;每月 2 日有限财务同步;"
+                "周五加评估);交易日 18:30 全市场估值同步;每月 1 日交易日历+"
+                "成分同步;每周六名录与全市场财务同步;"
                 "盘中每 30 分钟快照")
     return scheduler
 

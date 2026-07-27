@@ -5,14 +5,20 @@ available_date，宁可少参与历史筛选，也不把后来获得的数据泄
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import threading
+import time
 from datetime import date, datetime
 from typing import Any
 
 import akshare as ak
+import httpx
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from ..models import (FundamentalSnapshot, Stock,
@@ -32,9 +38,36 @@ FUNDAMENTAL_FIELDS = (
 
 _SYNC_LOCK = threading.Lock()
 
+EM_VALUATION_URL = "https://datacenter-web.eastmoney.com/api/data/v1/get"
+EM_FINANCIAL_URL = "https://datacenter.eastmoney.com/securities/api/data/get"
+EM_PAGE_SIZE = 1000
+DEFAULT_REQUEST_INTERVAL = 10.0
+# 单日估值、A 股单报告期正常约 3~8 页。过滤条件若失效会返回数百页，
+# 仍会被下方上限拦截，避免参数错误变成高频全站爬取。
+MAX_MARKET_PAGES = 10
+MAX_RESPONSE_BYTES = 25 * 1024 * 1024
+MAX_RESPONSE_SECONDS = 45.0
+
+VALUATION_COLUMNS = (
+    "SECUCODE,SECURITY_CODE,TRADE_DATE,BOARD_NAME,PE_TTM,PB_MRQ,PS_TTM,"
+    "TOTAL_MARKET_CAP"
+)
+FINANCIAL_COLUMNS = (
+    "SECUCODE,REPORT_DATE,NOTICE_DATE,UPDATE_DATE,ROEJQ,"
+    "TOTALOPERATEREVETZ,PARENTNETPROFITTZ,XSMLL,XSJLL,ZCFZL,NCO_NETPROFIT"
+)
+
 
 class FundamentalSyncInProgressError(RuntimeError):
     """同一进程中已有估值或财务同步任务。"""
+
+
+class FundamentalRateLimitError(RuntimeError):
+    """外部数据源已限流；调用方应停止本轮，不继续重试其他分页。"""
+
+
+class FundamentalSafetyLimitError(RuntimeError):
+    """响应大小或耗时越过安全阈值；本轮立即停止。"""
 
 
 def _as_float(value: Any) -> float | None:
@@ -90,6 +123,230 @@ def _as_date(value: Any) -> date | None:
         return pd.to_datetime(value).date()
     except (TypeError, ValueError):
         return None
+
+
+def _em_secu_to_code(value: Any) -> str | None:
+    """东财 000001.SZ / 600519.SH / 920000.BJ -> 本地代码。"""
+    text = str(value or "").strip().upper()
+    if "." not in text:
+        return None
+    symbol, market = text.split(".", 1)
+    if market not in {"SH", "SZ", "BJ"} or not (
+        symbol.isdigit() and len(symbol) == 6
+    ):
+        return None
+    return f"{market.lower()}.{symbol}"
+
+
+async def _request_em_json_async(
+    url: str, params: dict[str, str],
+) -> dict[str, Any]:
+    timeout = httpx.Timeout(connect=5, read=15, write=5, pool=5)
+    body = bytearray()
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with asyncio.timeout(MAX_RESPONSE_SECONDS):
+            async with client.stream("GET", url, params=params) as response:
+                if response.status_code in {403, 429}:
+                    raise FundamentalRateLimitError(
+                        f"东财限流 HTTP {response.status_code}，已停止本轮同步"
+                    )
+                if 400 <= response.status_code < 500:
+                    raise RuntimeError(
+                        f"东财请求被拒绝 HTTP {response.status_code}"
+                    )
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        raise FundamentalSafetyLimitError(
+                            "东财单页响应超过 "
+                            f"{MAX_RESPONSE_BYTES // 1024 // 1024}MB，已停止本轮同步"
+                        )
+    payload = json.loads(body)
+    if not payload.get("success"):
+        raise RuntimeError(
+            f"东财接口失败: {payload.get('message') or 'unknown'}"
+        )
+    return payload
+
+
+def _request_em_json(url: str, params: dict[str, str]) -> dict[str, Any]:
+    """低频请求东财；单页总超时，任何失败均不自动重试。"""
+    try:
+        return asyncio.run(_request_em_json_async(url, params))
+    except (FundamentalRateLimitError, FundamentalSafetyLimitError):
+        raise
+    except TimeoutError as exc:
+        raise FundamentalSafetyLimitError(
+            f"东财单页响应超过 {MAX_RESPONSE_SECONDS:.0f} 秒，已停止本轮同步"
+        ) from exc
+    except (httpx.HTTPError, ValueError, RuntimeError) as exc:
+        raise RuntimeError(f"东财请求失败，未自动重试: {exc}") from exc
+
+
+def _fetch_em_pages(
+    url: str,
+    params: dict[str, str],
+    *,
+    page_param: str,
+    size_param: str,
+    request_interval: float,
+) -> tuple[list[dict[str, Any]], int]:
+    """串行拉取一个已严格过滤的全市场报表，返回记录和请求数。"""
+    if request_interval < 0:
+        raise ValueError("request_interval 不能小于 0")
+    first_params = {**params, page_param: "1", size_param: str(EM_PAGE_SIZE)}
+    first = _request_em_json(url, first_params)
+    result = first.get("result") or {}
+    pages = int(result.get("pages") or 0)
+    if pages > MAX_MARKET_PAGES:
+        raise RuntimeError(
+            f"东财报表返回 {pages} 页，超过安全上限 {MAX_MARKET_PAGES}；"
+            "可能是过滤条件失效，已停止同步"
+        )
+    rows = list(result.get("data") or [])
+    requests_made = 1
+    logger.info("东财分页进度 1/%d，已收 %d 行", pages, len(rows))
+    for page in range(2, pages + 1):
+        if request_interval:
+            time.sleep(request_interval)
+        payload = _request_em_json(
+            url, {**params, page_param: str(page), size_param: str(EM_PAGE_SIZE)},
+        )
+        rows.extend((payload.get("result") or {}).get("data") or [])
+        requests_made += 1
+        logger.info("东财分页进度 %d/%d，已收 %d 行", page, pages, len(rows))
+    return rows, requests_made
+
+
+def fetch_market_valuations(
+    day: date,
+    *,
+    available_codes: set[str] | None = None,
+    request_interval: float = DEFAULT_REQUEST_INTERVAL,
+) -> tuple[list[dict[str, Any]], dict[str, str], int]:
+    """按交易日批量拉全市场估值；正常约六次千行分页请求。"""
+    raw_rows, requests_made = _fetch_em_pages(
+        EM_VALUATION_URL,
+        {
+            "sortColumns": "SECURITY_CODE",
+            "sortTypes": "1",
+            "reportName": "RPT_VALUEANALYSIS_DET",
+            "columns": VALUATION_COLUMNS,
+            "quoteColumns": "",
+            "source": "WEB",
+            "client": "WEB",
+            "filter": f"(TRADE_DATE='{day.isoformat()}')",
+        },
+        page_param="pageNumber",
+        size_param="pageSize",
+        request_interval=request_interval,
+    )
+    records: list[dict[str, Any]] = []
+    industries: dict[str, str] = {}
+    for row in raw_rows:
+        code = _em_secu_to_code(row.get("SECUCODE"))
+        data_date = _as_date(row.get("TRADE_DATE"))
+        if code is None or data_date != day:
+            continue
+        if available_codes is not None and code not in available_codes:
+            continue
+        records.append({
+            "code": code,
+            "data_date": data_date,
+            "report_period": None,
+            "available_date": data_date,
+            "source": "eastmoney:RPT_VALUEANALYSIS_DET",
+            "pe_ttm": _as_float(row.get("PE_TTM")),
+            "pb": _as_float(row.get("PB_MRQ")),
+            "ps_ttm": _as_float(row.get("PS_TTM")),
+            # 该报表没有 TTM 股息率，不能拿动态市盈率等其他口径冒充。
+            "dividend_yield": None,
+            "total_market_cap": _as_float(row.get("TOTAL_MARKET_CAP")),
+        })
+        industry = str(row.get("BOARD_NAME") or "").strip()
+        if industry:
+            industries[code] = industry
+    return records, industries, requests_made
+
+
+def fetch_market_financials(
+    report_period: date,
+    *,
+    available_codes: set[str] | None = None,
+    request_interval: float = DEFAULT_REQUEST_INTERVAL,
+) -> tuple[list[dict[str, Any]], int]:
+    """按报告期批量拉全市场主要财务指标；正常约八次千行分页请求。"""
+    raw_rows, requests_made = _fetch_em_pages(
+        EM_FINANCIAL_URL,
+        {
+            "type": "RPT_F10_FINANCE_MAINFINADATA",
+            "sty": FINANCIAL_COLUMNS,
+            "quoteColumns": "",
+            "filter": (
+                '(SECURITY_TYPE_CODE in ("058001001","058001008"))'
+                f"(REPORT_DATE='{report_period.isoformat()}')"
+            ),
+            "sr": "1",
+            "st": "SECUCODE",
+            "source": "HSF10",
+            "client": "PC",
+        },
+        page_param="p",
+        size_param="ps",
+        request_interval=request_interval,
+    )
+    records: list[dict[str, Any]] = []
+    for row in raw_rows:
+        code = _em_secu_to_code(row.get("SECUCODE"))
+        row_period = _as_date(row.get("REPORT_DATE"))
+        dates = [
+            value for value in (
+                _as_date(row.get("NOTICE_DATE")),
+                _as_date(row.get("UPDATE_DATE")),
+            )
+            if value is not None
+        ]
+        if code is None or row_period != report_period or not dates:
+            continue
+        if available_codes is not None and code not in available_codes:
+            continue
+        available_date = max(dates)
+        records.append({
+            "code": code,
+            "data_date": row_period,
+            "report_period": row_period,
+            "available_date": available_date,
+            "source": "eastmoney:RPT_F10_FINANCE_MAINFINADATA",
+            "roe": _as_percent_ratio(row.get("ROEJQ")),
+            "revenue_yoy": _as_percent_ratio(row.get("TOTALOPERATEREVETZ")),
+            "profit_yoy": _as_percent_ratio(row.get("PARENTNETPROFITTZ")),
+            "gross_margin": _as_percent_ratio(row.get("XSMLL")),
+            "net_margin": _as_percent_ratio(row.get("XSJLL")),
+            "debt_ratio": _as_percent_ratio(row.get("ZCFZL")),
+            "cashflow_ratio": _as_float(row.get("NCO_NETPROFIT")),
+        })
+    return records, requests_made
+
+
+def report_periods_between(start: date, end: date) -> list[date]:
+    """返回区间内已结束的季度报告期。"""
+    if start > end:
+        raise ValueError("start 不能晚于 end")
+    periods = [
+        date(year, month, day)
+        for year in range(start.year, end.year + 1)
+        for month, day in ((3, 31), (6, 30), (9, 30), (12, 31))
+    ]
+    return [period for period in periods if start <= period <= end]
+
+
+def recent_report_periods(day: date, count: int = 5) -> list[date]:
+    """日常刷新最近若干报告期，以捕获集中披露和后续修订。"""
+    if count <= 0:
+        raise ValueError("count 必须大于 0")
+    start = date(day.year - ((count + 3) // 4 + 1), 1, 1)
+    return report_periods_between(start, day)[-count:]
 
 
 def _xq_symbol(code: str) -> str:
@@ -209,7 +466,11 @@ def fetch_valuations(code: str, as_of: date | None = None,
     """拉取估值；当前快照走低成本雪球，显式历史回填才请求较慢的东财。"""
     as_of = as_of or date.today()
     if not history and as_of >= date.today():
-        return [_fetch_xq_valuation(code, as_of)]
+        try:
+            return [_fetch_xq_valuation(code, as_of)]
+        except Exception as exc:  # noqa: BLE001 - 雪球 token 经常失效
+            logger.info("雪球当前估值不可用 %s，降级东财最新估值: %s", code, exc)
+            return _fetch_em_valuations(code, as_of, history=False)
     if not history:
         return _fetch_em_valuations(code, as_of, history=False)
     try:
@@ -366,6 +627,158 @@ def _upsert_financial(db: Session, values: dict[str, Any]) -> None:
         if value is not None:
             setattr(row, field, value)
     row.source = values["source"]
+
+
+def _bulk_upsert(
+    db: Session,
+    model: type[ValuationSnapshot] | type[FundamentalSnapshot],
+    rows: list[dict[str, Any]],
+    *,
+    unique_fields: tuple[str, ...],
+    metric_fields: tuple[str, ...],
+    batch_size: int = 2000,
+) -> int:
+    """批量 upsert；整个调用由上层统一 commit，保证单个日期原子写入。"""
+    if not rows:
+        return 0
+    table = model.__table__
+    dialect = db.get_bind().dialect.name
+    for start in range(0, len(rows), batch_size):
+        batch = rows[start:start + batch_size]
+        if dialect == "mysql":
+            stmt = mysql_insert(table).values(batch)
+            updates = {
+                field: func.coalesce(stmt.inserted[field], table.c[field])
+                for field in metric_fields
+            }
+            updates["source"] = stmt.inserted.source
+            db.execute(stmt.on_duplicate_key_update(**updates))
+        elif dialect == "sqlite":
+            stmt = sqlite_insert(table).values(batch)
+            updates = {
+                field: func.coalesce(stmt.excluded[field], table.c[field])
+                for field in metric_fields
+            }
+            updates["source"] = stmt.excluded.source
+            db.execute(stmt.on_conflict_do_update(
+                index_elements=[table.c[field] for field in unique_fields],
+                set_=updates,
+            ))
+        else:
+            raise RuntimeError(f"不支持的数据库方言: {dialect}")
+    return len(rows)
+
+
+def _field_coverage(
+    rows: list[dict[str, Any]], fields: tuple[str, ...],
+) -> dict[str, int]:
+    return {
+        field: sum(row.get(field) is not None for row in rows)
+        for field in fields
+    }
+
+
+def sync_market_valuations(
+    db: Session,
+    day: date,
+    *,
+    request_interval: float = DEFAULT_REQUEST_INTERVAL,
+) -> dict[str, Any]:
+    """低请求量同步全市场单日估值，同时刷新当前行业分类。"""
+    if not _SYNC_LOCK.acquire(blocking=False):
+        raise FundamentalSyncInProgressError("已有基本面同步任务正在运行")
+    try:
+        stocks = {
+            stock.code: stock
+            for stock in db.execute(select(Stock)).scalars().all()
+        }
+        rows, industries, requests_made = fetch_market_valuations(
+            day,
+            available_codes=set(stocks),
+            request_interval=request_interval,
+        )
+        if not rows:
+            raise RuntimeError(f"东财全市场估值 {day} 返回空结果，未写库")
+        written = _bulk_upsert(
+            db,
+            ValuationSnapshot,
+            rows,
+            unique_fields=("code", "data_date", "available_date"),
+            metric_fields=VALUATION_FIELDS,
+        )
+        industry_updated = 0
+        for code, industry in industries.items():
+            stock = stocks.get(code)
+            if stock is not None and stock.industry != industry:
+                stock.industry = industry
+                industry_updated += 1
+        db.commit()
+        return {
+            "date": str(day),
+            "requests": requests_made,
+            "fetched": len(rows),
+            "upserted": written,
+            "industry_updated": industry_updated,
+            "coverage": _field_coverage(rows, VALUATION_FIELDS),
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        _SYNC_LOCK.release()
+
+
+def sync_market_financials(
+    db: Session,
+    report_periods: list[date],
+    *,
+    request_interval: float = DEFAULT_REQUEST_INTERVAL,
+) -> dict[str, Any]:
+    """低频串行刷新全市场报告期；每个报告期独立事务，便于断点续跑。"""
+    if not _SYNC_LOCK.acquire(blocking=False):
+        raise FundamentalSyncInProgressError("已有基本面同步任务正在运行")
+    try:
+        available_codes = {
+            row[0] for row in db.execute(select(Stock.code)).all()
+        }
+        results: list[dict[str, Any]] = []
+        total_requests = 0
+        for index, report_period in enumerate(sorted(set(report_periods))):
+            if index and request_interval:
+                time.sleep(request_interval)
+            try:
+                rows, requests_made = fetch_market_financials(
+                    report_period,
+                    available_codes=available_codes,
+                    request_interval=request_interval,
+                )
+                written = _bulk_upsert(
+                    db,
+                    FundamentalSnapshot,
+                    rows,
+                    unique_fields=("code", "report_period", "available_date"),
+                    metric_fields=FUNDAMENTAL_FIELDS,
+                )
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            total_requests += requests_made
+            results.append({
+                "report_period": str(report_period),
+                "fetched": len(rows),
+                "upserted": written,
+                "requests": requests_made,
+                "coverage": _field_coverage(rows, FUNDAMENTAL_FIELDS),
+            })
+        return {
+            "periods": results,
+            "period_count": len(results),
+            "requests": total_requests,
+            "upserted": sum(item["upserted"] for item in results),
+        }
+    finally:
+        _SYNC_LOCK.release()
 
 
 def _sync_fundamentals_unlocked(db: Session, codes: list[str],

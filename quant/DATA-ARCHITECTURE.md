@@ -13,6 +13,7 @@
 | 类别 | 表 | 会不会被改写 | 备份价值 |
 |---|---|---|---|
 | **原始事实** | `quant_daily_bar` 的 `raw_close`/`volume`/`amount`、`quant_adjust_factor`、`quant_trade_calendar`、`quant_stock` | 永不改写 | 高（重拉需数小时） |
+| **外部版本指标** | `quant_valuation_snapshot`、`quant_fundamental_snapshot` | 按交易日或报告版本追加；同版本可被数据源修订 | 中（可重拉，但需保留 `source`/`available_date`） |
 | **派生视图** | `quant_daily_bar` 的 `open/high/low/close`（前复权）、`quant_factor_daily`、`quant_pick`、`quant_signal`、`quant_strategy_eval`、`quant_backtest_*` | 会被重算或重写 | 低（可从原始事实重建） |
 | **用户数据** | `quant_trade`、`quant_watchlist`、`quant_pool`、`quant_pool_member` | 只由用户改 | 最高（不可再生） |
 
@@ -23,6 +24,24 @@
 - 业务代码不应写原始事实表 —— 写入只经 `app/data/`。历史上 `scripts/backfill_pool.py`
   的 `Base.metadata.create_all()` 越界建表，把生产库搞成「新表已存在但列不全」的
   混合状态，导致 Alembic 无法接管（处置脚本见 `scripts/prepare_alembic_takeover.py`）。
+
+### 为什么 PE/ROE 使用 snapshot，而不是查询时从日线计算
+
+`quant_daily_bar` 只有价格、成交量和成交额。可靠计算 PE/PB/PS/ROE 还需要带公告与
+修订时间的 TTM 归母净利润、平均净资产、营业收入、历史总股本等事实；这些原始财务
+报表当前没有入库。只用收盘价动态计算会在财报修订、增发和分红时产生看似精确、实则
+口径错误的值。
+
+因此当前边界是：
+
+- `quant_valuation_snapshot` 按交易日保存数据源给出的 PE(TTM)、PB、PS(TTM) 和总市值；
+- `quant_fundamental_snapshot` 按 `report_period + available_date` 保存 ROE、增长率、利润率、
+  负债率和现金流质量指标，修订后新增可用版本，防止历史研究看到未来值；
+- 技术指标仍从日线计算，可随时重建，不混入上述两张外部版本指标表。
+
+只有在后续引入完整的利润表、资产负债表、现金流量表、股本与分红事实表后，才适合把
+这些比率改成查询时或物化视图计算。当前再建一张“计算后基础数据表”只会复制现有两张
+snapshot 表的职责。
 
 ## 2. 前复权价：为什么它是最麻烦的一列
 
@@ -282,7 +301,7 @@ Schema 由 Alembic 管理（`alembic/versions/`），**启动时不再建表或�
 - 逐列 `MODIFY COLUMN` 的 revision 中断后可安全续跑（幂等），会留下「部分列已转换」
   的中间状态。
 
-## 9. 当前数据规模（2026-07-25 实测）
+## 9. 当前数据规模（2026-07-27 实测）
 
 | 项 | 数值 |
 |---|---|
@@ -290,9 +309,15 @@ Schema 由 Alembic 管理（`alembic/versions/`），**启动时不再建表或�
 | 其中北交所 | 330 只 |
 | `quant_adjust_factor` | 42,716 行（`baostock` 41,222 / `sina` 1,494） |
 | `quant_factor_daily` | 4,970 行（全市场当日因子） |
+| `quant_stock.industry` | 5,531 只有值 / 128 个行业分类 |
+| `quant_valuation_snapshot` | 5,531 行 / 2026-07-24；当日 5,530 根日线全部覆盖 |
+| `quant_fundamental_snapshot` | 214,567 行 / 5,584 只 / 46 个报告期（2015-03-31 至 2026-06-30） |
 | `kind='all'` 解析结果 | 5,300 只 |
 | 尺度审计 | 北交所 330 只全部一致；权威源抽样 400 只全部一致 |
 
-**仍为空的表**：`quant_valuation_snapshot`、`quant_fundamental_snapshot`。
-`available_date` 的 point-in-time 关联逻辑正确且有测试，但**还没有数据经过它** ——
-基本面筛选目前筛不出结果。这是当前最大的数据缺口。
+估值初始化只写最新交易日，不追拉 2015 年以来的每日历史；每天约 5,500 行的历史回填
+请求和存储成本都高，且会显著增加数据源封禁风险。交易日 18:30 的日常任务会从当前日期
+开始逐日积累。当前源没有 TTM 股息率，`dividend_yield` 保持空值，不拿其他口径冒充。
+
+财务指标已回填日线范围内全部 46 个季度报告期。`2026-06-30` 仍处披露期，截至实测日
+只有 21 只有数据；每周任务刷新最近 5 个报告期，会继续补充新披露和修订版本。

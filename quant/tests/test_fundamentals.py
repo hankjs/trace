@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.data import fundamentals
 from app.db import Base
-from app.models import FundamentalSnapshot, ValuationSnapshot
+from app.models import FundamentalSnapshot, Stock, ValuationSnapshot
 
 
 def test_xq_valuation_normalizes_percent_and_market_code(monkeypatch) -> None:
@@ -203,4 +203,121 @@ def test_financial_revision_is_stored_as_new_available_version() -> None:
     assert [(row.available_date, row.roe) for row in rows] == [
         (date(2024, 10, 30), 0.12),
         (date(2025, 2, 1), 0.18),
+    ]
+
+
+def test_market_valuation_uses_paged_report_and_updates_industry(
+    monkeypatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_request(url: str, params: dict[str, str]):
+        assert url == fundamentals.EM_VALUATION_URL
+        calls.append(params["pageNumber"])
+        page = params["pageNumber"]
+        row = {
+            "SECUCODE": "600001.SH" if page == "1" else "000002.SZ",
+            "TRADE_DATE": "2025-01-10 00:00:00",
+            "BOARD_NAME": "银行Ⅱ" if page == "1" else "制造业",
+            "PE_TTM": 10.0 if page == "1" else 20.0,
+            "PB_MRQ": 1.0,
+            "PS_TTM": 2.0,
+            "TOTAL_MARKET_CAP": 1e10,
+        }
+        return {"result": {"pages": 2, "data": [row]}}
+
+    monkeypatch.setattr(fundamentals, "_request_em_json", fake_request)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add_all([
+            Stock(code="sh.600001", name="甲", industry=""),
+            Stock(code="sz.000002", name="乙", industry="旧分类"),
+        ])
+        db.commit()
+        result = fundamentals.sync_market_valuations(
+            db, date(2025, 1, 10), request_interval=0,
+        )
+        stored = db.query(ValuationSnapshot).order_by(
+            ValuationSnapshot.code,
+        ).all()
+
+        assert calls == ["1", "2"]
+        assert result["requests"] == 2
+        assert result["upserted"] == 2
+        assert [(row.code, row.pe_ttm) for row in stored] == [
+            ("sh.600001", 10.0), ("sz.000002", 20.0),
+        ]
+        assert db.get(Stock, "sh.600001").industry == "银行Ⅱ"
+        assert db.get(Stock, "sz.000002").industry == "制造业"
+
+
+def test_market_financial_report_normalizes_ratios(monkeypatch) -> None:
+    def fake_request(url: str, params: dict[str, str]):
+        assert url == fundamentals.EM_FINANCIAL_URL
+        assert '(SECURITY_TYPE_CODE in ("058001001","058001008"))' in (
+            params["filter"]
+        )
+        assert params["filter"].endswith("(REPORT_DATE='2024-09-30')")
+        return {
+            "result": {
+                "pages": 1,
+                "data": [{
+                    "SECUCODE": "600001.SH",
+                    "REPORT_DATE": "2024-09-30 00:00:00",
+                    "NOTICE_DATE": "2024-10-20 00:00:00",
+                    "UPDATE_DATE": "2024-10-30 00:00:00",
+                    "ROEJQ": 12.5,
+                    "TOTALOPERATEREVETZ": 8.0,
+                    "PARENTNETPROFITTZ": 6.0,
+                    "XSMLL": 40.0,
+                    "XSJLL": 15.0,
+                    "ZCFZL": 35.0,
+                    "NCO_NETPROFIT": 1.1,
+                }],
+            },
+        }
+
+    monkeypatch.setattr(fundamentals, "_request_em_json", fake_request)
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Stock(code="sh.600001", name="测试"))
+        db.commit()
+        result = fundamentals.sync_market_financials(
+            db, [date(2024, 9, 30)], request_interval=0,
+        )
+        row = db.query(FundamentalSnapshot).one()
+
+        assert result["requests"] == 1
+        assert row.available_date == date(2024, 10, 30)
+        assert row.roe == pytest.approx(0.125)
+        assert row.gross_margin == pytest.approx(0.4)
+        assert row.cashflow_ratio == pytest.approx(1.1)
+
+
+def test_market_report_stops_when_filter_would_expand_pages(monkeypatch) -> None:
+    calls = 0
+
+    def fake_request(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {"result": {"pages": fundamentals.MAX_MARKET_PAGES + 1,
+                           "data": []}}
+
+    monkeypatch.setattr(fundamentals, "_request_em_json", fake_request)
+    with pytest.raises(RuntimeError, match="超过安全上限"):
+        fundamentals.fetch_market_valuations(
+            date(2025, 1, 10), request_interval=0,
+        )
+    assert calls == 1
+
+
+def test_recent_report_periods_only_returns_finished_quarters() -> None:
+    assert fundamentals.recent_report_periods(date(2026, 7, 27), count=5) == [
+        date(2025, 6, 30),
+        date(2025, 9, 30),
+        date(2025, 12, 31),
+        date(2026, 3, 31),
+        date(2026, 6, 30),
     ]
