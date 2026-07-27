@@ -331,8 +331,8 @@ onBeforeUnmount(() => {
       </header>
 
       <div class="flex min-h-0 min-w-0 flex-1">
-        <main class="min-w-0 flex-1 overflow-y-auto bg-surface">
-          <div class="min-h-full p-3 lg:p-4">
+        <main class="min-h-0 min-w-0 flex-1 overflow-hidden bg-surface">
+          <div class="h-full min-h-0 overflow-y-auto p-3 lg:p-4">
             <router-view />
           </div>
         </main>

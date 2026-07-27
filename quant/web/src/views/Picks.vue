@@ -5,6 +5,8 @@ import { api, type PickItem } from '../api'
 import { catalogEntry, factorName, loadCatalog } from '../catalog'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import { fmtBigAmount, fmtPct, localDateISO } from '../format'
 
 const date = ref('')
@@ -47,6 +49,17 @@ const emptyText = computed(() =>
     ? '今日还未生成选股池(交易日 17:00 生成)'
     : '该日期无选股池数据'
 )
+
+const columns = computed<QuTableColumn<PickItem>[]>(() => [
+  { key: 'rank', label: '排名', cellClass: 'font-medium' },
+  { key: 'stock', label: '股票' },
+  { key: 'score', label: '评分', align: 'right', cellClass: 'font-medium' },
+  { key: 'mom20', label: factorName('mom20'), align: 'right', cellClass: (item) => (item.factors?.mom20 ?? 0) >= 0 ? 'text-up' : 'text-down' },
+  { key: 'mom60', label: factorName('mom60'), align: 'right', cellClass: (item) => (item.factors?.mom60 ?? 0) >= 0 ? 'text-up' : 'text-down' },
+  { key: 'rsi14', label: factorName('rsi14'), align: 'right' },
+  { key: 'vol_ratio5', label: factorName('vol_ratio5'), align: 'right' },
+  { key: 'actions', label: '', align: 'right', cellClass: 'text-xs text-text-tertiary' },
+])
 
 async function load() {
   loading.value = true
@@ -96,71 +109,48 @@ onMounted(async () => {
 
     <template v-else>
       <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="border-b border-border text-left text-xs text-text-tertiary">
-              <th class="px-4 py-2 font-medium">排名</th>
-              <th class="px-4 py-2 font-medium">股票</th>
-              <th class="px-4 py-2 text-right font-medium">评分</th>
-              <th class="px-4 py-2 text-right font-medium">{{ factorName('mom20') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ factorName('mom60') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ factorName('rsi14') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ factorName('vol_ratio5') }}</th>
-              <th class="px-4 py-2 font-medium"></th>
-            </tr>
-          </thead>
-          <tbody>
-            <template v-for="p in items" :key="p.code">
-              <tr
-                class="border-b border-border-subtle hover:bg-hover"
-              >
-                <td class="px-4 py-2 font-medium">{{ p.rank }}</td>
-                <td class="px-4 py-2">
-                  <router-link :to="`/stock/${p.code}`" class="text-accent hover:underline" @click.stop>
-                    <span class="font-medium text-text-primary">{{ p.name || '名称待同步' }}</span>
-                    <span class="ml-2 text-xs text-text-tertiary">{{ p.code }}</span>
-                  </router-link>
-                  <span
-                    v-if="isNew(p)"
-                    class="ml-1.5 rounded bg-down/10 px-1.5 py-0.5 text-xs font-medium text-down"
-                  >新</span>
-                </td>
-                <td class="px-4 py-2 text-right font-medium">{{ p.score?.toFixed(4) ?? '--' }}</td>
-                <td class="px-4 py-2 text-right" :class="(p.factors?.mom20 ?? 0) >= 0 ? 'text-up' : 'text-down'">
-                  {{ factorText(p, 'mom20') }}
-                </td>
-                <td class="px-4 py-2 text-right" :class="(p.factors?.mom60 ?? 0) >= 0 ? 'text-up' : 'text-down'">
-                  {{ factorText(p, 'mom60') }}
-                </td>
-                <td class="px-4 py-2 text-right">{{ factorText(p, 'rsi14') }}</td>
-                <td class="px-4 py-2 text-right">{{ factorText(p, 'vol_ratio5') }}</td>
-                <td class="px-4 py-2 text-right text-xs text-text-tertiary">
-                  <button
-                    type="button"
-                    class="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-active hover:text-text-primary"
-                    :aria-expanded="expanded === p.code"
-                    :aria-controls="`pick-factors-${p.code}`"
-                    @click="toggleExpand(p.code)"
-                  >
-                    {{ expanded === p.code ? '收起' : '查看指标' }}
-                    <ChevronUp v-if="expanded === p.code" :size="14" />
-                    <ChevronDown v-else :size="14" />
-                  </button>
-                </td>
-              </tr>
-              <tr v-if="expanded === p.code" :id="`pick-factors-${p.code}`" class="border-b border-border-subtle bg-hover/50">
-                <td colspan="8" class="px-4 py-3">
-                  <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
-                    <div v-for="key in factorKeys" :key="key" class="p-2">
-                      <div class="text-xs text-text-tertiary">{{ factorName(key) }}</div>
-                      <div class="mt-0.5 text-sm font-medium">{{ factorText(p, key) }}</div>
-                    </div>
+        <QuTable :data="items" :columns="columns" row-key="code">
+          <template #cell-stock="{ row: p }">
+            <router-link :to="`/stock/${p.code}`" class="text-accent hover:underline" @click.stop>
+              <span class="font-medium text-text-primary">{{ p.name || '名称待同步' }}</span>
+              <span class="ml-2 text-xs text-text-tertiary">{{ p.code }}</span>
+            </router-link>
+            <span
+              v-if="isNew(p)"
+              class="ml-1.5 rounded bg-down/10 px-1.5 py-0.5 text-xs font-medium text-down"
+            >新</span>
+          </template>
+          <template #cell-score="{ row: p }">{{ p.score?.toFixed(4) ?? '--' }}</template>
+          <template #cell-mom20="{ row: p }">{{ factorText(p, 'mom20') }}</template>
+          <template #cell-mom60="{ row: p }">{{ factorText(p, 'mom60') }}</template>
+          <template #cell-rsi14="{ row: p }">{{ factorText(p, 'rsi14') }}</template>
+          <template #cell-vol_ratio5="{ row: p }">{{ factorText(p, 'vol_ratio5') }}</template>
+          <template #cell-actions="{ row: p }">
+            <button
+              type="button"
+              class="inline-flex items-center gap-1 rounded px-1.5 py-1 hover:bg-active hover:text-text-primary"
+              :aria-expanded="expanded === p.code"
+              :aria-controls="`pick-factors-${p.code}`"
+              @click="toggleExpand(p.code)"
+            >
+              {{ expanded === p.code ? '收起' : '查看指标' }}
+              <ChevronUp v-if="expanded === p.code" :size="14" />
+              <ChevronDown v-else :size="14" />
+            </button>
+          </template>
+          <template #after-row="{ row: p, colspan }">
+            <tr v-if="expanded === p.code" :id="`pick-factors-${p.code}`" class="border-b border-border-subtle bg-hover/50">
+              <td :colspan="colspan" class="px-4 py-3">
+                <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
+                  <div v-for="key in factorKeys" :key="key" class="p-2">
+                    <div class="text-xs text-text-tertiary">{{ factorName(key) }}</div>
+                    <div class="mt-0.5 text-sm font-medium">{{ factorText(p, key) }}</div>
                   </div>
-                </td>
-              </tr>
-            </template>
-          </tbody>
-        </table>
+                </div>
+              </td>
+            </tr>
+          </template>
+        </QuTable>
         <p v-if="!items.length" class="px-4 py-6 text-center text-sm text-text-tertiary">{{ emptyText }}</p>
       </div>
 

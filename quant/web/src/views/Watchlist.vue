@@ -11,6 +11,8 @@ import { api, type WatchItem } from '../api'
 import PageHeader from '../components/PageHeader.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import { useAsyncAction } from '../useAsyncAction'
 
@@ -19,6 +21,12 @@ const loading = ref(true)
 const { busy, error, notice, fail, run } = useAsyncAction()
 const stockCode = ref('')
 const removingCode = ref('')
+
+const watchColumns: QuTableColumn<WatchItem>[] = [
+  { key: 'stock', label: '名称 / 代码' },
+  { key: 'industry', label: '行业', cellClass: 'text-xs text-text-tertiary' },
+  { key: 'actions', label: '', align: 'right', widthClass: 'w-20' },
+]
 
 async function load() {
   loading.value = true
@@ -109,36 +117,32 @@ async function remove(item: WatchItem) {
       <LoadingRows v-if="loading" :rows="4" />
 
       <div v-else-if="items.length" class="overflow-auto">
-        <table class="terminal-table min-w-[480px]">
-          <thead>
-            <tr class="text-left">
-              <th>名称 / 代码</th>
-              <th>行业</th>
-              <th class="w-20 text-right">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="item in items" :key="item.code">
-              <td>
-                <router-link :to="`/stock/${item.code}`" class="font-medium hover:text-accent">{{ item.name || '名称待同步' }}</router-link>
-                <span class="ml-2 text-[11px] text-text-tertiary">{{ item.code }}</span>
-              </td>
-              <td class="text-xs text-text-tertiary">{{ item.industry || '--' }}</td>
-              <td class="text-right">
-                <button
-                  type="button"
-                  class="icon-button"
-                  :disabled="busy && removingCode === item.code"
-                  :title="`移出自选 ${item.name || item.code}`"
-                  @click="remove(item)"
-                >
-                  <Trash2 :size="15" />
-                  <span class="sr-only">移出自选</span>
-                </button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+        <QuTable
+          :data="items"
+          :columns="watchColumns"
+          row-key="code"
+          class="terminal-table min-w-[480px]"
+          header-row-class="text-left"
+          body-row-class=""
+        >
+          <template #cell-stock="{ row: item }">
+            <router-link :to="`/stock/${item.code}`" class="font-medium hover:text-accent">{{ item.name || '名称待同步' }}</router-link>
+            <span class="ml-2 text-[11px] text-text-tertiary">{{ item.code }}</span>
+          </template>
+          <template #cell-industry="{ row: item }">{{ item.industry || '--' }}</template>
+          <template #cell-actions="{ row: item }">
+            <button
+              type="button"
+              class="icon-button"
+              :disabled="busy && removingCode === item.code"
+              :title="`移出自选 ${item.name || item.code}`"
+              @click="remove(item)"
+            >
+              <Trash2 :size="15" />
+              <span class="sr-only">移出自选</span>
+            </button>
+          </template>
+        </QuTable>
       </div>
 
       <div v-else class="px-4 py-12 text-center">

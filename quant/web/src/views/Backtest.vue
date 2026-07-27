@@ -3,12 +3,14 @@ import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { AlertTriangle } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
-import { api, hasSurvivorshipBias, type BacktestResult, type SweepResult, type WatchItem } from '../api'
+import { api, hasSurvivorshipBias, type BacktestResult, type SweepResult, type SweepResultItem, type WatchItem } from '../api'
 import { catalogEntry, loadCatalog, metricName, templateName } from '../catalog'
 import { aggregateMetric, fmtPct, fmtPrice } from '../format'
 import EChart from '../components/EChart.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import StrategySelect from '../components/StrategySelect.vue'
 import StrategyParamFields from '../components/StrategyParamFields.vue'
@@ -134,6 +136,34 @@ const bestKey = computed(() => {
   const best = sweepRows.value[0]
   return best ? JSON.stringify(best.params) : ''
 })
+
+const sweepColumns = computed<QuTableColumn<SweepResultItem>[]>(() => [
+  { key: 'rank', label: '#', cellClass: 'text-text-tertiary' },
+  { key: 'params', label: '参数', cellClass: 'font-medium' },
+  { key: 'total-return', label: metricName('total_return'), align: 'right', cellClass: (row) => (aggregateMetric(row.metrics, 'total_return') ?? 0) >= 0 ? 'text-up' : 'text-down' },
+  { key: 'annual-return', label: metricName('annual_return'), align: 'right', cellClass: (row) => (aggregateMetric(row.metrics, 'annual_return') ?? 0) >= 0 ? 'text-up' : 'text-down' },
+  { key: 'max-drawdown', label: metricName('max_drawdown'), align: 'right', cellClass: 'text-down' },
+  { key: 'sharpe', label: metricName('sharpe'), align: 'right' },
+  { key: 'win-rate', label: metricName('win_rate'), align: 'right' },
+  { key: 'trade-count', label: metricName('trade_count'), align: 'right' },
+])
+
+interface PerCodeRow {
+  code: string
+  metrics: Record<string, number>
+}
+
+const perCodeRows = computed<PerCodeRow[]>(() => Object.entries(result.value?.metrics.per_code ?? {}).map(([code, metrics]) => ({
+  code,
+  metrics: metrics as Record<string, number>,
+})))
+const perCodeColumns = computed<QuTableColumn<PerCodeRow>[]>(() => [
+  { key: 'stock', label: '股票' },
+  { key: 'total-return', label: metricName('total_return'), align: 'right', cellClass: (row) => Number(row.metrics.total_return) >= 0 ? 'text-up' : 'text-down' },
+  { key: 'trade-count', label: metricName('trade_count'), align: 'right' },
+  { key: 'round-trips', label: metricName('round_trips'), align: 'right' },
+  { key: 'win-rate', label: metricName('win_rate'), align: 'right' },
+])
 
 function paramsText(params: Record<string, number>): string {
   return Object.entries(params)
@@ -556,53 +586,27 @@ onMounted(async () => {
       </div>
 
       <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
-        <table class="w-full text-sm">
-          <thead>
-            <tr class="border-b border-border text-left text-xs text-text-tertiary">
-              <th class="px-4 py-2 font-medium">#</th>
-              <th class="px-4 py-2 font-medium">参数</th>
-              <th class="px-4 py-2 text-right font-medium">{{ metricName('total_return') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ metricName('annual_return') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ metricName('max_drawdown') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ metricName('sharpe') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ metricName('win_rate') }}</th>
-              <th class="px-4 py-2 text-right font-medium">{{ metricName('trade_count') }}</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr
-              v-for="(r, i) in sweepRows"
-              :key="JSON.stringify(r.params)"
-              class="border-b border-border-subtle last:border-0 hover:bg-hover"
-              :class="JSON.stringify(r.params) === bestKey ? 'bg-down/5' : ''"
-            >
-              <td class="px-4 py-2 text-text-tertiary">
-                {{ i + 1 }}
-                <span
-                  v-if="JSON.stringify(r.params) === bestKey"
-                  class="ml-1 rounded bg-down/10 px-1.5 py-0.5 text-xs font-medium text-down"
-                >最优</span>
-              </td>
-              <td class="px-4 py-2 font-medium">{{ paramsText(r.params) }}</td>
-              <td class="px-4 py-2 text-right" :class="(aggregateMetric(r.metrics, 'total_return') ?? 0) >= 0 ? 'text-up' : 'text-down'">
-                {{ aggregateMetric(r.metrics, 'total_return') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'total_return')) : '--' }}
-              </td>
-              <td class="px-4 py-2 text-right" :class="(aggregateMetric(r.metrics, 'annual_return') ?? 0) >= 0 ? 'text-up' : 'text-down'">
-                {{ aggregateMetric(r.metrics, 'annual_return') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'annual_return')) : '--' }}
-              </td>
-              <td class="px-4 py-2 text-right text-down">
-                {{ aggregateMetric(r.metrics, 'max_drawdown') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'max_drawdown')) : '--' }}
-              </td>
-              <td class="px-4 py-2 text-right">
-                {{ aggregateMetric(r.metrics, 'sharpe') !== undefined ? fmtPrice(aggregateMetric(r.metrics, 'sharpe')) : '--' }}
-              </td>
-              <td class="px-4 py-2 text-right">
-                {{ aggregateMetric(r.metrics, 'win_rate') !== undefined ? fmtPct(aggregateMetric(r.metrics, 'win_rate')) : '--' }}
-              </td>
-              <td class="px-4 py-2 text-right">{{ aggregateMetric(r.metrics, 'trade_count') ?? '--' }}</td>
-            </tr>
-          </tbody>
-        </table>
+        <QuTable
+          :data="sweepRows"
+          :columns="sweepColumns"
+          :row-key="(row) => JSON.stringify(row.params)"
+          :body-row-class="(row) => `border-b border-border-subtle last:border-0 hover:bg-hover ${JSON.stringify(row.params) === bestKey ? 'bg-down/5' : ''}`"
+        >
+          <template #cell-rank="{ row, rowIndex }">
+            {{ rowIndex + 1 }}
+            <span
+              v-if="JSON.stringify(row.params) === bestKey"
+              class="ml-1 rounded bg-down/10 px-1.5 py-0.5 text-xs font-medium text-down"
+            >最优</span>
+          </template>
+          <template #cell-params="{ row }">{{ paramsText(row.params) }}</template>
+          <template #cell-total-return="{ row }">{{ aggregateMetric(row.metrics, 'total_return') !== undefined ? fmtPct(aggregateMetric(row.metrics, 'total_return')) : '--' }}</template>
+          <template #cell-annual-return="{ row }">{{ aggregateMetric(row.metrics, 'annual_return') !== undefined ? fmtPct(aggregateMetric(row.metrics, 'annual_return')) : '--' }}</template>
+          <template #cell-max-drawdown="{ row }">{{ aggregateMetric(row.metrics, 'max_drawdown') !== undefined ? fmtPct(aggregateMetric(row.metrics, 'max_drawdown')) : '--' }}</template>
+          <template #cell-sharpe="{ row }">{{ aggregateMetric(row.metrics, 'sharpe') !== undefined ? fmtPrice(aggregateMetric(row.metrics, 'sharpe')) : '--' }}</template>
+          <template #cell-win-rate="{ row }">{{ aggregateMetric(row.metrics, 'win_rate') !== undefined ? fmtPct(aggregateMetric(row.metrics, 'win_rate')) : '--' }}</template>
+          <template #cell-trade-count="{ row }">{{ aggregateMetric(row.metrics, 'trade_count') ?? '--' }}</template>
+        </QuTable>
         <p v-if="!sweepRows.length" class="px-4 py-6 text-center text-sm text-text-tertiary">无扫描结果</p>
       </div>
 
@@ -653,35 +657,16 @@ onMounted(async () => {
       <section v-if="result.metrics.per_code && Object.keys(result.metrics.per_code).length">
         <h3 class="mb-2 text-base font-semibold">分股票明细</h3>
         <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
-          <table class="w-full text-sm">
-            <thead>
-              <tr class="border-b border-border text-left text-xs text-text-tertiary">
-                <th class="px-4 py-2 font-medium">股票</th>
-                <th class="px-4 py-2 text-right font-medium">{{ metricName('total_return') }}</th>
-                <th class="px-4 py-2 text-right font-medium">{{ metricName('trade_count') }}</th>
-                <th class="px-4 py-2 text-right font-medium">{{ metricName('round_trips') }}</th>
-                <th class="px-4 py-2 text-right font-medium">{{ metricName('win_rate') }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="(v, c) in result.metrics.per_code"
-                :key="c"
-                class="border-b border-border-subtle last:border-0 hover:bg-hover"
-              >
-                <td class="px-4 py-2">
-                  <div class="font-medium">{{ stockName(String(c)) }}</div>
-                  <div class="text-xs text-text-tertiary">{{ c }}</div>
-                </td>
-                <td class="px-4 py-2 text-right" :class="Number((v as Record<string, number>).total_return) >= 0 ? 'text-up' : 'text-down'">
-                  {{ fmtPct(Number((v as Record<string, number>).total_return ?? 0)) }}
-                </td>
-                <td class="px-4 py-2 text-right">{{ (v as Record<string, number>).trade_count ?? '--' }}</td>
-                <td class="px-4 py-2 text-right">{{ (v as Record<string, number>).round_trips ?? '--' }}</td>
-                <td class="px-4 py-2 text-right">{{ fmtPrice(Number((v as Record<string, number>).win_rate ?? 0) * 100) }}%</td>
-              </tr>
-            </tbody>
-          </table>
+          <QuTable :data="perCodeRows" :columns="perCodeColumns" row-key="code">
+            <template #cell-stock="{ row }">
+              <div class="font-medium">{{ stockName(row.code) }}</div>
+              <div class="text-xs text-text-tertiary">{{ row.code }}</div>
+            </template>
+            <template #cell-total-return="{ row }">{{ fmtPct(Number(row.metrics.total_return ?? 0)) }}</template>
+            <template #cell-trade-count="{ row }">{{ row.metrics.trade_count ?? '--' }}</template>
+            <template #cell-round-trips="{ row }">{{ row.metrics.round_trips ?? '--' }}</template>
+            <template #cell-win-rate="{ row }">{{ fmtPrice(Number(row.metrics.win_rate ?? 0) * 100) }}%</template>
+          </QuTable>
         </div>
       </section>
     </template>

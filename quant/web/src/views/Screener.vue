@@ -16,6 +16,8 @@ import { categoryLabels, operatorLabels, useCatalog } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import { isKnownPoolId } from '../pools'
 import { fmtBigAmount, fmtPct, fmtPrice, pnlClass } from '../format'
 
@@ -97,6 +99,20 @@ const partialDataFields = computed(() => [...new Set(
 const usesValuation = computed(() => activeConditions.value.some(
   (condition) => fieldOf(condition.field)?.category === 'valuation'
 ))
+const resultColumns = computed<QuTableColumn<ScreenerItem>[]>(() => [
+  { key: 'stock', label: '股票' },
+  { key: 'industry', label: '行业', cellClass: 'text-text-secondary', value: (item) => item.industry || '--' },
+  { key: 'close', label: '最新价', align: 'right', cellClass: (item) => pnlClass(numericValue(item, 'pct_chg')) },
+  ...resultFields.value.map((field) => ({
+    key: `field:${field}`,
+    label: fieldOf(field)?.name ?? field,
+    align: 'right' as const,
+    cellClass: 'tabular-nums',
+    value: (item: ScreenerItem) => valueOf(item, field),
+    format: (_value: unknown, item: ScreenerItem) => formatFieldValue(item, field),
+  })),
+  { key: 'reasons', label: '命中原因', cellClass: 'max-w-sm' },
+])
 
 function nextId(prefix: string): string {
   sequence += 1
@@ -620,37 +636,27 @@ onMounted(async () => {
       </div>
 
       <div v-if="items.length" class="overflow-x-auto rounded-md border border-border bg-surface-raised">
-        <table class="w-full min-w-[760px] text-sm">
-          <thead>
-            <tr class="border-b border-border text-left text-xs text-text-tertiary">
-              <th class="px-4 py-2.5 font-medium">股票</th>
-              <th class="px-4 py-2.5 font-medium">行业</th>
-              <th class="px-4 py-2.5 text-right font-medium">最新价</th>
-              <th v-for="field in resultFields" :key="field" class="px-4 py-2.5 text-right font-medium">
-                {{ fieldOf(field)?.name ?? field }}
-              </th>
-              <th class="px-4 py-2.5 font-medium">命中原因</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr v-for="item in items" :key="item.code" class="border-b border-border-subtle last:border-0 hover:bg-hover">
-              <td class="px-4 py-3">
-                <router-link :to="`/stock/${item.code}`" class="font-medium text-text-primary hover:text-accent">{{ stockName(item) }}</router-link>
-                <div class="mt-0.5 text-xs text-text-tertiary">{{ item.code }}</div>
-              </td>
-              <td class="px-4 py-3 text-text-secondary">{{ item.industry || '--' }}</td>
-              <td class="px-4 py-3 text-right" :class="pnlClass(numericValue(item, 'pct_chg'))">{{ fmtPrice(numericValue(item, 'close')) }}</td>
-              <td v-for="field in resultFields" :key="field" class="px-4 py-3 text-right tabular-nums">{{ formatFieldValue(item, field) }}</td>
-              <td class="max-w-sm px-4 py-3">
-                <div class="flex flex-wrap gap-1.5">
-                  <span v-for="reason in matchReasons(item)" :key="reason" class="rounded bg-info-soft px-1.5 py-0.5 text-xs text-text-secondary">{{ reason }}</span>
-                  <span v-if="!matchReasons(item).length" class="text-xs text-text-tertiary">符合当前组合</span>
-                </div>
-                <div v-if="dataBasis(item)" class="mt-1.5 text-[11px] text-text-tertiary">{{ dataBasis(item) }}</div>
-              </td>
-            </tr>
-          </tbody>
-        </table>
+        <QuTable
+          :data="items"
+          :columns="resultColumns"
+          row-key="code"
+          class="min-w-[760px]"
+          header-cell-class="px-4 py-2.5 font-medium"
+          body-cell-class="px-4 py-3"
+        >
+          <template #cell-stock="{ row: item }">
+            <router-link :to="`/stock/${item.code}`" class="font-medium text-text-primary hover:text-accent">{{ stockName(item) }}</router-link>
+            <div class="mt-0.5 text-xs text-text-tertiary">{{ item.code }}</div>
+          </template>
+          <template #cell-close="{ row: item }">{{ fmtPrice(numericValue(item, 'close')) }}</template>
+          <template #cell-reasons="{ row: item }">
+            <div class="flex flex-wrap gap-1.5">
+              <span v-for="reason in matchReasons(item)" :key="reason" class="rounded bg-info-soft px-1.5 py-0.5 text-xs text-text-secondary">{{ reason }}</span>
+              <span v-if="!matchReasons(item).length" class="text-xs text-text-tertiary">符合当前组合</span>
+            </div>
+            <div v-if="dataBasis(item)" class="mt-1.5 text-[11px] text-text-tertiary">{{ dataBasis(item) }}</div>
+          </template>
+        </QuTable>
       </div>
 
       <div v-else class="rounded-md border border-dashed border-border px-5 py-10 text-center">

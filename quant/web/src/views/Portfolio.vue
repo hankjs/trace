@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
-import { api, type PortfolioSummary, type Trade } from '../api'
+import { api, type PortfolioSummary, type Position, type Trade } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import PageHeader from '../components/PageHeader.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import { fmtAmount, fmtPrice, fmtQty, fmtSigned, localDateISO, pnlClass } from '../format'
 
@@ -14,6 +16,28 @@ const loading = ref(true)
 const error = ref('')
 const formError = ref('')
 const submitting = ref(false)
+
+const positionColumns: QuTableColumn<Position>[] = [
+  { key: 'stock', label: '股票' },
+  { key: 'qty', label: '数量', align: 'right' },
+  { key: 'avg-cost', label: '成本价', align: 'right' },
+  { key: 'last-price', label: '最新价', align: 'right' },
+  { key: 'market-value', label: '市值', align: 'right' },
+  { key: 'unrealized-pnl', label: '浮动盈亏', align: 'right', cellClass: (position) => pnlClass(position.unrealized_pnl) },
+  { key: 'realized-pnl', label: '已实现盈亏', align: 'right', cellClass: (position) => pnlClass(position.realized_pnl) },
+]
+
+const tradeColumns: QuTableColumn<Trade>[] = [
+  { key: 'id', label: 'ID', cellClass: 'text-text-tertiary' },
+  { key: 'trade_date', label: '日期' },
+  { key: 'stock', label: '股票' },
+  { key: 'side', label: '方向' },
+  { key: 'price', label: '价格', align: 'right' },
+  { key: 'qty', label: '数量', align: 'right' },
+  { key: 'fee', label: '费用', align: 'right' },
+  { key: 'note', label: '备注', cellClass: 'text-text-secondary' },
+  { key: 'actions', label: '', align: 'right' },
+]
 
 const form = reactive({
   code: '',
@@ -120,37 +144,18 @@ onMounted(load)
       <section>
         <h3 class="mb-2 text-base font-semibold">当前持仓</h3>
         <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
-          <table class="w-full text-sm">
-            <thead>
-              <tr class="border-b border-border text-left text-xs text-text-tertiary">
-                <th class="px-4 py-2 font-medium">股票</th>
-                <th class="px-4 py-2 text-right font-medium">数量</th>
-                <th class="px-4 py-2 text-right font-medium">成本价</th>
-                <th class="px-4 py-2 text-right font-medium">最新价</th>
-                <th class="px-4 py-2 text-right font-medium">市值</th>
-                <th class="px-4 py-2 text-right font-medium">浮动盈亏</th>
-                <th class="px-4 py-2 text-right font-medium">已实现盈亏</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="p in summary.positions"
-                :key="p.code"
-                class="border-b border-border-subtle last:border-0 hover:bg-hover"
-              >
-                <td class="px-4 py-2">
-                  <router-link :to="`/stock/${p.code}`" class="font-medium hover:text-accent">{{ nameOf(p.code, p.name) }}</router-link>
-                  <div class="text-xs text-text-tertiary">{{ p.code }}</div>
-                </td>
-                <td class="px-4 py-2 text-right">{{ fmtQty(p.qty) }}</td>
-                <td class="px-4 py-2 text-right">{{ fmtPrice(p.avg_cost) }}</td>
-                <td class="px-4 py-2 text-right">{{ fmtPrice(p.last_price) }}</td>
-                <td class="px-4 py-2 text-right">{{ fmtAmount(p.market_value) }}</td>
-                <td class="px-4 py-2 text-right" :class="pnlClass(p.unrealized_pnl)">{{ fmtSigned(p.unrealized_pnl) }}</td>
-                <td class="px-4 py-2 text-right" :class="pnlClass(p.realized_pnl)">{{ fmtSigned(p.realized_pnl) }}</td>
-              </tr>
-            </tbody>
-          </table>
+          <QuTable :data="summary.positions" :columns="positionColumns" row-key="code">
+            <template #cell-stock="{ row: position }">
+              <router-link :to="`/stock/${position.code}`" class="font-medium hover:text-accent">{{ nameOf(position.code, position.name) }}</router-link>
+              <div class="text-xs text-text-tertiary">{{ position.code }}</div>
+            </template>
+            <template #cell-qty="{ row: position }">{{ fmtQty(position.qty) }}</template>
+            <template #cell-avg-cost="{ row: position }">{{ fmtPrice(position.avg_cost) }}</template>
+            <template #cell-last-price="{ row: position }">{{ fmtPrice(position.last_price) }}</template>
+            <template #cell-market-value="{ row: position }">{{ fmtAmount(position.market_value) }}</template>
+            <template #cell-unrealized-pnl="{ row: position }">{{ fmtSigned(position.unrealized_pnl) }}</template>
+            <template #cell-realized-pnl="{ row: position }">{{ fmtSigned(position.realized_pnl) }}</template>
+          </QuTable>
           <p v-if="!summary.positions.length" class="px-4 py-6 text-center text-sm text-text-tertiary">暂无持仓</p>
         </div>
       </section>
@@ -199,47 +204,23 @@ onMounted(load)
       <section>
         <h3 class="mb-2 text-base font-semibold">成交记录</h3>
         <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
-          <table class="w-full text-sm">
-            <thead>
-              <tr class="border-b border-border text-left text-xs text-text-tertiary">
-                <th class="px-4 py-2 font-medium">ID</th>
-                <th class="px-4 py-2 font-medium">日期</th>
-                <th class="px-4 py-2 font-medium">股票</th>
-                <th class="px-4 py-2 font-medium">方向</th>
-                <th class="px-4 py-2 text-right font-medium">价格</th>
-                <th class="px-4 py-2 text-right font-medium">数量</th>
-                <th class="px-4 py-2 text-right font-medium">费用</th>
-                <th class="px-4 py-2 font-medium">备注</th>
-                <th class="px-4 py-2 font-medium"></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="t in trades"
-                :key="t.id"
-                class="border-b border-border-subtle last:border-0 hover:bg-hover"
-              >
-                <td class="px-4 py-2 text-text-tertiary">{{ t.id }}</td>
-                <td class="px-4 py-2">{{ t.trade_date }}</td>
-                <td class="px-4 py-2">
-                  <span class="font-medium">{{ nameOf(t.code, t.name) }}</span>
-                  <div class="text-xs text-text-tertiary">{{ t.code }}</div>
-                </td>
-                <td class="px-4 py-2">
-                  <span :class="t.side === 'buy' ? 'text-up' : 'text-down'" class="font-medium">
-                    {{ t.side === 'buy' ? '买入' : '卖出' }}
-                  </span>
-                </td>
-                <td class="px-4 py-2 text-right">{{ fmtPrice(t.price) }}</td>
-                <td class="px-4 py-2 text-right">{{ fmtQty(t.qty) }}</td>
-                <td class="px-4 py-2 text-right">{{ fmtPrice(t.fee) }}</td>
-                <td class="px-4 py-2 text-text-secondary">{{ t.note }}</td>
-                <td class="px-4 py-2 text-right">
-                  <button class="text-xs text-text-tertiary hover:text-up" @click="removeTrade(t.id)">删除</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
+          <QuTable :data="trades" :columns="tradeColumns" row-key="id">
+            <template #cell-stock="{ row: trade }">
+              <span class="font-medium">{{ nameOf(trade.code, trade.name) }}</span>
+              <div class="text-xs text-text-tertiary">{{ trade.code }}</div>
+            </template>
+            <template #cell-side="{ row: trade }">
+              <span :class="trade.side === 'buy' ? 'text-up' : 'text-down'" class="font-medium">
+                {{ trade.side === 'buy' ? '买入' : '卖出' }}
+              </span>
+            </template>
+            <template #cell-price="{ row: trade }">{{ fmtPrice(trade.price) }}</template>
+            <template #cell-qty="{ row: trade }">{{ fmtQty(trade.qty) }}</template>
+            <template #cell-fee="{ row: trade }">{{ fmtPrice(trade.fee) }}</template>
+            <template #cell-actions="{ row: trade }">
+              <button class="text-xs text-text-tertiary hover:text-up" @click="removeTrade(trade.id)">删除</button>
+            </template>
+          </QuTable>
           <p v-if="!trades.length" class="px-4 py-6 text-center text-sm text-text-tertiary">暂无成交记录</p>
         </div>
       </section>

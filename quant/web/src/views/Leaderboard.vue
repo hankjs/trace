@@ -4,6 +4,8 @@ import { api, type LeaderboardItem } from '../api'
 import { loadCatalog, metricName, templateName } from '../catalog'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import { aggregateMetric, fmtPct } from '../format'
 
 const items = ref<LeaderboardItem[]>([])
@@ -42,6 +44,20 @@ function metricClass(v: number | undefined): string {
   if (v === undefined || v === 0) return 'text-text-secondary'
   return v > 0 ? 'text-up' : 'text-down'
 }
+
+const columns = computed<QuTableColumn<LeaderboardItem>[]>(() => [
+  { key: 'rank', label: '#', value: (_item, index) => index + 1, cellClass: 'text-text-tertiary' },
+  { key: 'strategy', label: '策略' },
+  { key: 'scope', label: '范围' },
+  { key: 'period', label: '区间', cellClass: 'whitespace-nowrap text-text-secondary' },
+  { key: 'total-return', label: metricName('total_return'), align: 'right', cellClass: (item) => metricClass(metricNum(item, 'total_return')) },
+  { key: 'annual-return', label: metricName('annual_return'), align: 'right', cellClass: (item) => `font-medium ${metricClass(metricNum(item, 'annual_return'))}` },
+  { key: 'max-drawdown', label: metricName('max_drawdown'), align: 'right', cellClass: 'text-down' },
+  { key: 'sharpe', label: metricName('sharpe'), align: 'right' },
+  { key: 'win-rate', label: metricName('win_rate'), align: 'right' },
+  { key: 'run-at', label: '评估时间', cellClass: 'whitespace-nowrap text-xs text-text-tertiary' },
+  { key: 'actions', label: '', align: 'right', cellClass: 'text-xs text-text-tertiary' },
+])
 
 function rowKey(it: LeaderboardItem): string {
   return `${it.strategy_id}|${it.scope}|${it.start}|${it.end}`
@@ -85,75 +101,48 @@ onMounted(async () => {
     <LoadingRows v-if="loading" :rows="5" />
 
     <div v-else class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
-      <table class="w-full text-sm">
-        <thead>
-          <tr class="border-b border-border text-left text-xs text-text-tertiary">
-            <th class="px-4 py-2 font-medium">#</th>
-            <th class="px-4 py-2 font-medium">策略</th>
-            <th class="px-4 py-2 font-medium">范围</th>
-            <th class="px-4 py-2 font-medium">区间</th>
-            <th class="px-4 py-2 text-right font-medium">{{ metricName('total_return') }}</th>
-            <th class="px-4 py-2 text-right font-medium">{{ metricName('annual_return') }}</th>
-            <th class="px-4 py-2 text-right font-medium">{{ metricName('max_drawdown') }}</th>
-            <th class="px-4 py-2 text-right font-medium">{{ metricName('sharpe') }}</th>
-            <th class="px-4 py-2 text-right font-medium">{{ metricName('win_rate') }}</th>
-            <th class="px-4 py-2 font-medium">评估时间</th>
-            <th class="px-4 py-2 font-medium"></th>
+      <QuTable
+        :data="sorted"
+        :columns="columns"
+        :row-key="rowKey"
+        body-row-class="cursor-pointer border-b border-border-subtle hover:bg-hover"
+        @row-click="toggleExpand"
+      >
+        <template #cell-strategy="{ row: item }">
+          <div class="flex items-center gap-1.5">
+            <span class="font-medium">{{ item.strategy }}</span>
+            <span v-if="!item.is_system" class="rounded bg-active px-1.5 py-0.5 text-[11px] text-accent">自定义</span>
+          </div>
+          <div class="text-[11px] text-text-tertiary">{{ templateName(item.template) }}</div>
+        </template>
+        <template #cell-scope="{ row: item }">
+          <span class="rounded bg-active px-1.5 py-0.5 text-xs text-text-secondary">{{ scopeLabel(item.scope) }}</span>
+        </template>
+        <template #cell-period="{ row: item }">{{ item.start }} ~ {{ item.end }}</template>
+        <template #cell-total-return="{ row: item }">{{ metricText(metricNum(item, 'total_return')) }}</template>
+        <template #cell-annual-return="{ row: item }">{{ metricText(metricNum(item, 'annual_return')) }}</template>
+        <template #cell-max-drawdown="{ row: item }">{{ metricText(metricNum(item, 'max_drawdown')) }}</template>
+        <template #cell-sharpe="{ row: item }">{{ metricText(metricNum(item, 'sharpe'), false) }}</template>
+        <template #cell-win-rate="{ row: item }">{{ metricText(metricNum(item, 'win_rate')) }}</template>
+        <template #cell-run-at="{ row: item }">{{ item.run_at || '--' }}</template>
+        <template #cell-actions="{ row: item }">{{ expanded === rowKey(item) ? '收起 ▲' : '明细 ▼' }}</template>
+        <template #after-row="{ row: item, colspan }">
+          <tr v-if="expanded === rowKey(item)" class="border-b border-border-subtle bg-hover/50">
+            <td :colspan="colspan" class="px-4 py-3">
+              <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
+                <div
+                  v-for="[key, value] in metricEntries(item)"
+                  :key="key"
+                  class="rounded-md border border-border bg-surface-raised p-2"
+                >
+                  <div class="text-xs text-text-tertiary">{{ key }}</div>
+                  <div class="mt-0.5 text-sm font-medium">{{ value }}</div>
+                </div>
+              </div>
+            </td>
           </tr>
-        </thead>
-        <tbody>
-          <template v-for="(it, i) in sorted" :key="rowKey(it)">
-            <tr
-              class="cursor-pointer border-b border-border-subtle hover:bg-hover"
-              @click="toggleExpand(it)"
-            >
-              <td class="px-4 py-2 text-text-tertiary">{{ i + 1 }}</td>
-              <td class="px-4 py-2">
-                <div class="flex items-center gap-1.5">
-                  <span class="font-medium">{{ it.strategy }}</span>
-                  <span v-if="!it.is_system" class="rounded bg-active px-1.5 py-0.5 text-[11px] text-accent">自定义</span>
-                </div>
-                <div class="text-[11px] text-text-tertiary">{{ templateName(it.template) }}</div>
-              </td>
-              <td class="px-4 py-2">
-                <span class="rounded bg-active px-1.5 py-0.5 text-xs text-text-secondary">
-                  {{ scopeLabel(it.scope) }}
-                </span>
-              </td>
-              <td class="px-4 py-2 whitespace-nowrap text-text-secondary">{{ it.start }} ~ {{ it.end }}</td>
-              <td class="px-4 py-2 text-right" :class="metricClass(metricNum(it, 'total_return'))">
-                {{ metricText(metricNum(it, 'total_return')) }}
-              </td>
-              <td class="px-4 py-2 text-right font-medium" :class="metricClass(metricNum(it, 'annual_return'))">
-                {{ metricText(metricNum(it, 'annual_return')) }}
-              </td>
-              <td class="px-4 py-2 text-right text-down">
-                {{ metricText(metricNum(it, 'max_drawdown')) }}
-              </td>
-              <td class="px-4 py-2 text-right">{{ metricText(metricNum(it, 'sharpe'), false) }}</td>
-              <td class="px-4 py-2 text-right">{{ metricText(metricNum(it, 'win_rate')) }}</td>
-              <td class="px-4 py-2 whitespace-nowrap text-xs text-text-tertiary">{{ it.run_at || '--' }}</td>
-              <td class="px-4 py-2 text-right text-xs text-text-tertiary">
-                {{ expanded === rowKey(it) ? '收起 ▲' : '明细 ▼' }}
-              </td>
-            </tr>
-            <tr v-if="expanded === rowKey(it)" class="border-b border-border-subtle bg-hover/50">
-              <td colspan="11" class="px-4 py-3">
-                <div class="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-6">
-                  <div
-                    v-for="[k, v] in metricEntries(it)"
-                    :key="k"
-                    class="rounded-md border border-border bg-surface-raised p-2"
-                  >
-                    <div class="text-xs text-text-tertiary">{{ k }}</div>
-                    <div class="mt-0.5 text-sm font-medium">{{ v }}</div>
-                  </div>
-                </div>
-              </td>
-            </tr>
-          </template>
-        </tbody>
-      </table>
+        </template>
+      </QuTable>
       <p v-if="!items.length" class="px-4 py-6 text-center text-sm text-text-tertiary">
         暂无策略评估数据(定时任务评估后生成)
       </p>

@@ -5,6 +5,8 @@ import { api, type PickItem, type SignalItem, type SnapshotItem } from '../api'
 import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import { fmtPct, fmtPrice, pnlClass } from '../format'
 
 const snapshot = ref<SnapshotItem[]>([])
@@ -14,6 +16,19 @@ const picksDate = ref('')
 const loading = ref(true)
 const error = ref('')
 
+const snapshotColumns: QuTableColumn<SnapshotItem>[] = [
+  { key: 'stock', label: '名称 / 代码', widthClass: 'w-[52%]' },
+  { key: 'price', label: '最新价', align: 'right', widthClass: 'w-[24%]', cellClass: (item) => `font-medium ${pnlClass(item.pct_chg)}` },
+  { key: 'change', label: '涨跌幅', align: 'right', widthClass: 'w-[24%]', cellClass: (item) => `font-medium ${pnlClass(item.pct_chg)}` },
+]
+
+const pickColumns: QuTableColumn<PickItem>[] = [
+  { key: 'rank', label: '排名', widthClass: 'w-[12%]', headerClass: 'w-10', cellClass: 'hidden text-xs font-medium text-text-tertiary sm:table-cell' },
+  { key: 'stock', label: '股票', widthClass: 'w-[43%]' },
+  { key: 'score', label: '评分', align: 'right', widthClass: 'w-[20%]', cellClass: 'font-medium' },
+  { key: 'momentum', label: '20日动量', align: 'right', widthClass: 'w-[25%]', cellClass: (item) => pnlClass(item.factors?.mom20) },
+]
+
 const latestSnapshotTime = computed(() => {
   const values = snapshot.value.map((item) => item.ts).filter((value): value is string => Boolean(value))
   values.sort()
@@ -22,11 +37,25 @@ const latestSnapshotTime = computed(() => {
 
 const researchDate = computed(() => picksDate.value || latestSnapshotTime.value.slice(0, 10) || '等待数据')
 const stockMap = computed(() => Object.fromEntries(snapshot.value.map((item) => [item.code, item.name])))
+const snapshotNotice = computed(() => {
+  const notices: string[] = []
+  const closeCount = snapshot.value.filter((item) => item.source === 'close').length
+  const missingCount = snapshot.value.filter((item) => item.source === null).length
+  if (closeCount) notices.push(`${closeCount} 只使用最近收盘价`)
+  if (missingCount) notices.push(`${missingCount} 只暂无行情`)
+  return notices.join(' · ') || '盘中价格仅供显示'
+})
 
 function sourceLabel(item: SnapshotItem): string {
   if (item.source === 'snapshot') return '快照'
   if (item.source === 'close') return '收盘'
   return '缺失'
+}
+
+function sourceBadgeClass(item: SnapshotItem): string {
+  return item.source === 'close'
+    ? 'bg-surface-muted text-text-secondary'
+    : 'bg-warning-soft text-warning'
 }
 
 function displayName(signal: SignalItem): string {
@@ -70,88 +99,94 @@ onMounted(load)
 </script>
 
 <template>
-  <div class="space-y-3">
-    <header class="flex min-h-10 flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
+  <div class="flex min-h-full flex-col gap-3 xl:h-full xl:min-h-0">
+    <header class="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
       <div class="flex min-w-0 items-baseline gap-3">
         <h1 class="text-base font-semibold">行情总览</h1>
         <span class="hidden text-xs text-text-tertiary sm:inline">研究基准 {{ researchDate }}</span>
       </div>
-      <div class="flex items-center gap-1.5 overflow-x-auto">
-        <router-link to="/selection?tab=picks" class="workspace-command">
+      <div class="grid w-full grid-cols-2 gap-1.5 sm:flex sm:w-auto sm:flex-wrap sm:justify-end">
+        <router-link to="/selection?tab=picks" class="workspace-command justify-center">
           <ListFilter :size="14" /> 系统选股
         </router-link>
-        <router-link to="/signals" class="workspace-command">
+        <router-link to="/signals" class="workspace-command justify-center">
           <Bell :size="14" /> 全部提醒
         </router-link>
-        <router-link to="/strategies?tab=backtest" class="workspace-command">
+        <router-link to="/strategies?tab=backtest" class="workspace-command justify-center">
           <FlaskConical :size="14" /> 策略回测
         </router-link>
-        <button type="button" class="icon-button !h-8 !w-8" title="刷新盘面" :disabled="loading" @click="load">
+        <button type="button" class="workspace-command justify-center" title="刷新盘面" :disabled="loading" @click="load">
           <RefreshCw :size="15" :class="loading ? 'animate-spin' : ''" />
-          <span class="sr-only">刷新盘面</span>
+          <span>刷新</span>
         </button>
       </div>
     </header>
 
-    <InlineFeedback v-if="error" tone="warning">{{ error }}</InlineFeedback>
+    <InlineFeedback v-if="error" class="shrink-0" tone="warning">{{ error }}</InlineFeedback>
     <LoadingRows v-if="loading" :rows="8" />
 
     <template v-else>
-      <dl class="grid grid-cols-2 overflow-hidden border border-border bg-surface-raised xl:grid-cols-4">
-        <div class="flex min-h-14 items-center justify-between gap-3 border-b border-r border-border-subtle px-3 py-2 xl:border-b-0">
+      <dl class="grid shrink-0 grid-cols-2 overflow-hidden border border-border bg-surface-raised xl:grid-cols-4">
+        <div class="flex min-h-14 flex-col items-start justify-center gap-0.5 border-b border-r border-border-subtle px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3 xl:border-b-0">
           <dt class="text-xs text-text-tertiary">数据基准</dt>
           <dd class="text-sm font-semibold">{{ researchDate }}</dd>
         </div>
-        <div class="flex min-h-14 items-center justify-between gap-3 border-b border-border-subtle px-3 py-2 xl:border-b-0 xl:border-r">
+        <div class="flex min-h-14 flex-col items-start justify-center gap-0.5 border-b border-border-subtle px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3 xl:border-b-0 xl:border-r">
           <dt class="text-xs text-text-tertiary">自选行情</dt>
           <dd class="text-sm font-semibold">{{ snapshot.length }} <span class="font-normal text-text-tertiary">只</span></dd>
         </div>
-        <div class="flex min-h-14 items-center justify-between gap-3 border-r border-border-subtle px-3 py-2">
+        <div class="flex min-h-14 flex-col items-start justify-center gap-0.5 border-r border-border-subtle px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
           <dt class="text-xs text-text-tertiary">系统候选</dt>
           <dd class="text-sm font-semibold">{{ picks.length }} <span class="font-normal text-text-tertiary">只</span></dd>
         </div>
-        <div class="flex min-h-14 items-center justify-between gap-3 px-3 py-2">
+        <div class="flex min-h-14 flex-col items-start justify-center gap-0.5 px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
           <dt class="text-xs text-text-tertiary">近期提示</dt>
           <dd class="text-sm font-semibold">{{ signals.length }} <span class="font-normal text-text-tertiary">条</span></dd>
         </div>
       </dl>
 
-      <div class="grid items-start gap-3 xl:grid-cols-[minmax(420px,1.25fr)_minmax(330px,0.9fr)] 2xl:grid-cols-[minmax(390px,1.08fr)_minmax(320px,0.88fr)_minmax(340px,1fr)]">
-        <section class="terminal-panel xl:row-span-2 2xl:row-span-1" aria-labelledby="watch-heading">
-          <div class="terminal-panel-header">
-            <div class="flex items-baseline gap-2">
+      <div class="grid items-stretch gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(420px,1.25fr)_minmax(330px,0.9fr)] xl:grid-rows-2 2xl:grid-cols-[minmax(390px,1.08fr)_minmax(320px,0.88fr)_minmax(340px,1fr)] 2xl:grid-rows-1">
+        <section class="terminal-panel flex min-h-0 min-w-0 flex-col xl:row-span-2 2xl:row-span-1" aria-labelledby="watch-heading">
+          <div class="terminal-panel-header shrink-0 flex-wrap">
+            <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
               <h2 id="watch-heading" class="text-sm font-semibold">自选行情</h2>
               <span class="text-[11px] text-text-tertiary">{{ latestSnapshotTime || '尚无行情时间' }}</span>
             </div>
-            <span class="text-[11px] text-text-tertiary">盘中价格仅供显示</span>
-            <router-link to="/watchlist" class="text-[11px] text-accent hover:underline">管理自选</router-link>
+            <span class="order-3 w-full text-[11px] text-text-tertiary sm:order-none sm:w-auto">{{ snapshotNotice }}</span>
+            <router-link to="/watchlist" class="shrink-0 text-[11px] text-accent hover:underline">管理自选</router-link>
           </div>
-          <div v-if="snapshot.length" class="max-h-[calc(100vh-214px)] overflow-auto">
-            <table class="terminal-table min-w-[510px]">
-              <thead>
-                <tr class="text-left">
-                  <th>名称 / 代码</th>
-                  <th>来源</th>
-                  <th class="text-right">最新价</th>
-                  <th class="text-right">涨跌幅</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="item in snapshot" :key="item.code">
-                  <td>
-                    <router-link :to="`/stock/${item.code}`" class="font-medium hover:text-accent">{{ item.name || '名称待同步' }}</router-link>
-                    <span class="ml-2 text-[11px] text-text-tertiary">{{ item.code }}</span>
-                  </td>
-                  <td class="text-xs text-text-tertiary">{{ sourceLabel(item) }}</td>
-                  <td class="text-right font-medium" :class="pnlClass(item.pct_chg)">{{ fmtPrice(item.price) }}</td>
-                  <td class="text-right font-medium" :class="pnlClass(item.pct_chg)">
-                    {{ item.pct_chg === null ? '--' : fmtPct(item.pct_chg / 100) }}
-                  </td>
-                </tr>
-              </tbody>
-            </table>
+          <div v-if="snapshot.length" class="min-h-0 overflow-auto xl:flex-1">
+            <QuTable
+              :data="snapshot"
+              :columns="snapshotColumns"
+              row-key="code"
+              class="terminal-table dashboard-market-table dashboard-market-table--snapshot table-fixed"
+              header-row-class="text-left"
+              body-row-class=""
+            >
+              <template #cell-stock="{ row: item }">
+                <router-link :to="`/stock/${item.code}`" class="block truncate font-medium hover:text-accent">{{ item.name || '名称待同步' }}</router-link>
+                <div class="mt-0.5 text-[11px] text-text-tertiary">{{ item.code }}</div>
+              </template>
+              <template #cell-price="{ row: item }">
+                <div class="flex items-center justify-end gap-1.5">
+                  <span
+                    v-if="item.source !== 'snapshot'"
+                    class="rounded px-1 py-0.5 text-[10px] font-normal leading-none"
+                    :class="sourceBadgeClass(item)"
+                  >
+                    {{ sourceLabel(item) }}
+                  </span>
+                  <span>{{ fmtPrice(item.price) }}</span>
+                </div>
+              </template>
+              <template #cell-change="{ row: item }">
+                <span class="mr-1 font-normal text-text-tertiary sm:hidden">涨跌</span>
+                {{ item.pct_chg === null ? '--' : fmtPct(item.pct_chg / 100) }}
+              </template>
+            </QuTable>
           </div>
-          <div v-else class="px-4 py-12 text-center">
+          <div v-else class="flex min-h-32 flex-col items-center justify-center px-4 py-12 text-center xl:flex-1">
             <p class="text-sm text-text-secondary">暂无自选行情</p>
             <router-link to="/watchlist" class="mt-2 inline-flex items-center gap-1 text-xs text-accent hover:underline">
               去添加自选股 <ArrowRight :size="13" />
@@ -159,52 +194,53 @@ onMounted(load)
           </div>
         </section>
 
-        <section class="terminal-panel" aria-labelledby="picks-heading">
-          <div class="terminal-panel-header">
+        <section class="terminal-panel flex min-h-0 min-w-0 flex-col" aria-labelledby="picks-heading">
+          <div class="terminal-panel-header shrink-0">
             <div class="flex items-baseline gap-2">
               <h2 id="picks-heading" class="text-sm font-semibold">系统候选</h2>
               <span class="text-[11px] text-text-tertiary">{{ picksDate || '尚未生成' }}</span>
             </div>
             <router-link to="/selection?tab=picks" class="text-xs text-accent hover:underline">完整列表</router-link>
           </div>
-          <div v-if="picks.length" class="max-h-[330px] overflow-auto 2xl:max-h-[calc(100vh-214px)]">
-            <table class="terminal-table min-w-[380px]">
-              <thead>
-                <tr class="text-left">
-                  <th class="w-10">排名</th>
-                  <th>股票</th>
-                  <th class="text-right">评分</th>
-                  <th class="text-right">20日动量</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="pick in picks" :key="pick.code">
-                  <td class="text-xs font-medium text-text-tertiary">{{ pick.rank }}</td>
-                  <td>
-                    <router-link :to="`/stock/${pick.code}`" class="font-medium hover:text-accent">{{ pick.name || '名称待同步' }}</router-link>
-                    <div class="mt-0.5 flex items-center gap-1.5 text-[11px] text-text-tertiary">
-                      <span>{{ pick.code }}</span>
-                      <span v-if="pick.change === 'new'" class="bg-up/10 px-1 text-up">新进</span>
-                    </div>
-                  </td>
-                  <td class="text-right font-medium">{{ pick.score?.toFixed(3) ?? '--' }}</td>
-                  <td class="text-right" :class="pnlClass(pick.factors?.mom20)">{{ fmtPct(pick.factors?.mom20) }}</td>
-                </tr>
-              </tbody>
-            </table>
+          <div v-if="picks.length" class="min-h-0 overflow-auto xl:flex-1">
+            <QuTable
+              :data="picks"
+              :columns="pickColumns"
+              row-key="code"
+              class="terminal-table dashboard-market-table dashboard-market-table--picks table-fixed"
+              header-row-class="text-left"
+              body-row-class=""
+            >
+              <template #cell-stock="{ row: pick }">
+                <router-link :to="`/stock/${pick.code}`" class="block truncate font-medium hover:text-accent">{{ pick.name || '名称待同步' }}</router-link>
+                <div class="mt-0.5 flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px] text-text-tertiary">
+                  <span>{{ pick.code }}</span>
+                  <span class="sm:hidden">第 {{ pick.rank }} 名</span>
+                  <span v-if="pick.change === 'new'" class="bg-up/10 px-1 text-up">新进</span>
+                </div>
+              </template>
+              <template #cell-score="{ row: pick }">
+                <span class="mr-1 font-normal text-text-tertiary sm:hidden">评分</span>
+                {{ pick.score?.toFixed(3) ?? '--' }}
+              </template>
+              <template #cell-momentum="{ row: pick }">
+                <span class="mr-1 text-text-tertiary sm:hidden">20日</span>
+                {{ fmtPct(pick.factors?.mom20) }}
+              </template>
+            </QuTable>
           </div>
-          <div v-else class="px-4 py-10 text-center text-sm text-text-tertiary">该研究日暂无系统候选</div>
+          <div v-else class="flex min-h-32 items-center justify-center px-4 py-10 text-center text-sm text-text-tertiary xl:flex-1">该研究日暂无系统候选</div>
         </section>
 
-        <section class="terminal-panel" aria-labelledby="signal-heading">
-          <div class="terminal-panel-header">
+        <section class="terminal-panel flex min-h-0 min-w-0 flex-col" aria-labelledby="signal-heading">
+          <div class="terminal-panel-header shrink-0">
             <div class="flex items-baseline gap-2">
               <h2 id="signal-heading" class="text-sm font-semibold">策略提示</h2>
               <span class="text-[11px] text-text-tertiary">状态变化，不是交易指令</span>
             </div>
             <router-link to="/signals" class="text-xs text-accent hover:underline">全部提示</router-link>
           </div>
-          <div v-if="signals.length" class="max-h-[360px] divide-y divide-border-subtle overflow-auto 2xl:max-h-[calc(100vh-214px)]">
+          <div v-if="signals.length" class="min-h-0 divide-y divide-border-subtle overflow-auto xl:flex-1">
             <article v-for="signal in signals" :key="signal.id" class="px-3 py-2.5 hover:bg-hover">
               <div class="flex items-start gap-2">
                 <div class="min-w-0 flex-1">
@@ -226,9 +262,82 @@ onMounted(load)
               </p>
             </article>
           </div>
-          <div v-else class="px-4 py-10 text-center text-sm text-text-tertiary">暂无策略状态变化</div>
+          <div v-else class="flex min-h-32 items-center justify-center px-4 py-10 text-center text-sm text-text-tertiary xl:flex-1">暂无策略状态变化</div>
         </section>
       </div>
     </template>
   </div>
 </template>
+
+<style scoped>
+@media (max-width: 639px) {
+  .dashboard-market-table,
+  .dashboard-market-table :deep(tbody) {
+    display: block;
+    min-width: 0;
+    width: 100%;
+  }
+
+  .dashboard-market-table :deep(colgroup),
+  .dashboard-market-table :deep(thead) {
+    display: none;
+  }
+
+  .dashboard-market-table :deep(tr) {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      "stock primary"
+      "stock secondary";
+    align-items: center;
+    border-top: 1px solid var(--color-border-subtle);
+  }
+
+  .dashboard-market-table :deep(tr:first-child) {
+    border-top: 0;
+  }
+
+  .dashboard-market-table :deep(td) {
+    min-width: 0;
+    border-top: 0;
+  }
+
+  .dashboard-market-table--picks :deep(td:nth-child(1)) {
+    display: none;
+  }
+
+  .dashboard-market-table--picks :deep(td:nth-child(2)) {
+    grid-area: stock;
+    padding: 0.65rem 0.5rem 0.65rem 0.75rem;
+  }
+
+  .dashboard-market-table--picks :deep(td:nth-child(3)) {
+    grid-area: primary;
+    padding: 0.55rem 0.75rem 0.1rem 0.5rem;
+    white-space: nowrap;
+  }
+
+  .dashboard-market-table--picks :deep(td:nth-child(4)) {
+    grid-area: secondary;
+    padding: 0.1rem 0.75rem 0.55rem 0.5rem;
+    white-space: nowrap;
+  }
+
+  .dashboard-market-table--snapshot :deep(td:nth-child(1)) {
+    grid-area: stock;
+    padding: 0.65rem 0.5rem 0.65rem 0.75rem;
+  }
+
+  .dashboard-market-table--snapshot :deep(td:nth-child(2)) {
+    grid-area: primary;
+    padding: 0.55rem 0.75rem 0.1rem 0.5rem;
+    white-space: nowrap;
+  }
+
+  .dashboard-market-table--snapshot :deep(td:nth-child(3)) {
+    grid-area: secondary;
+    padding: 0.1rem 0.75rem 0.55rem 0.5rem;
+    white-space: nowrap;
+  }
+}
+</style>

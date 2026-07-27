@@ -6,6 +6,8 @@ import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import PageHeader from '../components/PageHeader.vue'
+import QuTable from '../components/QuTable.vue'
+import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import StrategySelect from '../components/StrategySelect.vue'
 import { fmtPrice } from '../format'
@@ -19,6 +21,15 @@ const fCode = ref('')
 /** null = 全部策略 */
 const fStrategyId = ref<number | null>(null)
 const fSide = ref('')
+
+const signalColumns: QuTableColumn<SignalItem>[] = [
+  { key: 'date', label: '日期', cellClass: 'whitespace-nowrap text-text-secondary' },
+  { key: 'stock', label: '股票' },
+  { key: 'strategy', label: '策略' },
+  { key: 'side', label: '提示' },
+  { key: 'price', label: '参考价格', align: 'right', cellClass: 'tabular-nums' },
+  { key: 'reason', label: '为什么出现', cellClass: 'max-w-md text-xs leading-5 text-text-secondary' },
+]
 
 async function load() {
   loading.value = true
@@ -104,42 +115,34 @@ onMounted(async () => {
     <LoadingRows v-if="loading" :rows="5" />
 
     <div v-else-if="items.length" class="overflow-x-auto rounded-md border border-border bg-surface-raised">
-      <table class="w-full min-w-[860px] text-sm">
-        <thead>
-          <tr class="border-b border-border text-left text-xs text-text-tertiary">
-            <th class="px-4 py-2.5 font-medium">日期</th>
-            <th class="px-4 py-2.5 font-medium">股票</th>
-            <th class="px-4 py-2.5 font-medium">策略</th>
-            <th class="px-4 py-2.5 font-medium">提示</th>
-            <th class="px-4 py-2.5 text-right font-medium">参考价格</th>
-            <th class="px-4 py-2.5 font-medium">为什么出现</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="signal in items" :key="signal.id" class="border-b border-border-subtle last:border-0 hover:bg-hover">
-            <td class="whitespace-nowrap px-4 py-3 text-text-secondary">{{ signal.date }}</td>
-            <td class="px-4 py-3">
-              <router-link :to="`/stock/${signal.code}`" class="font-medium hover:text-accent">{{ nameOf(signal) }}</router-link>
-              <div class="mt-0.5 text-xs text-text-tertiary">{{ signal.code }}</div>
-            </td>
-            <td class="px-4 py-3">
-              <div class="flex items-center gap-1.5">
-                <span>{{ strategyLabel(signal) }}</span>
-                <span v-if="signal.is_system === false" class="rounded bg-active px-1.5 py-0.5 text-[11px] text-accent">自定义</span>
-              </div>
-              <div class="mt-0.5 text-[11px] text-text-tertiary">{{ templateLabel(signal) }}</div>
-            </td>
-            <td class="px-4 py-3">
-              <span class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-1 text-xs font-medium" :class="sideClass(signal.side)">
-                <span class="h-1.5 w-1.5 rounded-full bg-current" />
-                {{ sideLabel(signal) }}
-              </span>
-            </td>
-            <td class="px-4 py-3 text-right tabular-nums">{{ fmtPrice(signal.price) }}</td>
-            <td class="max-w-md px-4 py-3 text-xs leading-5 text-text-secondary">{{ reasonText(signal.reason, signal.reason_text) }}</td>
-          </tr>
-        </tbody>
-      </table>
+      <QuTable
+        :data="items"
+        :columns="signalColumns"
+        row-key="id"
+        class="min-w-[860px]"
+        header-cell-class="px-4 py-2.5 font-medium"
+        body-cell-class="px-4 py-3"
+      >
+        <template #cell-stock="{ row: signal }">
+          <router-link :to="`/stock/${signal.code}`" class="font-medium hover:text-accent">{{ nameOf(signal) }}</router-link>
+          <div class="mt-0.5 text-xs text-text-tertiary">{{ signal.code }}</div>
+        </template>
+        <template #cell-strategy="{ row: signal }">
+          <div class="flex items-center gap-1.5">
+            <span>{{ strategyLabel(signal) }}</span>
+            <span v-if="signal.is_system === false" class="rounded bg-active px-1.5 py-0.5 text-[11px] text-accent">自定义</span>
+          </div>
+          <div class="mt-0.5 text-[11px] text-text-tertiary">{{ templateLabel(signal) }}</div>
+        </template>
+        <template #cell-side="{ row: signal }">
+          <span class="inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-2 py-1 text-xs font-medium" :class="sideClass(signal.side)">
+            <span class="h-1.5 w-1.5 rounded-full bg-current" />
+            {{ sideLabel(signal) }}
+          </span>
+        </template>
+        <template #cell-price="{ row: signal }">{{ fmtPrice(signal.price) }}</template>
+        <template #cell-reason="{ row: signal }">{{ reasonText(signal.reason, signal.reason_text) }}</template>
+      </QuTable>
     </div>
 
     <div v-else class="rounded-md border border-dashed border-border px-5 py-10 text-center">
