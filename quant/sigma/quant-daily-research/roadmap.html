@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A Stock Daily Research - Learning Roadmap</title>
+  <style>
+    :root {
+      --bg: #080b0b;
+      --surface: rgba(255, 255, 255, 0.035);
+      --surface-hover: rgba(255, 255, 255, 0.07);
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #edf4f1;
+      --text-secondary: rgba(237, 244, 241, 0.62);
+      --text-tertiary: rgba(237, 244, 241, 0.34);
+      --accent-1: #2dd4bf;
+      --accent-2: #84cc16;
+      --accent-gradient: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --font-mono: "SF Mono", "Fira Code", "JetBrains Mono", monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --radius: 8px;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      min-height: 100vh;
+      margin: 0;
+      padding: 40px 20px;
+      color: var(--text);
+      font-family: var(--font-sans);
+      background:
+        radial-gradient(circle at 12% 8%, rgba(45, 212, 191, 0.10), transparent 30%),
+        radial-gradient(circle at 86% 90%, rgba(132, 204, 22, 0.07), transparent 28%),
+        var(--bg);
+    }
+
+    main { width: min(720px, 100%); margin: 0 auto; }
+
+    header {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 92px;
+      align-items: center;
+      gap: 24px;
+      padding-bottom: 28px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .eyebrow {
+      margin: 0 0 8px;
+      color: var(--accent-1);
+      font: 600 12px/1 var(--font-mono);
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(25px, 5vw, 36px);
+      line-height: 1.18;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 10px 0 0;
+      color: var(--text-secondary);
+      font-size: 14px;
+      line-height: 1.7;
+    }
+
+    .chips { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 16px; }
+    .chip {
+      padding: 5px 8px;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      color: var(--text-secondary);
+      background: var(--surface);
+      font: 11px/1.2 var(--font-mono);
+    }
+
+    .ring { position: relative; width: 88px; height: 88px; }
+    .ring svg { width: 100%; height: 100%; transform: rotate(-90deg); }
+    .ring circle { fill: none; stroke-width: 7; }
+    .ring .track { stroke: var(--border); }
+    .ring .value { stroke: url(#gradient); stroke-linecap: round; stroke-dasharray: 239; stroke-dashoffset: 239; }
+    .ring-label { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
+    .ring-label strong { font-size: 20px; }
+    .ring-label span { color: var(--text-tertiary); font-size: 9px; }
+
+    .timeline {
+      --mastered-pct: 0%;
+      position: relative;
+      display: grid;
+      gap: 12px;
+      margin-top: 26px;
+      padding-left: 30px;
+    }
+
+    .timeline::before {
+      content: "";
+      position: absolute;
+      top: 22px;
+      bottom: 22px;
+      left: 8px;
+      width: 2px;
+      background: linear-gradient(to bottom, var(--accent-1) 0 var(--mastered-pct), var(--border) var(--mastered-pct) 100%);
+    }
+
+    .node {
+      position: relative;
+      min-height: 86px;
+      padding: 15px 16px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      backdrop-filter: blur(12px);
+      transition: transform 180ms cubic-bezier(.4, 0, .2, 1), background 180ms cubic-bezier(.4, 0, .2, 1);
+    }
+
+    .node:hover { transform: translateY(-1px); background: var(--surface-hover); }
+    .node::before {
+      content: "";
+      position: absolute;
+      top: 19px;
+      left: -28px;
+      width: 11px;
+      height: 11px;
+      border: 2px solid rgba(237, 244, 241, 0.22);
+      border-radius: 50%;
+      background: var(--bg);
+    }
+
+    .node.active { border-color: rgba(45, 212, 191, 0.50); background: rgba(45, 212, 191, 0.065); }
+    .node.active::before { border-color: var(--accent-1); box-shadow: 0 0 0 5px rgba(45, 212, 191, 0.11); animation: pulse 2s infinite; }
+    .node.upcoming { opacity: 0.57; }
+
+    .node-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+    .number { color: var(--text-tertiary); font: 11px/1.4 var(--font-mono); }
+    h2 { margin: 3px 0 0; font-size: 15px; line-height: 1.4; letter-spacing: 0; }
+    .node p { margin: 7px 0 0; color: var(--text-secondary); font-size: 12px; line-height: 1.55; }
+    .badge { flex: 0 0 auto; padding: 4px 7px; border-radius: 4px; font: 10px/1 var(--font-mono); }
+    .active .badge { color: var(--accent-1); background: rgba(45, 212, 191, 0.12); }
+    .upcoming .badge { color: var(--text-secondary); background: var(--surface-hover); }
+
+    footer { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }
+    .progress-copy { display: flex; justify-content: space-between; color: var(--text-secondary); font-size: 12px; }
+    .bar { height: 5px; margin-top: 9px; overflow: hidden; border-radius: 3px; background: var(--border); }
+    .bar span { display: block; width: 0%; height: 100%; background: var(--accent-gradient); }
+    .note { margin: 14px 0 0; color: var(--text-tertiary); font-size: 11px; line-height: 1.55; }
+
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 0 0 4px rgba(45, 212, 191, 0.08); }
+      50% { box-shadow: 0 0 0 7px rgba(45, 212, 191, 0.15); }
+    }
+
+    @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+    @media (max-width: 480px) {
+      body { padding: 24px 14px; }
+      header { grid-template-columns: 1fr; }
+      .ring { display: none; }
+      .timeline { padding-left: 25px; }
+      .node::before { left: -23px; }
+      .node-top { align-items: center; }
+    }
+  </style>
+</head>
+<body>
+  <svg style="position:absolute;width:0;height:0" aria-hidden="true">
+    <defs>
+      <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="var(--accent-1)"/>
+        <stop offset="100%" stop-color="var(--accent-2)"/>
+      </linearGradient>
+    </defs>
+  </svg>
+  <main>
+    <header>
+      <div>
+        <p class="eyebrow">User Story Learning Path</p>
+        <h1>A Stock Daily Research System</h1>
+        <p class="subtitle">Follow one investor from the post-close review to a manual decision, learning one judgment at a time.</p>
+        <div class="chips">
+          <span class="chip">Beginner</span>
+          <span class="chip">6 scenes</span>
+          <span class="chip">Current: Scene 1</span>
+        </div>
+      </div>
+      <div class="ring" aria-label="0 percent complete">
+        <svg viewBox="0 0 88 88"><circle class="track" cx="44" cy="44" r="38"/><circle class="value" cx="44" cy="44" r="38"/></svg>
+        <div class="ring-label"><strong>0%</strong><span>mastered</span></div>
+      </div>
+    </header>
+
+    <section class="timeline" aria-label="Learning roadmap">
+      <article class="node active">
+        <div class="node-top"><div><span class="number">SCENE 01 · 75%</span><h2>First check the data clock</h2></div><span class="badge">IN PROGRESS</span></div>
+        <p>Distinguish the research date, intraday snapshot time, and the moment when candidates are generated.</p>
+      </article>
+      <article class="node upcoming">
+        <div class="node-top"><div><span class="number">SCENE 02</span><h2>Read a system candidate</h2></div><span class="badge">UPCOMING</span></div>
+        <p>Understand ranking, composite score, momentum, RSI, volume ratio, and new-entry status.</p>
+      </article>
+      <article class="node upcoming">
+        <div class="node-top"><div><span class="number">SCENE 03</span><h2>Research one stock</h2></div><span class="badge">UPCOMING</span></div>
+        <p>Connect candlesticks, moving averages, volume, and strategy state changes without treating them as orders.</p>
+      </article>
+      <article class="node upcoming">
+        <div class="node-top"><div><span class="number">SCENE 04</span><h2>Build your own screen</h2></div><span class="badge">UPCOMING</span></div>
+        <p>Choose a stock pool, combine conditions, inspect independent hit counts, and notice missing coverage.</p>
+      </article>
+      <article class="node upcoming">
+        <div class="node-top"><div><span class="number">SCENE 05</span><h2>Challenge a strategy with history</h2></div><span class="badge">UPCOMING</span></div>
+        <p>Compare return with drawdown, win rate, turnover, costs, and possible look-ahead bias.</p>
+      </article>
+      <article class="node upcoming">
+        <div class="node-top"><div><span class="number">SCENE 06</span><h2>Decide and review manually</h2></div><span class="badge">UPCOMING</span></div>
+        <p>Use watchlists and the trade ledger to record external decisions while keeping research separate from execution.</p>
+      </article>
+    </section>
+
+    <footer>
+      <div class="progress-copy"><span>Overall progress</span><strong>0 / 6 mastered</strong></div>
+      <div class="bar"><span></span></div>
+      <p class="note">The next scene unlocks after you can apply the current idea to a new situation.</p>
+    </footer>
+  </main>
+</body>
+</html>

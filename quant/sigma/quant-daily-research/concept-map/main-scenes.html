@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A Stock Research Workflow Concept Map</title>
+  <link rel="stylesheet" href="https://esm.sh/@excalidraw/excalidraw@0.18.0/dist/dev/index.css">
+  <script>window.EXCALIDRAW_ASSET_PATH = "https://esm.sh/@excalidraw/excalidraw@0.18.0/dist/prod/";</script>
+  <script type="importmap">
+    {"imports":{"react":"https://esm.sh/react@19.0.0","react/jsx-runtime":"https://esm.sh/react@19.0.0/jsx-runtime","react-dom":"https://esm.sh/react-dom@19.0.0","react-dom/client":"https://esm.sh/react-dom@19.0.0/client"}}
+  </script>
+  <style>* { margin: 0; padding: 0; box-sizing: border-box; } html, body, #app { width: 100%; height: 100%; }</style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import React from "https://esm.sh/react@19.0.0";
+    import { createRoot } from "https://esm.sh/react-dom@19.0.0/client";
+    import * as ExcalidrawLib from "https://esm.sh/@excalidraw/excalidraw@0.18.0/dist/dev/index.js?external=react,react-dom";
+    const { Excalidraw, convertToExcalidrawElements } = ExcalidrawLib;
+
+    const elementsData = [
+      { type: "text", x: 380, y: 25, width: 440, text: "A Stock Daily Research: Six User Stories", fontSize: 28, fontFamily: 2, textAlign: "center", strokeColor: "#212529" },
+      { type: "rectangle", x: 40, y: 125, width: 190, height: 92, backgroundColor: "#99e9f2", strokeColor: "#0c8599", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 60, y: 148, width: 150, text: "1  Data clock\nWhat date is this?", fontSize: 18, fontFamily: 2, textAlign: "center", strokeColor: "#0b5964" },
+      { type: "arrow", x: 230, y: 171, width: 62, height: 0, strokeColor: "#495057", strokeWidth: 2, roughness: 0 },
+      { type: "rectangle", x: 292, y: 125, width: 190, height: 92, backgroundColor: "#e9ecef", strokeColor: "#495057", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 312, y: 148, width: 150, text: "2  Candidates\nWhy was it selected?", fontSize: 18, fontFamily: 2, textAlign: "center", strokeColor: "#343a40" },
+      { type: "arrow", x: 482, y: 171, width: 62, height: 0, strokeColor: "#495057", strokeWidth: 2, roughness: 0 },
+      { type: "rectangle", x: 544, y: 125, width: 190, height: 92, backgroundColor: "#e9ecef", strokeColor: "#495057", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 564, y: 148, width: 150, text: "3  One stock\nWhat state is it in?", fontSize: 18, fontFamily: 2, textAlign: "center", strokeColor: "#343a40" },
+      { type: "arrow", x: 734, y: 171, width: 62, height: 0, strokeColor: "#495057", strokeWidth: 2, roughness: 0 },
+      { type: "rectangle", x: 796, y: 125, width: 190, height: 92, backgroundColor: "#e9ecef", strokeColor: "#495057", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 816, y: 148, width: 150, text: "4  My screen\nWhat fits my criteria?", fontSize: 18, fontFamily: 2, textAlign: "center", strokeColor: "#343a40" },
+      { type: "arrow", x: 986, y: 171, width: 62, height: 0, strokeColor: "#495057", strokeWidth: 2, roughness: 0 },
+      { type: "rectangle", x: 1048, y: 125, width: 190, height: 92, backgroundColor: "#e9ecef", strokeColor: "#495057", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 1068, y: 148, width: 150, text: "5  Backtest\nDid it survive history?", fontSize: 18, fontFamily: 2, textAlign: "center", strokeColor: "#343a40" },
+      { type: "arrow", x: 1238, y: 171, width: 62, height: 0, strokeColor: "#495057", strokeWidth: 2, roughness: 0 },
+      { type: "rectangle", x: 1300, y: 125, width: 190, height: 92, backgroundColor: "#e9ecef", strokeColor: "#495057", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 1320, y: 148, width: 150, text: "6  Manual decision\nWhat will I do?", fontSize: 18, fontFamily: 2, textAlign: "center", strokeColor: "#343a40" },
+
+      { type: "rectangle", x: 292, y: 320, width: 442, height: 150, backgroundColor: "#b2f2bb", strokeColor: "#2f9e44", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 328, y: 342, width: 370, text: "Evidence layer\nCandlesticks  +  factors  +  fundamentals\n+  structured signal reasons", fontSize: 20, fontFamily: 2, textAlign: "center", strokeColor: "#246b36" },
+      { type: "arrow", x: 515, y: 320, width: 123, height: -103, strokeColor: "#2f9e44", strokeWidth: 2, roughness: 0 },
+      { type: "arrow", x: 630, y: 320, width: 260, height: -103, strokeColor: "#2f9e44", strokeWidth: 2, roughness: 0 },
+
+      { type: "rectangle", x: 796, y: 320, width: 442, height: 150, backgroundColor: "#ffec99", strokeColor: "#f08c00", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 832, y: 342, width: 370, text: "Validation layer\nStock pool  +  condition coverage\n+  return / drawdown / costs / bias", fontSize: 20, fontFamily: 2, textAlign: "center", strokeColor: "#8a4b00" },
+      { type: "arrow", x: 902, y: 320, width: -10, height: -103, strokeColor: "#f08c00", strokeWidth: 2, roughness: 0 },
+      { type: "arrow", x: 1112, y: 320, width: 31, height: -103, strokeColor: "#f08c00", strokeWidth: 2, roughness: 0 },
+
+      { type: "rectangle", x: 544, y: 570, width: 442, height: 128, backgroundColor: "#ffc9c9", strokeColor: "#e03131", fillStyle: "solid", strokeWidth: 2, roughness: 0, roundness: { type: 3 } },
+      { type: "text", x: 584, y: 592, width: 362, text: "Product boundary\nThe system provides research and simulation.\nYou decide and trade externally.", fontSize: 20, fontFamily: 2, textAlign: "center", strokeColor: "#9d2525" },
+      { type: "arrow", x: 986, y: 635, width: 315, height: -418, strokeColor: "#e03131", strokeWidth: 2, roughness: 0 }
+    ];
+
+    const elements = convertToExcalidrawElements(elementsData);
+    function App() {
+      return React.createElement("div", { style: { width: "100%", height: "100%" } }, React.createElement(Excalidraw, {
+        initialData: { elements, appState: { viewBackgroundColor: "#f8f9fa" } },
+        langCode: "zh-CN",
+        viewModeEnabled: true,
+        zenModeEnabled: true
+      }));
+    }
+    createRoot(document.getElementById("app")).render(React.createElement(App));
+  </script>
+</body>
+</html>
