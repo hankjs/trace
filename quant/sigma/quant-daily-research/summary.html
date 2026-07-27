@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>A股日频研究系统 - 结课总结</title>
+  <style>
+    :root {
+      --bg: #080b0b;
+      --surface: rgba(255,255,255,0.04);
+      --surface-hover: rgba(255,255,255,0.08);
+      --border: rgba(255,255,255,0.08);
+      --text: #edf4f1;
+      --text-secondary: rgba(237,244,241,0.62);
+      --text-tertiary: rgba(237,244,241,0.35);
+      --accent-1: #2dd4bf;
+      --accent-2: #84cc16;
+      --accent-gradient: linear-gradient(135deg, var(--accent-1), var(--accent-2));
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #f87171;
+      --font-mono: "SF Mono", "Fira Code", monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --radius: 8px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      margin: 0;
+      padding: 38px 18px;
+      color: var(--text);
+      font-family: var(--font-sans);
+      background: radial-gradient(circle at 12% 8%, rgba(45,212,191,.10), transparent 30%), radial-gradient(circle at 88% 90%, rgba(132,204,22,.07), transparent 28%), var(--bg);
+    }
+    main { width: min(720px, 100%); margin: 0 auto; }
+    header { padding-bottom: 22px; border-bottom: 1px solid var(--border); }
+    .eyebrow { margin: 0 0 7px; color: var(--accent-1); font: 600 11px/1 var(--font-mono); }
+    h1 { margin: 0; font-size: clamp(25px, 5vw, 35px); line-height: 1.2; letter-spacing: 0; }
+    header p { margin: 9px 0 0; color: var(--text-secondary); font-size: 13px; line-height: 1.6; }
+    .badge { display: inline-block; margin-top: 14px; padding: 5px 8px; border-radius: 4px; color: var(--green); background: rgba(52,211,153,.10); font: 10px/1 var(--font-mono); }
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); margin-top: 18px; border: 1px solid var(--border); background: var(--surface); }
+    .stat { min-height: 84px; padding: 15px; border-right: 1px solid var(--border); }
+    .stat:last-child { border-right: 0; }
+    .stat span { color: var(--text-tertiary); font-size: 10px; }
+    .stat strong { display: block; margin-top: 8px; font-size: 22px; }
+    section { margin-top: 22px; }
+    h2 { margin: 0 0 11px; font-size: 14px; letter-spacing: 0; }
+    .concept { display: grid; grid-template-columns: 150px 1fr 42px; align-items: center; gap: 12px; margin: 10px 0; color: var(--text-secondary); font-size: 12px; }
+    .track { height: 6px; overflow: hidden; border-radius: 3px; background: var(--border); }
+    .track span { display: block; height: 100%; background: var(--accent-gradient); }
+    .score { text-align: right; color: var(--text); font: 11px/1 var(--font-mono); }
+    .insights { display: grid; gap: 8px; }
+    .insight { padding: 13px 15px; border-left: 3px solid var(--accent-1); background: var(--surface); color: var(--text-secondary); font-size: 12px; line-height: 1.65; }
+    footer { margin-top: 22px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--text-tertiary); font-size: 11px; }
+    @media (max-width: 580px) {
+      body { padding: 24px 12px; }
+      .stats { grid-template-columns: 1fr 1fr; }
+      .stat:nth-child(2) { border-right: 0; }
+      .stat:nth-child(-n+2) { border-bottom: 1px solid var(--border); }
+      .concept { grid-template-columns: 1fr 42px; }
+      .track { grid-column: 1 / -1; grid-row: 2; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">FINAL MILESTONE</p>
+      <h1>从看数字，到完成一轮可复盘的研究</h1>
+      <p>你已经掌握六个主要用户故事：确认数据时点、理解候选与指标、研究个股、组合筛选、检验策略，以及把外部实际交易记入账本。</p>
+      <span class="badge">6 / 6 场景已掌握</span>
+    </header>
+    <div class="stats">
+      <div class="stat"><span>已掌握</span><strong>6 / 6</strong></div>
+      <div class="stat"><span>学习问题</span><strong>68</strong></div>
+      <div class="stat"><span>平均掌握度</span><strong>89%</strong></div>
+      <div class="stat"><span>学习周期</span><strong>1 天</strong></div>
+    </div>
+    <section>
+      <h2>场景掌握度</h2>
+      <div class="concept"><span>数据时钟</span><div class="track"><span style="width:88%"></span></div><span class="score">88%</span></div>
+      <div class="concept"><span>系统候选与指标</span><div class="track"><span style="width:86%"></span></div><span class="score">86%</span></div>
+      <div class="concept"><span>个股研究与信号</span><div class="track"><span style="width:84%"></span></div><span class="score">84%</span></div>
+      <div class="concept"><span>组合筛选与覆盖率</span><div class="track"><span style="width:100%"></span></div><span class="score">100%</span></div>
+      <div class="concept"><span>回测、回撤与偏差</span><div class="track"><span style="width:93%"></span></div><span class="score">93%</span></div>
+      <div class="concept"><span>人工决策与持仓账本</span><div class="track"><span style="width:80%"></span></div><span class="score">80%</span></div>
+    </section>
+    <section>
+      <h2>你已经能独立判断</h2>
+      <div class="insights">
+        <div class="insight">7 月 24 日形成的候选只使用当时可得的数据，7 月 27 日的盘中价格不能反过来解释或改写它。</div>
+        <div class="insight">动量描述价格变化，RSI 比较近期上涨与下跌力量，量比描述交易规模；任何单项指标都不能证明应该买入。</div>
+        <div class="insight">成交量必须结合 K 线形态与收盘位置判断；策略信号是概率性的研究状态，不是系统代替你下单。</div>
+        <div class="insight">AND、OR 与数据覆盖率会改变筛选含义；数据不足应保留为“无法判断”，历史研究必须使用当时的股票池成员。</div>
+        <div class="insight">回测要同时看收益、最大回撤、换手成本、可执行时点、前视偏差与过拟合，并用未参与调参的数据验证。</div>
+        <div class="insight">实际交易只在外部完成并手工入账。部分卖出按原均价移出对应成本，卖出回款计入已实现盈亏，不改写剩余持仓均价。</div>
+      </div>
+    </section>
+    <section>
+      <h2>你的日常使用顺序</h2>
+      <div class="insights">
+        <div class="insight">收盘后先确认研究日期、数据完整性和候选生成时点。</div>
+        <div class="insight">从候选理由进入个股页，把价格、指标、量价形态与信号原因放在一起看。</div>
+        <div class="insight">需要缩小范围时建立组合筛选，并检查命中数、可计算数和数据不足数。</div>
+        <div class="insight">做决定前查看策略的历史收益、回撤、成本假设、失效条件和样本外表现。</div>
+        <div class="insight">在外部自行决定和交易；之后按真实价格、股数与费用记账，再复盘研究判断和实际操作的差异。</div>
+      </div>
+    </section>
+    <footer>学习完成于 2026-07-27。系统始终用于日频研究、模拟与记录，不连接券商，也不执行真实交易。</footer>
+  </main>
+</body>
+</html>
