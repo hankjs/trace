@@ -59,19 +59,19 @@ const chartOption = computed<EChartsCoreOption>(() => {
 
   return {
     animation: false,
-    legend: { data: ['5日平均线', '20日平均线'], top: 0, textStyle: { color: '#666' } },
+    legend: { data: ['5日平均线', '20日平均线'], top: 0 },
     tooltip: { trigger: 'axis', axisPointer: { type: 'cross' } },
     axisPointer: { link: [{ xAxisIndex: 'all' }] },
     grid: [
-      { left: 60, right: 20, top: 30, height: '58%' },
-      { left: 60, right: 20, top: '72%', height: '16%' },
+      { left: 88, right: 20, top: 30, height: '58%' },
+      { left: 88, right: 20, top: '72%', height: '16%' },
     ],
     xAxis: [
       { type: 'category', data: dates, gridIndex: 0, axisLabel: { show: false } },
       { type: 'category', data: dates, gridIndex: 1 },
     ],
     yAxis: [
-      { scale: true, gridIndex: 0, splitLine: { lineStyle: { color: '#eee' } } },
+      { scale: true, gridIndex: 0 },
       { scale: true, gridIndex: 1, splitLine: { show: false } },
     ],
     dataZoom: [

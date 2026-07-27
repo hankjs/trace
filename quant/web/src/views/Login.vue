@@ -2,6 +2,7 @@
 import { ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, setAuth } from '../api'
+import ThemeToggle from '../components/ThemeToggle.vue'
 
 const router = useRouter()
 const username = ref('')
@@ -29,7 +30,10 @@ async function submit() {
 </script>
 
 <template>
-  <div class="flex min-h-[60vh] items-center justify-center">
+  <div class="relative flex min-h-screen items-center justify-center px-4">
+    <div class="absolute right-4 top-4">
+      <ThemeToggle />
+    </div>
     <form class="w-80 rounded-lg border border-border bg-surface-raised p-6" @submit.prevent="submit">
       <h1 class="mb-1 text-center text-lg font-semibold text-accent">quant</h1>
       <p class="mb-6 text-center text-sm text-text-secondary">量化研究决策工作台</p>
@@ -47,7 +51,7 @@ async function submit() {
         autocomplete="current-password"
         class="mb-4 w-full rounded-md border border-border px-2 py-1.5"
       />
-      <p v-if="error" class="mb-4 text-sm text-red-500">{{ error }}</p>
+      <p v-if="error" class="mb-4 text-sm text-up">{{ error }}</p>
       <button
         type="submit"
         :disabled="loading"

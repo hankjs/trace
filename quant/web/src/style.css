@@ -27,12 +27,43 @@
   --shadow-drawer: -12px 0 40px oklch(0.2 0.02 228 / 0.18);
 }
 
+html.dark {
+  --color-surface: oklch(0.18 0.012 228);
+  --color-surface-raised: oklch(0.215 0.012 228);
+  --color-surface-muted: oklch(0.25 0.013 228);
+  --color-workbench: oklch(0.155 0.014 222);
+  --color-border: oklch(0.35 0.014 228);
+  --color-border-subtle: oklch(0.285 0.012 228);
+  --color-text-primary: oklch(0.91 0.01 228);
+  --color-text-secondary: oklch(0.73 0.012 228);
+  --color-text-tertiary: oklch(0.57 0.012 228);
+  --color-accent: oklch(0.72 0.11 210);
+  --color-accent-hover: oklch(0.78 0.105 210);
+  --color-on-accent: oklch(0.17 0.018 210);
+  --color-hover: oklch(0.265 0.015 220);
+  --color-active: oklch(0.295 0.035 210);
+  --color-info-soft: oklch(0.255 0.03 235);
+  --color-warning: oklch(0.79 0.105 75);
+  --color-warning-soft: oklch(0.255 0.035 75);
+  --color-danger-soft: oklch(0.26 0.045 25);
+  --color-overlay: oklch(0.08 0.01 228 / 0.62);
+  --color-up: oklch(0.69 0.19 25);
+  --color-down: oklch(0.7 0.14 155);
+  --shadow-panel: 0 8px 24px oklch(0.06 0.01 228 / 0.38);
+  --shadow-drawer: -12px 0 40px oklch(0.06 0.01 228 / 0.48);
+}
+
 * {
   box-sizing: border-box;
 }
 
 html {
   color-scheme: light;
+  background: var(--color-surface);
+}
+
+html.dark {
+  color-scheme: dark;
 }
 
 body {
@@ -44,10 +75,15 @@ body {
   color: var(--color-text-primary);
   -webkit-font-smoothing: antialiased;
   font-variant-numeric: tabular-nums;
+  transition: background-color 180ms cubic-bezier(0.16, 1, 0.3, 1), color 180ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 ::selection {
   background: oklch(0.85 0.07 210);
+}
+
+html.dark ::selection {
+  background: oklch(0.42 0.09 210);
 }
 
 button,
@@ -55,6 +91,12 @@ input,
 select,
 textarea {
   font: inherit;
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--color-text-tertiary);
+  opacity: 1;
 }
 
 input,

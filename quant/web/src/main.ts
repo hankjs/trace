@@ -9,6 +9,7 @@ const router = createRouter({
   routes: [
     { path: '/login', name: 'login', component: () => import('./views/Login.vue'), meta: { public: true } },
     { path: '/', name: 'dashboard', component: () => import('./views/Dashboard.vue') },
+    { path: '/watchlist', name: 'watchlist', component: () => import('./views/Watchlist.vue') },
     { path: '/stock/:code', name: 'stock', component: () => import('./views/StockDetail.vue') },
     { path: '/selection', name: 'selection', component: () => import('./views/SelectionWorkspace.vue') },
     { path: '/pools', name: 'pools', component: () => import('./views/Pools.vue') },

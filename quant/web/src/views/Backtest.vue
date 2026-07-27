@@ -239,7 +239,7 @@ const chartOption = computed<EChartsCoreOption>(() => {
     tooltip: { trigger: 'axis' },
     grid: { left: 70, right: 20, top: 20, bottom: 60 },
     xAxis: { type: 'category', data: eq.map((e) => e.date) },
-    yAxis: { scale: true, splitLine: { lineStyle: { color: '#eee' } } },
+    yAxis: { scale: true },
     dataZoom: [
       { type: 'inside' },
       { type: 'slider' },

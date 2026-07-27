@@ -124,6 +124,7 @@ onMounted(load)
               <span class="text-[11px] text-text-tertiary">{{ latestSnapshotTime || '尚无行情时间' }}</span>
             </div>
             <span class="text-[11px] text-text-tertiary">盘中价格仅供显示</span>
+            <router-link to="/watchlist" class="text-[11px] text-accent hover:underline">管理自选</router-link>
           </div>
           <div v-if="snapshot.length" class="max-h-[calc(100vh-214px)] overflow-auto">
             <table class="terminal-table min-w-[510px]">
@@ -152,8 +153,8 @@ onMounted(load)
           </div>
           <div v-else class="px-4 py-12 text-center">
             <p class="text-sm text-text-secondary">暂无自选行情</p>
-            <router-link to="/selection" class="mt-2 inline-flex items-center gap-1 text-xs text-accent hover:underline">
-              从选股中心查看股票 <ArrowRight :size="13" />
+            <router-link to="/watchlist" class="mt-2 inline-flex items-center gap-1 text-xs text-accent hover:underline">
+              去添加自选股 <ArrowRight :size="13" />
             </router-link>
           </div>
         </section>

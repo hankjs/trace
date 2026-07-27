@@ -16,12 +16,14 @@ import {
   PanelLeftOpen,
   Search,
   ShieldCheck,
+  Star,
   X,
 } from 'lucide-vue-next'
 import { clearAuth, currentUsername, getToken } from './api'
 import { loadCatalog } from './catalog'
 import ResearchAssistant from './components/ResearchAssistant.vue'
 import StockSearchInput from './components/StockSearchInput.vue'
+import ThemeToggle from './components/ThemeToggle.vue'
 import type { ResearchGuide } from './guides'
 
 const route = useRoute()
@@ -53,6 +55,7 @@ const navGroups = [
     label: '行情研究',
     items: [
       { to: { name: 'dashboard' }, name: 'dashboard', label: '行情总览', icon: LayoutDashboard },
+      { to: { name: 'watchlist' }, name: 'watchlist', label: '自选股', icon: Star },
       { to: { name: 'selection' }, name: 'selection', label: '选股中心', icon: ListFilter },
       { to: { name: 'signals' }, name: 'signals', label: '信号提醒', icon: Bell },
     ],
@@ -84,6 +87,16 @@ const guides: Record<string, ResearchGuide> = {
     ],
     steps: ['确认行情和选股池已更新', '查看候选股票及入选原因', '阅读策略提示', '用历史回测验证', '自行决定并手工记录'],
     note: '盘中快照只用于显示和估值，策略按日线收盘数据研究。',
+  },
+  watchlist: {
+    title: '自选股提示',
+    summary: '自选股是你日常盯盘的名单：行情总览的「自选行情」和盘中快照采集都以它为准。',
+    concepts: [
+      { term: '自选关系', explanation: '只属于当前账号的名单，不影响其他用户，股票资料本身全系统共享。' },
+      { term: '盘中快照', explanation: '交易时段内定时采集的最新价，仅供显示和估值。' },
+    ],
+    steps: ['搜索并加入自选', '在行情总览查看最新价', '不需要时移出自选'],
+    note: '自选只是观察名单，系统不会据此产生任何交易动作。',
   },
   selection: {
     title: '选股提示',
@@ -261,6 +274,7 @@ onBeforeUnmount(() => {
           <span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-down" />日频研究模式</span>
         </div>
 
+        <ThemeToggle />
         <span class="hidden max-w-24 truncate text-xs text-text-tertiary md:block">{{ username }}</span>
         <button class="icon-button shrink-0" title="退出登录" @click="logout">
           <LogOut :size="17" />
