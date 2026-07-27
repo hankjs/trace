@@ -5,6 +5,7 @@
   池内+自选 日线增量(池内只走 baostock,单登录会话;自选另做 akshare 对账)
   -> 因子计算(quant_factor_daily)+ 选股池 Top 30(quant_pick)
   -> 信号引擎(自选+选股池股票 × 全部**启用的**单标的策略,含 watch)
+  -> 组合策略在系统默认池生成计划调仓/资格变化研究计划
   -> 周五再加批量策略评估(quant_strategy_eval,同样跑全部启用的策略)
   历史拆分的 17:00/17:05/17:30 独立定时,在行情任务超时时会读到
   "部分股票已更新、部分未更新"的数据,故合并为顺序作业。
@@ -32,6 +33,7 @@ from .data.clock import SHANGHAI_TZ, now_cst
 from .db import SessionLocal
 from .models import Pick, WatchlistItem
 from .selection.pipeline import run_selection
+from .research_plan.pipeline import run_portfolio_plans
 from .strategy.engine import run_signals
 
 logger = logging.getLogger(__name__)
@@ -156,6 +158,8 @@ def job_signals() -> dict | None:
                 select(Pick.code).where(Pick.date == _now().date())).all()]
             codes = sorted(set(_watch_codes()) | set(picks))
             result = run_signals(db, codes=codes)
+            result["portfolio_plans"] = run_portfolio_plans(
+                db, day=_now().date())
             logger.info("信号计算完成: %s", result)
             return result
         except Exception:  # noqa: BLE001

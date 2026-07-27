@@ -102,7 +102,7 @@ def _seed_bars(db: Session, codes: list[str], start: date, end: date) -> None:
             rows.append({
                 "code": code, "date": d, "open": px, "high": px * 1.01,
                 "low": px * 0.99, "close": px, "raw_close": px,
-                "volume": 1e6, "amount": 1e7,
+                "volume": 1e6, "amount": 1e7, "is_st": False,
             })
             d += timedelta(days=1)
             i += 1
@@ -505,6 +505,10 @@ def test_portfolio_backtest_resolves_static_pool_and_persists_pool_id():
     }
     assert run.pool_id == pool["id"]
     assert reloaded["pool"] == result["pool"]
+    assert reloaded["params"] == result["parameter_snapshot"]
+    assert reloaded["costs"] == result["costs"]
+    assert reloaded["trade_details"] == result["trade_details"]
+    assert reloaded["exit_reason_distribution"] == result["exit_reason_distribution"]
 
 
 def test_explicit_codes_backtest_does_not_echo_pool():

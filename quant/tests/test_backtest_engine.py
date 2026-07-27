@@ -12,6 +12,7 @@ from __future__ import annotations
 import sys
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -32,6 +33,7 @@ from app.backtest.engine import (
     _sharpe_ratio,
     _validate_costs,
     _validate_params,
+    run_backtest,
 )
 from app.strategy.strategies import momentum_rotation
 
@@ -90,6 +92,26 @@ def test_prestart_position_single():
     assert m["trade_count"] == 1  # 仅首日一笔买入
 
 
+def test_prestart_synthetic_hold_survives_limit_up_and_zero_volume():
+    """首日合成持仓是状态初始化，不是新买信号，不能被涨停/停牌规则丢弃。"""
+    start = date(2024, 1, 1)
+    df = _mk_df_ohlc(
+        start,
+        [10.0, 11.0, 11.0, 11.0, 11.0],
+        [10.0, 11.0, 11.0, 11.0, 11.0],
+    )
+    df.loc[1, "volume"] = 0
+    pos = pd.Series(1, index=df.index)
+
+    result = _batch_single(
+        {"X": df}, {"X": pos}, DEFAULT_COSTS, df["date"].iat[1],
+    )["X"]
+
+    assert result["metrics"]["trade_count"] == 1
+    assert result["trade_details"][0]["side"] == "buy"
+    assert result["trade_details"][0]["execution_date"] == str(df["date"].iat[1])
+
+
 def test_prestart_position_portfolio():
     """组合:起点前已有 50/50 权重,首日即建仓而不是空仓等下个调仓点。"""
     start = date(2024, 1, 1)
@@ -104,6 +126,24 @@ def test_prestart_position_portfolio():
     sim = _portfolio_sim(w, dfs, bt_idx, DEFAULT_COSTS)
     assert sim["metrics"]["total_return"] > 0.02
     assert sim["metrics"]["trade_count"] >= 2  # 首日两只都建仓
+
+
+def test_prestart_portfolio_hold_survives_limit_up_and_zero_volume():
+    start = date(2024, 1, 1)
+    df = _mk_df_ohlc(
+        start,
+        [10.0, 11.0, 11.0, 11.0, 11.0],
+        [10.0, 11.0, 11.0, 11.0, 11.0],
+    )
+    df.loc[1, "volume"] = 0
+    full_idx = pd.DatetimeIndex(df["date"])
+    weights = pd.DataFrame({"X": [1.0] * len(full_idx)}, index=full_idx)
+
+    sim = _portfolio_sim(weights, {"X": df}, full_idx[1:], DEFAULT_COSTS)
+
+    buy = sim["pf"].orders.records_readable.iloc[0]
+    assert buy["Side"] == "Buy"
+    assert buy["Timestamp"] == full_idx[1]
 
 
 def test_stamp_tax_in_simulation():
@@ -168,6 +208,33 @@ def test_costs_and_strategy_params_are_validated():
         _validate_params("ma_cross", {"fast": 20, "slow": 5})
     with pytest.raises(ValueError, match="不支持参数"):
         _validate_params("ma_cross", {"future_window": 3})
+
+
+def test_backtest_evidence_versions_exact_params_but_not_temporary_override(monkeypatch):
+    df = _mk_df(date(2024, 1, 1), [10 + index * 0.1 for index in range(80)])
+    strategy = SimpleNamespace(
+        id=9, name="版本证据", template="ma_cross",
+        params={"fast": 2, "slow": 5},
+    )
+    monkeypatch.setattr(
+        "app.backtest.engine.load_bars_df",
+        lambda db, code, start=None, end=None: df,
+    )
+
+    exact = run_backtest(
+        None, strategy, ["X"], df["date"].iat[0], df["date"].iat[-1],
+        save=False,
+    )
+    temporary = run_backtest(
+        None, strategy, ["X"], df["date"].iat[0], df["date"].iat[-1],
+        params={"fast": 3}, save=False,
+    )
+
+    assert exact["evidence"]["strategy_version"].startswith("rp1-")
+    assert exact["metrics"]["evidence"]["strategy_version"] == (
+        exact["evidence"]["strategy_version"]
+    )
+    assert temporary["evidence"]["strategy_version"] is None
 
 
 def test_portfolio_stamp_tax_is_applied_to_actual_sell_order():
@@ -436,3 +503,22 @@ def test_limit_pct_is_20_for_chinext_and_star_board():
     assert _limit_pct("sh.688111") == 0.20
     assert _limit_pct("sh.600519") == 0.10
     assert _limit_pct("sz.000001") == 0.10
+    assert _limit_pct("bj.430047") == 0.30
+    assert _limit_pct("sh.600519", is_st=True) == 0.05
+    assert _limit_pct("sz.300750", is_st=True) == 0.05
+
+
+def test_daily_st_limit_blocks_sell_at_five_percent():
+    """同一普通主板代码仅当日为 ST 时，开盘跌约 5% 即不可卖出。"""
+    start = date(2024, 1, 1)
+    opens = [10, 10, 10, 10, 9.5, 9.5, 9.5]
+    df = _mk_df_ohlc(start, opens, opens)
+    df["is_st"] = [False, False, False, False, True, True, True]
+    pos = pd.Series([0, 1, 1, 0, 0, 0, 0], index=df.index)
+
+    result = _batch_single(
+        {"sh.600519": df}, {"sh.600519": pos}, DEFAULT_COSTS, start,
+    )["sh.600519"]
+    sell = next(item for item in result["trade_details"] if item["side"] == "sell")
+
+    assert sell["execution_date"] == str(df["date"].iat[5])

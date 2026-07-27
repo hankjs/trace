@@ -9,10 +9,18 @@ import pandas as pd
 
 from ...selection.pipeline import SCORE_WEIGHTS
 from ..rebalance import close_price_matrix, top_n_rebalance_weights
+from ..overlays import overlay_defaults
 
 NAME = "multifactor_hold"
 KIND = "portfolio"
-DEFAULT_PARAMS = {"top_n": 20}
+DEFAULT_PARAMS = {"top_n": 20, **overlay_defaults()}
+
+
+def rebalance_mask(dates) -> pd.Series:
+    """每月首个交易日形成计划调仓。"""
+    idx = pd.DatetimeIndex(dates)
+    month = pd.Series(idx.year * 100 + idx.month, index=idx)
+    return month.ne(month.shift())
 
 
 def target_weights(dates, pool_dfs: dict[str, pd.DataFrame],
@@ -31,8 +39,7 @@ def target_weights(dates, pool_dfs: dict[str, pd.DataFrame],
         + SCORE_WEIGHTS["ma20_slope"] * (ma20 / ma20.shift(5) - 1)
     )
 
-    month = pd.Series(idx.year * 100 + idx.month, index=idx)
-    rebalance = month.ne(month.shift()).to_numpy()
+    rebalance = rebalance_mask(idx).to_numpy()
 
     return top_n_rebalance_weights(
         score,

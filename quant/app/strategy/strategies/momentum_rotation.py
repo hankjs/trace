@@ -9,10 +9,24 @@ from __future__ import annotations
 import pandas as pd
 
 from ..rebalance import close_price_matrix, top_n_rebalance_weights
+from ..overlays import overlay_defaults
 
 NAME = "momentum_rotation"
 KIND = "portfolio"
-DEFAULT_PARAMS = {"top_n": 10, "w_mom20": 0.6, "w_mom60": 0.4}
+DEFAULT_PARAMS = {
+    "top_n": 10, "w_mom20": 0.6, "w_mom60": 0.4,
+    **overlay_defaults(),
+}
+
+
+def rebalance_mask(dates) -> pd.Series:
+    """每周首个交易日形成计划调仓。"""
+    idx = pd.DatetimeIndex(dates)
+    iso = idx.isocalendar()
+    week = pd.Series(
+        iso["year"].to_numpy() * 100 + iso["week"].to_numpy(), index=idx,
+    )
+    return week.ne(week.shift())
 
 
 def target_weights(dates, pool_dfs: dict[str, pd.DataFrame],
@@ -28,9 +42,7 @@ def target_weights(dates, pool_dfs: dict[str, pd.DataFrame],
         + p["w_mom60"] * (close / close.shift(60) - 1)
     ma20 = close.rolling(20).mean()
 
-    iso = idx.isocalendar()
-    week = pd.Series(iso["year"].to_numpy() * 100 + iso["week"].to_numpy(), index=idx)
-    rebalance = week.ne(week.shift()).to_numpy()
+    rebalance = rebalance_mask(idx).to_numpy()
 
     return top_n_rebalance_weights(
         score,

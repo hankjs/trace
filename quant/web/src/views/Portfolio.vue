@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
-import { api, type PortfolioSummary, type Position, type Trade } from '../api'
+import { computed, onMounted, reactive, ref } from 'vue'
+import { api, type PortfolioSummary, type Position, type ResearchPlanSummary, type Trade } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import PageHeader from '../components/PageHeader.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
+import PortfolioResearchPlan from '../components/PortfolioResearchPlan.vue'
 import { fmtAmount, fmtPrice, fmtQty, fmtSigned, localDateISO, pnlClass } from '../format'
 
 const summary = ref<PortfolioSummary | null>(null)
@@ -16,6 +17,10 @@ const loading = ref(true)
 const error = ref('')
 const formError = ref('')
 const submitting = ref(false)
+const researchPlans = ref<ResearchPlanSummary[]>([])
+const latestRebalancePlan = computed(() => [...researchPlans.value].sort((a, b) =>
+  `${b.data_date}-${b.generated_at ?? ''}`.localeCompare(`${a.data_date}-${a.generated_at ?? ''}`)
+)[0] ?? null)
 
 const positionColumns: QuTableColumn<Position>[] = [
   { key: 'stock', label: '股票' },
@@ -57,14 +62,19 @@ async function load() {
   loading.value = true
   error.value = ''
   try {
-    const [pos, tr, watch] = await Promise.all([
+    const [pos, tr, watch, planResult] = await Promise.all([
       api.positions(),
       api.trades(),
       api.watchlist(),
+      api.portfolioResearchPlans({ limit: 5 }).catch(() => null),
     ])
     summary.value = pos
     trades.value = tr.items
     nameMap.value = Object.fromEntries(watch.items.map((i) => [i.code, i.name]))
+    const summaries = planResult?.items ?? []
+    researchPlans.value = await Promise.all(summaries.slice(0, 5).map((plan) =>
+      plan.id > 0 ? api.researchPlan(plan.id).catch(() => plan) : Promise.resolve(plan)
+    ))
   } catch (e) {
     error.value = (e as Error).message
   } finally {
@@ -122,6 +132,8 @@ onMounted(load)
     <LoadingRows v-if="loading" :rows="5" />
 
     <template v-else-if="summary">
+      <PortfolioResearchPlan v-if="latestRebalancePlan" :plan="latestRebalancePlan" />
+
       <section class="grid overflow-hidden rounded-md border border-border bg-surface-raised sm:grid-cols-3">
         <div class="border-b border-border-subtle p-4 sm:border-b-0 sm:border-r">
           <div class="text-xs text-text-tertiary">总市值</div>

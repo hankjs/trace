@@ -11,7 +11,8 @@ from ..auth import require_client, user_id_from_claims
 from ..catalog import (render_signal_reason, signal_reason_type,
                        signal_side_name)
 from ..db import get_db
-from ..models import Signal, Stock, Strategy
+from ..models import ResearchPlan, Signal, Stock, Strategy
+from ..research_plan.service import plan_summary
 from ..strategy.store import visible_to
 
 router = APIRouter(prefix="/api/signals", tags=["signals"])
@@ -30,9 +31,10 @@ def list_signals(date_: date | None = Query(None, alias="date"),
     和我自己策略的信号 —— 否则别人的策略名会出现在我的列表里。
     """
     user_id = user_id_from_claims(claims)
-    q = (select(Signal, Stock, Strategy)
+    q = (select(Signal, Stock, Strategy, ResearchPlan)
          .join(Strategy, Strategy.id == Signal.strategy_id)
          .outerjoin(Stock, Stock.code == Signal.code)
+         .outerjoin(ResearchPlan, ResearchPlan.id == Signal.plan_id)
          .where(visible_to(user_id))
          .order_by(Signal.date.desc(), Signal.id.desc()).limit(limit))
     if date_:
@@ -44,9 +46,25 @@ def list_signals(date_: date | None = Query(None, alias="date"),
     if side:
         q = q.where(Signal.side == side)
     rows = db.execute(q).all()
-    return {
-        "count": len(rows),
-        "items": [
+    evidence_cache: dict = {}
+    plan_ids = [plan.id for _, _, _, plan in rows if plan is not None]
+    superseded_plan_ids = set(db.execute(
+        select(ResearchPlan.supersedes_plan_id).where(
+            ResearchPlan.supersedes_plan_id.in_(plan_ids)
+        )
+    ).scalars()) if plan_ids else set()
+    read_context = {"superseded_plan_ids": superseded_plan_ids}
+    items = []
+    for signal, stock, strategy, plan in rows:
+        summary = (
+            plan_summary(
+                plan, db=db, viewer_user_id=user_id,
+                evidence_cache=evidence_cache,
+                read_context=read_context,
+            )
+            if plan is not None else None
+        )
+        items.append(
             {
                 "id": signal.id,
                 "code": signal.code,
@@ -60,14 +78,17 @@ def list_signals(date_: date | None = Query(None, alias="date"),
                 "side": signal.side,
                 "side_name": signal_side_name(signal.side),
                 "price": signal.price,
-                "reason": signal.reason,
+                "signal_close_price": signal.price,
                 "reason_type": signal_reason_type(signal.reason),
                 # 措辞按模板选,兜底句用策略实例的名字(用户可能起了自己的名)
                 "reason_text": render_signal_reason(
                     strategy.template, signal.side, signal.reason,
                     display_name=strategy.name,
                 ),
+                "research_plan_id": plan.id if plan is not None else None,
+                "plan_status": summary["status"] if summary else None,
+                "plan_status_name": summary["status_name"] if summary else None,
+                "research_plan": summary,
             }
-            for signal, stock, strategy in rows
-        ],
-    }
+        )
+    return {"count": len(items), "items": items}

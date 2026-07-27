@@ -149,13 +149,426 @@ export interface Strategy {
   /** 被多少条回测引用;>0 时删除会 409,只能改为停用 */
   backtest_count?: number | null
   created_at?: string | null
+  /** 模板可生成哪些研究线/条件，由后端按模板声明。 */
+  plan_capabilities?: ResearchPlanCapabilities | null
+  research_plan_capabilities?: ResearchPlanCapabilities | null
 }
 
 /** single 逐只股票跑;portfolio 在股票池上排序后模拟持有一组 */
 export type StrategyKind = 'single' | 'portfolio'
 
-/** 策略参数值。模板参数目前都是数值,布尔/字符串留给后续模板 */
-export type StrategyParamValue = number | string | boolean
+export type StrategyOverlayType = 'fixed_pct' | 'atr_multiple'
+
+/** 风险与止盈都是策略参数，关闭时不参与信号和回测。 */
+export interface StrategyOverlayConfig {
+  enabled: boolean
+  type: StrategyOverlayType
+  value: number
+  atr_period: number
+}
+
+/** 策略参数值。覆盖层以内嵌对象跟随策略版本化保存。 */
+export type StrategyParamValue = number | string | boolean | StrategyOverlayConfig
+
+export type ResearchPlanStatus =
+  | 'active'
+  | 'needs_review'
+  | 'invalidated'
+  | 'exit_triggered'
+  | 'expired'
+
+export type ResearchPlanType = 'single' | 'portfolio_rebalance'
+export type ResearchPlanSignalType = 'buy' | 'sell' | 'watch' | 'hold' | 'rebalance' | 'qualification_change'
+export type EntryObservationMode = 'none' | 'line' | 'range' | 'portfolio_rebalance'
+export type ResearchRuleSource = 'entry' | 'native_risk' | 'risk_overlay' | 'take_profit' | 'native_exit' | 'rebalance'
+
+export interface ResearchPriceReference {
+  id?: string
+  source: ResearchRuleSource
+  name: string
+  /** 单线使用 value，区间使用 lower/upper；无客观价格时三者均不返回。 */
+  value?: number | null
+  lower?: number | null
+  upper?: number | null
+  data_date: string
+  calculation?: string | null
+  status?: string | null
+}
+
+export interface ResearchCondition {
+  id?: string
+  source: ResearchRuleSource
+  name: string
+  summary: string
+  formula?: string | null
+  threshold?: number | string | null
+  current_value?: number | string | null
+  unit?: string | null
+  data_date?: string | null
+  status?: string | null
+  triggered?: boolean
+  price_reference?: ResearchPriceReference | null
+}
+
+export interface EntryObservation {
+  mode: EntryObservationMode
+  summary: string
+  calculation?: string | null
+  data_date: string
+  valid_until?: string | null
+  review_condition?: string | null
+  line?: ResearchPriceReference | null
+  range?: ResearchPriceReference | null
+  conditions?: ResearchCondition[]
+}
+
+export interface ResearchExitRule extends ResearchCondition {
+  priority?: number
+  enabled?: boolean
+  /** 动态条件为 true 时，不应解释成预先确定的未来价格。 */
+  dynamic?: boolean
+}
+
+export interface BacktestCostSnapshot {
+  commission?: number
+  stamp_tax?: number
+  slippage?: number
+  [key: string]: number | undefined
+}
+
+export interface BacktestEvidence {
+  status: 'verified' | 'unverified'
+  exact_match: boolean
+  backtest_id?: number | null
+  start?: string | null
+  end?: string | null
+  metrics?: Partial<BacktestMetrics> | null
+  costs?: BacktestCostSnapshot | null
+  message?: string | null
+}
+
+export type PortfolioChangeType = 'new' | 'keep' | 'increase' | 'decrease' | 'remove' | 'risk_filtered'
+
+export interface PortfolioScoreFactor {
+  name: string
+  value: number
+  weight: number
+  contribution: number
+}
+
+export interface PortfolioWeightChange {
+  code: string
+  name?: string
+  change_type: PortfolioChangeType
+  change_name?: string
+  previous_weight: number
+  target_weight: number
+  score?: number | null
+  score_details?: Record<string, PortfolioScoreFactor>
+  rank?: number | null
+  reasons: string[]
+  risk_rules?: ResearchExitRule[]
+  risk_reference?: ResearchPriceReference | null
+}
+
+export interface PortfolioRebalancePlan {
+  pool_id?: number | null
+  pool_name: string
+  frequency: string
+  plan_date: string
+  next_simulated_trade_date: string
+  cash_weight: number
+  changes: PortfolioWeightChange[]
+  risk_summary?: string | null
+}
+
+export interface ResearchPlanCapabilities {
+  plan_type?: ResearchPlanType
+  observation_kinds?: EntryObservationMode[]
+  price_references?: string[]
+  native_exit?: string[]
+  entry_modes?: EntryObservationMode[]
+  supports_risk_overlay?: boolean
+  supports_take_profit?: boolean
+  native_exit_types?: string[]
+}
+
+export interface ResearchPlanSummary {
+  id: number
+  type: ResearchPlanType
+  status: ResearchPlanStatus
+  status_name?: string
+  status_reason?: string | null
+  data_date: string
+  generated_at?: string | null
+  next_simulated_trade_date?: string | null
+  signal_close_price?: number | null
+  signal_type?: ResearchPlanSignalType | null
+  entry?: EntryObservation | null
+  risk_rules?: ResearchExitRule[]
+  take_profit_rules?: ResearchExitRule[]
+  native_exit_rules?: ResearchExitRule[]
+  evidence?: BacktestEvidence | null
+  rebalance?: PortfolioRebalancePlan | null
+}
+
+export interface ResearchPlan extends ResearchPlanSummary {
+  strategy_id: number
+  strategy_name: string
+  template: string
+  strategy_version: string
+  params_snapshot: Record<string, StrategyParamValue>
+  adjustment: string
+  signal_side?: ResearchPlanSignalType | null
+  signal_reason?: string | null
+  calculation_notes?: string[]
+}
+
+type ApiRecord = Record<string, unknown>
+
+function asRecord(value: unknown): ApiRecord {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as ApiRecord : {}
+}
+
+function asRecords(value: unknown): ApiRecord[] {
+  return Array.isArray(value) ? value.map(asRecord) : []
+}
+
+function asNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null
+}
+
+function normalizedPlanStatus(value: unknown): ResearchPlanStatus {
+  const aliases: Record<string, ResearchPlanStatus> = {
+    current: 'active',
+    reevaluate: 'needs_review',
+    invalid: 'invalidated',
+    active: 'active',
+    needs_review: 'needs_review',
+    invalidated: 'invalidated',
+    exit_triggered: 'exit_triggered',
+    expired: 'expired',
+  }
+  return aliases[String(value)] ?? 'needs_review'
+}
+
+function calculationStatus(value: unknown): string {
+  return {
+    calculated: '已计算',
+    insufficient_data: '数据不足',
+    pending_simulated_entry: '等待模拟入场价后计算',
+    disabled: '未启用',
+  }[String(value)] ?? String(value || '按规则判断')
+}
+
+function normalizedRule(
+  rawValue: unknown,
+  source: ResearchRuleSource,
+  dataDate: string,
+  fallbackName: string
+): ResearchExitRule {
+  const raw = asRecord(rawValue)
+  const referenceLine = asNumber(raw.reference_line)
+  const currentValue = raw.current_value ?? asRecord(raw.current_values).fast_ma ?? null
+  const summary = String(raw.condition ?? raw.explanation ?? calculationStatus(raw.calculation_status))
+  return {
+    source,
+    name: String(raw.name ?? fallbackName),
+    summary,
+    current_value: typeof currentValue === 'number' || typeof currentValue === 'string' ? currentValue : null,
+    data_date: String(raw.data_date ?? dataDate),
+    status: calculationStatus(raw.calculation_status),
+    enabled: typeof raw.enabled === 'boolean' ? raw.enabled : true,
+    dynamic: referenceLine == null,
+    price_reference: referenceLine == null ? null : {
+      source,
+      name: source === 'take_profit' ? '止盈参考线' : source === 'native_exit' ? '策略退出参考线' : '风险失效线',
+      value: referenceLine,
+      data_date: String(raw.data_date ?? dataDate),
+      calculation: summary,
+    },
+  }
+}
+
+function normalizedEntry(rawValue: unknown, dataDate: string): EntryObservation {
+  const raw = asRecord(rawValue)
+  const mode = String(raw.kind ?? 'none') as EntryObservationMode
+  const line = asNumber(raw.line)
+  const lower = asNumber(raw.lower)
+  const upper = asNumber(raw.upper)
+  const conditions = asRecords(raw.conditions).map((condition, index): ResearchCondition => {
+    const current = condition.value ?? condition.current_value ?? null
+    const threshold = condition.threshold ?? null
+    const summary = current == null
+      ? '当前数据不足'
+      : threshold == null
+        ? `当前值 ${String(current)}`
+        : `当前值 ${String(current)}，阈值 ${String(threshold)}`
+    return {
+      id: `entry-condition-${index}`,
+      source: 'entry',
+      name: String(condition.name ?? `观察条件 ${index + 1}`),
+      summary,
+      current_value: typeof current === 'number' || typeof current === 'string' ? current : null,
+      threshold: typeof threshold === 'number' || typeof threshold === 'string' ? threshold : null,
+      data_date: dataDate,
+      status: calculationStatus(raw.calculation_status),
+    }
+  })
+  return {
+    mode,
+    summary: String(raw.explanation ?? raw.name ?? '按策略条件观察'),
+    calculation: calculationStatus(raw.calculation_status),
+    data_date: String(raw.data_date ?? dataDate),
+    valid_until: raw.valid_until == null ? null : String(raw.valid_until),
+    review_condition: Array.isArray(raw.reevaluate_when) ? raw.reevaluate_when.map(String).join('；') : null,
+    line: line == null ? null : {
+      source: 'entry', name: '进场观察线', value: line,
+      data_date: String(raw.data_date ?? dataDate), calculation: String(raw.explanation ?? ''),
+    },
+    range: lower == null || upper == null ? null : {
+      source: 'entry', name: '进场观察区间', lower, upper,
+      data_date: String(raw.data_date ?? dataDate), calculation: String(raw.explanation ?? ''),
+    },
+    conditions,
+  }
+}
+
+function normalizedPortfolioChangeType(value: unknown): PortfolioChangeType {
+  const aliases: Record<string, PortfolioChangeType> = {
+    added: 'new', retained: 'keep', increased: 'increase', reduced: 'decrease', removed: 'remove',
+    new: 'new', keep: 'keep', increase: 'increase', decrease: 'decrease', remove: 'remove', risk_filtered: 'risk_filtered',
+  }
+  return aliases[String(value)] ?? 'keep'
+}
+
+/** 后端保存忠实快照，API 层把模板差异归一为页面的连续阅读模型。 */
+export function normalizeResearchPlanResponse(value: unknown): ResearchPlanSummary | ResearchPlan {
+  const raw = asRecord(value)
+  const dataDate = String(raw.data_date ?? '')
+  const status = normalizedPlanStatus(raw.status)
+  const statusReason = asRecord(raw.status_reason)
+  const planType = String(raw.plan_type ?? 'single') as ResearchPlanType
+  const evidenceRaw = asRecord(raw.backtest_evidence)
+  const evidenceStatus = String(evidenceRaw.status ?? raw.backtest_status ?? 'unverified')
+  const takeProfitRaw = asRecord(raw.take_profit)
+  const portfolioSummary = asRecord(raw.portfolio_summary)
+  const changes = asRecords(raw.portfolio_changes)
+  const base: ResearchPlanSummary = {
+    id: Number(raw.plan_id ?? raw.id ?? 0),
+    type: planType,
+    status,
+    status_name: typeof raw.status_name === 'string' ? raw.status_name : undefined,
+    status_reason: typeof raw.status_reason === 'string'
+      ? raw.status_reason
+      : typeof statusReason.text === 'string' ? statusReason.text : null,
+    data_date: dataDate,
+    generated_at: raw.generated_at == null ? null : String(raw.generated_at),
+    next_simulated_trade_date: raw.next_simulated_execution_date == null
+      ? null : String(raw.next_simulated_execution_date),
+    signal_close_price: asNumber(raw.signal_close_price),
+    signal_type: raw.signal_type == null ? null : raw.signal_type as ResearchPlanSignalType,
+    entry: normalizedEntry(raw.entry_observation, dataDate),
+    risk_rules: asRecords(raw.risk_rules).map((rule) => normalizedRule(
+      rule,
+      asRecord(rule).source === 'overlay' ? 'risk_overlay' : 'native_risk',
+      dataDate,
+      '风险失效条件'
+    )),
+    take_profit_rules: takeProfitRaw.enabled === true
+      ? [normalizedRule(takeProfitRaw, 'take_profit', dataDate, '止盈覆盖层')]
+      : [],
+    native_exit_rules: asRecords(raw.native_exit).map((rule) => normalizedRule(rule, 'native_exit', dataDate, '策略退出条件')),
+    evidence: {
+      status: evidenceStatus === 'verified' ? 'verified' : 'unverified',
+      exact_match: evidenceStatus === 'verified',
+      backtest_id: asNumber(evidenceRaw.run_id),
+      start: evidenceRaw.start == null ? null : String(evidenceRaw.start),
+      end: evidenceRaw.end == null ? null : String(evidenceRaw.end),
+      metrics: asRecord(evidenceRaw.metrics) as Partial<BacktestMetrics>,
+      costs: asRecord(evidenceRaw.costs) as BacktestCostSnapshot,
+      message: evidenceRaw.reason == null ? null : String(evidenceRaw.reason),
+    },
+    rebalance: planType !== 'portfolio_rebalance' ? null : {
+      pool_name: String(portfolioSummary.pool_name ?? '股票池待同步'),
+      frequency: String(portfolioSummary.frequency ?? '按策略频率'),
+      plan_date: dataDate,
+      next_simulated_trade_date: raw.next_simulated_execution_date == null ? '待交易日历确认' : String(raw.next_simulated_execution_date),
+      cash_weight: asNumber(portfolioSummary.cash_weight) ?? 0,
+      changes: changes.map((change): PortfolioWeightChange => {
+        const riskSnapshot = asRecord(change.risk_snapshot)
+        const scoreSnapshot = asRecord(change.score_details)
+        const scoreFactors = asRecord(scoreSnapshot.factors)
+        const riskLine = asNumber(riskSnapshot.reference_line)
+        const holdingRules = asRecords(riskSnapshot.rules).map((rule) => {
+          const source = String(rule.source)
+          const normalizedSource: ResearchRuleSource = source === 'take_profit'
+            ? 'take_profit'
+            : source === 'risk_overlay' ? 'risk_overlay' : 'native_risk'
+          return normalizedRule(
+            rule,
+            normalizedSource,
+            String(rule.data_date ?? dataDate),
+            normalizedSource === 'take_profit' ? '止盈覆盖层' : '风险失效条件'
+          )
+        })
+        return {
+          code: String(change.code ?? ''),
+          name: change.name == null ? undefined : String(change.name),
+          change_type: normalizedPortfolioChangeType(change.change_type),
+          previous_weight: asNumber(change.previous_weight) ?? 0,
+          target_weight: asNumber(change.target_weight) ?? 0,
+          score: asNumber(change.score),
+          score_details: Object.fromEntries(
+            Object.entries(scoreFactors).flatMap(([key, value]) => {
+              const factor = asRecord(value)
+              const factorValue = asNumber(factor.value)
+              const weight = asNumber(factor.weight)
+              const contribution = asNumber(factor.contribution)
+              if (factorValue == null || weight == null || contribution == null) return []
+              return [[key, {
+                name: String(factor.name ?? key),
+                value: factorValue,
+                weight,
+                contribution,
+              }]]
+            })
+          ),
+          rank: asNumber(change.rank),
+          reasons: Array.isArray(change.reasons) ? change.reasons.map((reason) => {
+            if (typeof reason === 'string') return reason
+            const item = asRecord(reason)
+            return String(item.text ?? item.name ?? '未提供结构化原因')
+          }) : [],
+          risk_rules: holdingRules,
+          risk_reference: riskLine == null ? null : {
+            source: 'native_risk',
+            name: String(riskSnapshot.name ?? '风险过滤线'),
+            value: riskLine,
+            data_date: String(riskSnapshot.data_date ?? dataDate),
+          },
+        }
+      }),
+      risk_summary: `风险规则 ${asRecords(raw.risk_rules).length} 条；止盈覆盖层${takeProfitRaw.enabled === true ? '已启用' : '未启用'}。`,
+    },
+  }
+  const strategy = asRecord(raw.strategy)
+  if (!Object.keys(strategy).length) return base
+  const snapshot = asRecord(raw.params_snapshot)
+  const effective = Object.keys(asRecord(snapshot.effective_params)).length
+    ? asRecord(snapshot.effective_params)
+    : snapshot
+  return {
+    ...base,
+    strategy_id: Number(strategy.id ?? 0),
+    strategy_name: String(strategy.name ?? ''),
+    template: String(strategy.template ?? ''),
+    strategy_version: String(strategy.version ?? ''),
+    params_snapshot: effective as Record<string, StrategyParamValue>,
+    adjustment: raw.price_adjustment === 'forward' ? '前复权' : String(raw.price_adjustment ?? '复权口径待同步'),
+    signal_side: raw.signal_type == null ? null : raw.signal_type as ResearchPlanSignalType,
+  }
+}
 
 /** 每个用户的策略数量与启用数上限,由后端下发 */
 export interface StrategyLimits {
@@ -213,9 +626,16 @@ export interface SignalItem {
   is_system?: boolean
   side: 'buy' | 'sell' | 'watch'
   side_name?: string
+  /** 新契约明确命名；price 仅保留给过渡期响应。 */
+  signal_close_price?: number
   price: number
-  reason: Record<string, unknown>
+  reason?: Record<string, unknown>
   reason_text?: string
+  research_plan_id?: number | null
+  plan_status?: ResearchPlanStatus | null
+  plan_status_name?: string | null
+  plan_summary?: ResearchPlanSummary | null
+  research_plan?: ResearchPlan | null
 }
 
 export interface Trade {
@@ -257,6 +677,7 @@ export interface BacktestMetrics {
   trade_count: number
   round_trips: number
   per_code?: Record<string, unknown>
+  evidence?: BacktestRunEvidence
 }
 
 export interface BacktestResult {
@@ -267,6 +688,10 @@ export interface BacktestResult {
   template?: string | null
   /** 本次实际生效的全量参数快照 */
   params?: Record<string, StrategyParamValue>
+  /** 本次回测实际使用的覆盖层与费用快照。 */
+  risk_overlay?: StrategyOverlayConfig | null
+  take_profit?: StrategyOverlayConfig | null
+  costs?: BacktestCostSnapshot
   codes?: string[]
   stocks?: StockRef[]
   start?: string
@@ -275,6 +700,73 @@ export interface BacktestResult {
   pool?: PoolRef
   metrics: BacktestMetrics
   equity: { date: string; equity: number }[]
+  evidence?: BacktestRunEvidence
+  trade_details?: BacktestTradeDetail[]
+  exit_reason_distribution?: BacktestExitReasonDistribution | BacktestExitReasonCount[] | Record<string, number>
+  trades?: BacktestTrade[]
+}
+
+export interface BacktestExitReason {
+  code: string
+  name: string
+  price_line?: number | null
+}
+
+export interface BacktestTradeDetail {
+  code: string
+  name?: string
+  signal_date?: string | null
+  execution_date: string
+  execution_price: number
+  size: number
+  fees: number
+  side: 'buy' | 'sell'
+  primary_reason?: BacktestExitReason | null
+  all_reasons: BacktestExitReason[]
+  tradable: boolean
+  execution_status: string
+  closed_trades: number
+  winning_trades: number
+  realized_pnl: number
+}
+
+export interface BacktestExitReasonDistribution {
+  by_primary: Record<string, number>
+  all_hits: Record<string, number>
+}
+
+export interface BacktestRunEvidence {
+  parameter_snapshot?: Record<string, StrategyParamValue>
+  fee_assumptions?: Record<string, unknown>
+  trade_details?: BacktestTradeDetail[]
+  exit_reason_distribution?: BacktestExitReasonDistribution
+  start?: string
+  end?: string
+}
+
+export interface BacktestExitReasonCount {
+  reason: string
+  reason_name?: string
+  count: number
+  primary_count?: number
+}
+
+export interface BacktestTrade {
+  id?: number | string
+  code: string
+  name?: string
+  side?: 'buy' | 'sell'
+  signal_date: string
+  simulated_trade_date: string
+  simulated_price: number
+  exit_signal_date?: string | null
+  exit_trade_date?: string | null
+  exit_price?: number | null
+  primary_exit_reason?: string | null
+  exit_reasons: string[]
+  fees?: number | null
+  pnl?: number | null
+  pnl_pct?: number | null
 }
 
 export interface StockRef {
@@ -403,18 +895,22 @@ export interface CatalogEntry {
   input_scale?: number
   operators?: string[]
   options?: CatalogOption[]
+  plan_capabilities?: ResearchPlanCapabilities
+  plan_capability?: Record<string, unknown>
+  research_plan_capabilities?: ResearchPlanCapabilities
 }
 
 export interface CatalogParameter {
   key: string
   name: string
   description?: string
-  default?: number | string | boolean
-  value_type?: 'number' | 'integer' | 'boolean' | 'string'
+  default?: number | string | boolean | StrategyOverlayConfig
+  value_type?: 'number' | 'integer' | 'boolean' | 'string' | 'overlay'
   unit?: string
   minimum?: number
   maximum?: number
   step?: number
+  fields?: Record<string, unknown>
 }
 
 export interface CatalogPayload {
@@ -477,7 +973,7 @@ export interface SweepMetrics {
 }
 
 export interface SweepResultItem {
-  params: Record<string, number>
+  params: Record<string, StrategyParamValue>
   metrics: SweepMetrics
   per_code?: Record<string, Record<string, number>>
 }
@@ -543,7 +1039,43 @@ export const api = {
     if (filters.strategy_id) params.set('strategy_id', String(filters.strategy_id))
     if (filters.side) params.set('side', filters.side)
     if (filters.limit) params.set('limit', String(filters.limit))
-    return request<{ count: number; items: SignalItem[] }>(`/api/signals?${params}`)
+    return request<{ count: number; items: SignalItem[] }>(`/api/signals?${params}`).then((payload) => ({
+      ...payload,
+      items: payload.items.map((signal): SignalItem => {
+        const normalized = signal.research_plan
+          ? normalizeResearchPlanResponse(signal.research_plan)
+          : null
+        return {
+          ...signal,
+          research_plan_id: normalized?.id ?? signal.research_plan_id,
+          plan_status: normalized?.status ?? signal.plan_status,
+          plan_status_name: normalized?.status_name ?? signal.plan_status_name,
+          plan_summary: normalized ?? signal.plan_summary,
+          research_plan: normalized && 'strategy_id' in normalized ? normalized as ResearchPlan : null,
+        }
+      }),
+    }))
+  },
+
+  researchPlan(planId: number) {
+    return request<unknown>(`/api/research-plans/${planId}`)
+      .then((plan) => normalizeResearchPlanResponse(plan) as ResearchPlan)
+  },
+
+  stockResearchPlans(code: string, limit = 20) {
+    const params = new URLSearchParams({ code, limit: String(limit) })
+    return request<{ count: number; items: unknown[] }>(`/api/research-plans?${params}`)
+      .then((payload) => ({ ...payload, items: payload.items.map(normalizeResearchPlanResponse) }))
+  },
+
+  portfolioResearchPlans(filters: { strategy_id?: number; date?: string; limit?: number } = {}) {
+    const params = new URLSearchParams()
+    if (filters.strategy_id) params.set('strategy_id', String(filters.strategy_id))
+    if (filters.date) params.set('date', filters.date)
+    if (filters.limit) params.set('limit', String(filters.limit))
+    params.set('plan_type', 'portfolio_rebalance')
+    return request<{ count: number; items: unknown[] }>(`/api/research-plans?${params}`)
+      .then((payload) => ({ ...payload, items: payload.items.map(normalizeResearchPlanResponse) }))
   },
 
   trades(code?: string) {
@@ -675,7 +1207,7 @@ export const api = {
     pool_id?: number
     /** 临时覆盖策略自身的参数,不改策略行 */
     params?: Record<string, unknown>
-    costs?: Record<string, unknown>
+    costs?: BacktestCostSnapshot
   }) {
     return request<BacktestResult>('/api/backtest', {
       method: 'POST',
@@ -715,7 +1247,8 @@ export const api = {
     codes: string[]
     start: string
     end: string
-    param_grid: Record<string, number[]>
+    param_grid: Record<string, Array<number | string | boolean>>
+    costs?: BacktestCostSnapshot
   }) {
     return request<SweepResult>('/api/backtest/sweep', {
       method: 'POST',

@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import app.strategy.engine as signal_engine
 from app.api.signals import list_signals
 from app.db import Base
-from app.models import SYSTEM_OWNER_ID, DailyBar, Signal, Stock, Strategy
+from app.models import (SYSTEM_OWNER_ID, DailyBar, ResearchPlan, Signal, Stock,
+                        Strategy, TradeCalendar)
 
 USER_A = "11111111-1111-1111-1111-111111111111"
 USER_B = "22222222-2222-2222-2222-222222222222"
@@ -202,3 +203,94 @@ def test_unknown_template_is_skipped_with_warning(caplog):
 
     assert result["total"] == 0
     assert "removed_template" in caplog.text
+
+
+def test_ongoing_holding_generates_plan_with_entry_based_overlay_lines():
+    with _session() as db:
+        last = _seed_bars(db)
+        next_day = last + timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        following = next_day + timedelta(days=1)
+        while following.weekday() >= 5:
+            following += timedelta(days=1)
+        db.add_all([
+            Strategy(
+                id=1, owner_id=USER_A, is_system=False,
+                name="带风险线的趋势", template="ma_cross", kind="single",
+                params={
+                    "risk_overlay": {
+                        "enabled": True, "type": "fixed_pct", "value": 0.1,
+                    },
+                    "take_profit": {
+                        "enabled": True, "type": "fixed_pct", "value": 0.2,
+                    },
+                }, enabled=True,
+            ),
+            TradeCalendar(date=last, is_open=True),
+            TradeCalendar(date=next_day, is_open=True),
+            TradeCalendar(date=following, is_open=True),
+        ])
+        db.commit()
+        signal_engine.run_signals(db, day=last, codes=[CODE])
+        db.add(DailyBar(
+            code=CODE, date=next_day, open=15, high=15, low=15,
+            close=15, raw_close=15, volume=1e6, amount=15e6,
+        ))
+        db.commit()
+
+        result = signal_engine.run_signals(db, day=next_day, codes=[CODE])
+        plans = db.execute(select(ResearchPlan).where(
+            ResearchPlan.strategy_id == 1,
+            ResearchPlan.code == CODE,
+        ).order_by(ResearchPlan.id)).scalars().all()
+
+        assert result["total"] == 0
+        assert [plan.signal_type for plan in plans] == ["buy", "hold"]
+        assert plans[-1].signal_price is None
+        overlay = next(
+            rule for rule in plans[-1].risk_rules if rule["source"] == "overlay"
+        )
+        assert overlay["reference_line"] == pytest.approx(13.50135)
+        assert plans[-1].take_profit["reference_line"] == pytest.approx(18.0018)
+
+
+def test_blocked_t_plus_one_entry_does_not_create_fake_sell_signal():
+    with _session() as db:
+        last = _seed_bars(db)
+        next_day = last + timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        following = next_day + timedelta(days=1)
+        while following.weekday() >= 5:
+            following += timedelta(days=1)
+        db.add_all([
+            Strategy(
+                id=1, owner_id=USER_A, is_system=False,
+                name="默认趋势", template="ma_cross", kind="single",
+                params={}, enabled=True,
+            ),
+            TradeCalendar(date=last, is_open=True),
+            TradeCalendar(date=next_day, is_open=True),
+            TradeCalendar(date=following, is_open=True),
+        ])
+        db.commit()
+        first = signal_engine.run_signals(db, day=last, codes=[CODE])
+        db.add(DailyBar(
+            code=CODE, date=next_day, open=16.5, high=16.5, low=16.5,
+            close=16.5, raw_close=16.5, volume=1e6, amount=16.5e6,
+        ))
+        db.commit()
+
+        second = signal_engine.run_signals(db, day=next_day, codes=[CODE])
+        signals = db.execute(select(Signal).where(
+            Signal.strategy_id == 1, Signal.code == CODE,
+        ).order_by(Signal.id)).scalars().all()
+        plans = db.execute(select(ResearchPlan).where(
+            ResearchPlan.strategy_id == 1, ResearchPlan.code == CODE,
+        ).order_by(ResearchPlan.id)).scalars().all()
+
+        assert first["total"] == 1
+        assert second["total"] == 0
+        assert [signal.side for signal in signals] == ["buy"]
+        assert [plan.signal_type for plan in plans] == ["buy"]

@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0012_strategy_table
+-- Schema revision: 0013_research_plan
 
 SET NAMES utf8mb4;
 
@@ -249,6 +249,82 @@ CREATE TABLE `quant_pool_member` (
     FOREIGN KEY (`pool_id`) REFERENCES `quant_pool` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+CREATE TABLE `quant_research_plan` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `owner_id` VARCHAR(36) NOT NULL,
+  `strategy_is_system` TINYINT(1) NOT NULL DEFAULT 0,
+  `strategy_id` INT NOT NULL,
+  `strategy_name` VARCHAR(64) NOT NULL,
+  `template` VARCHAR(32) NOT NULL,
+  `strategy_kind` VARCHAR(16) NOT NULL,
+  `strategy_version` VARCHAR(64) NOT NULL,
+  `params_snapshot` JSON NOT NULL,
+  `plan_type` VARCHAR(32) NOT NULL,
+  `code` VARCHAR(16) DEFAULT NULL,
+  `pool_id` INT DEFAULT NULL,
+  `data_date` DATE NOT NULL,
+  `generated_at` DATETIME NOT NULL,
+  `next_execution_date` DATE DEFAULT NULL,
+  `valid_until` DATE DEFAULT NULL,
+  `signal_type` VARCHAR(32) NOT NULL,
+  `status` VARCHAR(32) NOT NULL,
+  `status_reason` JSON NOT NULL,
+  `price_adjustment` VARCHAR(16) NOT NULL DEFAULT 'forward',
+  `signal_price` DECIMAL(12, 4) DEFAULT NULL,
+  `entry_observation` JSON NOT NULL,
+  `risk_rules` JSON NOT NULL,
+  `take_profit` JSON NOT NULL,
+  `native_exit` JSON NOT NULL,
+  `exit_hits` JSON NOT NULL,
+  `portfolio_summary` JSON DEFAULT NULL,
+  `backtest_run_id` INT DEFAULT NULL,
+  `backtest_evidence` JSON NOT NULL,
+  `product_boundary` TEXT NOT NULL,
+  `revision` INT NOT NULL DEFAULT 1,
+  `supersedes_plan_id` BIGINT DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_quant_research_plan_owner_id` (`owner_id`),
+  KEY `ix_quant_research_plan_strategy_is_system` (`strategy_is_system`),
+  KEY `ix_quant_research_plan_strategy_id` (`strategy_id`),
+  KEY `ix_quant_research_plan_template` (`template`),
+  KEY `ix_quant_research_plan_plan_type` (`plan_type`),
+  KEY `ix_quant_research_plan_code` (`code`),
+  KEY `ix_quant_research_plan_data_date` (`data_date`),
+  KEY `ix_quant_research_plan_generated_at` (`generated_at`),
+  KEY `ix_quant_research_plan_status` (`status`),
+  KEY `ix_quant_research_plan_backtest_run_id` (`backtest_run_id`),
+  KEY `ix_quant_research_plan_supersedes_plan_id` (`supersedes_plan_id`),
+  CONSTRAINT `fk_research_plan_backtest_run`
+    FOREIGN KEY (`backtest_run_id`) REFERENCES `quant_backtest_run` (`id`)
+    ON DELETE RESTRICT,
+  CONSTRAINT `fk_research_plan_supersedes`
+    FOREIGN KEY (`supersedes_plan_id`) REFERENCES `quant_research_plan` (`id`)
+    ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_research_plan_item` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `plan_id` BIGINT NOT NULL,
+  `code` VARCHAR(16) NOT NULL,
+  `previous_weight` DECIMAL(12, 8) NOT NULL DEFAULT 0,
+  `target_weight` DECIMAL(12, 8) NOT NULL DEFAULT 0,
+  `change_type` VARCHAR(16) NOT NULL,
+  `score` FLOAT DEFAULT NULL,
+  `score_details` JSON DEFAULT NULL,
+  `rank` INT DEFAULT NULL,
+  `eligible` TINYINT(1) NOT NULL DEFAULT 1,
+  `reasons` JSON NOT NULL,
+  `risk_snapshot` JSON DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_research_plan_item` (`plan_id`, `code`),
+  KEY `ix_quant_research_plan_item_plan_id` (`plan_id`),
+  KEY `ix_quant_research_plan_item_code` (`code`),
+  KEY `ix_quant_research_plan_item_change_type` (`change_type`),
+  CONSTRAINT `fk_research_plan_item_plan`
+    FOREIGN KEY (`plan_id`) REFERENCES `quant_research_plan` (`id`)
+    ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 CREATE TABLE `quant_signal` (
   `id` BIGINT NOT NULL AUTO_INCREMENT,
   `code` VARCHAR(16) NOT NULL,
@@ -257,14 +333,19 @@ CREATE TABLE `quant_signal` (
   `side` VARCHAR(8) NOT NULL,
   `price` DECIMAL(12, 4) DEFAULT NULL,
   `reason` JSON DEFAULT NULL,
+  `plan_id` BIGINT DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_signal` (`code`, `date`, `strategy_id`, `side`),
   KEY `ix_quant_signal_code` (`code`),
   KEY `ix_quant_signal_date` (`date`),
   KEY `ix_quant_signal_strategy_id` (`strategy_id`),
+  KEY `ix_quant_signal_plan_id` (`plan_id`),
   CONSTRAINT `fk_quant_signal_strategy_id`
     FOREIGN KEY (`strategy_id`) REFERENCES `quant_strategy` (`id`)
-    ON DELETE CASCADE
+    ON DELETE CASCADE,
+  CONSTRAINT `fk_quant_signal_plan_id`
+    FOREIGN KEY (`plan_id`) REFERENCES `quant_research_plan` (`id`)
+    ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `quant_strategy_eval` (
@@ -338,6 +419,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0012_strategy_table');
+VALUES ('0013_research_plan');
 
 COMMIT;

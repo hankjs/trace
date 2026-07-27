@@ -105,7 +105,10 @@ def test_effective_params_merge_template_defaults():
             db=db, claims=CLAIMS_A,
         )
     assert created["params"] == {"fast": 10}
-    assert created["effective_params"] == {"fast": 10, "slow": 20}
+    assert created["effective_params"]["fast"] == 10
+    assert created["effective_params"]["slow"] == 20
+    assert created["effective_params"]["risk_overlay"]["enabled"] is False
+    assert created["effective_params"]["take_profit"]["enabled"] is False
     assert created["params_valid"] is True
     assert created["editable"] is True
     assert created["template_name"] == "双均线趋势策略"
@@ -217,7 +220,10 @@ def test_duplicate_makes_editable_copy_owned_by_caller():
     assert copy["is_system"] is False
     assert copy["editable"] is True
     assert copy["template"] == "ma_cross"
-    assert copy["effective_params"] == {"fast": 8, "slow": 20}
+    assert copy["effective_params"]["fast"] == 8
+    assert copy["effective_params"]["slow"] == 20
+    assert copy["effective_params"]["risk_overlay"]["enabled"] is False
+    assert copy["effective_params"]["take_profit"]["enabled"] is False
 
 
 def test_duplicate_without_name_suffixes_original():
@@ -241,7 +247,10 @@ def test_update_changes_name_params_and_enabled():
             db=db, claims=CLAIMS_A,
         )
     assert updated["name"] == "改好了"
-    assert updated["effective_params"] == {"fast": 7, "slow": 20}
+    assert updated["effective_params"]["fast"] == 7
+    assert updated["effective_params"]["slow"] == 20
+    assert updated["effective_params"]["risk_overlay"]["enabled"] is False
+    assert updated["effective_params"]["take_profit"]["enabled"] is False
     assert updated["enabled"] is False
 
 

@@ -8,10 +8,11 @@ from __future__ import annotations
 import pandas as pd
 
 from ...indicators import ma, rsi
+from ..overlays import overlay_defaults
 
 NAME = "mean_reversion"
 KIND = "single"
-DEFAULT_PARAMS = {"rsi_buy": 30, "rsi_sell": 55, "ma": 60}
+DEFAULT_PARAMS = {"rsi_buy": 30, "rsi_sell": 55, "ma": 60, **overlay_defaults()}
 WATCH_RSI_GAP = 2.0  # RSI 距买入阈值 <2 时给 watch 预警
 
 

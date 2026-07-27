@@ -772,7 +772,7 @@ def load_bars_df(db: Session, code: str, start: date | None = None,
         [
             {"date": r.date, "open": r.open, "high": r.high, "low": r.low,
              "close": r.close, "raw_close": r.raw_close,
-             "volume": r.volume, "amount": r.amount}
+             "volume": r.volume, "amount": r.amount, "is_st": r.is_st}
             for r in rows
         ]
     )

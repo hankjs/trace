@@ -1,12 +1,15 @@
 """历史指数成分区间查询。"""
 from datetime import date
 
+import pandas as pd
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db import Base
-from app.data.universe import membership_intervals, pool_during
-from app.models import IndexMember
+from app.data.universe import (membership_intervals, pool_during,
+                               pool_eligibility_matrix,
+                               resolve_pool_during)
+from app.models import DailyBar, IndexMember, Stock
 
 
 def test_pool_during_uses_half_open_membership_intervals():
@@ -60,3 +63,62 @@ def test_pool_during_uses_half_open_membership_intervals():
         )
 
     assert {row.code for row in intervals} == {"sh.entering", "sh.exiting"}
+
+
+def test_index_eligibility_respects_requested_index_and_membership_dates():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    dates = pd.date_range("2024-01-01", periods=4, freq="D")
+    with Session(engine) as db:
+        db.add_all([
+            IndexMember(index_name="hs300", code="a", in_date=date(2024, 1, 1),
+                        out_date=date(2024, 1, 3)),
+            IndexMember(index_name="zz500", code="a", in_date=date(2024, 1, 3)),
+        ])
+        db.commit()
+
+        eligibility = pool_eligibility_matrix(
+            db, dates, ["a"], kind="index", index_name="hs300",
+        )
+
+    assert eligibility["a"].tolist() == [True, True, False, False]
+
+
+def test_all_market_interval_union_keeps_delisted_stock_and_daily_st_history():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    dates = pd.date_range("2024-01-01", periods=4, freq="D")
+    with Session(engine) as db:
+        db.add_all([
+            Stock(code="a", list_date=date(2020, 1, 1), is_st=False),
+            Stock(code="b", list_date=date(2020, 1, 1),
+                  delist_date=date(2024, 1, 3), is_st=False),
+        ])
+        for code in ("a", "b"):
+            for day in dates:
+                if code == "b" and day.date() >= date(2024, 1, 3):
+                    continue
+                db.add(DailyBar(
+                    code=code, date=day.date(), open=10, high=10, low=10,
+                    close=10, raw_close=10, volume=1, amount=10,
+                    is_st=code == "a" and day.date() == date(2024, 1, 2),
+                ))
+        db.commit()
+        codes = resolve_pool_during(
+            db, date(2024, 1, 1), date(2024, 1, 4), kind="all",
+            min_list_days=0,
+        )
+        frames = {
+            code: pd.DataFrame([{
+                "date": row.date, "is_st": row.is_st,
+            } for row in db.query(DailyBar).filter(DailyBar.code == code).all()])
+            for code in codes
+        }
+        eligibility = pool_eligibility_matrix(
+            db, dates, codes, kind="all", min_list_days=0,
+            daily_frames=frames,
+        )
+
+    assert codes == ["a", "b"]
+    assert eligibility["a"].tolist() == [True, False, True, True]
+    assert eligibility["b"].tolist() == [True, True, False, False]

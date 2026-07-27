@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
-import { Search } from 'lucide-vue-next'
-import { api, type SignalItem, type WatchItem } from '../api'
+import { ChevronDown, ChevronRight, Search } from 'lucide-vue-next'
+import { api, type ResearchPlanSummary, type SignalItem, type WatchItem } from '../api'
 import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
@@ -10,6 +10,7 @@ import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import StrategySelect from '../components/StrategySelect.vue'
+import ResearchPlanSummaryView from '../components/ResearchPlanSummary.vue'
 import { fmtPrice } from '../format'
 
 const items = ref<SignalItem[]>([])
@@ -21,13 +22,18 @@ const fCode = ref('')
 /** null = 全部策略 */
 const fStrategyId = ref<number | null>(null)
 const fSide = ref('')
+const expandedIds = ref<Set<number>>(new Set())
+const plansBySignal = ref<Record<number, ResearchPlanSummary>>({})
+const loadingPlanIds = ref<Set<number>>(new Set())
+const planErrors = ref<Record<number, string>>({})
 
 const signalColumns: QuTableColumn<SignalItem>[] = [
+  { key: 'expand', label: '计划', widthClass: 'w-14', align: 'center' },
   { key: 'date', label: '日期', cellClass: 'whitespace-nowrap text-text-secondary' },
   { key: 'stock', label: '股票' },
   { key: 'strategy', label: '策略' },
   { key: 'side', label: '提示' },
-  { key: 'price', label: '参考价格', align: 'right', cellClass: 'tabular-nums' },
+  { key: 'price', label: '信号日收盘价', align: 'right', cellClass: 'tabular-nums whitespace-nowrap' },
   { key: 'reason', label: '为什么出现', cellClass: 'max-w-md text-xs leading-5 text-text-secondary' },
 ]
 
@@ -72,6 +78,44 @@ function templateLabel(signal: SignalItem): string {
 
 function sideLabel(signal: SignalItem): string {
   return signal.side_name || signalName(signal.side)
+}
+
+function signalClosePrice(signal: SignalItem): number {
+  return signal.signal_close_price ?? signal.price
+}
+
+function isExpanded(id: number): boolean {
+  return expandedIds.value.has(id)
+}
+
+async function togglePlan(signal: SignalItem) {
+  const next = new Set(expandedIds.value)
+  if (next.has(signal.id)) {
+    next.delete(signal.id)
+    expandedIds.value = next
+    return
+  }
+  next.add(signal.id)
+  expandedIds.value = next
+
+  const inline = signal.research_plan ?? signal.plan_summary
+  if (inline) plansBySignal.value = { ...plansBySignal.value, [signal.id]: inline }
+  if (!signal.research_plan_id || signal.research_plan) return
+
+  loadingPlanIds.value = new Set(loadingPlanIds.value).add(signal.id)
+  const errors = { ...planErrors.value }
+  delete errors[signal.id]
+  planErrors.value = errors
+  try {
+    const plan = await api.researchPlan(signal.research_plan_id)
+    plansBySignal.value = { ...plansBySignal.value, [signal.id]: plan }
+  } catch {
+    planErrors.value = { ...planErrors.value, [signal.id]: '完整计划暂不可用，以下显示信号基础信息。' }
+  } finally {
+    const loading = new Set(loadingPlanIds.value)
+    loading.delete(signal.id)
+    loadingPlanIds.value = loading
+  }
 }
 
 onMounted(async () => {
@@ -119,12 +163,26 @@ onMounted(async () => {
         :data="items"
         :columns="signalColumns"
         row-key="id"
-        class="min-w-[860px]"
+        class="min-w-[940px]"
         header-cell-class="px-4 py-2.5 font-medium"
         body-cell-class="px-4 py-3"
       >
+        <template #cell-expand="{ row: signal }">
+          <button
+            type="button"
+            class="icon-button mx-auto !h-8 !w-8"
+            :aria-expanded="isExpanded(signal.id)"
+            :aria-controls="`signal-plan-${signal.id}`"
+            :title="isExpanded(signal.id) ? '收起研究计划' : '展开研究计划'"
+            @click.stop="togglePlan(signal)"
+          >
+            <ChevronDown v-if="isExpanded(signal.id)" :size="16" aria-hidden="true" />
+            <ChevronRight v-else :size="16" aria-hidden="true" />
+            <span class="sr-only">{{ isExpanded(signal.id) ? '收起研究计划' : '展开研究计划' }}</span>
+          </button>
+        </template>
         <template #cell-stock="{ row: signal }">
-          <router-link :to="`/stock/${signal.code}`" class="font-medium hover:text-accent">{{ nameOf(signal) }}</router-link>
+          <router-link :to="`/stock/${signal.code}`" class="font-medium hover:text-accent" @click.stop>{{ nameOf(signal) }}</router-link>
           <div class="mt-0.5 text-xs text-text-tertiary">{{ signal.code }}</div>
         </template>
         <template #cell-strategy="{ row: signal }">
@@ -140,8 +198,19 @@ onMounted(async () => {
             {{ sideLabel(signal) }}
           </span>
         </template>
-        <template #cell-price="{ row: signal }">{{ fmtPrice(signal.price) }}</template>
-        <template #cell-reason="{ row: signal }">{{ reasonText(signal.reason, signal.reason_text) }}</template>
+        <template #cell-price="{ row: signal }">{{ fmtPrice(signalClosePrice(signal)) }}</template>
+        <template #cell-reason="{ row: signal }">{{ reasonText(signal.reason ?? {}, signal.reason_text) }}</template>
+        <template #after-row="{ row: signal, colspan }">
+          <tr v-if="isExpanded(signal.id)" :id="`signal-plan-${signal.id}`">
+            <td :colspan="colspan" class="border-b border-border p-0">
+              <p v-if="loadingPlanIds.has(signal.id)" class="bg-surface-muted px-5 py-4 text-xs text-text-tertiary">正在读取完整研究计划…</p>
+              <template v-else>
+                <p v-if="planErrors[signal.id]" class="bg-warning-soft px-5 py-2 text-xs text-warning">{{ planErrors[signal.id] }}</p>
+                <ResearchPlanSummaryView :plan="plansBySignal[signal.id]" :signal="signal" />
+              </template>
+            </td>
+          </tr>
+        </template>
       </QuTable>
     </div>
 

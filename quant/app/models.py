@@ -42,6 +42,7 @@ _SHARES = _money(20, 2)     # 成交量/成交额:amount 可达千亿
 _TRADE_QTY = _money(18, 4)  # 手工账本数量与手续费
 _PCT = _money(9, 4)         # 涨跌幅
 _EQUITY = _money(18, 8)     # 回测净值:累计乘除需高小数位
+_WEIGHT = _money(12, 8)     # 组合目标权重:保留足够精度使权重和可审计
 _MARKET_CAP = _money(20, 2)  # 总市值
 # 复权因子:baostock 权威值给 6 位小数(如 0.792993 / 6.081667),
 # 精度必须高于 _PRICE —— 用 close/raw_close 两个 4 位小数相除只能得到
@@ -177,6 +178,12 @@ class Signal(Base):
     side: Mapped[str] = mapped_column(String(8))
     price: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
     reason: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 指向同一信号最新一版研究计划。计划自身是不可变快照，重算时新建一版并
+    # 通过 supersedes_plan_id 保留版本链；删除派生信号不会删除历史计划。
+    plan_id: Mapped[int | None] = mapped_column(
+        _BIG_PK, ForeignKey("quant_research_plan.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
 
 
 class Trade(Base):
@@ -401,6 +408,90 @@ class Strategy(Base):
     # 删除策略会牵连历史(见下方三张表的外键),故「停用」是常规操作、删除是例外。
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ResearchPlan(Base):
+    """策略研究计划的不可变版本快照。
+
+    策略可能改名、改参数甚至被删除，计划仍要能按生成当时的语义解释，因此
+    策略名称、模板、版本哈希和完整生效参数均在本表固化。owner_id / is_system
+    也是可见性快照，避免历史计划因当前策略行变化而越权或丢失。
+
+    规则计算结果使用有稳定字段契约的 JSON 对象保存：不同模板的真实语义不同，
+    强行拆成一组所有模板共用的可空价格列反而会诱导调用方伪造价格区间。组合
+    逐股变化是重复结构，单独放在 quant_research_plan_item 中便于完整返回。
+    """
+
+    __tablename__ = "quant_research_plan"
+
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    strategy_is_system: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    # 刻意不建策略外键：历史计划必须在策略删除后继续保留并展示当时实例 ID。
+    strategy_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
+    strategy_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    template: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    strategy_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    params_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+
+    plan_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    pool_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    data_date: Mapped[date] = mapped_column(Date, nullable=False, index=True)
+    generated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, index=True)
+    next_execution_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
+    signal_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    status_reason: Mapped[dict] = mapped_column(JSON, nullable=False)
+    price_adjustment: Mapped[str] = mapped_column(String(16), nullable=False,
+                                                  default="forward")
+    signal_price: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
+
+    entry_observation: Mapped[dict] = mapped_column(JSON, nullable=False)
+    risk_rules: Mapped[list] = mapped_column(JSON, nullable=False)
+    take_profit: Mapped[dict] = mapped_column(JSON, nullable=False)
+    native_exit: Mapped[list] = mapped_column(JSON, nullable=False)
+    exit_hits: Mapped[list] = mapped_column(JSON, nullable=False)
+    portfolio_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
+    backtest_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("quant_backtest_run.id", ondelete="RESTRICT"),
+        nullable=True, index=True,
+    )
+    backtest_evidence: Mapped[dict] = mapped_column(JSON, nullable=False)
+    product_boundary: Mapped[str] = mapped_column(Text, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    supersedes_plan_id: Mapped[int | None] = mapped_column(
+        _BIG_PK, ForeignKey("quant_research_plan.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
+
+class ResearchPlanItem(Base):
+    """组合调仓计划的逐股变化快照。"""
+
+    __tablename__ = "quant_research_plan_item"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "code", name="uq_research_plan_item"),
+    )
+
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    plan_id: Mapped[int] = mapped_column(
+        _BIG_PK, ForeignKey("quant_research_plan.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    code: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    previous_weight: Mapped[float] = mapped_column(_WEIGHT, nullable=False, default=0)
+    target_weight: Mapped[float] = mapped_column(_WEIGHT, nullable=False, default=0)
+    change_type: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score_details: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    reasons: Mapped[list] = mapped_column(JSON, nullable=False)
+    risk_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
 class Pool(Base):

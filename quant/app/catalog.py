@@ -276,6 +276,107 @@ def _param(
     }
 
 
+def _overlay_param(key: str, name: str, description: str) -> dict[str, Any]:
+    """统一覆盖层参数元数据；fixed_pct.value 使用 0..1 小数比例。"""
+    defaults = {
+        "risk_overlay": {
+            "enabled": False, "type": "fixed_pct", "value": 0.08,
+            "atr_period": 14,
+        },
+        "take_profit": {
+            "enabled": False, "type": "fixed_pct", "value": 0.20,
+            "atr_period": 14,
+        },
+    }
+    return {
+        "key": key,
+        "name": name,
+        "description": description,
+        "default": defaults[key],
+        "value_type": "overlay",
+        "unit": "fixed_pct 为小数比例；atr_multiple 为 ATR 倍数",
+        "minimum": None,
+        "maximum": None,
+        "step": None,
+        "fields": {
+            "enabled": {"name": "是否启用", "value_type": "boolean"},
+            "type": {
+                "name": "计算类型", "value_type": "enum",
+                "options": [
+                    {"value": "fixed_pct", "name": "相对模拟入场价的固定比例"},
+                    {"value": "atr_multiple", "name": "相对模拟入场价的 ATR 倍数"},
+                ],
+            },
+            "value": {
+                "name": "覆盖距离", "value_type": "number",
+                "unit_by_type": {
+                    "fixed_pct": "小数比例（0.08 表示 8%）",
+                    "atr_multiple": "ATR 倍数",
+                },
+            },
+            "atr_period": {
+                "name": "ATR 计算窗口", "value_type": "integer", "unit": "交易日",
+                "minimum": 2, "maximum": 250,
+            },
+        },
+    }
+
+
+def _plan_capability(
+    *,
+    plan_type: str,
+    entry_type: str,
+    entry_name: str,
+    native_exit_name: str,
+    native_exit_condition: str,
+    native_price_line: bool,
+) -> dict[str, Any]:
+    """六模板共用的结构化中文研究计划能力声明。"""
+    return {
+        "plan_type": plan_type,
+        "plan_type_name": "单标的研究计划" if plan_type == "single" else "组合调仓研究计划",
+        "entry_observation": {
+            "type": entry_type,
+            "name": entry_name,
+            "price_line_supported": entry_type in {"line", "range"},
+        },
+        "native_exit": {
+            "name": native_exit_name,
+            "condition": native_exit_condition,
+            "price_line_supported": native_price_line,
+        },
+        "overlays": {
+            "risk_overlay": {
+                "name": "用户启用的风险覆盖层", "default_enabled": False,
+                "types": ["fixed_pct", "atr_multiple"],
+                "confirmation": "T 日收盘确认，T+1 日开盘模拟退出",
+            },
+            "take_profit": {
+                "name": "可选止盈覆盖层", "default_enabled": False,
+                "types": ["fixed_pct", "atr_multiple"],
+                "confirmation": "T 日收盘确认，T+1 日开盘模拟退出",
+            },
+        },
+        "execution": {
+            "signal_time": "T 日收盘后",
+            "simulation_time": "T+1 日开盘",
+            "real_execution": "外部手工确认",
+        },
+    }
+
+
+_OVERLAY_PARAMS = [
+    _overlay_param(
+        "risk_overlay", "统一风险覆盖层",
+        "默认关闭；按模拟入场价的固定比例或入场信号日 ATR 计算风险失效线。",
+    ),
+    _overlay_param(
+        "take_profit", "可选止盈覆盖层",
+        "默认关闭；按模拟入场价的固定收益率或入场信号日 ATR 计算止盈参考线。",
+    ),
+]
+
+
 # 算法模板字典,键 = `app/strategy/strategies` 里的模块 NAME。
 # 这里描述的是**算法**(有哪些参数、什么含义、什么限制),不是用户的策略实例 ——
 # 后者是 `quant_strategy` 的行(模板 + 一组参数 + 名字),见 alembic 0012。
@@ -287,11 +388,17 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
         "unit": None, "direction": "跟随价格趋势", "kind": "single", "kind_name": "单只股票",
         "limits": "均线滞后，震荡行情可能频繁切换；信号仅供研究，不会提交订单。",
         "constraints": ["fast < slow"],
+        "plan_capability": _plan_capability(
+            plan_type="single", entry_type="none", entry_name="快慢均线关系",
+            native_exit_name="均线下穿退出", native_exit_condition="短期均线下穿长期均线",
+            native_price_line=False,
+        ),
         "params": [
             _param("fast", "短期均线天数", "较灵敏的均线窗口。", 5,
                    value_type="integer", unit="交易日", minimum=2, maximum=120, step=1),
             _param("slow", "长期均线天数", "用于确认中期趋势的均线窗口。", 20,
                    value_type="integer", unit="交易日", minimum=3, maximum=250, step=1),
+            *_OVERLAY_PARAMS,
         ],
     },
     "breakout": {
@@ -300,11 +407,23 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
         "unit": None, "direction": "跟随价格突破", "kind": "single", "kind_name": "单只股票",
         "limits": "假突破可能造成快速反转；信号在收盘后产生，回测按下一交易日开盘模拟成交。",
         "constraints": [],
+        "plan_capability": _plan_capability(
+            plan_type="single", entry_type="line", entry_name="过去 N 日高点观察线",
+            native_exit_name="区间低点退出", native_exit_condition="收盘价跌破过去 M 日低点",
+            native_price_line=True,
+        ),
         "params": [
             _param("entry", "入场观察天数", "突破此前多少个交易日的最高价。", 20,
                    value_type="integer", unit="交易日", minimum=5, maximum=250, step=1),
             _param("exit", "退出观察天数", "跌破此前多少个交易日的最低价。", 10,
                    value_type="integer", unit="交易日", minimum=2, maximum=120, step=1),
+            _param(
+                "max_entry_premium", "最大观察溢价",
+                "高于突破线仍可继续观察的最大比例；0 表示只展示观察线。",
+                0.0, value_type="number", unit="比例",
+                minimum=0.0, maximum=0.5, step=0.01,
+            ),
+            *_OVERLAY_PARAMS,
         ],
     },
     "mean_reversion": {
@@ -313,6 +432,11 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
         "unit": None, "direction": "在上升趋势中观察短期回落", "kind": "single", "kind_name": "单只股票",
         "limits": "超跌后仍可能继续下跌，RSI阈值不能单独作为真实交易依据。",
         "constraints": ["rsi_buy < rsi_sell"],
+        "plan_capability": _plan_capability(
+            plan_type="single", entry_type="none", entry_name="RSI 与长期均线条件",
+            native_exit_name="强弱修复或趋势破坏", native_exit_condition="RSI 修复或收盘跌破长期均线",
+            native_price_line=True,
+        ),
         "params": [
             _param("rsi_buy", "RSI偏弱阈值", "低于该值时视为短期偏弱。", 30,
                    value_type="number", unit="0-100", minimum=5, maximum=50, step=1),
@@ -320,6 +444,7 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
                    value_type="number", unit="0-100", minimum=30, maximum=95, step=1),
             _param("ma", "长期趋势天数", "判断收盘价是否仍处于长期均线上方。", 60,
                    value_type="integer", unit="交易日", minimum=20, maximum=250, step=1),
+            *_OVERLAY_PARAMS,
         ],
     },
     "volume_breakout": {
@@ -328,6 +453,11 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
         "unit": None, "direction": "观察整理后的量价突破", "kind": "single", "kind_name": "单只股票",
         "limits": "成交量和平台阈值对结果敏感，突发消息可能导致跳空和较大滑点。",
         "constraints": [],
+        "plan_capability": _plan_capability(
+            plan_type="single", entry_type="line", entry_name="整理平台上沿观察线",
+            native_exit_name="平台或波动风险退出", native_exit_condition="收盘跌破平台下沿或模板 ATR 风险线",
+            native_price_line=True,
+        ),
         "params": [
             _param("window", "整理平台天数", "计算平台高低点和长期均量的窗口。", 20,
                    value_type="integer", unit="交易日", minimum=10, maximum=120, step=1),
@@ -337,6 +467,13 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
                    value_type="number", unit="倍", minimum=1.0, maximum=10.0, step=0.1),
             _param("atr_mult", "波动止损倍数", "入场价下方保留多少倍ATR波动空间。", 2.0,
                    value_type="number", unit="倍ATR", minimum=0.5, maximum=10.0, step=0.1),
+            _param(
+                "max_entry_premium", "最大观察溢价",
+                "高于平台上沿仍可继续观察的最大比例；0 表示只展示观察线。",
+                0.0, value_type="number", unit="比例",
+                minimum=0.0, maximum=0.5, step=0.01,
+            ),
+            *_OVERLAY_PARAMS,
         ],
     },
     "momentum_rotation": {
@@ -345,6 +482,11 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
         "unit": None, "direction": "在股票池内轮换相对强势标的", "kind": "portfolio", "kind_name": "股票组合",
         "limits": "需要完整股票池和足够历史数据；高换手阶段会受到费用和滑点影响。",
         "constraints": ["w_mom20 + w_mom60 建议等于 1"],
+        "plan_capability": _plan_capability(
+            plan_type="portfolio_rebalance", entry_type="portfolio_rebalance", entry_name="周度 Top N 目标权重",
+            native_exit_name="趋势资格过滤", native_exit_condition="收盘跌破 20 日均线或调仓调出",
+            native_price_line=True,
+        ),
         "params": [
             _param("top_n", "持有股票数量", "每次调仓最多等权持有的股票数。", 10,
                    value_type="integer", unit="只", minimum=1, maximum=100, step=1),
@@ -352,6 +494,7 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
                    value_type="number", unit="权重", minimum=0, maximum=1, step=0.05),
             _param("w_mom60", "60日动量权重", "近60日涨跌幅在综合分数中的权重。", 0.4,
                    value_type="number", unit="权重", minimum=0, maximum=1, step=0.05),
+            *_OVERLAY_PARAMS,
         ],
     },
     "multifactor_hold": {
@@ -360,9 +503,15 @@ STRATEGY_TEMPLATES: dict[str, dict[str, Any]] = {
         "unit": None, "direction": "持有综合评分较高的股票组合", "kind": "portfolio", "kind_name": "股票组合",
         "limits": "评分目前以技术因子为主，不等同于公司基本面质量；组合结果是历史模拟。",
         "constraints": [],
+        "plan_capability": _plan_capability(
+            plan_type="portfolio_rebalance", entry_type="portfolio_rebalance", entry_name="月度 Top N 目标权重",
+            native_exit_name="排名变化调出", native_exit_condition="计划调仓时不再进入 Top N",
+            native_price_line=False,
+        ),
         "params": [
             _param("top_n", "持有股票数量", "每次调仓最多等权持有的股票数。", 20,
                    value_type="integer", unit="只", minimum=1, maximum=100, step=1),
+            *_OVERLAY_PARAMS,
         ],
     },
 }

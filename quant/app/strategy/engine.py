@@ -18,13 +18,19 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
+import pandas as pd
 from sqlalchemy import delete, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
+from ..data.calendar import is_trading_day
 from ..data.ingest import load_bars_df
+from ..backtest.engine import opening_buy_tradable_mask
 from ..models import Signal, Strategy, WatchlistItem
+from ..research_plan.service import create_holding_plan, create_single_plan
 from .store import enabled_strategies
+from .overlays import (DEFAULT_SIMULATION_SLIPPAGE, apply_single_overlays,
+                       single_entry_price_ceiling, single_entry_price_floor)
 from .strategies import REGISTRY
 
 logger = logging.getLogger(__name__)
@@ -42,6 +48,21 @@ def _save_signal(db: Session, code: str, day: date, strategy_id: int,
     )
     stmt = stmt.on_duplicate_key_update(price=price, reason=reason)
     db.execute(stmt)
+
+
+def _save_signal_and_plan(db: Session, code: str, day: date,
+                          strategy: Strategy, side: str, price: float,
+                          reason: dict, df) -> None:
+    """信号与其研究计划在同一保存点写入，避免出现有信号却无法解释的半状态。"""
+    with db.begin_nested():
+        _save_signal(db, code, day, strategy.id, side, price, reason)
+        signal = db.execute(select(Signal).where(
+            Signal.code == code,
+            Signal.date == day,
+            Signal.strategy_id == strategy.id,
+            Signal.side == side,
+        )).scalar_one()
+        create_single_plan(db, strategy, signal, df)
 
 
 def _resolve_strategies(db: Session,
@@ -72,6 +93,9 @@ def run_signals(db: Session, day: date | None = None,
     返回 {策略名: {code: side}} 汇总。
     """
     day = day or date.today()
+    if not is_trading_day(db, day):
+        logger.info("%s 非交易日，不生成信号或研究计划", day)
+        return {"date": str(day), "signals": {}, "total": 0}
     if codes is None:
         codes = [r[0] for r in db.execute(
             select(WatchlistItem.code).distinct()).all()]
@@ -100,7 +124,19 @@ def run_signals(db: Session, day: date | None = None,
             mod = REGISTRY[strategy.template]
             params = strategy.params or {}
             try:
-                pos = mod.positions(df, params)
+                native = mod.positions(df, params)
+                dates = pd.DatetimeIndex(df["date"])
+                overlay_state: dict = {}
+                pos, overlay_exits = apply_single_overlays(
+                    df, native, params, slippage=DEFAULT_SIMULATION_SLIPPAGE,
+                    entry_tradable=opening_buy_tradable_mask(
+                        {code: df}, dates)[code],
+                    entry_price_ceiling=single_entry_price_ceiling(
+                        mod, df, params),
+                    entry_price_floor=single_entry_price_floor(
+                        mod, df, params),
+                    state_out=overlay_state,
+                )
             except Exception:  # noqa: BLE001 - 单个策略出错不影响其他策略和股票
                 logger.exception("策略 %s 计算失败 %s", strategy.name, code)
                 continue
@@ -109,6 +145,16 @@ def run_signals(db: Session, day: date | None = None,
             produced.setdefault((strategy.id, code), set())  # 已重算,允许清理旧 side
             cur, prev = int(pos.iat[-1]), int(pos.iat[-2])
             if cur != prev:
+                # T 日进入信号在今日开盘受阻时，模拟仓位会从“待进入”回到 0，
+                # 但原生条件仍为持有。这不是退出，不能制造一条卖出提示。
+                blocked_entry = (
+                    cur < prev
+                    and overlay_state.get("entry_blocked") is True
+                    and pd.Timestamp(day) not in overlay_exits
+                )
+                if blocked_entry:
+                    logger.info("模拟入场未成交 %s %s，等待原生条件重置", strategy.name, code)
+                    continue
                 side = "buy" if cur == 1 else "sell"
                 reason = {
                     "params": params,
@@ -116,17 +162,36 @@ def run_signals(db: Session, day: date | None = None,
                     "cur_position": cur,
                     "close": price,
                 }
-                _save_signal(db, code, day, strategy.id, side, price, reason)
+                if side == "sell" and pd.Timestamp(day) in overlay_exits:
+                    reasons = overlay_exits[pd.Timestamp(day)]
+                    reason["primary_exit_reason"] = reasons[0]
+                    reason["all_exit_reasons"] = reasons
+                if overlay_state.get("simulated_entry_price") is not None:
+                    reason["simulated_entry_price"] = overlay_state[
+                        "simulated_entry_price"
+                    ]
+                if overlay_state.get("rules"):
+                    reason["overlay_state_rules"] = overlay_state["rules"]
+                _save_signal_and_plan(
+                    db, code, day, strategy, side, price, reason, df)
                 produced[(strategy.id, code)].add(side)
                 summary[strategy.id][code] = side
                 logger.info("信号 %s %s %s @ %.2f",
                             strategy.name, code, side, price)
+            elif cur == prev == 1:
+                create_holding_plan(
+                    db, strategy, code=code, data_date=day,
+                    df=df,
+                    simulated_entry_price=overlay_state.get(
+                        "simulated_entry_price"),
+                    overlay_state_rules=overlay_state.get("rules") or [],
+                )
             elif hasattr(mod, "watch"):
                 reason = mod.watch(df, params)
                 if reason:
                     reason["params"] = params
-                    _save_signal(db, code, day, strategy.id, "watch", price,
-                                 reason)
+                    _save_signal_and_plan(
+                        db, code, day, strategy, "watch", price, reason, df)
                     produced[(strategy.id, code)].add("watch")
                     summary[strategy.id][code] = "watch"
                     logger.info("watch %s %s @ %.2f %s",

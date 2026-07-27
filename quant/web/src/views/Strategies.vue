@@ -12,13 +12,21 @@ import {
   api,
   type CatalogEntry,
   type Strategy,
+  type StrategyOverlayConfig,
 } from '../api'
 import StrategyParamFields from '../components/StrategyParamFields.vue'
+import StrategyOverlayFields from '../components/StrategyOverlayFields.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import { useStrategies } from '../strategies'
 import { useAsyncAction } from '../useAsyncAction'
 import { useStrategyParamForm } from '../useStrategyParamForm'
+import {
+  DEFAULT_RISK_OVERLAY,
+  DEFAULT_TAKE_PROFIT,
+  overlayFromParams,
+  overlayParamSnapshot,
+} from '../researchPlans'
 
 const {
   strategies,
@@ -41,6 +49,10 @@ const draft = reactive({ name: '', template: '' })
 
 /** 选中策略的编辑态,保存前不写回列表 */
 const editName = ref('')
+const draftRisk = ref<StrategyOverlayConfig>({ ...DEFAULT_RISK_OVERLAY })
+const draftTakeProfit = ref<StrategyOverlayConfig>({ ...DEFAULT_TAKE_PROFIT })
+const editRisk = ref<StrategyOverlayConfig>({ ...DEFAULT_RISK_OVERLAY })
+const editTakeProfit = ref<StrategyOverlayConfig>({ ...DEFAULT_TAKE_PROFIT })
 
 const selected = computed<Strategy | null>(
   () => strategies.value.find((strategy) => strategy.id === selectedId.value) ?? null
@@ -55,7 +67,11 @@ function templateOf(key: string): CatalogEntry | undefined {
 }
 
 function paramsOf(key: string) {
-  return templateOf(key)?.params ?? []
+  return (templateOf(key)?.params ?? []).filter((parameter) =>
+    parameter.value_type !== 'overlay'
+    && parameter.key !== 'risk_overlay'
+    && parameter.key !== 'take_profit'
+  )
 }
 
 const draftParameterDefs = computed(() => paramsOf(draft.template))
@@ -80,6 +96,8 @@ watch([selected, templates], ([strategy]) => {
   if (!strategy) return
   editName.value = strategy.name
   editParamForm.reset(strategy.effective_params)
+  editRisk.value = overlayFromParams(strategy.effective_params, 'risk_overlay')
+  editTakeProfit.value = overlayFromParams(strategy.effective_params, 'take_profit')
 })
 
 watch(selectedId, () => {
@@ -92,6 +110,8 @@ watch(strategies, (items) => {
 
 watch(() => draft.template, () => {
   draftParamForm.reset()
+  draftRisk.value = { ...DEFAULT_RISK_OVERLAY }
+  draftTakeProfit.value = { ...DEFAULT_TAKE_PROFIT }
 })
 
 function startCreate() {
@@ -120,7 +140,10 @@ async function createStrategy() {
     const strategy = await api.createStrategy({
       name,
       template: draft.template,
-      params: draftParamForm.overrides.value,
+      params: {
+        ...draftParamForm.overrides.value,
+        ...overlayParamSnapshot(draftRisk.value, draftTakeProfit.value),
+      },
     })
     await refreshStrategies(strategy.id)
     return strategy
@@ -138,7 +161,14 @@ async function saveAsMine() {
   await runAction(async () => {
     const copy = await api.duplicateStrategy(source.id, {
       // 模板元数据未就绪时不传 params,让后端沿用源策略的参数而不是重置为默认值
-      ...(paramsOf(source.template).length ? { params: editParamForm.overrides.value } : {}),
+      ...(paramsOf(source.template).length || editRisk.value.enabled || editTakeProfit.value.enabled
+        ? {
+            params: {
+              ...editParamForm.overrides.value,
+              ...overlayParamSnapshot(editRisk.value, editTakeProfit.value, source.effective_params),
+            },
+          }
+        : {}),
     })
     await refreshStrategies(copy.id)
     return copy
@@ -172,7 +202,12 @@ async function saveParams() {
     return
   }
   await runAction(async () => {
-    await api.updateStrategy(strategy.id, { params: editParamForm.overrides.value })
+    await api.updateStrategy(strategy.id, {
+      params: {
+        ...editParamForm.overrides.value,
+        ...overlayParamSnapshot(editRisk.value, editTakeProfit.value, strategy.effective_params),
+      },
+    })
     await refreshStrategies(strategy.id)
   }, { success: '已保存策略参数。历史回测保留当时的参数快照，不受影响。' })
 }
@@ -327,13 +362,20 @@ void init()
             </p>
           </div>
 
-          <div v-if="paramsOf(draft.template).length" class="rounded-md border border-border bg-surface-raised p-4">
-            <span class="mb-2 block text-xs font-medium text-text-secondary">策略参数</span>
-            <StrategyParamFields
-              v-model="draftParamForm.values"
-              :parameters="draftParameterDefs"
-              :errors="draftParamForm.errors"
-              id-prefix="draft-strategy-param"
+          <div class="rounded-md border border-border bg-surface-raised p-4">
+            <section v-if="paramsOf(draft.template).length" aria-labelledby="draft-native-params-heading">
+              <h4 id="draft-native-params-heading" class="mb-2 text-sm font-semibold">模板原生参数</h4>
+              <StrategyParamFields
+                v-model="draftParamForm.values"
+                :parameters="draftParameterDefs"
+                :errors="draftParamForm.errors"
+                id-prefix="draft-strategy-param"
+              />
+            </section>
+            <StrategyOverlayFields
+              v-model:risk="draftRisk"
+              v-model:take-profit="draftTakeProfit"
+              id-prefix="draft-strategy-overlay"
             />
           </div>
         </form>
@@ -422,19 +464,27 @@ void init()
           </div>
         </template>
 
-        <div v-if="paramsOf(selected.template).length" class="space-y-3 rounded-md border border-border bg-surface-raised p-4">
-          <div class="flex items-baseline justify-between gap-3">
-            <h4 class="text-sm font-semibold">策略参数</h4>
-            <span v-if="templateOf(selected.template)?.constraints?.length" class="text-xs text-text-tertiary">
-              约束：{{ templateOf(selected.template)?.constraints?.join('；') }}
-            </span>
-          </div>
-          <StrategyParamFields
-            v-model="editParamForm.values"
-            :parameters="editParameterDefs"
-            :errors="editParamForm.errors"
+        <div class="space-y-3 rounded-md border border-border bg-surface-raised p-4">
+          <section v-if="paramsOf(selected.template).length" aria-labelledby="edit-native-params-heading">
+            <div class="mb-3 flex items-baseline justify-between gap-3">
+              <h4 id="edit-native-params-heading" class="text-sm font-semibold">模板原生参数</h4>
+              <span v-if="templateOf(selected.template)?.constraints?.length" class="text-xs text-text-tertiary">
+                约束：{{ templateOf(selected.template)?.constraints?.join('；') }}
+              </span>
+            </div>
+            <StrategyParamFields
+              v-model="editParamForm.values"
+              :parameters="editParameterDefs"
+              :errors="editParamForm.errors"
+              :disabled="readonlyStrategy"
+              id-prefix="edit-strategy-param"
+            />
+          </section>
+          <StrategyOverlayFields
+            v-model:risk="editRisk"
+            v-model:take-profit="editTakeProfit"
             :disabled="readonlyStrategy"
-            id-prefix="edit-strategy-param"
+            id-prefix="edit-strategy-overlay"
           />
           <button
             v-if="!readonlyStrategy"

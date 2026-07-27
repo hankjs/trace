@@ -4,10 +4,11 @@ from __future__ import annotations
 import pandas as pd
 
 from ...indicators import ma
+from ..overlays import overlay_defaults
 
 NAME = "ma_cross"
 KIND = "single"
-DEFAULT_PARAMS = {"fast": 5, "slow": 20}
+DEFAULT_PARAMS = {"fast": 5, "slow": 20, **overlay_defaults()}
 WATCH_GAP_PCT = 0.01  # 快慢线差距 <1% 时给 watch 预警
 
 

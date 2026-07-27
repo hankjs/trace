@@ -15,6 +15,7 @@ import logging
 import uuid
 from datetime import date, timedelta
 
+import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -23,9 +24,12 @@ from ..models import FactorDaily, Strategy, StrategyEval
 from ..selection.pipeline import score_cross_section
 from ..strategy.store import enabled_strategies, visible_to
 from ..strategy.strategies import resolve_module
+from ..strategy.overlays import (apply_single_overlays,
+                                 single_entry_price_ceiling,
+                                 single_entry_price_floor)
 from .engine import (DEFAULT_COSTS, SINGLE_WARMUP_DAYS, _batch_single,
-                     _median_or_none, _mean_or_none, run_backtest,
-                     validate_params)
+                     _median_or_none, _mean_or_none, opening_buy_tradable_mask,
+                     run_backtest, validate_params)
 from ..data.ingest import load_bars_df
 
 logger = logging.getLogger(__name__)
@@ -76,7 +80,17 @@ def _eval_single(db: Session, strategy: Strategy, codes: list[str],
         if len(df) == 0 or int((df["date"] >= start).sum()) < 60:
             continue
         dfs[code] = df
-        positions[code] = mod.positions(df, params)
+        native = mod.positions(df, params)
+        positions[code] = apply_single_overlays(
+            df, native, params, slippage=DEFAULT_COSTS["slippage"],
+            entry_tradable=opening_buy_tradable_mask(
+                {code: df}, pd.DatetimeIndex(df["date"]),
+            )[code],
+            entry_price_ceiling=single_entry_price_ceiling(
+                mod, df, params),
+            entry_price_floor=single_entry_price_floor(
+                mod, df, params),
+        )[0]
     if not dfs:
         return {"error": "数据不足"}
     results = _batch_single(dfs, positions, DEFAULT_COSTS, start)

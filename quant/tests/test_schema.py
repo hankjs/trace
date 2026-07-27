@@ -57,7 +57,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0012_strategy_table"}
+    assert heads == {"0013_research_plan"}
     assert current_heads(migrated_db) == heads
 
 
@@ -76,6 +76,8 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_pool",
         "quant_pool_grant",
         "quant_pool_member",
+        "quant_research_plan",
+        "quant_research_plan_item",
         "quant_signal",
         "quant_snapshot",
         "quant_stock",
@@ -456,6 +458,46 @@ def test_signal_unique_constraint_uses_strategy_id(migrated_db):
         for u in inspect(migrated_db).get_unique_constraints("quant_signal")
     }
     assert uniques["uq_signal"] == ["code", "date", "strategy_id", "side"]
+
+
+def test_research_plan_snapshot_shape(migrated_db):
+    """研究计划固化版本、日期、规则和回测证据，不依赖当前策略参数重算。"""
+    columns = _columns(migrated_db, "quant_research_plan")
+    required = {
+        "strategy_id", "strategy_name", "template", "strategy_version",
+        "params_snapshot", "plan_type", "data_date", "generated_at",
+        "next_execution_date", "status", "status_reason", "entry_observation",
+        "risk_rules", "take_profit", "native_exit", "portfolio_summary",
+        "backtest_run_id", "backtest_evidence", "supersedes_plan_id",
+    }
+    assert required <= set(columns)
+    assert all(not columns[name]["nullable"] for name in (
+        "strategy_id", "strategy_version", "params_snapshot", "plan_type",
+        "data_date", "generated_at", "status", "entry_observation",
+        "risk_rules", "take_profit", "native_exit", "backtest_evidence",
+    ))
+
+
+def test_research_plan_items_are_unique_per_stock(migrated_db):
+    columns = _columns(migrated_db, "quant_research_plan_item")
+    assert {"plan_id", "code", "previous_weight", "target_weight",
+            "change_type", "reasons", "risk_snapshot"} <= set(columns)
+    assert "score_details" in columns
+    uniques = {
+        item["name"]: item["column_names"]
+        for item in inspect(migrated_db).get_unique_constraints(
+            "quant_research_plan_item")
+    }
+    assert uniques["uq_research_plan_item"] == ["plan_id", "code"]
+
+
+def test_signal_points_to_latest_research_plan(migrated_db):
+    columns = _columns(migrated_db, "quant_signal")
+    assert columns["plan_id"]["nullable"] is True
+    fks = inspect(migrated_db).get_foreign_keys("quant_signal")
+    match = [fk for fk in fks if fk["constrained_columns"] == ["plan_id"]]
+    assert match and match[0]["referred_table"] == "quant_research_plan"
+    assert (match[0]["options"].get("ondelete") or "").upper() == "SET NULL"
 
 
 def test_snapshot_pk_types_upgraded_to_bigint():

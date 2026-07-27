@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
+import pandas as pd
 from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -178,17 +179,92 @@ def pool_at(db: Session, day: date, index_name: str | None = None) -> list[str]:
 
 
 def membership_intervals(db: Session, codes: list[str], start: date,
-                         end: date) -> list[IndexMember]:
+                         end: date,
+                         index_name: str | None = None) -> list[IndexMember]:
     """返回与区间重叠的成分记录，供动态股票池回测构造逐日可选掩码。"""
     if not codes:
         return []
-    return list(db.execute(
-        select(IndexMember).where(
+    query = select(IndexMember).where(
             IndexMember.code.in_(codes),
             IndexMember.in_date <= end,
             or_(IndexMember.out_date.is_(None), IndexMember.out_date > start),
         )
-    ).scalars().all())
+    if index_name is not None:
+        query = query.where(IndexMember.index_name == index_name)
+    return list(db.execute(query).scalars().all())
+
+
+class MissingPoolHistoryError(ValueError):
+    """股票池逐日资格数据不足，不能用当前状态替代历史。"""
+
+
+def pool_eligibility_matrix(
+    db: Session,
+    dates,
+    codes: list[str],
+    *,
+    kind: str,
+    index_name: str | None = None,
+    min_list_days: int = DEFAULT_MIN_LIST_DAYS,
+    daily_frames: dict[str, pd.DataFrame] | None = None,
+) -> pd.DataFrame:
+    """按池类型构造逐日资格，不把结束日成分快照广播到整个历史区间。"""
+    idx = pd.DatetimeIndex(dates)
+    result = pd.DataFrame(False, index=idx, columns=codes)
+    if not len(idx) or not codes:
+        return result
+    if kind == "static":
+        # 静态池本身没有成员生效日期；其定义是在整个研究区间保持不变。
+        return pd.DataFrame(True, index=idx, columns=codes)
+    if kind == "index":
+        intervals = membership_intervals(
+            db, codes, idx[0].date(), idx[-1].date(), index_name=index_name,
+        )
+        for member in intervals:
+            active = idx.date >= member.in_date
+            if member.out_date is not None:
+                active &= idx.date < member.out_date
+            result.loc[active, member.code] = True
+        if not intervals:
+            raise MissingPoolHistoryError("回看区间缺少指数成分历史，不能用当前成分替代")
+        return result
+
+    stocks = {
+        stock.code: stock for stock in db.execute(
+            select(Stock).where(Stock.code.in_(codes))
+        ).scalars()
+    }
+    frames = daily_frames or {}
+    for code in codes:
+        stock = stocks.get(code)
+        if stock is None or stock.list_date is None:
+            raise MissingPoolHistoryError(
+                f"{code} 缺少上市日期，不能还原全 A 历史资格"
+            )
+        listed_from = stock.list_date + timedelta(days=min_list_days)
+        active = idx.date >= listed_from
+        if stock.delist_date is not None:
+            active &= idx.date < stock.delist_date
+        frame = frames.get(code)
+        if frame is None or "is_st" not in frame:
+            raise MissingPoolHistoryError(
+                f"{code} 缺少逐日 ST 历史，不能用当前状态替代"
+            )
+        observed = frame.set_index("date")["is_st"]
+        missing_observed = observed[observed.isna()]
+        if len(missing_observed):
+            first = pd.Timestamp(missing_observed.index[0]).date()
+            raise MissingPoolHistoryError(
+                f"{code} 在 {first} 缺少逐日 ST 历史，不能用当前状态替代"
+            )
+        # 停牌日没有 bar，不代表资格历史缺失；沿用最近一次已确认的 ST 状态，
+        # 价格矩阵本身仍为 NaN，因此策略不会在停牌日产生可成交目标。
+        status = observed.reindex(idx).ffill()
+        result[code] = (
+            active & status.notna().to_numpy()
+            & ~status.fillna(False).astype(bool).to_numpy()
+        )
+    return result
 
 
 def pool_during(db: Session, start: date, end: date,
@@ -375,6 +451,21 @@ def resolve_pool_during(db: Session, start: date, end: date, *,
     """
     if kind == "index":
         return pool_during(db, start, end, index_name=index_name)
+    if kind == "all":
+        # 先复用完整性护栏，再取区间内任一时点达到上市年限且尚未退市的并集；
+        # ST 是逐日状态，在 pool_eligibility_matrix 中按 bar 过滤。
+        all_market_pool(
+            db, end, min_list_days=min_list_days,
+            max_missing_ratio=max_missing_ratio,
+        )
+        cutoff = end - timedelta(days=min_list_days)
+        has_bars = select(DailyBar.code).distinct()
+        return [row[0] for row in db.execute(select(Stock.code).where(
+            Stock.list_date.is_not(None),
+            Stock.list_date <= cutoff,
+            or_(Stock.delist_date.is_(None), Stock.delist_date > start),
+            Stock.code.in_(has_bars),
+        ).order_by(Stock.code)).all()]
     return resolve_pool(db, end, kind=kind, index_name=index_name,
                         pool_id=pool_id, min_list_days=min_list_days,
                         max_missing_ratio=max_missing_ratio)

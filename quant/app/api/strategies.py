@@ -29,6 +29,7 @@ from ..models import BacktestRun, Strategy
 from ..strategy.store import (MAX_ENABLED_PER_USER, MAX_STRATEGIES_PER_USER,
                               can_edit, count_owned, list_visible, visible_to)
 from ..strategy.strategies import REGISTRY
+from ..research_plan.domain import CAPABILITIES
 
 router = APIRouter(prefix="/api/strategies", tags=["strategies"])
 
@@ -77,6 +78,7 @@ def strategy_out(strategy: Strategy, *, editable: bool = False,
         "template_name": template_name(strategy.template),
         "kind": strategy.kind,
         "kind_name": template.get("kind_name", strategy.kind),
+        "research_plan_capabilities": CAPABILITIES.get(strategy.template, {}),
         "params": strategy.params or {},
         "effective_params": effective,
         "params_valid": valid,
@@ -163,8 +165,12 @@ def list_templates():
     新建策略页不必拉整份目录。
     """
     from copy import deepcopy
-    return {"items": [deepcopy(STRATEGY_TEMPLATES[name])
-                      for name in sorted(REGISTRY)]}
+    items = []
+    for name in sorted(REGISTRY):
+        item = deepcopy(STRATEGY_TEMPLATES[name])
+        item["research_plan_capabilities"] = deepcopy(CAPABILITIES.get(name, {}))
+        items.append(item)
+    return {"items": items}
 
 
 @router.get("")

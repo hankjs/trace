@@ -337,7 +337,7 @@ export function reasonText(reason: Record<string, unknown>, fallback = ''): stri
         cur_position: '当前策略状态',
         fast: '短期参数',
         slow: '长期参数',
-        price: '参考价格',
+        price: '信号日收盘价',
         close: '收盘价',
       }[key] ?? key
       const text = typeof value === 'number' ? String(+value.toFixed(4)) : String(value)

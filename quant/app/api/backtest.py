@@ -119,8 +119,7 @@ def create_backtest(body: BacktestIn, db: Session = Depends(get_db),
     try:
         result = run_backtest(db, strategy, codes,
                               body.start, body.end, body.params, body.costs,
-                              # 成分变动的逐日掩码只对指数口径有意义
-                              dynamic_universe=use_pool and pool.kind == "index",
+                              dynamic_universe=use_pool,
                               user_id=user_id,
                               pool_id=pool.id if use_pool else None)
     except ValueError as e:
@@ -145,17 +144,27 @@ def get_backtest(run_id: int, db: Session = Depends(get_db),
     # 策略可能已被改名或(停用后)删除。历史回测的 params 是当时的快照,
     # 名字则只能回显当前值;策略已删时留 None,由前端显示为「策略已删除」
     strategy = db.get(Strategy, run.strategy_id)
+    metrics = run.metrics or {}
+    evidence = metrics.get("evidence") if isinstance(metrics.get("evidence"), dict) else {}
     result = {
         "run_id": run.id,
         "strategy_id": run.strategy_id,
         "strategy_name": strategy.name if strategy else None,
         "template": strategy.template if strategy else None,
         "params": run.params,
+        "parameter_snapshot": evidence.get("parameter_snapshot", run.params),
         "codes": run.codes,
         "stocks": StockRepository(db).items(run.codes),
         "start": str(run.start),
         "end": str(run.end),
-        "metrics": run.metrics,
+        "costs": run.costs or {},
+        "fee_assumptions": evidence.get("fee_assumptions", {}),
+        "metrics": metrics,
+        "evidence": evidence or None,
+        "trade_details": evidence.get("trade_details", []),
+        "exit_reason_distribution": evidence.get(
+            "exit_reason_distribution", {"by_primary": {}, "all_hits": {}},
+        ),
         "created_at": run.created_at.isoformat(sep=" "),
         "equity": [{"date": str(e.date), "equity": e.equity} for e in equity],
     }

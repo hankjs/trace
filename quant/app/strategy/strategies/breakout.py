@@ -7,17 +7,29 @@ from __future__ import annotations
 
 import pandas as pd
 
+from ..overlays import overlay_defaults
+
 NAME = "breakout"
 KIND = "single"
-DEFAULT_PARAMS = {"entry": 20, "exit": 10}
+DEFAULT_PARAMS = {
+    "entry": 20, "exit": 10, "max_entry_premium": 0.0,
+    **overlay_defaults(),
+}
 WATCH_HIGH_DIST = 0.02  # 距 N 日新高 <2% 时给 watch 预警
+
+
+def entry_observation_line(
+    df: pd.DataFrame,
+    params: dict | None = None,
+) -> pd.Series:
+    p = {**DEFAULT_PARAMS, **(params or {})}
+    return df["high"].shift(1).rolling(int(p["entry"])).max()
 
 
 def positions(df: pd.DataFrame, params: dict | None = None) -> pd.Series:
     p = {**DEFAULT_PARAMS, **(params or {})}
-    entry_n = int(p["entry"])
     exit_n = int(p["exit"])
-    entry_line = df["high"].shift(1).rolling(entry_n).max()
+    entry_line = entry_observation_line(df, p)
     exit_line = df["low"].shift(1).rolling(exit_n).min()
 
     pos = pd.Series(0, index=df.index, dtype=int)
@@ -37,7 +49,7 @@ def watch(df: pd.DataFrame, params: dict | None = None) -> dict | None:
     pos = positions(df, params)
     if pos.empty or pos.iat[-1] != 0:
         return None
-    entry_line = df["high"].shift(1).rolling(int(p["entry"])).max()
+    entry_line = entry_observation_line(df, p)
     if pd.isna(entry_line.iat[-1]):
         return None
     c = float(df["close"].iat[-1])

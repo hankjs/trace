@@ -257,8 +257,8 @@ onMounted(load)
                   {{ sideLabel(signal) }}
                 </span>
               </div>
-              <p class="mt-1.5 line-clamp-2 text-[11px] leading-4 text-text-tertiary" :title="reasonText(signal.reason, signal.reason_text)">
-                {{ reasonText(signal.reason, signal.reason_text) }}
+              <p class="mt-1.5 line-clamp-2 text-[11px] leading-4 text-text-tertiary" :title="reasonText(signal.reason ?? {}, signal.reason_text)">
+                {{ reasonText(signal.reason ?? {}, signal.reason_text) }}
               </p>
             </article>
           </div>

@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import (admin, auth, backtest, catalog, market, pools, portfolio,
-                  selection, signals, strategies, watchlist)
+                  research_plans, selection, signals, strategies, watchlist)
 from .auth import require_admin, require_client
 from .config import settings
 from .db import engine
@@ -69,6 +69,7 @@ app.include_router(watchlist.router, dependencies=_auth)
 app.include_router(pools.router, dependencies=_auth)
 app.include_router(strategies.router, dependencies=_auth)
 app.include_router(signals.router, dependencies=_auth)
+app.include_router(research_plans.router, dependencies=_auth)
 app.include_router(portfolio.router, dependencies=_auth)
 app.include_router(backtest.router, dependencies=_auth)
 app.include_router(selection.router, dependencies=_auth)
