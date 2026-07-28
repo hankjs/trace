@@ -6,12 +6,9 @@
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from copy import deepcopy
 from datetime import date
-from pathlib import Path
 from typing import Any, Mapping
 
 import pandas as pd
@@ -19,7 +16,15 @@ import pandas as pd
 from ..indicators import atr, ma, rsi
 from ..catalog import STRATEGY_TEMPLATES
 from ..selection.pipeline import SCORE_WEIGHTS
+from ..strategy.compiler import (
+    COMPILER_VERSION,
+    compile_single,
+    component_versions_for_spec,
+)
+from ..strategy.components import build_reason_tree, evaluate_expression
 from ..strategy.overlays import overlay_price_line
+from ..strategy.runtime import build_execution_snapshot, strategy_spec_for
+from ..strategy.spec import Expression, PortfolioPositioningSpec, StrategySpec
 from ..strategy.strategies import REGISTRY
 
 PRODUCT_BOUNDARY = (
@@ -153,18 +158,25 @@ def evaluate_single_entry_condition(
 
 
 def parameter_snapshot(strategy: Any) -> dict:
-    """固化原始实例参数、完整模板参数和统一覆盖层配置。"""
-    # 延迟导入避免 catalog/策略 API 初始化时形成模块环；验证与回测、信号共用
-    # 同一入口，不能由计划层近似复刻一份规则。
-    from ..backtest.engine import DEFAULT_COSTS, validate_strategy_params
+    """固化完整规格和通用编译元数据。
 
-    supplied = dict(strategy.params or {})
-    effective = validate_strategy_params(strategy.template, supplied)
-    risk = dict(effective["risk_overlay"])
-    profit = dict(effective["take_profit"])
+    ``strategy_params`` / ``effective_params`` 仅为旧客户端兼容字段；新执行路径
+    只读取 ``strategy_spec``，不会再按模板参数重建规则。
+    """
+    from ..backtest.engine import DEFAULT_COSTS
+
+    spec = strategy_spec_for(strategy)
+    spec_snapshot = spec.model_dump(mode="json")
+    components = component_versions_for_spec(spec)
+    risk = spec.overlays.risk.model_dump(mode="json")
+    profit = spec.overlays.take_profit.model_dump(mode="json")
     return {
-        "strategy_params": supplied,
-        "effective_params": effective,
+        "strategy_params": dict(strategy.params or {}),
+        "effective_params": deepcopy(spec_snapshot),
+        "strategy_spec": deepcopy(spec_snapshot),
+        "strategy_spec_hash": strategy_version(strategy, {}),
+        "compiler_version": COMPILER_VERSION,
+        "component_versions": components,
         "risk_overlay": risk,
         "take_profit": profit,
         "simulation_costs": deepcopy(DEFAULT_COSTS),
@@ -172,25 +184,10 @@ def parameter_snapshot(strategy: Any) -> dict:
 
 
 def strategy_version(strategy: Any, params_snapshot: dict) -> str:
-    """内容寻址版本：参数或实际算法源码变化都会得到新版本。"""
-    implementation = hashlib.sha256()
-    files = [
-        Path(__file__),
-        Path(__file__).parents[1] / "strategy" / "overlays.py",
-        Path(REGISTRY[strategy.template].__file__),
-    ]
-    for path in files:
-        implementation.update(path.read_bytes())
-    payload = {
-        "adapter_version": ADAPTER_VERSION,
-        "implementation": implementation.hexdigest(),
-        "strategy_id": strategy.id,
-        "template": strategy.template,
-        "params": params_snapshot,
-    }
-    canonical = json.dumps(payload, ensure_ascii=True, sort_keys=True,
-                           separators=(",", ":"), default=str)
-    return f"rp{ADAPTER_VERSION}-{hashlib.sha256(canonical.encode()).hexdigest()[:24]}"
+    """计划版本就是完整 StrategySpec 的规范化 SHA-256。"""
+    from ..strategy.spec import strategy_spec_hash
+
+    return strategy_spec_hash(strategy_spec_for(strategy))
 
 
 def _base_observation(kind: str, data_date: date, explanation: str,
@@ -426,58 +423,227 @@ def _single_adapter(template: str, df: pd.DataFrame, params: dict,
     raise ValueError(f"模板 {template} 不是已支持的单标的研究计划")
 
 
-def build_single_snapshot(strategy: Any, df: pd.DataFrame, *, side: str,
-                          data_date: date, next_execution_date: date | None,
-                          entry_price: float | None = None,
-                          exit_hits: list[dict] | None = None,
-                          overlay_state_rules: list[dict] | None = None) -> dict:
-    if strategy.template not in CAPABILITIES or strategy.kind != "single":
-        raise ValueError(f"模板 {strategy.template} 不是单标的研究计划模板")
-    if df.empty or df["date"].iat[-1] != data_date:
-        raise ValueError("行情未更新到计划数据基准日")
+def _single_fields(df: pd.DataFrame) -> dict[str, pd.Series]:
+    return {
+        column: pd.Series(df[column].to_numpy(), index=df.index)
+        for column in df.columns
+        if column != "date"
+    }
 
-    params_snapshot = parameter_snapshot(strategy)
-    params = _native_params(strategy.template, params_snapshot["effective_params"])
-    observation, native_risk, native_exit, atr_value = _single_adapter(
-        strategy.template, df, params, data_date, next_execution_date)
-    overlay_risk, take_profit = _overlay_rules(
-        params_snapshot, entry_price=entry_price, df=df, data_date=data_date)
-    # 状态机保存的是模拟入场时 ATR/价格口径下的真实覆盖线，优先于计划层按
-    # 最新 ATR 能做出的静态估算。固定比例覆盖层也走同一路径，保持单一口径。
-    for state_rule in overlay_state_rules or []:
+
+def _reason_tree(expr: Expression, df: pd.DataFrame) -> dict[str, Any]:
+    return build_reason_tree(expr, _single_fields(df), len(df) - 1)
+
+
+def _tree_has_unavailable_value(tree: Mapping[str, Any]) -> bool:
+    indicator_ops = {
+        "rolling_mean", "rolling_max", "rolling_min", "volume_ratio",
+        "ma", "rsi", "atr", "momentum", "return", "shift",
+    }
+    if tree.get("op") in indicator_ops and tree.get("value") is None:
+        return True
+    return any(
+        _tree_has_unavailable_value(child)
+        for child in tree.get("children", [])
+        if isinstance(child, Mapping)
+    )
+
+
+def _entry_reference(
+    expr: Expression,
+    tree: Mapping[str, Any],
+) -> tuple[float | None, dict[str, Any] | None]:
+    """从通用比较树中寻找“收盘价 vs 客观数值表达式”的观察线。"""
+    children = tree.get("children") or []
+    if expr.op in {"gt", "gte", "cross_above"} and len(children) == 2:
+        pairs = ((expr.left, expr.right, 1), (expr.right, expr.left, 0))
+        for close_expr, reference_expr, tree_index in pairs:
+            if (
+                close_expr is not None
+                and close_expr.op == "field"
+                and close_expr.name == "close"
+                and reference_expr is not None
+                and reference_expr.op != "literal"
+                and _contains_shifted_channel(reference_expr)
+            ):
+                value = children[tree_index].get("value")
+                if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                    return float(value), reference_expr.model_dump(mode="json")
+    expression_children = [
+        child for child in (
+            expr.arg, expr.left, expr.right, expr.input,
+            expr.high, expr.low, expr.close,
+        ) if child is not None
+    ] + list(expr.args or [])
+    for child_expr, child_tree in zip(expression_children, children):
+        result = _entry_reference(child_expr, child_tree)
+        if result[0] is not None:
+            return result
+    return None, None
+
+
+def _contains_shifted_channel(expr: Expression) -> bool:
+    if expr.op in {"rolling_max", "rolling_min"} and (expr.shift or 0) > 0:
+        return True
+    children = [
+        child for child in (
+            expr.arg, expr.left, expr.right, expr.input,
+            expr.high, expr.low, expr.close,
+        ) if child is not None
+    ] + list(expr.args or [])
+    return any(_contains_shifted_channel(child) for child in children)
+
+
+def evaluate_single_spec_condition(
+    spec: StrategySpec | dict[str, Any],
+    df: pd.DataFrame,
+    signal_type: str,
+) -> dict[str, Any]:
+    """按完整规格重算最新确认日的入场条件，不读取模板名。"""
+    from ..strategy.spec import parse_strategy_spec
+
+    parsed = parse_strategy_spec(spec)
+    if parsed.kind != "single":
+        raise ValueError("只有 single StrategySpec 可以重算单标的条件")
+    if df.empty:
+        return {
+            "satisfied": None,
+            "text": "没有可用于重算的已确认日线数据。",
+            "reason_tree": None,
+        }
+    compile_single(parsed, df)
+    tree = _reason_tree(parsed.entry.condition, df)
+    if _tree_has_unavailable_value(tree):
+        return {
+            "satisfied": None,
+            "text": "规格所需指标或历史窗口不足，无法重算入场条件。",
+            "reason_tree": tree,
+        }
+    # 动态规格不再定义模板私有的“临近触发”函数。历史 watch 计划只要规格
+    # 仍可完整计算就进入常规重评，而不会调用已删除的模板旁路。
+    # 计划尚未在真实世界自动执行；重评关注的是最新收盘下入场表达式是否仍
+    # 成立，不能把编译器历史模拟中已经进入持仓误当成当前条件仍成立。
+    satisfied = bool(tree.get("value"))
+    if signal_type == "watch" and not satisfied:
+        satisfied = True
+    return {
+        "satisfied": satisfied,
+        "text": (
+            f"入场规则 {parsed.entry.reason_code} 当前不再成立。"
+            if not satisfied else f"入场规则 {parsed.entry.reason_code} 仍可计算。"
+        ),
+        "reason_tree": tree,
+    }
+
+
+def _apply_compiler_overlay_state(
+    overlay_risk: list[dict],
+    take_profit: dict,
+    rules: list[dict] | None,
+) -> None:
+    for state_rule in rules or []:
         if not isinstance(state_rule, dict):
             continue
-        source = state_rule.get("source")
+        source = state_rule.get("source") or state_rule.get("code")
         target = (
             overlay_risk[0] if source == "risk_overlay"
             else take_profit if source == "take_profit" else None
         )
         if target is None:
             continue
-        target.pop("reference_line", None)
-        for key in (
-            "calculation_status", "reference_line", "simulated_entry_price",
-            "data_date", "explanation",
-        ):
+        line = state_rule.get("price_line", state_rule.get("reference_line"))
+        if isinstance(line, (int, float)) and math.isfinite(float(line)):
+            target.update({
+                "calculation_status": "calculated",
+                "reference_line": _number(line, 6),
+            })
+        for key in ("simulated_entry_price", "data_date", "explanation"):
             if key in state_rule:
                 target[key] = deepcopy(state_rule[key])
-    exit_hits = exit_hits or []
-    # 覆盖层状态机已把实际命中线固化在退出原因中。退出计划必须复用这条线，
-    # 不能一边显示“已触发”，一边仍称“等待模拟入场价后计算”。
-    for hit in exit_hits:
-        line = hit.get("price_line") if isinstance(hit, dict) else None
-        if not isinstance(line, (int, float)) or not math.isfinite(float(line)):
-            continue
-        if hit.get("code") == "risk_overlay":
-            overlay_risk[0].update({
-                "calculation_status": "calculated",
-                "reference_line": _number(line, 6),
-            })
-        elif hit.get("code") == "take_profit":
-            take_profit.update({
-                "calculation_status": "calculated",
-                "reference_line": _number(line, 6),
-            })
+
+
+def build_single_snapshot(strategy: Any, df: pd.DataFrame, *, side: str,
+                          data_date: date, next_execution_date: date | None,
+                          entry_price: float | None = None,
+                          exit_hits: list[dict] | None = None,
+                          overlay_state_rules: list[dict] | None = None) -> dict:
+    spec = strategy_spec_for(strategy)
+    if spec.kind != "single":
+        raise ValueError("组合策略不能生成单标的研究计划")
+    if df.empty or df["date"].iat[-1] != data_date:
+        raise ValueError("行情未更新到计划数据基准日")
+
+    compilation = compile_single(spec, df)
+    execution = build_execution_snapshot(
+        strategy,
+        compiler_version=COMPILER_VERSION,
+        component_versions=compilation.component_versions,
+        spec_override=spec,
+    )
+    params_snapshot = parameter_snapshot(strategy)
+    entry_tree = _reason_tree(spec.entry.condition, df)
+    entry_line, entry_basis = _entry_reference(spec.entry.condition, entry_tree)
+    if entry_basis is None:
+        observation = _base_observation(
+            "none", data_date,
+            "按 StrategySpec 入场表达式判断，不生成固定价格区间。",
+            next_execution_date,
+        )
+        observation.update({
+            "calculation_status": (
+                "insufficient_data" if _tree_has_unavailable_value(entry_tree)
+                else "calculated"
+            ),
+        })
+    else:
+        observation = _line_or_range(
+            entry_line,
+            {"max_entry_premium": spec.execution.max_entry_premium},
+            data_date=data_date,
+            explanation="StrategySpec 入场比较表达式形成客观观察线。",
+            valid_until=next_execution_date,
+            basis={"type": "strategy_spec_expression", "expression": entry_basis},
+        )
+    observation.update({
+        "reason_code": spec.entry.reason_code,
+        "reason_tree": entry_tree,
+        "compiler_version": execution.compiler_version,
+        "component_versions": deepcopy(execution.component_versions),
+    })
+
+    assert spec.native_exit is not None
+    native_tree = _reason_tree(spec.native_exit.condition, df)
+    native_exit = [{
+        "source": "native",
+        "name": "StrategySpec 原生退出条件",
+        "reason_code": spec.native_exit.reason_code,
+        "condition": spec.native_exit.condition.model_dump(mode="json"),
+        "reason_tree": native_tree,
+        "triggered": bool(native_tree.get("value")),
+        "data_date": str(data_date),
+    }]
+    native_risk = [{
+        "source": "native",
+        "name": "StrategySpec 原生风险条件",
+        "reason_code": spec.native_exit.reason_code,
+        "condition": spec.native_exit.condition.model_dump(mode="json"),
+        "reason_tree": native_tree,
+        "data_date": str(data_date),
+    }]
+    overlay_risk, take_profit = _overlay_rules(
+        params_snapshot, entry_price=entry_price, df=df, data_date=data_date)
+    compiler_reasons = compilation.reasons.get(pd.Timestamp(data_date), [])
+    all_overlay_rules = list(overlay_state_rules or []) + list(compiler_reasons)
+    exit_hits = list(exit_hits or [])
+    if not exit_hits:
+        exit_hits = [
+            deepcopy(item) for item in compiler_reasons
+            if isinstance(item, dict)
+            and item.get("code") in {"risk_overlay", "take_profit", "native_exit"}
+        ]
+    _apply_compiler_overlay_state(
+        overlay_risk, take_profit, all_overlay_rules + exit_hits)
+
     insufficient = observation.get("calculation_status") == "insufficient_data"
     status = "exit_triggered" if side == "sell" else (
         "reevaluate" if insufficient or next_execution_date is None else "current")
@@ -497,10 +663,15 @@ def build_single_snapshot(strategy: Any, df: pd.DataFrame, *, side: str,
             if next_execution_date is None
             else "使用当日已确认收盘数据生成，有效至下一交易日。"
         ),
+        "compiler_reasons": deepcopy(compiler_reasons),
     }
     return {
         "params_snapshot": params_snapshot,
-        "strategy_version": strategy_version(strategy, params_snapshot),
+        "strategy_version": execution.spec_hash,
+        "strategy_spec_snapshot": deepcopy(execution.spec_snapshot),
+        "strategy_spec_hash": execution.spec_hash,
+        "compiler_version": execution.compiler_version,
+        "component_versions": deepcopy(execution.component_versions),
         "plan_type": "single", "data_date": data_date,
         "next_execution_date": next_execution_date,
         "valid_until": next_execution_date, "signal_type": side,
@@ -587,6 +758,89 @@ def portfolio_change_type(previous: float, target: float) -> str:
     return "retained"
 
 
+def portfolio_spec_score_details(
+    spec: StrategySpec | dict[str, Any],
+    dates: pd.DatetimeIndex,
+    pool_dfs: Mapping[str, pd.DataFrame],
+    data_date: date,
+) -> dict[str, dict[str, Any]]:
+    """从通用 score 表达式生成逐股数值和贡献树。"""
+    from ..strategy.spec import parse_strategy_spec
+
+    parsed = parse_strategy_spec(spec)
+    if not isinstance(parsed.positioning, PortfolioPositioningSpec):
+        raise ValueError("只有 portfolio StrategySpec 包含横截面评分")
+    common = set.intersection(*(set(frame.columns) for frame in pool_dfs.values()))
+    common.discard("date")
+    fields = {
+        field: pd.DataFrame({
+            code: pd.Series(
+                frame[field].to_numpy(),
+                index=pd.DatetimeIndex(frame["date"]),
+            )
+            for code, frame in pool_dfs.items()
+        }).reindex(dates)
+        for field in common
+    }
+    scores = evaluate_expression(parsed.positioning.score, fields)
+    if not isinstance(scores, pd.DataFrame):
+        scores = pd.DataFrame(
+            float(scores), index=dates, columns=list(pool_dfs),
+        )
+    risk_values = (
+        evaluate_expression(parsed.positioning.risk_filter, fields)
+        if parsed.positioning.risk_filter is not None else None
+    )
+    position = len(dates) - 1
+    result: dict[str, dict[str, Any]] = {}
+    for code in pool_dfs:
+        value = scores.at[pd.Timestamp(data_date), code]
+        total = _number(value, 8)
+        item: dict[str, Any] = {
+            "calculation_status": (
+                "calculated" if total is not None else "insufficient_data"
+            ),
+            "total": total,
+            "reason_tree": build_reason_tree(
+                parsed.positioning.score, fields, position, column=code,
+            ),
+            "data_date": str(data_date),
+        }
+        if parsed.positioning.risk_filter is not None:
+            item["risk_filter_tree"] = build_reason_tree(
+                parsed.positioning.risk_filter, fields, position, column=code,
+            )
+            if isinstance(risk_values, pd.DataFrame):
+                item["risk_blocked"] = bool(
+                    risk_values.at[pd.Timestamp(data_date), code]
+                )
+        result[code] = item
+    return result
+
+
+def is_portfolio_rebalance_day(
+    spec: StrategySpec | dict[str, Any],
+    dates: pd.DatetimeIndex,
+) -> bool:
+    """按通用调仓规格判断最后一个交易日是否为计划调仓日。"""
+    from ..strategy.spec import parse_strategy_spec
+
+    parsed = parse_strategy_spec(spec)
+    if not isinstance(parsed.positioning, PortfolioPositioningSpec):
+        raise ValueError("只有 portfolio StrategySpec 包含调仓频率")
+    rebalance = parsed.positioning.rebalance
+    if rebalance.frequency == "fixed":
+        assert rebalance.interval_days is not None
+        return (len(dates) - 1) % rebalance.interval_days == 0
+    current = dates[-1]
+    if len(dates) == 1:
+        return True
+    previous = dates[-2]
+    if rebalance.frequency == "weekly":
+        return current.isocalendar()[:2] != previous.isocalendar()[:2]
+    return (current.year, current.month) != (previous.year, previous.month)
+
+
 def build_portfolio_snapshot(strategy: Any, *, data_date: date,
                              next_execution_date: date | None,
                              pool_name: str, target_weights: Mapping[str, float],
@@ -597,11 +851,20 @@ def build_portfolio_snapshot(strategy: Any, *, data_date: date,
                              overlay_snapshots: Mapping[str, dict] | None = None,
                              exit_reasons: Mapping[str, list[dict]] | None = None,
                              score_details: Mapping[str, dict] | None = None,
+                             compiler_reasons: Mapping[str, list[dict]] | None = None,
+                             component_versions: Mapping[str, str] | None = None,
                              ) -> tuple[dict, list[dict]]:
-    if strategy.template not in CAPABILITIES or strategy.kind != "portfolio":
-        raise ValueError(f"模板 {strategy.template} 不是组合研究计划模板")
+    spec = strategy_spec_for(strategy)
+    if not isinstance(spec.positioning, PortfolioPositioningSpec):
+        raise ValueError("单标的策略不能生成组合研究计划")
+    versions = dict(component_versions or component_versions_for_spec(spec))
+    execution = build_execution_snapshot(
+        strategy,
+        compiler_version=COMPILER_VERSION,
+        component_versions=versions,
+        spec_override=spec,
+    )
     params_snapshot = parameter_snapshot(strategy)
-    params = _native_params(strategy.template, params_snapshot["effective_params"])
     previous_weights = previous_weights or {}
     scores = scores or {}
     eligible = eligible or {}
@@ -609,6 +872,7 @@ def build_portfolio_snapshot(strategy: Any, *, data_date: date,
     overlay_snapshots = overlay_snapshots or {}
     exit_reasons = exit_reasons or {}
     score_details = score_details or {}
+    compiler_reasons = compiler_reasons or {}
     all_codes = sorted(set(previous_weights) | set(target_weights))
     ranked = sorted(
         ((code, value) for code, value in scores.items() if value is not None),
@@ -620,32 +884,80 @@ def build_portfolio_snapshot(strategy: Any, *, data_date: date,
         target = float(target_weights.get(code, 0.0))
         is_eligible = bool(eligible.get(code, True))
         change = portfolio_change_type(previous, target)
+        raw_reasons = list(compiler_reasons.get(code) or exit_reasons.get(code) or [])
         reasons: list[dict] = []
         if not is_eligible:
-            reasons.append({"code": "ineligible", "text": "不满足基准日股票池资格。"})
+            reason_code = "ineligible"
+            reason_text = "不满足基准日股票池或 StrategySpec 入场资格。"
         elif any(
-            item.get("code") == "native"
-            for item in exit_reasons.get(code, [])
-            if isinstance(item, dict)
+            isinstance(item, dict) and item.get("risk_blocked")
+            for item in raw_reasons
         ):
-            reasons.append({"code": "ma20_risk_filter",
-                            "text": "收盘价跌破20日均线，目标权重按模板风险过滤清零。"})
+            reason_code = "risk_filter_triggered"
+            reason_text = "StrategySpec 风险过滤条件成立，目标权重清零。"
+        elif any(
+            isinstance(item, dict) and item.get("native_exit")
+            for item in raw_reasons
+        ):
+            reason_code = "native_exit_triggered"
+            reason_text = "StrategySpec 原生退出条件成立，目标权重清零。"
+        elif any(
+            isinstance(item, dict) and item.get("overlay_blocked")
+            for item in raw_reasons
+        ):
+            reason_code = "overlay_triggered"
+            reason_text = "StrategySpec 覆盖层条件成立，目标权重清零。"
         elif change == "added":
-            reasons.append({"code": "entered_top_n", "text": "基准日评分进入 Top N。"})
+            reason_code = "entered_selection"
+            reason_text = "基准日评分进入 StrategySpec 目标选择范围。"
         elif change == "removed":
-            reasons.append({"code": "left_top_n", "text": "基准日评分或资格不再满足持有范围。"})
+            reason_code = "left_selection"
+            reason_text = "基准日评分或资格不再满足 StrategySpec 持有范围。"
         elif change == "retained":
-            reasons.append({"code": "retained_top_n", "text": "仍在目标排名范围内，权重保持。"})
+            reason_code = "retained_selection"
+            reason_text = "仍在 StrategySpec 目标选择范围内，权重保持。"
         else:
-            reasons.append({"code": "weight_changed", "text": "目标数量或资格变化导致权重调整。"})
-        native_risk_snapshot = (
-            {"source": "native_risk", "name": "20日均线资格过滤",
-             "reference_line": risk_lines.get(code),
-             "data_date": str(data_date)}
-            if strategy.template == "momentum_rotation" else None)
+            reason_code = "weight_changed"
+            reason_text = "StrategySpec 评分、约束或资格变化导致权重调整。"
+        reasons.append({
+            "code": reason_code,
+            "text": reason_text,
+            "compiler_reasons": deepcopy(raw_reasons),
+        })
+        detail = score_details.get(code) or {}
+        risk_tree = detail.get("risk_filter_tree")
+        native_risk_snapshot = None
+        if spec.positioning.risk_filter is not None:
+            native_risk_snapshot = {
+                "source": "native_risk",
+                "name": "StrategySpec 风险过滤",
+                "condition": spec.positioning.risk_filter.model_dump(mode="json"),
+                "reason_tree": deepcopy(risk_tree),
+                "triggered": bool(detail.get("risk_blocked", False)),
+                "reference_line": risk_lines.get(code),
+                "data_date": str(data_date),
+            }
         overlay_snapshot = overlay_snapshots.get(code) or {}
         snapshot_rules = ([native_risk_snapshot] if native_risk_snapshot else [])
         snapshot_rules += list(overlay_snapshot.get("rules") or [])
+        for raw in raw_reasons:
+            if not isinstance(raw, dict):
+                continue
+            for hit in raw.get("all_reasons") or []:
+                if not isinstance(hit, dict) or hit.get("code") not in {
+                    "risk_overlay", "take_profit"
+                }:
+                    continue
+                snapshot_rules.append({
+                    "source": hit["code"],
+                    "name": (
+                        "风险覆盖层" if hit["code"] == "risk_overlay"
+                        else "止盈覆盖层"
+                    ),
+                    "reference_line": hit.get("price_line"),
+                    "data_date": str(data_date),
+                    "calculation_status": "calculated",
+                })
         risk_snapshot = None
         if snapshot_rules:
             risk_snapshot = {
@@ -671,28 +983,54 @@ def build_portfolio_snapshot(strategy: Any, *, data_date: date,
     total_weight = sum(item["target_weight"] for item in active)
     insufficient = not scores or all(value is None for value in scores.values())
     status = "reevaluate" if insufficient or next_execution_date is None else "current"
-    frequency = "每周" if strategy.template == "momentum_rotation" else "每月"
+    frequency_names = {"fixed": "固定周期", "weekly": "每周", "monthly": "每月"}
+    frequency = frequency_names[spec.positioning.rebalance.frequency]
     observation = _base_observation(
         "portfolio_rebalance", data_date,
-        f"{frequency}按评分排名生成目标权重，不生成单股进场价格区间。", None)
+        f"{frequency}按 StrategySpec 评分表达式生成目标权重，不生成单股进场价格区间。",
+        None)
     observation.update({
         "calculation_status": "insufficient_data" if insufficient else "calculated",
-        "pool_name": pool_name, "top_n": int(params["top_n"]),
+        "pool_name": pool_name,
+        "top_n": spec.positioning.selection.n,
+        "score_expression": spec.positioning.score.model_dump(mode="json"),
+        "compiler_version": execution.compiler_version,
+        "component_versions": deepcopy(execution.component_versions),
     })
     overlay_risk, take_profit = _overlay_rules(
         params_snapshot, entry_price=None, df=None, data_date=data_date)
-    native_exit = ([{
-        "source": "native", "name": "20日均线资格过滤",
-        "condition": "收盘价跌破20日均线时目标权重清零",
+    native_exit = []
+    if spec.native_exit is not None:
+        native_exit.append({
+            "source": "native",
+            "name": "StrategySpec 原生退出条件",
+            "reason_code": spec.native_exit.reason_code,
+            "condition": spec.native_exit.condition.model_dump(mode="json"),
+            "data_date": str(data_date),
+        })
+    if spec.positioning.risk_filter is not None:
+        native_exit.append({
+            "source": "native",
+            "name": "StrategySpec 风险过滤条件",
+            "condition": spec.positioning.risk_filter.model_dump(mode="json"),
+            "data_date": str(data_date),
+        })
+    native_exit.append({
+        "source": "native",
+        "name": "StrategySpec 组合选择条件",
+        "condition": {
+            "selection": spec.positioning.selection.model_dump(mode="json"),
+            "rebalance": spec.positioning.rebalance.model_dump(mode="json"),
+        },
         "data_date": str(data_date),
-    }] if strategy.template == "momentum_rotation" else [{
-        "source": "native", "name": "月度排名变化",
-        "condition": "月度调仓时不再位于 Top N 或失去股票池资格",
-        "data_date": str(data_date),
-    }])
+    })
     snapshot = {
         "params_snapshot": params_snapshot,
-        "strategy_version": strategy_version(strategy, params_snapshot),
+        "strategy_version": execution.spec_hash,
+        "strategy_spec_snapshot": deepcopy(execution.spec_snapshot),
+        "strategy_spec_hash": execution.spec_hash,
+        "compiler_version": execution.compiler_version,
+        "component_versions": deepcopy(execution.component_versions),
         "plan_type": "portfolio_rebalance", "data_date": data_date,
         "next_execution_date": next_execution_date, "valid_until": None,
         "signal_type": "rebalance", "status": status,
@@ -704,9 +1042,12 @@ def build_portfolio_snapshot(strategy: Any, *, data_date: date,
                 else "基准日目标权重已生成，等待下一交易日开盘进行模拟调仓。"),
         },
         "entry_observation": observation,
-        "risk_rules": ([{"source": "native", "name": "模板原生风险",
-                          "condition": native_exit[0]["condition"],
-                          "data_date": str(data_date)}] + overlay_risk),
+        "risk_rules": ([{
+            "source": "native",
+            "name": "StrategySpec 原生风险规则",
+            "condition": item["condition"],
+            "data_date": str(data_date),
+        } for item in native_exit] + overlay_risk),
         "take_profit": take_profit, "native_exit": native_exit,
         "exit_hits": [],
         "portfolio_summary": {

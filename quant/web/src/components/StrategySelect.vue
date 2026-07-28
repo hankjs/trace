@@ -86,19 +86,20 @@ onMounted(() => {
     :manage-link="manageLink"
     :manage-to="{ name: 'strategies', query: { tab: 'manage' } }"
     manage-label="管理策略"
-    :described-by="selected && !selected.params_valid ? 'strategy-params-hint' : undefined"
+    :described-by="selected?.capability && selected.capability.status !== 'supported' ? 'strategy-capability-hint' : undefined"
     @change="emit('change', $event)"
   >
     <p v-if="selected" class="mt-1 text-xs text-text-tertiary">
-      算法模板：{{ selected.template_name }} · {{ selected.kind_name }}
+      {{ selected.kind === 'portfolio' ? '组合目标权重' : '单标的目标仓位' }}
+      <template v-if="selected.spec_hash"> · 规格 {{ selected.spec_hash.slice(0, 12) }}</template>
     </p>
 
     <p
-      v-if="selected && !selected.params_valid"
-      id="strategy-params-hint"
+      v-if="selected?.capability && selected.capability.status !== 'supported'"
+      id="strategy-capability-hint"
       class="mt-1 text-xs text-up"
     >
-      该策略的参数与当前算法模板不匹配，请到「管理策略」修正后再使用。
+      当前规格存在数据或引擎能力缺口，请到「管理策略」查看校验结果。
     </p>
   </ManagedSelectField>
 </template>

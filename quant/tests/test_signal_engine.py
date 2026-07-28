@@ -40,13 +40,13 @@ def sqlite_upsert(monkeypatch):
     生产是 MySQL,这里只把落库语句换成等价的 sqlite upsert,被测的循环与
     信号判定逻辑保持原样。
     """
-    def _save(db, code, day, strategy_id, side, price, reason):
+    def _save(db, code, day, strategy_id, side, price, reason, spec_hash):
         stmt = sqlite_insert(Signal).values(
             code=code, date=day, strategy_id=strategy_id, side=side,
-            price=price, reason=reason)
+            price=price, reason=reason, spec_hash=spec_hash)
         db.execute(stmt.on_conflict_do_update(
             index_elements=["code", "date", "strategy_id", "side"],
-            set_={"price": price, "reason": reason}))
+            set_={"price": price, "reason": reason, "spec_hash": spec_hash}))
 
     monkeypatch.setattr(signal_engine, "_save_signal", _save)
 
@@ -190,19 +190,22 @@ def test_reason_text_uses_each_strategy_own_params():
     assert item["reason_text"] == "3日均线上穿8日均线，策略模拟状态变为持有。"
 
 
-def test_unknown_template_is_skipped_with_warning(caplog):
-    """库里的模板在代码里不存在(降级部署/手改数据)时告警跳过,不静默。"""
+def test_execution_uses_spec_even_when_legacy_template_name_is_unknown():
+    """迁移占位 template 不得参与运行分支；完整 spec 才是唯一执行定义。"""
+    from app.strategy.presets import get_preset_spec
+
     with _session() as db:
         last = _seed_bars(db)
+        spec = get_preset_spec("ma_cross").model_dump(mode="json")
         db.add(Strategy(id=1, owner_id=USER_A, is_system=False, name="幽灵策略",
                         template="removed_template", kind="single", params={},
-                        enabled=True))
+                        spec=spec, enabled=True))
         db.commit()
 
         result = signal_engine.run_signals(db, day=last, codes=[CODE])
 
-    assert result["total"] == 0
-    assert "removed_template" in caplog.text
+    assert result["total"] == 1
+    assert result["signals"]["幽灵策略#1"] == {CODE: "buy"}
 
 
 def test_ongoing_holding_generates_plan_with_entry_based_overlay_lines():

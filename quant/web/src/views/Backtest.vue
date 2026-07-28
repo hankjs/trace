@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { AlertTriangle } from 'lucide-vue-next'
+import { AlertTriangle, CheckCircle2, Code2, Fingerprint, TriangleAlert } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
 import {
   api,
@@ -10,13 +10,13 @@ import {
   type BacktestExitReasonDistribution,
   type BacktestResult,
   type BacktestTradeDetail,
-  type StrategyOverlayConfig,
   type StrategyParamValue,
+  type StrategySpec,
   type SweepResult,
   type SweepResultItem,
   type WatchItem,
 } from '../api'
-import { catalogEntry, loadCatalog, metricName, templateName } from '../catalog'
+import { metricName } from '../catalog'
 import { aggregateMetric, fmtPct, fmtPrice } from '../format'
 import EChart from '../components/EChart.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
@@ -25,19 +25,10 @@ import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import StrategySelect from '../components/StrategySelect.vue'
-import StrategyParamFields from '../components/StrategyParamFields.vue'
-import StrategyOverlayFields from '../components/StrategyOverlayFields.vue'
 import { poolById } from '../pools'
-import { invalidateStrategies, strategyById, useStrategies } from '../strategies'
-import { useStrategyParamForm } from '../useStrategyParamForm'
+import { strategyById, useStrategies } from '../strategies'
 import {
-  DEFAULT_RISK_OVERLAY,
-  DEFAULT_TAKE_PROFIT,
   RESEARCH_PLAN_BOUNDARY,
-  isOverlayConfig,
-  overlayFromParams,
-  overlayParamSnapshot,
-  overlaySummary,
 } from '../researchPlans'
 
 const route = useRoute()
@@ -47,14 +38,12 @@ const watchlist = ref<WatchItem[]>([])
 const result = ref<BacktestResult | null>(null)
 const running = ref(false)
 const error = ref('')
-const notice = ref('')
 const runIdInput = ref('')
 const searchCode = ref('')
 /** 组合策略的研究范围;单标的策略不使用 */
 const poolId = ref<number | null>(null)
-/** 选中的策略实例 id;参数元数据来自它的算法模板 */
+/** 选中的数据库策略；回测只按当前完整规格运行。 */
 const strategyId = ref<number | null>(null)
-const saveAsName = ref('')
 
 /** 模式:single 单次回测 / sweep 参数扫描 */
 const mode = ref<'single' | 'sweep'>('single')
@@ -67,122 +56,99 @@ const form = reactive({
 })
 
 const strategy = computed(() => strategyById(strategyId.value))
-/** 算法模板的元数据:说明、限制与参数定义 */
-const templateMeta = computed(() =>
-  strategy.value ? catalogEntry('strategy_templates', strategy.value.template) : undefined
-)
-const strategyParams = computed(() => (templateMeta.value?.params ?? []).filter((parameter) =>
-  parameter.value_type !== 'overlay'
-  && parameter.key !== 'risk_overlay'
-  && parameter.key !== 'take_profit'
-))
 const isPortfolio = computed(() => strategy.value?.kind === 'portfolio')
-const parameterForm = useStrategyParamForm(strategyParams)
-const parameterValues = parameterForm.values
-const riskOverlay = ref<StrategyOverlayConfig>({ ...DEFAULT_RISK_OVERLAY })
-const takeProfit = ref<StrategyOverlayConfig>({ ...DEFAULT_TAKE_PROFIT })
 const costForm = reactive({ commissionWan: 2.5, stampTaxWan: 5, slippageWan: 1 })
+const selectedCapability = computed(() => strategy.value?.capability ?? null)
+const strategyRunnable = computed(() => selectedCapability.value?.status === 'supported')
+const selectedHypothesis = computed(() => String(strategy.value?.spec?.metadata?.hypothesis ?? '未提供研究假设'))
+const selectedSpecHash = computed(() => strategy.value?.spec_hash ?? '')
 
-/** 与策略自身参数是否有差异:有差异才是「临时调参」,才值得提示另存 */
-const paramsTweaked = computed(() => {
-  const source = strategy.value?.effective_params ?? {}
-  return parameterForm.differsFrom(source)
-    || JSON.stringify(riskOverlay.value) !== JSON.stringify(overlayFromParams(source, 'risk_overlay'))
-    || JSON.stringify(takeProfit.value) !== JSON.stringify(overlayFromParams(source, 'take_profit'))
-})
-
-watch([strategy, strategyParams], () => {
-  parameterForm.reset(strategy.value?.effective_params ?? {})
-  riskOverlay.value = overlayFromParams(strategy.value?.effective_params, 'risk_overlay')
-  takeProfit.value = overlayFromParams(strategy.value?.effective_params, 'take_profit')
-  notice.value = ''
-  saveAsName.value = ''
+watch(strategy, () => {
   if (isPortfolio.value && mode.value === 'sweep') mode.value = 'single'
 })
-
-/** 把临时调好的参数另存为一条新策略,不改动原策略(公共策略本就只读) */
-async function saveTweakedAsStrategy() {
-  const source = strategy.value
-  if (!source) return
-  if (!parameterForm.validate()) {
-    error.value = '请修正策略参数后再另存'
-    return
-  }
-  running.value = true
-  error.value = ''
-  try {
-    const created = await api.duplicateStrategy(source.id, {
-      name: saveAsName.value.trim() || undefined,
-      params: {
-        ...parameterForm.overrides.value,
-        ...overlayParamSnapshot(riskOverlay.value, takeProfit.value, source.effective_params),
-      },
-    })
-    invalidateStrategies()
-    await loadStrategies(true)
-    strategyId.value = created.id
-    saveAsName.value = ''
-    notice.value = `已另存为「${created.name}」，之后可直接选用。`
-  } catch (caught) {
-    error.value = (caught as Error).message
-  } finally {
-    running.value = false
-  }
-}
 
 // ---- 参数扫描 ----
 
 interface GridRow {
-  name: string
+  path: string
   valuesText: string
 }
 
-const gridRows = ref<GridRow[]>([{ name: '', valuesText: '' }])
+const gridRows = ref<GridRow[]>([{ path: '', valuesText: '' }])
 const sweepResult = ref<SweepResult | null>(null)
 
-const scanParameterOptions = computed(() => [
-  ...strategyParams.value.map((parameter) => ({ key: parameter.key, name: parameter.name })),
-  { key: 'risk_overlay.enabled', name: '风险覆盖层开关（true/false）' },
-  { key: 'risk_overlay.type', name: '风险覆盖层类型' },
-  { key: 'risk_overlay.value', name: '风险覆盖层数值' },
-  { key: 'risk_overlay.atr_period', name: '风险 ATR 周期' },
-  { key: 'take_profit.enabled', name: '止盈覆盖层开关（true/false）' },
-  { key: 'take_profit.type', name: '止盈覆盖层类型' },
-  { key: 'take_profit.value', name: '止盈覆盖层数值' },
-  { key: 'take_profit.atr_period', name: '止盈 ATR 周期' },
-])
+const scanPathLabels: Record<string, string> = {
+  '$.positioning.target': '目标仓位',
+  '$.holding.cooldown_days': '冷却天数',
+  '$.overlays.risk.enabled': '风险止损开关',
+  '$.overlays.risk.value': '风险止损数值',
+  '$.overlays.risk.atr_period': '风险 ATR 周期',
+  '$.overlays.risk.trailing': '风险追踪开关',
+  '$.overlays.take_profit.enabled': '止盈开关',
+  '$.overlays.take_profit.value': '止盈数值',
+  '$.overlays.take_profit.atr_period': '止盈 ATR 周期',
+  '$.overlays.take_profit.trailing': '止盈追踪开关',
+  '$.universe.min_listing_days': '最少上市天数',
+  '$.universe.min_amount_avg20': '20 日平均成交额下限',
+  '$.execution.max_entry_premium': '最大入场跳空比例',
+}
+
+function record(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {}
+}
+
+function specPathExists(spec: StrategySpec | undefined, path: string): boolean {
+  if (!spec || !path.startsWith('$.')) return false
+  let current: unknown = spec
+  for (const part of path.slice(2).split('.')) {
+    const parent = record(current)
+    if (!(part in parent)) return false
+    current = parent[part]
+  }
+  return typeof current === 'number' || typeof current === 'boolean'
+}
+
+const scanParameterOptions = computed(() => Object.entries(scanPathLabels)
+  .filter(([path]) => specPathExists(strategy.value?.spec, path))
+  .map(([path, name]) => ({ path, name })))
 
 function addGridRow() {
-  gridRows.value.push({ name: '', valuesText: '' })
+  gridRows.value.push({ path: '', valuesText: '' })
 }
 
 function removeGridRow(i: number) {
   gridRows.value.splice(i, 1)
 }
 
-function gridPlaceholder(name: string): string {
-  if (name.endsWith('.enabled')) return 'true, false'
-  if (name.endsWith('.type')) return 'fixed_pct, atr_multiple'
+function gridPlaceholder(path: string): string {
+  if (path.endsWith('.enabled') || path.endsWith('.trailing')) return 'true, false'
   return '候选值，如 3, 5, 8'
 }
 
-function parseGrid(): Record<string, Array<number | string | boolean>> {
-  const grid: Record<string, Array<number | string | boolean>> = {}
+function parseGrid(): Record<string, Array<number | boolean>> {
+  const grid: Record<string, Array<number | boolean>> = {}
   for (const row of gridRows.value) {
-    const name = row.name.trim()
-    if (!name) continue
+    const path = row.path.trim()
+    if (!path) continue
+    if (!/^\$\.[a-zA-Z0-9_.]+$/.test(path)) {
+      throw new Error(`扫描路径必须以 $. 开头且只包含字段名：${path}`)
+    }
     const tokens = row.valuesText
-      .split(/[,,\s]+/)
+      .split(/[,，\s]+/)
       .map((value) => value.trim())
       .filter(Boolean)
-    const values = name.endsWith('.enabled')
-      ? tokens
-          .map((value) => ({ true: true, '1': true, false: false, '0': false }[value.toLowerCase()]))
-          .filter((value): value is boolean => typeof value === 'boolean')
-      : name.endsWith('.type')
-        ? tokens.filter((value) => value === 'fixed_pct' || value === 'atr_multiple')
-        : tokens.map(Number).filter((value) => !Number.isNaN(value))
-    if (values.length) grid[name] = [...new Set<number | string | boolean>(values)]
+    const values = tokens.map((value): number | boolean => {
+      const normalized = value.toLowerCase()
+      if (normalized === 'true') return true
+      if (normalized === 'false') return false
+      const number = Number(value)
+      if (Number.isFinite(number)) return number
+      throw new Error(`候选值只支持有限数字或 true / false：${value}`)
+    })
+    if (!values.length) throw new Error(`请填写 ${path} 的候选值`)
+    grid[path] = [...new Set<number | boolean>(values)]
   }
   return grid
 }
@@ -203,7 +169,7 @@ const bestKey = computed(() => {
 
 const sweepColumns = computed<QuTableColumn<SweepResultItem>[]>(() => [
   { key: 'rank', label: '#', cellClass: 'text-text-tertiary' },
-  { key: 'params', label: '参数', cellClass: 'font-medium' },
+  { key: 'params', label: '规格路径', cellClass: 'font-medium' },
   { key: 'total-return', label: metricName('total_return'), align: 'right', cellClass: (row) => (aggregateMetric(row.metrics, 'total_return') ?? 0) >= 0 ? 'text-up' : 'text-down' },
   { key: 'annual-return', label: metricName('annual_return'), align: 'right', cellClass: (row) => (aggregateMetric(row.metrics, 'annual_return') ?? 0) >= 0 ? 'text-up' : 'text-down' },
   { key: 'max-drawdown', label: metricName('max_drawdown'), align: 'right', cellClass: 'text-down' },
@@ -229,9 +195,13 @@ const perCodeColumns = computed<QuTableColumn<PerCodeRow>[]>(() => [
   { key: 'win-rate', label: metricName('win_rate'), align: 'right' },
 ])
 
+function pathName(path: string): string {
+  return scanPathLabels[path] ?? path
+}
+
 function paramsText(params: Record<string, StrategyParamValue>): string {
   return Object.entries(params)
-    .map(([k, v]) => `${paramName(k)}=${typeof v === 'object' ? overlaySummary(v, k === 'risk_overlay' ? 'risk' : 'take_profit') : v}`)
+    .map(([path, value]) => `${pathName(path)}=${String(value)}`)
     .join(', ')
 }
 
@@ -269,11 +239,11 @@ const heatmapOption = computed<EChartsCoreOption | null>(() => {
     animation: false,
     tooltip: {
       formatter: (p: { data: [number, number, number] }) =>
-        `${paramName(xName)}=${xVals[p.data[0]]}, ${paramName(yName)}=${yVals[p.data[1]]}<br/>总收益: ${fmtPct(p.data[2])}`,
+        `${pathName(xName)}=${xVals[p.data[0]]}, ${pathName(yName)}=${yVals[p.data[1]]}<br/>总收益: ${fmtPct(p.data[2])}`,
     },
     grid: { left: 90, right: 90, top: 30, bottom: 50 },
-    xAxis: { type: 'category', name: paramName(xName), data: xVals.map(String) },
-    yAxis: { type: 'category', name: paramName(yName), data: yVals.map(String) },
+    xAxis: { type: 'category', name: pathName(xName), data: xVals.map(String) },
+    yAxis: { type: 'category', name: pathName(yName), data: yVals.map(String) },
     visualMap: {
       min: Math.min(...values),
       max: Math.max(...values),
@@ -307,6 +277,10 @@ async function runSweep() {
     error.value = '请选择策略'
     return
   }
+  if (!strategyRunnable.value) {
+    error.value = '当前策略存在数据或引擎能力缺口，不能运行参数扫描'
+    return
+  }
   if (!codes.length) {
     error.value = '请至少选择一个股票代码'
     return
@@ -315,9 +289,15 @@ async function runSweep() {
     error.value = '请选择起止日期'
     return
   }
-  const param_grid = parseGrid()
+  let param_grid: Record<string, Array<number | boolean>>
+  try {
+    param_grid = parseGrid()
+  } catch (caught) {
+    error.value = (caught as Error).message
+    return
+  }
   if (!Object.keys(param_grid).length) {
-    error.value = '请至少配置一个参数网格(参数名 + 逗号分隔的候选值)'
+    error.value = '请至少配置一个规格路径及其候选值'
     return
   }
   running.value = true
@@ -385,22 +365,25 @@ const metrics = computed(() => {
 const resultPool = computed(() => result.value?.pool ?? (isPortfolio.value ? poolById(poolId.value) : null))
 const resultBiased = computed(() => hasSurvivorshipBias(resultPool.value))
 
-const resultParams = computed(() => result.value?.params ?? {})
-const resultRiskOverlay = computed(() => {
-  if (result.value?.risk_overlay) return result.value.risk_overlay
-  const value = resultParams.value.risk_overlay
-  return isOverlayConfig(value) ? value : { ...DEFAULT_RISK_OVERLAY }
-})
-const resultTakeProfit = computed(() => {
-  if (result.value?.take_profit) return result.value.take_profit
-  const value = resultParams.value.take_profit
-  return isOverlayConfig(value) ? value : { ...DEFAULT_TAKE_PROFIT }
-})
-const resultNativeParams = computed(() => Object.entries(resultParams.value)
-  .filter(([key]) => key !== 'risk_overlay' && key !== 'take_profit'))
 const resultCosts = computed(() => result.value?.costs ?? {})
-
 const resultEvidence = computed(() => result.value?.evidence ?? result.value?.metrics.evidence)
+const resultSpecSnapshot = computed(() => result.value?.strategy_spec_snapshot ?? resultEvidence.value?.strategy_spec_snapshot)
+const resultSpecHash = computed(() => result.value?.strategy_spec_hash ?? resultEvidence.value?.strategy_spec_hash ?? '')
+const resultCompilerVersion = computed(() => result.value?.compiler_version ?? resultEvidence.value?.compiler_version ?? '')
+const resultComponentVersions = computed(() => result.value?.component_versions ?? resultEvidence.value?.component_versions ?? {})
+const resultFingerprints = computed(() => [
+  { label: '执行指纹', value: result.value?.execution_fingerprint ?? resultEvidence.value?.execution_fingerprint ?? '' },
+  { label: '数据指纹', value: result.value?.data_fingerprint ?? resultEvidence.value?.data_fingerprint ?? '' },
+  { label: '股票池指纹', value: result.value?.universe_fingerprint ?? resultEvidence.value?.universe_fingerprint ?? '' },
+  { label: '费用指纹', value: result.value?.cost_fingerprint ?? resultEvidence.value?.cost_fingerprint ?? '' },
+].filter((item) => item.value))
+const resultSpecJson = computed(() => resultSpecSnapshot.value ? JSON.stringify(resultSpecSnapshot.value, null, 2) : '')
+const resultCurrentStrategy = computed(() => strategyById(result.value?.strategy_id ?? null))
+const exactHashMatch = computed<boolean | null>(() => {
+  const currentHash = resultCurrentStrategy.value?.spec_hash
+  if (!currentHash || !resultSpecHash.value) return null
+  return currentHash === resultSpecHash.value
+})
 const resultTradeDetails = computed(() => result.value?.trade_details ?? resultEvidence.value?.trade_details ?? [])
 
 const exitReasonRows = computed<BacktestExitReasonCount[]>(() => {
@@ -447,24 +430,6 @@ function exitReasonName(reason: string): string {
   return exitReasonLabels[reason] ?? reason
 }
 
-function paramValueText(value: StrategyParamValue): string {
-  return typeof value === 'object' ? '结构化覆盖层' : String(value)
-}
-
-function paramName(key: string): string {
-  const fixedNames: Record<string, string> = {
-    fast: '短期均线天数', slow: '长期均线天数', entry: '入场观察天数', exit: '退出观察天数',
-    rsi_buy: 'RSI 偏弱阈值', rsi_sell: 'RSI 修复阈值', ma: '长期趋势天数',
-    window: '整理平台天数', range_max: '平台最大振幅', vol_mult: '放量倍数', atr_mult: '波动风险倍数',
-    top_n: '持有股票数量', w_mom20: '20 日动量权重', w_mom60: '60 日动量权重',
-    risk_overlay: '统一风险覆盖层', take_profit: '止盈覆盖层',
-  }
-  return strategyParams.value.find((parameter) => parameter.key === key)?.name
-    ?? scanParameterOptions.value.find((parameter) => parameter.key === key)?.name
-    ?? fixedNames[key]
-    ?? '模板参数'
-}
-
 function toggleCode(code: string) {
   const i = form.codes.indexOf(code)
   if (i >= 0) form.codes.splice(i, 1)
@@ -486,7 +451,7 @@ function stockName(code: string): string {
 
 function parsedCodes(): string[] {
   const extra = form.codesText
-    .split(/[,,\s]+/)
+    .split(/[,，\s]+/)
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean)
   return [...new Set([...form.codes, ...extra])]
@@ -494,10 +459,13 @@ function parsedCodes(): string[] {
 
 async function run() {
   error.value = ''
-  notice.value = ''
   const codes = parsedCodes()
   if (strategyId.value === null) {
     error.value = '请选择策略'
+    return
+  }
+  if (!strategyRunnable.value) {
+    error.value = '当前策略存在数据或引擎能力缺口，请先在策略管理中修正'
     return
   }
   if (!codes.length && !isPortfolio.value) {
@@ -506,10 +474,6 @@ async function run() {
   }
   if (!form.start || !form.end) {
     error.value = '请选择起止日期'
-    return
-  }
-  if (!parameterForm.validate()) {
-    error.value = '请修正策略参数后再运行回测'
     return
   }
   running.value = true
@@ -521,10 +485,6 @@ async function run() {
       end: form.end,
       // 组合策略按股票池解析成分(取代旧的「codes 留空隐式动态池」约定)
       ...(isPortfolio.value && poolId.value !== null ? { pool_id: poolId.value } : {}),
-      params: {
-        ...parameterForm.snapshot(),
-        ...overlayParamSnapshot(riskOverlay.value, takeProfit.value, strategy.value?.effective_params),
-      },
       costs: runCosts(),
     })
   } catch (e) {
@@ -552,13 +512,15 @@ async function loadRun() {
 }
 
 onMounted(async () => {
-  await loadCatalog()
   try {
     // 策略列表由 StrategySelect 自行加载,这里只补自选股;
-    // 但仍等一次 load,避免 strategyId 落位前先渲染出空参数表单
+    // 仍等待策略列表完成，确保 strategy_id 与能力状态先落位。
     const [, w] = await Promise.all([loadStrategies(), api.watchlist()])
     watchlist.value = w.items
-    parameterForm.reset(strategy.value?.effective_params ?? {})
+    const requestedStrategyId = Number(route.query.strategy)
+    if (requestedStrategyId && strategyById(requestedStrategyId)) {
+      strategyId.value = requestedStrategyId
+    }
   } catch (e) {
     error.value = (e as Error).message
   }
@@ -608,54 +570,30 @@ onMounted(async () => {
           <span class="mb-1 block text-xs text-text-tertiary">结束日期</span>
           <input v-model="form.end" type="date" class="rounded-md border border-border px-2 py-1.5" />
         </label>
-        <button type="submit" :disabled="running" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50">
+        <button type="submit" :disabled="running || !strategyRunnable" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50">
           {{ running ? '运行中…' : mode === 'single' ? '运行回测' : '开始扫描' }}
         </button>
       </div>
 
-      <div v-if="templateMeta" class="max-w-3xl text-xs leading-5 text-text-secondary">
-        <p>{{ templateMeta.description }}</p>
-        <p v-if="templateMeta.caveat" class="mt-1 text-text-tertiary">限制：{{ templateMeta.caveat }}</p>
-      </div>
-
-      <div v-if="mode === 'single'" class="border-t border-border-subtle pt-3">
-        <section v-if="strategyParams.length" aria-labelledby="backtest-native-params-heading">
-          <h3 id="backtest-native-params-heading" class="mb-2 text-xs font-medium text-text-secondary">
-            模板原生参数
-            <span class="ml-1 font-normal text-text-tertiary">（本页调整只作用于本次回测）</span>
-          </h3>
-          <StrategyParamFields
-            v-model="parameterValues"
-            :parameters="strategyParams"
-            :errors="parameterForm.errors"
-            id-prefix="backtest-param"
-          />
-        </section>
-
-        <StrategyOverlayFields
-          v-model:risk="riskOverlay"
-          v-model:take-profit="takeProfit"
-          id-prefix="backtest-overlay"
-        />
-
-        <!-- 临时调参后可固化为一条新策略,原策略(尤其公共策略)保持不变 -->
-        <div v-if="paramsTweaked" class="mt-3 flex flex-wrap items-end gap-2">
-          <label class="text-sm">
-            <span class="mb-1 block text-xs text-text-tertiary">新策略名称（留空自动加「副本」）</span>
-            <input
-              v-model="saveAsName"
-              placeholder="如 双均线（快5慢30）"
-              class="w-56 rounded-md border border-border px-2 py-1.5 text-sm"
-            />
-          </label>
-          <button
-            type="button"
-            :disabled="running"
-            class="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
-            @click="saveTweakedAsStrategy"
-          >
-            另存为我的策略
-          </button>
+      <div v-if="strategy" class="border-t border-border-subtle pt-3">
+        <InlineFeedback v-if="selectedCapability && selectedCapability.status !== 'supported'" tone="error">
+          {{ selectedCapability.issues[0]?.message ?? '当前策略不能回测' }}
+          <template v-if="selectedCapability.issues[0]?.path">（{{ selectedCapability.issues[0].path }}）</template>
+        </InlineFeedback>
+        <ul v-if="selectedCapability && selectedCapability.status !== 'supported' && selectedCapability.issues.length > 1" class="mt-2 space-y-1 text-xs text-text-secondary">
+          <li v-for="issue in selectedCapability.issues.slice(1)" :key="`${issue.code}-${issue.path}`">
+            {{ issue.message }} <code class="text-text-tertiary">{{ issue.path }}</code>
+          </li>
+        </ul>
+        <div v-else class="grid gap-3 text-xs md:grid-cols-[minmax(0,1fr)_auto]">
+          <div class="min-w-0">
+            <p class="font-medium text-text-primary">{{ selectedHypothesis }}</p>
+            <p class="mt-1 text-text-tertiary">回测将固化当前完整规格，页面不提供临时规则覆盖。</p>
+          </div>
+          <div class="text-text-tertiary md:text-right">
+            <p>{{ isPortfolio ? '组合目标权重' : '单标的目标仓位' }}</p>
+            <code v-if="selectedSpecHash" class="mt-1 block">{{ selectedSpecHash.slice(0, 16) }}</code>
+          </div>
         </div>
       </div>
 
@@ -694,21 +632,22 @@ onMounted(async () => {
 
       <div v-if="mode === 'sweep'">
         <div class="mb-1 flex items-center justify-between">
-          <span class="text-xs text-text-tertiary">参数网格(参数名 + 逗号分隔候选值,如 fast: 3,5,8)</span>
-          <button type="button" class="text-xs text-accent hover:underline" @click="addGridRow">+ 添加参数</button>
+          <span class="text-xs text-text-tertiary">规格路径与候选值</span>
+          <button type="button" class="text-xs text-accent hover:underline" @click="addGridRow">添加路径</button>
         </div>
         <div class="space-y-2">
           <div v-for="(row, i) in gridRows" :key="i" class="flex items-center gap-2">
-            <select
-              v-model="row.name"
-              class="w-48 rounded-md border border-border px-2 py-1.5 text-sm"
-            >
-              <option value="">选择参数</option>
-              <option v-for="parameter in scanParameterOptions" :key="parameter.key" :value="parameter.key">{{ parameter.name }}</option>
-            </select>
+            <input
+              v-model.trim="row.path"
+              data-testid="sweep-path"
+              list="strategy-scan-paths"
+              placeholder="$.overlays.risk.value"
+              class="w-72 rounded-md border border-border px-2 py-1.5 font-mono text-sm"
+            />
             <input
               v-model="row.valuesText"
-              :placeholder="gridPlaceholder(row.name)"
+              data-testid="sweep-values"
+              :placeholder="gridPlaceholder(row.path)"
               class="w-64 rounded-md border border-border px-2 py-1.5 text-sm"
             />
             <button
@@ -721,8 +660,11 @@ onMounted(async () => {
             </button>
           </div>
         </div>
+        <datalist id="strategy-scan-paths">
+          <option v-for="parameter in scanParameterOptions" :key="parameter.path" :value="parameter.path">{{ parameter.name }}</option>
+        </datalist>
         <p class="mt-2 text-xs leading-5 text-text-tertiary">
-          扫描覆盖层时，开关候选值使用 true / false，类型候选值使用 fixed_pct / atr_multiple；覆盖层关闭的组合不会应用其数值。
+          路径必须以 <code>$.</code> 开头并指向当前规格中的数字或布尔字段。候选值用逗号分隔，最多 200 组组合。
         </p>
       </div>
 
@@ -756,17 +698,16 @@ onMounted(async () => {
     </div>
 
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
-    <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
     <!-- 参数扫描结果 -->
     <template v-if="mode === 'sweep' && sweepResult">
       <div class="flex items-center gap-3 text-sm text-text-secondary">
         <span>
           策略: <span class="font-medium text-text-primary">{{ sweepResult.strategy_name }}</span>
-          <span class="ml-1 text-xs text-text-tertiary">（{{ templateName(sweepResult.template) }}）</span>
+          <code v-if="sweepResult.strategy_spec_hash" class="ml-2 text-xs text-text-tertiary">{{ sweepResult.strategy_spec_hash.slice(0, 12) }}</code>
         </span>
         <span>{{ sweepResult.start }} ~ {{ sweepResult.end }}</span>
-        <span>{{ sweepRows.length }} 组参数组合</span>
+        <span>{{ sweepRows.length }} 组路径组合</span>
       </div>
 
       <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
@@ -795,22 +736,38 @@ onMounted(async () => {
       </div>
 
       <section v-if="heatmapOption" class="rounded-lg border border-border bg-surface-raised p-2">
-        <h3 class="px-2 pt-2 text-base font-semibold">参数热力图(总收益)</h3>
+        <h3 class="px-2 pt-2 text-base font-semibold">规格路径热力图（总收益）</h3>
         <EChart :option="heatmapOption" height="380px" />
       </section>
     </template>
 
     <!-- 单次回测结果 -->
     <template v-if="mode === 'single' && result">
-      <div class="flex items-center gap-3 text-sm text-text-secondary">
+      <div class="flex flex-wrap items-center gap-3 text-sm text-text-secondary">
         <span>回测编号：<span class="font-medium text-text-primary">{{ result.run_id }}</span></span>
         <template v-if="result.strategy_id">
           <!-- 策略行可能已被删除,后端此时回显 strategy_name = null -->
           <span>策略: {{ result.strategy_name ?? '策略已删除' }}</span>
-          <span v-if="result.template" class="text-xs text-text-tertiary">{{ templateName(result.template) }}</span>
           <span>{{ result.start }} ~ {{ result.end }}</span>
         </template>
         <span v-if="resultPool">股票池: {{ resultPool.name }}</span>
+      </div>
+
+      <div
+        v-if="resultSpecHash"
+        class="flex items-start gap-2 rounded-md border px-4 py-3 text-sm leading-5"
+        :class="exactHashMatch === true
+          ? 'border-down/30 bg-down/5 text-text-secondary'
+          : exactHashMatch === false
+            ? 'border-warning/30 bg-warning-soft text-text-secondary'
+            : 'border-border bg-info-soft text-text-secondary'"
+      >
+        <CheckCircle2 v-if="exactHashMatch === true" :size="17" class="mt-0.5 shrink-0 text-down" />
+        <TriangleAlert v-else-if="exactHashMatch === false" :size="17" class="mt-0.5 shrink-0 text-warning" />
+        <Fingerprint v-else :size="17" class="mt-0.5 shrink-0 text-text-tertiary" />
+        <span v-if="exactHashMatch === true">本次规格哈希与当前策略完全一致，可作为当前策略的回测证据。</span>
+        <span v-else-if="exactHashMatch === false">这是旧规格的历史快照，不作为当前策略证据。当前策略修改不会改变本次结果。</span>
+        <span v-else>本次回测保留了完整规格快照，但当前策略已不可用，无法建立精确哈希关联。</span>
       </div>
 
       <!-- 静态池无成员历史,历史区间结果含幸存者偏差;预置池逐日解析成分,不标注 -->
@@ -828,25 +785,39 @@ onMounted(async () => {
       </p>
 
       <section class="border-y border-border bg-surface-raised px-4 py-4" aria-labelledby="backtest-snapshot-heading">
-        <h3 id="backtest-snapshot-heading" class="text-sm font-semibold">本次回测规则快照</h3>
-        <div class="mt-3 grid gap-5 text-xs leading-5 md:grid-cols-3">
+        <div class="flex items-center gap-2">
+          <Fingerprint :size="17" class="text-text-tertiary" />
+          <h3 id="backtest-snapshot-heading" class="text-sm font-semibold">不可变执行证据</h3>
+        </div>
+        <div class="mt-3 grid gap-4 text-xs leading-5 md:grid-cols-2">
           <div>
-            <h4 class="font-medium">模板原生参数</h4>
-            <dl v-if="resultNativeParams.length" class="mt-1 space-y-1 text-text-secondary">
-              <div v-for="([key, value]) in resultNativeParams" :key="key" class="flex justify-between gap-3">
-                <dt>{{ paramName(key) }}</dt>
-                <dd class="font-medium text-text-primary">{{ paramValueText(value) }}</dd>
+            <h4 class="font-medium text-text-primary">规格与编译器</h4>
+            <dl class="mt-1 space-y-1 text-text-secondary">
+              <div class="flex justify-between gap-3"><dt>StrategySpec 哈希</dt><dd class="font-mono" :title="resultSpecHash">{{ resultSpecHash ? resultSpecHash.slice(0, 16) : '未提供' }}</dd></div>
+              <div class="flex justify-between gap-3"><dt>编译器版本</dt><dd class="font-mono">{{ resultCompilerVersion || '未提供' }}</dd></div>
+            </dl>
+          </div>
+          <div>
+            <h4 class="font-medium text-text-primary">组件版本</h4>
+            <dl v-if="Object.keys(resultComponentVersions).length" class="mt-1 space-y-1 text-text-secondary">
+              <div v-for="(version, component) in resultComponentVersions" :key="component" class="flex justify-between gap-3">
+                <dt class="font-mono">{{ component }}</dt><dd class="font-mono">{{ version }}</dd>
               </div>
             </dl>
-            <p v-else class="mt-1 text-text-tertiary">历史响应未提供参数快照。</p>
+            <p v-else class="mt-1 text-text-tertiary">未提供组件版本。</p>
+          </div>
+          <div class="md:col-span-2">
+            <h4 class="font-medium text-text-primary">复现指纹</h4>
+            <dl v-if="resultFingerprints.length" class="mt-1 grid gap-1 md:grid-cols-2">
+              <div v-for="item in resultFingerprints" :key="item.label" class="flex min-w-0 justify-between gap-3 rounded-md bg-surface-muted px-3 py-1.5 text-text-secondary">
+                <dt>{{ item.label }}</dt>
+                <dd class="max-w-[65%] truncate font-mono" :title="item.value">{{ item.value }}</dd>
+              </div>
+            </dl>
+            <p v-else class="mt-1 text-text-tertiary">该历史记录未保存完整指纹。</p>
           </div>
           <div>
-            <h4 class="font-medium">风险与止盈覆盖层</h4>
-            <p class="mt-1 text-text-secondary">风险：{{ overlaySummary(resultRiskOverlay, 'risk') }}</p>
-            <p class="mt-1 text-text-secondary">止盈：{{ overlaySummary(resultTakeProfit, 'take_profit') }}</p>
-          </div>
-          <div>
-            <h4 class="font-medium">费用假设</h4>
+            <h4 class="font-medium text-text-primary">费用假设</h4>
             <dl class="mt-1 space-y-1 text-text-secondary">
               <div class="flex justify-between gap-3"><dt>双边佣金</dt><dd>{{ resultCosts.commission == null ? '未提供' : fmtPct(resultCosts.commission) }}</dd></div>
               <div class="flex justify-between gap-3"><dt>卖出印花税</dt><dd>{{ resultCosts.stamp_tax == null ? '未提供' : fmtPct(resultCosts.stamp_tax) }}</dd></div>
@@ -854,6 +825,13 @@ onMounted(async () => {
             </dl>
           </div>
         </div>
+        <details v-if="resultSpecJson" class="mt-4 border-t border-border-subtle pt-3">
+          <summary class="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-text-secondary">
+            <Code2 :size="14" />
+            完整 StrategySpec 快照
+          </summary>
+          <pre class="mt-2 max-h-80 overflow-auto rounded-md bg-surface-muted p-3 text-xs leading-5 text-text-secondary">{{ resultSpecJson }}</pre>
+        </details>
       </section>
 
       <section class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">

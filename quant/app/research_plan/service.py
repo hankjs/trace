@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from datetime import date, timedelta
 from typing import Any, Mapping
 
@@ -15,14 +14,13 @@ from ..data.calendar import is_trading_day
 from ..models import (BacktestRun, DailyBar, Pool, ResearchPlan,
                       ResearchPlanItem, Signal, Snapshot, Stock, Strategy,
                       TradeCalendar)
-from ..strategy.strategies import REGISTRY
-from ..strategy.overlays import (DEFAULT_SIMULATION_SLIPPAGE,
-                                 apply_portfolio_overlays,
-                                 portfolio_base_exit_reasons)
+from ..strategy.compiler import compile_portfolio
+from ..strategy.runtime import strategy_spec_for
 from .domain import (PLAN_TYPE_NAMES, PRODUCT_BOUNDARY, STATUS_NAMES,
                      build_portfolio_snapshot, build_single_snapshot,
-                     evaluate_single_entry_condition,
-                     portfolio_score_details)
+                     evaluate_single_spec_condition,
+                     is_portfolio_rebalance_day,
+                     portfolio_spec_score_details)
 
 
 def next_trading_day(db: Session, day: date) -> date | None:
@@ -56,7 +54,7 @@ def _backtest_evidence(
     db: Session,
     *,
     strategy_id: int,
-    strategy_version: str,
+    strategy_spec_hash: str | None,
     params_snapshot: dict,
     viewer_user_id: str | None,
     plan_code: str | None = None,
@@ -64,18 +62,18 @@ def _backtest_evidence(
     pool_signature: str | None = None,
     cache: dict | None = None,
 ) -> tuple[int | None, dict]:
-    """只绑定查看者本人、版本、参数、费用和研究范围完全一致的回测。"""
+    """只绑定查看者本人、规格哈希、费用和研究范围完全一致的回测。"""
     from ..backtest.engine import DEFAULT_COSTS
 
     expected_costs = dict(
         params_snapshot.get("simulation_costs") or DEFAULT_COSTS
     )
-    if viewer_user_id is None:
+    if viewer_user_id is None or not strategy_spec_hash:
         return _unverified_evidence(expected_costs)
     cache_key = (
-        viewer_user_id, strategy_id, strategy_version, plan_code, pool_id,
+        viewer_user_id, strategy_id, strategy_spec_hash, plan_code, pool_id,
         pool_signature,
-        json.dumps(params_snapshot, ensure_ascii=True, sort_keys=True),
+        tuple(sorted(expected_costs.items())),
     )
     if cache is not None and cache_key in cache:
         return cache[cache_key]
@@ -85,9 +83,8 @@ def _backtest_evidence(
             BacktestRun.user_id == viewer_user_id,
         ).order_by(BacktestRun.created_at.desc(), BacktestRun.id.desc())
     ).scalars().all()
-    expected = params_snapshot["effective_params"]
     for run in candidates:
-        if (run.params or {}) != expected:
+        if run.strategy_spec_hash != strategy_spec_hash:
             continue
         if (run.costs or {}) != expected_costs:
             continue
@@ -101,12 +98,13 @@ def _backtest_evidence(
             continue
         metrics = run.metrics or {}
         persisted_evidence = metrics.get("evidence") or {}
-        if persisted_evidence.get("strategy_version") != strategy_version:
-            continue
         result = run.id, {
             "status": "verified", "status_name": "已有同配置历史验证",
             "run_id": run.id, "start": str(run.start), "end": str(run.end),
             "costs": run.costs or {},
+            "strategy_spec_hash": run.strategy_spec_hash,
+            "compiler_version": run.compiler_version,
+            "component_versions": dict(run.component_versions or {}),
             "metrics": {
                 key: metrics.get(key)
                 for key in ("total_return", "max_drawdown", "win_rate", "trade_count")
@@ -137,9 +135,11 @@ def _new_plan(strategy: Strategy, snapshot: dict, *, code: str | None,
         strategy_id=strategy.id,
         strategy_name=strategy.name,
         template=strategy.template,
-        strategy_kind=strategy.kind,
+        strategy_kind=snapshot["strategy_spec_snapshot"]["kind"],
         strategy_version=snapshot["strategy_version"],
         params_snapshot=snapshot["params_snapshot"],
+        strategy_spec_snapshot=snapshot["strategy_spec_snapshot"],
+        strategy_spec_hash=snapshot["strategy_spec_hash"],
         plan_type=snapshot["plan_type"],
         code=code,
         pool_id=pool_id,
@@ -169,7 +169,7 @@ def _new_plan(strategy: Strategy, snapshot: dict, *, code: str | None,
 def create_single_plan(db: Session, strategy: Strategy, signal: Signal,
                        df: pd.DataFrame) -> ResearchPlan:
     """为已落库的单标的信号新建一版计划，并让信号指向最新版。"""
-    if strategy.kind != "single":
+    if strategy_spec_for(strategy).kind != "single":
         raise ValueError("组合策略不能生成单标的研究计划")
     if not is_trading_day(db, signal.date):
         raise ValueError("非交易日不生成研究计划")
@@ -194,7 +194,7 @@ def create_single_plan(db: Session, strategy: Strategy, signal: Signal,
         ).order_by(ResearchPlan.id.desc()).limit(1)).scalar_one_or_none()
     backtest_run_id, evidence = _backtest_evidence(
         db, strategy_id=strategy.id,
-        strategy_version=snapshot["strategy_version"],
+        strategy_spec_hash=snapshot["strategy_spec_hash"],
         params_snapshot=snapshot["params_snapshot"],
         viewer_user_id=None if strategy.is_system else strategy.owner_id,
         plan_code=signal.code)
@@ -219,7 +219,7 @@ def create_holding_plan(
     overlay_state_rules: list[dict] | None = None,
 ) -> ResearchPlan:
     """为持续模拟持有状态生成每日风险/退出快照，不制造新的买卖信号。"""
-    if strategy.kind != "single":
+    if strategy_spec_for(strategy).kind != "single":
         raise ValueError("组合策略不能生成单标的持有计划")
     if not is_trading_day(db, data_date):
         raise ValueError("非交易日不生成研究计划")
@@ -236,7 +236,7 @@ def create_holding_plan(
     ).order_by(ResearchPlan.id.desc()).limit(1)).scalar_one_or_none()
     backtest_run_id, evidence = _backtest_evidence(
         db, strategy_id=strategy.id,
-        strategy_version=snapshot["strategy_version"],
+        strategy_spec_hash=snapshot["strategy_spec_hash"],
         params_snapshot=snapshot["params_snapshot"],
         viewer_user_id=None if strategy.is_system else strategy.owner_id,
         plan_code=code,
@@ -262,16 +262,6 @@ def _portfolio_dates(pool_dfs: Mapping[str, pd.DataFrame],
     return pd.DatetimeIndex(values)
 
 
-def _ma20_lines(pool_dfs: Mapping[str, pd.DataFrame],
-                data_date: date) -> dict[str, float | None]:
-    result = {}
-    for code, frame in pool_dfs.items():
-        close = frame.loc[frame["date"] <= data_date].sort_values("date")["close"]
-        value = close.astype(float).rolling(20).mean().iat[-1] if len(close) else None
-        result[code] = None if value is None or pd.isna(value) else round(float(value), 4)
-    return result
-
-
 def create_portfolio_plan(
     db: Session,
     strategy: Strategy,
@@ -282,25 +272,21 @@ def create_portfolio_plan(
     pool_dfs: Mapping[str, pd.DataFrame],
     eligibility: pd.DataFrame | None = None,
 ) -> ResearchPlan:
-    """运行组合模板并保存调仓计划及逐股变化原因。
+    """编译组合 StrategySpec 并保存调仓计划及逐股变化原因。
 
     调用方负责按历史口径解析股票池；本函数拒绝基准日没有行情的数据，防止用
     当前成分或旧行情冒充历史调仓计划。
     """
-    if strategy.kind != "portfolio":
+    if strategy_spec_for(strategy).kind != "portfolio":
         raise ValueError("单标的策略不能生成组合调仓计划")
     if not is_trading_day(db, data_date):
         raise ValueError("非交易日不生成研究计划")
-    if strategy.template not in REGISTRY:
-        raise ValueError(f"未知策略模板 {strategy.template}")
     dates = _portfolio_dates(pool_dfs, data_date)
     if not len(dates) or dates[-1].date() != data_date:
         raise ValueError("非交易日或行情未更新到组合计划基准日")
-    module = REGISTRY[strategy.template]
-    from ..backtest.engine import (opening_buy_tradable_mask,
-                                   validate_strategy_params)
-
-    params = validate_strategy_params(strategy.template, strategy.params)
+    spec = strategy_spec_for(strategy)
+    if spec.kind != "portfolio":
+        raise ValueError("策略行 kind 与 StrategySpec 不一致")
     supersedes = db.execute(
         select(ResearchPlan).where(
             ResearchPlan.strategy_id == strategy.id,
@@ -324,98 +310,70 @@ def create_portfolio_plan(
                 ResearchPlanItem.plan_id == baseline.id,
             )).scalars()
         }
-    weights = module.target_weights(
-        dates.date, dict(pool_dfs), params, eligibility=eligibility)
-    base_exit_reasons = portfolio_base_exit_reasons(
-        strategy.template, weights, dict(pool_dfs),
-        module.rebalance_mask(dates),
+    compilation = compile_portfolio(
+        spec, dates, dict(pool_dfs), eligibility=eligibility,
     )
-    weights, overlay_exits, overlay_snapshots = apply_portfolio_overlays(
-        weights, dict(pool_dfs), params, module.rebalance_mask(dates),
-        slippage=DEFAULT_SIMULATION_SLIPPAGE,
-        entry_tradable=opening_buy_tradable_mask(dict(pool_dfs), dates),
-        base_exit_reasons=base_exit_reasons)
+    weights = compilation.weights
     target = {code: float(value) for code, value in weights.iloc[-1].items()}
     calculated_previous = (
         {code: float(value) for code, value in weights.iloc[-2].items()}
         if len(weights) > 1 else {})
     previous = persisted_previous or calculated_previous
-    score_details = portfolio_score_details(
-        strategy.template, pool_dfs, data_date, params)
+    score_details = portfolio_spec_score_details(
+        spec, dates, pool_dfs, data_date,
+    )
     scores = {code: detail.get("total") for code, detail in score_details.items()}
+    current_reasons = {
+        code: reasons
+        for (day, code), reasons in compilation.reasons.items()
+        if day == pd.Timestamp(data_date)
+    }
     eligible_now = (
         {code: bool(value) for code, value in eligibility.reindex(
             index=dates, columns=weights.columns).iloc[-1].fillna(False).items()}
         if eligibility is not None else {code: True for code in weights.columns})
+    for code, reasons in current_reasons.items():
+        for item in reasons:
+            if isinstance(item, dict) and "eligible" in item:
+                eligible_now[code] = bool(item["eligible"])
     eligible_now.update({
         code: False for code in previous if code not in weights.columns
     })
-    risk_lines = (
-        _ma20_lines(pool_dfs, data_date)
-        if strategy.template == "momentum_rotation" else {})
     snapshot, item_snapshots = build_portfolio_snapshot(
         strategy, data_date=data_date,
         next_execution_date=next_trading_day(db, data_date),
         pool_name=pool_name, target_weights=target,
         previous_weights=previous, scores=scores,
-        eligible=eligible_now, risk_lines=risk_lines,
-        overlay_snapshots=overlay_snapshots,
+        eligible=eligible_now,
         score_details=score_details,
-        exit_reasons={
-            code: reasons
-            for (day, code), reasons in overlay_exits.items()
-            if day == pd.Timestamp(data_date)
-        })
+        compiler_reasons=current_reasons,
+        component_versions=compilation.component_versions,
+    )
     pool = db.get(Pool, pool_id)
     if pool is not None and pool.kind == "static":
         snapshot["portfolio_summary"]["pool_signature"] = _code_signature(
             pool_dfs.keys()
         )
     plan_exit_hits: list[dict] = []
-    for item in item_snapshots:
-        hits = overlay_exits.get((pd.Timestamp(data_date), item["code"]), [])
-        if not hits:
-            continue
-        existing_codes = {
-            reason.get("code") for reason in item["reasons"]
-            if isinstance(reason, dict)
-        }
-        if "ma20_risk_filter" in existing_codes:
-            existing_codes.add("native")
-        hit_reasons = []
-        for hit in hits:
-            if hit.get("code") not in existing_codes:
-                hit_reasons.append({
-                "code": hit["code"],
-                "text": f"{hit['name']}在基准日收盘触发，目标权重清零。",
-                })
-            plan_exit_hits.append({"code": item["code"], **hit})
-        item["reasons"] = hit_reasons + item["reasons"]
-        priced_hits = [
-            hit for hit in hits if hit.get("code") in {
-                "risk_overlay", "take_profit"
-            } and hit.get("price_line") is not None
-        ]
-        if priced_hits:
-            item_snapshot = item["risk_snapshot"] or {
-                "data_date": str(data_date), "rules": [],
-            }
-            rules = list(item_snapshot.get("rules") or [])
-            for hit in priced_hits:
-                rules.append({
-                    "source": hit["code"], "name": hit["name"],
-                    "reference_line": hit["price_line"],
-                    "data_date": str(data_date),
-                    "calculation_status": "calculated",
-                    "explanation": "基准日收盘已触发该逐股覆盖层。",
-                })
-            item_snapshot["rules"] = rules
-            item_snapshot.setdefault("name", priced_hits[0]["name"])
-            item_snapshot.setdefault(
-                "reference_line", priced_hits[0]["price_line"])
-            item["risk_snapshot"] = item_snapshot
+    for code, reasons in current_reasons.items():
+        for reason in reasons:
+            if not isinstance(reason, dict):
+                continue
+            for flag, reason_code in (
+                ("risk_blocked", "risk_filter"),
+                ("native_exit", "native_exit"),
+            ):
+                if reason.get(flag):
+                    plan_exit_hits.append({
+                        "code": code,
+                        "reason_code": reason_code,
+                        "compiler_reason": reason,
+                    })
+            for hit in reason.get("all_reasons") or []:
+                if isinstance(hit, dict):
+                    plan_exit_hits.append({"code": code, **hit})
     snapshot["exit_hits"] = plan_exit_hits
-    scheduled = bool(module.rebalance_mask(dates).iat[-1])
+    scheduled = is_portfolio_rebalance_day(spec, dates)
     changed = any(
         abs(item["target_weight"] - item["previous_weight"]) > 1e-10
         for item in item_snapshots)
@@ -433,11 +391,11 @@ def create_portfolio_plan(
         snapshot["status"] = "current"
         snapshot["status_reason"] = {
             "code": "native_qualification_change",
-            "text": "模板日常资格或风险条件发生变化，逐股目标权重已更新。",
+            "text": "规格中的日常资格或风险条件发生变化，逐股目标权重已更新。",
         }
     backtest_run_id, evidence = _backtest_evidence(
         db, strategy_id=strategy.id,
-        strategy_version=snapshot["strategy_version"],
+        strategy_spec_hash=snapshot["strategy_spec_hash"],
         params_snapshot=snapshot["params_snapshot"],
         viewer_user_id=None if strategy.is_system else strategy.owner_id,
         pool_id=pool_id,
@@ -622,11 +580,13 @@ def _native_condition_reevaluation(
         "volume": row.volume,
         "amount": row.amount,
     } for row in rows])
-    result = evaluate_single_entry_condition(
-        plan.template,
-        frame,
-        (plan.params_snapshot or {}).get("effective_params") or {},
-        plan.signal_type,
+    if not plan.strategy_spec_snapshot:
+        return "reevaluate", {
+            "code": "strategy_spec_snapshot_missing",
+            "text": "历史计划没有完整 StrategySpec 快照，不能可靠重算原生条件。",
+        }
+    result = evaluate_single_spec_condition(
+        plan.strategy_spec_snapshot, frame, plan.signal_type,
     )
     if result["satisfied"] is None:
         return "reevaluate", {
@@ -702,7 +662,7 @@ def plan_summary(
     if db is not None:
         _, evidence = _backtest_evidence(
             db, strategy_id=plan.strategy_id,
-            strategy_version=plan.strategy_version,
+            strategy_spec_hash=plan.strategy_spec_hash,
             params_snapshot=plan.params_snapshot,
             viewer_user_id=viewer_user_id,
             plan_code=plan.code,
@@ -748,8 +708,11 @@ def plan_detail(db: Session, plan: ResearchPlan, *, as_of: date | None = None,
             "id": plan.strategy_id, "name": plan.strategy_name,
             "template": plan.template, "kind": plan.strategy_kind,
             "version": plan.strategy_version,
+            "spec_hash": plan.strategy_spec_hash,
         },
         "params_snapshot": plan.params_snapshot,
+        "strategy_spec_snapshot": plan.strategy_spec_snapshot,
+        "strategy_spec_hash": plan.strategy_spec_hash,
         "price_adjustment": plan.price_adjustment,
         "risk_rules": plan.risk_rules,
         "take_profit": plan.take_profit,

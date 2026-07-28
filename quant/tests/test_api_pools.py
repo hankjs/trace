@@ -29,6 +29,8 @@ from app.api.pools import (add_pool_members, create_pool, default_pool,
 from app.db import Base
 from app.models import (SYSTEM_OWNER_ID, BacktestRun, DailyBar, IndexMember,
                         Pool, PoolMember, Stock, Strategy)
+from app.strategy.presets import get_preset_spec
+from app.strategy.spec import strategy_spec_hash
 
 # 回测用的公共策略(对齐 Alembic 0012 的 seed):单标的 1 号、组合 5 号
 MA_CROSS_ID = 1
@@ -509,6 +511,38 @@ def test_portfolio_backtest_resolves_static_pool_and_persists_pool_id():
     assert reloaded["costs"] == result["costs"]
     assert reloaded["trade_details"] == result["trade_details"]
     assert reloaded["exit_reason_distribution"] == result["exit_reason_distribution"]
+
+
+def test_portfolio_backtest_defaults_to_frozen_spec_pool():
+    start, end = date(2024, 1, 1), date(2024, 6, 30)
+    with _session() as db:
+        _seed(db)
+        _seed_bars(db, ["sh.600519", "sz.000001"], start, end)
+        pool = create_pool(
+            PoolCreateIn(name="规格指定池", codes=["sh.600519"]),
+            db=db,
+            claims=CLAIMS_A,
+        )
+        strategy = db.get(Strategy, ROTATION_ID)
+        spec = get_preset_spec("momentum_rotation").model_dump(mode="json")
+        spec["universe"]["pool_id"] = pool["id"]
+        strategy.spec = spec
+        strategy.spec_hash = strategy_spec_hash(spec)
+        db.commit()
+
+        result = create_backtest(
+            BacktestIn(
+                strategy_id=ROTATION_ID,
+                codes=[],
+                start=start,
+                end=end,
+            ),
+            db=db,
+            claims=CLAIMS_A,
+        )
+
+    assert result["pool"]["id"] == pool["id"]
+    assert result["codes"] == ["sh.600519"]
 
 
 def test_explicit_codes_backtest_does_not_echo_pool():

@@ -16,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -178,6 +179,11 @@ class Signal(Base):
     side: Mapped[str] = mapped_column(String(8))
     price: Mapped[float | None] = mapped_column(_PRICE, nullable=True)
     reason: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 执行时的完整规格哈希。旧派生信号无法可靠反推，迁移后历史行允许为空；
+    # 新信号必须由运行路径在写入时固化，不能读取当前策略后补写。
+    spec_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
     # 指向同一信号最新一版研究计划。计划自身是不可变快照，重算时新建一版并
     # 通过 supersedes_plan_id 保留版本链；删除派生信号不会删除历史计划。
     plan_id: Mapped[int | None] = mapped_column(
@@ -225,6 +231,20 @@ class BacktestRun(Base):
     start: Mapped[date] = mapped_column(Date)
     end: Mapped[date] = mapped_column(Date)
     metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 回测证据快照必须在任务创建时固化。旧记录没有可靠的创建时规格与数据
+    # 指纹，故这些迁移新增列可空；不得用迁移时的当前策略伪造历史证据。
+    strategy_spec_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    strategy_spec_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
+    compiler_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    component_versions: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    data_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    universe_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cost_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    execution_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
@@ -348,6 +368,10 @@ class StrategyEval(Base):
     start: Mapped[date] = mapped_column(Date)
     end: Mapped[date] = mapped_column(Date)
     metrics: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 与 Signal 同理：只记录执行当时的规格哈希，不追随当前策略原地更新。
+    spec_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
     run_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 
 
@@ -374,19 +398,15 @@ SYSTEM_OWNER_ID = "00000000-0000-0000-0000-000000000000"
 
 
 class Strategy(Base):
-    """用户可管理的策略实例 = 算法模板 + 一组参数。
+    """用户可管理的当前完整策略规格。
 
     归属模型与 `Pool` 完全一致(见 alembic 0011):可见性 = `is_system`
     OR `owner_id` 是我。**不建 grant 表** —— 当前只需要「公共」和「我的」两
     档,定向分享等真有需求再照 `quant_pool_grant` 补,不预先建一张没人写的表。
 
-    `template` 指向 `app/strategy/strategies` 里的算法模块,算法逻辑仍在代码
-    里,本表只存参数组合。这也是后续「规则构建器」的扩展点:新增
-    `template='rule'` 和一列 `rules JSON` 即可,不动现有行的语义。
-
-    `kind` 是 template 的冗余(模块的 `KIND`)。冗余是刻意的:夜间信号引擎要
-    取「所有启用的单标的策略」,有了这一列就是一条带索引的查询,否则得把全部
-    策略行读进内存再逐行查 REGISTRY 过滤。写入时由 API 从模块回填,用户改不到。
+    `spec` 是当前完整 StrategySpec 的唯一事实来源，用户编辑时原地更新；
+    `spec_hash` 是规范化规格的 SHA-256。`template` / `params` 仅在迁移期保留，
+    新执行路径不得按具体模板名分支。`kind` 仍是服务端从规格派生的检索列。
     """
 
     __tablename__ = "quant_strategy"
@@ -404,10 +424,37 @@ class Strategy(Base):
     kind: Mapped[str] = mapped_column(String(16), index=True)  # single / portfolio
     # 空 dict 表示全用模板默认参数;只存用户显式覆盖的键,模板默认值改动能自动生效
     params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    spec_schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    spec: Mapped[dict] = mapped_column(JSON, nullable=False)
+    spec_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    research_status: Mapped[str] = mapped_column(
+        String(32), default="unverified", index=True,
+    )
     # 停用的策略不进夜间信号引擎和批量评估,但历史信号/回测记录保留。
     # 删除策略会牵连历史(见下方三张表的外键),故「停用」是常规操作、删除是例外。
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now,
+    )
+
+
+@event.listens_for(Strategy, "before_insert")
+def _populate_legacy_strategy_spec(_mapper, _connection, target: Strategy) -> None:
+    """让迁移期 legacy fixture/写入在入库前转换为完整 StrategySpec。"""
+    from .strategy.presets import get_preset_spec
+    from .strategy.spec import parse_strategy_spec, strategy_spec_hash
+
+    spec = (
+        parse_strategy_spec(target.spec)
+        if target.spec else get_preset_spec(target.template, target.params)
+    )
+    target.spec = spec.model_dump(mode="json")
+    target.spec_schema_version = spec.schema_version
+    target.spec_hash = strategy_spec_hash(spec)
+    target.kind = spec.kind
+    target.research_status = target.research_status or "unverified"
+    target.updated_at = target.updated_at or target.created_at or datetime.now()
 
 
 class ResearchPlan(Base):
@@ -434,6 +481,12 @@ class ResearchPlan(Base):
     strategy_kind: Mapped[str] = mapped_column(String(16), nullable=False)
     strategy_version: Mapped[str] = mapped_column(String(64), nullable=False)
     params_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    # 新计划直接固化完整 StrategySpec；旧计划只保存了 legacy 参数快照，无法
+    # 在迁移时证明原始规格，因此兼容历史行允许为空。
+    strategy_spec_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    strategy_spec_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, index=True,
+    )
 
     plan_type: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     code: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)

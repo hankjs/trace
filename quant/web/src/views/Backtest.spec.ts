@@ -1,0 +1,176 @@
+import { flushPromises, mount } from '@vue/test-utils'
+import { createMemoryHistory, createRouter } from 'vue-router'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { BacktestResult, Strategy, StrategyCapability } from '../api'
+import { createBreakoutStrategySpec } from '../strategySpecForm'
+
+const spec = (() => {
+  const value = createBreakoutStrategySpec()
+  value.universe.pool_id = 1
+  return value
+})()
+
+function strategy(capability: StrategyCapability = { status: 'supported', issues: [] }): Strategy {
+  return {
+    id: 7,
+    name: '20 日放量突破',
+    template: 'strategy_spec',
+    template_name: '数据库策略',
+    kind: 'single',
+    kind_name: '单只股票',
+    params: {},
+    effective_params: {},
+    params_valid: true,
+    enabled: true,
+    is_system: false,
+    editable: true,
+    spec,
+    spec_hash: 'current-spec-hash',
+    capability,
+  }
+}
+
+function backtestResult(): BacktestResult {
+  return {
+    run_id: 21,
+    strategy_id: 7,
+    strategy_name: '20 日放量突破',
+    strategy_spec_snapshot: spec,
+    strategy_spec_hash: 'current-spec-hash',
+    compiler_version: 'strategy-compiler-v1',
+    component_versions: { rolling_max: '1', rolling_min: '1' },
+    data_fingerprint: 'data-fingerprint-123',
+    universe_fingerprint: 'universe-fingerprint-123',
+    cost_fingerprint: 'cost-fingerprint-123',
+    execution_fingerprint: 'execution-fingerprint-123',
+    codes: ['sh.600519'],
+    stocks: [{ code: 'sh.600519', name: '贵州茅台' }],
+    start: '2024-01-01',
+    end: '2024-12-31',
+    costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
+    metrics: {
+      total_return: 0.12,
+      annual_return: 0.11,
+      max_drawdown: -0.08,
+      win_rate: 0.55,
+      trade_count: 4,
+      round_trips: 2,
+    },
+    equity: [],
+    trade_details: [],
+  }
+}
+
+async function mountPage(item: Strategy) {
+  const { api } = await import('../api')
+  vi.spyOn(api, 'strategies').mockResolvedValue({
+    items: [item],
+    limits: { max_total: 50, max_enabled: 10 },
+  })
+  vi.spyOn(api, 'watchlist').mockResolvedValue({ count: 0, items: [] })
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: [
+      { path: '/', component: { template: '<div />' } },
+      { path: '/strategies', name: 'strategies', component: { template: '<div />' } },
+    ],
+  })
+  await router.push('/')
+  await router.isReady()
+  const Component = (await import('./Backtest.vue')).default
+  const wrapper = mount(Component, {
+    global: {
+      plugins: [router],
+      stubs: { EChart: true },
+    },
+  })
+  await flushPromises()
+  await wrapper.get('select').setValue(String(item.id))
+  await flushPromises()
+  return { wrapper, api }
+}
+
+async function fillScope(wrapper: Awaited<ReturnType<typeof mountPage>>['wrapper']) {
+  const dates = wrapper.findAll<HTMLInputElement>('input[type="date"]')
+  await dates[0].setValue('2024-01-01')
+  await dates[1].setValue('2024-12-31')
+  await wrapper.get<HTMLInputElement>('input[placeholder="sh.600519, sz.000001"]').setValue('sh.600519')
+}
+
+beforeEach(() => {
+  vi.restoreAllMocks()
+  vi.resetModules()
+})
+
+describe('saved StrategySpec backtest workflow', () => {
+  it('submits only the saved strategy id and shows immutable evidence', async () => {
+    const { wrapper, api } = await mountPage(strategy())
+    const run = vi.spyOn(api, 'runBacktest').mockResolvedValue(backtestResult())
+    await fillScope(wrapper)
+
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(run).toHaveBeenCalledWith({
+      strategy_id: 7,
+      codes: ['sh.600519'],
+      start: '2024-01-01',
+      end: '2024-12-31',
+      costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
+    })
+    expect(run.mock.calls[0][0]).not.toHaveProperty('params')
+    expect(wrapper.text()).toContain('不可变执行证据')
+    expect(wrapper.text()).toContain('与当前策略完全一致')
+    expect(wrapper.text()).toContain('strategy-compiler-v1')
+    expect(wrapper.text()).toContain('execution-fingerprint-123')
+    expect(wrapper.text()).toContain('完整 StrategySpec 快照')
+  })
+
+  it('uses only controlled $.path values for a sweep', async () => {
+    const { wrapper, api } = await mountPage(strategy())
+    const sweep = vi.spyOn(api, 'sweepBacktest').mockResolvedValue({
+      strategy_id: 7,
+      strategy_name: '20 日放量突破',
+      template: 'strategy_spec',
+      strategy_spec_hash: 'current-spec-hash',
+      codes: ['sh.600519'],
+      start: '2024-01-01',
+      end: '2024-12-31',
+      results: [],
+    })
+
+    await wrapper.findAll('button').find((button) => button.text() === '参数扫描')!.trigger('click')
+    await fillScope(wrapper)
+    await wrapper.get<HTMLInputElement>('[data-testid="sweep-path"]').setValue('$.overlays.risk.value')
+    await wrapper.get<HTMLInputElement>('[data-testid="sweep-values"]').setValue('0.05, 0.08')
+
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(sweep).toHaveBeenCalledWith({
+      strategy_id: 7,
+      codes: ['sh.600519'],
+      start: '2024-01-01',
+      end: '2024-12-31',
+      param_grid: { '$.overlays.risk.value': [0.05, 0.08] },
+      costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
+    })
+  })
+
+  it('blocks a strategy with capability failures', async () => {
+    const capability: StrategyCapability = {
+      status: 'missing_engine',
+      issues: [{
+        status: 'missing_engine',
+        code: 'unknown_operator',
+        path: '$.entry.condition.op',
+        message: '当前编译器不支持操作符 future_magic',
+      }],
+    }
+    const { wrapper } = await mountPage(strategy(capability))
+
+    expect(wrapper.text()).toContain('当前编译器不支持操作符 future_magic')
+    const runButton = wrapper.findAll('button').find((button) => button.text() === '运行回测')
+    expect(runButton?.attributes('disabled')).toBeDefined()
+  })
+})

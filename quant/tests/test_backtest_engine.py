@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import sys
+from copy import deepcopy
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,6 +37,8 @@ from app.backtest.engine import (
     run_backtest,
 )
 from app.strategy.strategies import momentum_rotation
+from app.strategy.presets import get_preset_spec
+from app.strategy.spec import strategy_spec_hash
 
 
 def _mk_df(start: date, prices: list[float]) -> pd.DataFrame:
@@ -210,7 +213,7 @@ def test_costs_and_strategy_params_are_validated():
         _validate_params("ma_cross", {"future_window": 3})
 
 
-def test_backtest_evidence_versions_exact_params_but_not_temporary_override(monkeypatch):
+def test_backtest_evidence_hashes_exact_and_temporary_specs(monkeypatch):
     df = _mk_df(date(2024, 1, 1), [10 + index * 0.1 for index in range(80)])
     strategy = SimpleNamespace(
         id=9, name="版本证据", template="ma_cross",
@@ -230,11 +233,56 @@ def test_backtest_evidence_versions_exact_params_but_not_temporary_override(monk
         params={"fast": 3}, save=False,
     )
 
-    assert exact["evidence"]["strategy_version"].startswith("rp1-")
+    exact_hash = strategy_spec_hash(get_preset_spec("ma_cross", {"fast": 2, "slow": 5}))
+    temporary_hash = strategy_spec_hash(
+        get_preset_spec("ma_cross", {"fast": 3, "slow": 5}),
+    )
+    assert exact["evidence"]["strategy_version"] == exact_hash
+    assert exact["strategy_spec_hash"] == exact_hash
     assert exact["metrics"]["evidence"]["strategy_version"] == (
         exact["evidence"]["strategy_version"]
     )
-    assert temporary["evidence"]["strategy_version"] is None
+    assert temporary["evidence"]["strategy_version"] == temporary_hash
+    assert temporary["strategy_spec_hash"] == temporary_hash
+    assert temporary_hash != exact_hash
+    assert temporary["strategy_spec_snapshot"] != exact["strategy_spec_snapshot"]
+
+
+def test_editing_current_spec_does_not_change_prior_backtest_snapshot(monkeypatch):
+    df = _mk_df(date(2024, 1, 1), [10 + index * 0.1 for index in range(80)])
+    monkeypatch.setattr(
+        "app.backtest.engine.load_bars_df",
+        lambda db, code, start=None, end=None: df,
+    )
+    original = get_preset_spec(
+        "ma_cross", {"fast": 2, "slow": 5},
+    ).model_dump(mode="json")
+    strategy = SimpleNamespace(
+        id=10, name="快照证据", template="ma_cross", params={}, spec=original,
+    )
+
+    first = run_backtest(
+        None, strategy, ["X"], df["date"].iat[0], df["date"].iat[-1],
+        save=False,
+    )
+    preserved_snapshot = deepcopy(first["strategy_spec_snapshot"])
+    preserved_hash = first["strategy_spec_hash"]
+    preserved_execution = first["execution_fingerprint"]
+
+    strategy.spec = get_preset_spec(
+        "ma_cross", {"fast": 3, "slow": 8},
+    ).model_dump(mode="json")
+    second = run_backtest(
+        None, strategy, ["X"], df["date"].iat[0], df["date"].iat[-1],
+        save=False,
+    )
+
+    assert first["strategy_spec_snapshot"] == preserved_snapshot == original
+    assert first["strategy_spec_hash"] == preserved_hash == strategy_spec_hash(original)
+    assert first["execution_fingerprint"] == preserved_execution
+    assert second["strategy_spec_hash"] != preserved_hash
+    assert second["strategy_spec_snapshot"] != preserved_snapshot
+    assert second["execution_fingerprint"] != preserved_execution
 
 
 def test_portfolio_stamp_tax_is_applied_to_actual_sell_order():

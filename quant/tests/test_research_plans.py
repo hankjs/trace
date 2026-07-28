@@ -29,6 +29,9 @@ from app.research_plan.service import (create_portfolio_plan,
                                        next_trading_day, plan_detail,
                                        plan_summary)
 import app.research_plan.pipeline as plan_pipeline
+from app.strategy.compiler import COMPILER_VERSION, component_versions_for_spec
+from app.strategy.presets import get_preset_spec
+from app.strategy.spec import strategy_spec_hash
 
 USER = "11111111-1111-1111-1111-111111111111"
 CLAIMS = {"sub": USER, "username": "researcher", "can_client": True}
@@ -62,10 +65,12 @@ def _bars(*, end: str = "2026-07-24", periods: int = 120,
 
 def _strategy(template: str, kind: str = "single", params: dict | None = None,
               *, strategy_id: int = 1) -> Strategy:
+    spec = get_preset_spec(template, params)
     return Strategy(
         id=strategy_id, owner_id=USER, is_system=False,
         name=f"研究-{template}", template=template, kind=kind,
-        params=params or {}, enabled=True,
+        params=params or {}, spec=spec.model_dump(mode="json"),
+        spec_hash=strategy_spec_hash(spec), enabled=True,
     )
 
 
@@ -139,12 +144,50 @@ def test_four_single_templates_keep_their_real_observation_semantics(
     # 未配置溢价容忍时只允许客观观察线，不能伪造上下界。
     assert "lower" not in observation
     assert "upper" not in observation
-    assert plan["params_snapshot"]["risk_overlay"]["enabled"] is False
+    assert observation["reason_tree"]["op"]
+    assert plan["strategy_version"] == plan["strategy_spec_hash"]
+    assert len(plan["strategy_spec_hash"]) == 64
+    assert plan["params_snapshot"]["compiler_version"] == COMPILER_VERSION
+    assert plan["params_snapshot"]["risk_overlay"]["enabled"] is (
+        template == "volume_breakout"
+    )
     assert plan["take_profit"]["enabled"] is False
     assert plan["take_profit"]["explanation"].startswith("未设置止盈")
 
 
-def test_volume_breakout_plan_uses_the_templates_actual_native_risk_line():
+def test_single_plan_live_path_uses_spec_without_registered_template_name():
+    with _session() as db:
+        spec = get_preset_spec("breakout")
+        raw = spec.model_dump(mode="json")
+        raw["metadata"]["canonical_id"] = "USER-DYNAMIC-001"
+        strategy = Strategy(
+            id=1, owner_id=USER, is_system=False,
+            name="用户动态规则", template="user_dynamic_rule", kind="single",
+            params={}, spec=raw, spec_hash=strategy_spec_hash(raw), enabled=True,
+        )
+        db.add_all([
+            strategy,
+            TradeCalendar(date=date(2026, 7, 24), is_open=True),
+            TradeCalendar(date=date(2026, 7, 27), is_open=True),
+        ])
+        signal = Signal(
+            code="sh.600000", date=date(2026, 7, 24), strategy_id=1,
+            side="buy", price=11.0, reason={},
+        )
+        db.add(signal)
+        db.flush()
+
+        plan = create_single_plan(
+            db, strategy, signal, _native_condition_case("breakout")[1],
+        )
+
+        assert plan.template == "user_dynamic_rule"
+        assert plan.strategy_spec_snapshot == raw
+        assert plan.strategy_version == strategy_spec_hash(raw)
+        assert plan.entry_observation["reason_code"] == "close_above_prior_high"
+
+
+def test_volume_breakout_plan_exposes_spec_native_exit_and_atr_overlay():
     strategy = _strategy("volume_breakout")
     _, entry_frame, _ = _native_condition_case("volume_breakout")
     holding_frame = pd.concat([
@@ -156,24 +199,26 @@ def test_volume_breakout_plan_uses_the_templates_actual_native_risk_line():
         strategy, holding_frame, side="hold", data_date=date(2026, 7, 27),
         next_execution_date=date(2026, 7, 28),
     )
-    atr_rule = next(
-        rule for rule in holding["native_exit"]
-        if rule["name"] == "模板 ATR 风险退出"
+    native = holding["native_exit"][0]
+    overlay = next(
+        rule for rule in holding["risk_rules"]
+        if rule["source"] == "overlay"
     )
 
-    # 风险线仍以原入场信号价为基准，不能随 15 元的当日收盘价漂到其附近。
-    assert atr_rule["reference_line"] is not None
-    assert atr_rule["reference_line"] < 11
+    assert native["reason_code"] == "close_below_platform_low"
+    assert native["reason_tree"]["op"] == "lt"
+    assert overlay["type"] == "atr_multiple"
+    assert overlay["calculation_status"] == "pending_simulated_entry"
 
     watch = build_single_snapshot(
         strategy, _bars(), side="watch", data_date=date(2026, 7, 24),
         next_execution_date=date(2026, 7, 27),
     )
-    watch_atr_rule = next(
-        rule for rule in watch["native_exit"]
-        if rule["name"] == "模板 ATR 风险退出"
+    watch_overlay = next(
+        rule for rule in watch["risk_rules"]
+        if rule["source"] == "overlay"
     )
-    assert watch_atr_rule["reference_line"] is None
+    assert "reference_line" not in watch_overlay
 
 
 def test_enabled_overlays_are_snapshot_but_no_price_is_fabricated_before_fill():
@@ -194,11 +239,11 @@ def test_enabled_overlays_are_snapshot_but_no_price_is_fabricated_before_fill():
     assert "reference_line" not in plan["take_profit"]
 
 
-def test_single_plan_prefers_the_overlay_state_machines_entry_atr_line():
+def test_single_plan_prefers_the_compiler_overlay_state_line():
     bars = _bars()
     strategy = _strategy("ma_cross", params={
         "risk_overlay": {
-            "enabled": True, "type": "atr_multiple", "value": 2,
+            "enabled": True, "type": "fixed_pct", "value": 0.1,
             "atr_period": 14,
         },
     })
@@ -283,7 +328,7 @@ def test_two_portfolio_templates_return_per_stock_change_reasons(template):
     assert by_code["c"]["change_type"] == "added"
     assert all(item["reasons"] for item in items)
     if template == "momentum_rotation":
-        assert by_code["b"]["reasons"][0]["code"] == "left_top_n"
+        assert by_code["b"]["reasons"][0]["code"] == "left_selection"
 
 
 def test_single_plan_is_versioned_bound_to_exact_backtest_and_returned_with_signal():
@@ -312,6 +357,10 @@ def test_single_plan_is_versioned_bound_to_exact_backtest_and_returned_with_sign
             id=7, user_id=USER, strategy_id=1, params=exact_params,
             costs=DEFAULT_COSTS, codes=["sh.600000"],
             start=date(2024, 1, 1), end=date(2025, 12, 31),
+            strategy_spec_snapshot=strategy.spec,
+            strategy_spec_hash=expected_version,
+            compiler_version=COMPILER_VERSION,
+            component_versions=component_versions_for_spec(strategy.spec),
             metrics={
                 "total_return": 0.12, "max_drawdown": -0.08,
                 "win_rate": 0.55, "trade_count": 20,
@@ -328,6 +377,10 @@ def test_single_plan_is_versioned_bound_to_exact_backtest_and_returned_with_sign
             costs={**DEFAULT_COSTS, "slippage": 0.02},
             codes=["sh.600000"], start=date(2024, 1, 1),
             end=date(2025, 12, 31),
+            strategy_spec_snapshot=strategy.spec,
+            strategy_spec_hash=expected_version,
+            compiler_version=COMPILER_VERSION,
+            component_versions=component_versions_for_spec(strategy.spec),
             metrics={"evidence": {"strategy_version": expected_version}},
         ))
         signal = Signal(
@@ -349,6 +402,9 @@ def test_single_plan_is_versioned_bound_to_exact_backtest_and_returned_with_sign
         assert first.params_snapshot == second.params_snapshot
         assert first.params_snapshot["simulation_costs"] == DEFAULT_COSTS
         assert first.product_boundary == PRODUCT_BOUNDARY
+        assert first.strategy_spec_snapshot == strategy.spec
+        assert first.strategy_spec_hash == expected_version
+        assert first.strategy_version == expected_version
         assert second.backtest_run_id == 7
         assert second.backtest_evidence["status"] == "verified"
         assert second.backtest_evidence["metrics"]["trade_count"] == 20
@@ -369,8 +425,11 @@ def test_single_plan_is_versioned_bound_to_exact_backtest_and_returned_with_sign
 
         detail = plan_detail(
             db, second, as_of=date(2026, 7, 27), viewer_user_id=USER)
-        assert detail["strategy"]["version"].startswith("rp1-")
-        assert detail["params_snapshot"]["effective_params"]["entry"] == 20
+        assert detail["strategy"]["version"] == expected_version
+        assert detail["strategy_spec_hash"] == expected_version
+        assert detail["strategy_spec_snapshot"]["entry"]["reason_code"] == (
+            "close_above_prior_high"
+        )
         assert detail["portfolio_changes"] == []
 
 
@@ -397,16 +456,16 @@ def test_unverified_plan_keeps_its_simulation_fee_snapshot():
 
 
 @pytest.mark.parametrize(
-    ("template", "expected_text"),
+    ("template", "expected_reason_code"),
     [
-        ("ma_cross", "均线"),
-        ("breakout", "高点"),
-        ("mean_reversion", "RSI"),
-        ("volume_breakout", "放量"),
+        ("ma_cross", "fast_ma_above_slow"),
+        ("breakout", "close_above_prior_high"),
+        ("mean_reversion", "uptrend_oversold"),
+        ("volume_breakout", "contracted_volume_breakout"),
     ],
 )
 def test_new_confirmed_close_invalidates_lost_native_entry_condition(
-    template, expected_text,
+    template, expected_reason_code,
 ):
     with _session() as db:
         params, initial, later = _native_condition_case(template)
@@ -434,7 +493,7 @@ def test_new_confirmed_close_invalidates_lost_native_entry_condition(
         assert status == "invalid"
         assert reason["code"] == "native_entry_condition_lost"
         assert "最新确认收盘" in reason["text"]
-        assert expected_text in reason["text"]
+        assert expected_reason_code in reason["text"]
 
 
 def test_native_condition_reevaluation_uses_plan_snapshot_not_current_strategy_params():
@@ -460,14 +519,18 @@ def test_native_condition_reevaluation_uses_plan_snapshot_not_current_strategy_p
         db.flush()
         plan = create_single_plan(db, strategy, signal, initial)
 
+        current_spec = get_preset_spec("mean_reversion", {"rsi_buy": 40})
         strategy.params = {"rsi_buy": 40}
+        strategy.spec = current_spec.model_dump(mode="json")
+        strategy.spec_hash = strategy_spec_hash(current_spec)
         current_params = validate_strategy_params(strategy.template, strategy.params)
         assert evaluate_single_entry_condition(
             strategy.template, combined, current_params, "buy")["satisfied"] is True
 
         status, reason = effective_status(plan, date(2026, 7, 27), db=db)
 
-        assert plan.params_snapshot["effective_params"]["rsi_buy"] == 30
+        assert plan.strategy_spec_snapshot["entry"]["reason_code"] == "uptrend_oversold"
+        assert plan.strategy_spec_hash != strategy.spec_hash
         assert status == "invalid"
         assert reason["code"] == "native_entry_condition_lost"
 
@@ -514,6 +577,10 @@ def test_public_plan_binds_only_viewers_matching_strategy_version_backtest():
                 params=exact_params, costs=DEFAULT_COSTS,
                 codes=["sh.600000"],
                 start=date(2024, 1, 1), end=date(2025, 12, 31),
+                strategy_spec_snapshot=plan.strategy_spec_snapshot,
+                strategy_spec_hash=version,
+                compiler_version=COMPILER_VERSION,
+                component_versions=plan.params_snapshot["component_versions"],
                 metrics={
                     "total_return": run_id / 100,
                     "evidence": {
@@ -566,8 +633,10 @@ def test_same_params_with_wrong_strategy_version_is_unverified():
             db, strategy, signal, _native_condition_case("breakout")[1])
         db.add(BacktestRun(
             user_id=USER, strategy_id=1,
-            params=plan.params_snapshot["effective_params"], costs={},
+            params=plan.params_snapshot["effective_params"], costs=DEFAULT_COSTS,
             codes=["sh.600000"], start=date(2024, 1, 1), end=date(2025, 1, 1),
+            strategy_spec_snapshot=plan.strategy_spec_snapshot,
+            strategy_spec_hash="0" * 64,
             metrics={"evidence": {"strategy_version": "rp1-old"}},
         ))
         db.flush()
@@ -757,14 +826,18 @@ def test_portfolio_plan_persists_structured_items_and_reasons():
             ResearchPlanItem.plan_id == plan.id)).scalars().all()
         assert len(items) == 2
         assert all(item.reasons for item in items)
-        assert all(item.score_details.get("factors") for item in items)
+        assert all(item.score_details.get("reason_tree") for item in items)
+        assert all(
+            item.reasons[0].get("compiler_reasons") is not None
+            for item in items
+        )
         detail = plan_detail(db, plan, as_of=date(2024, 7, 1))
         assert detail["plan_type"] == "portfolio_rebalance"
         assert {item["code"] for item in detail["portfolio_changes"]} == {"a", "b"}
         assert all(item["reasons"] for item in detail["portfolio_changes"])
 
 
-def test_portfolio_plan_persists_active_per_holding_overlay_lines():
+def test_portfolio_plan_persists_overlay_configs_without_fabricating_lines():
     with _session() as db:
         strategy = _strategy("momentum_rotation", kind="portfolio", params={
             "risk_overlay": {
@@ -789,18 +862,15 @@ def test_portfolio_plan_persists_active_per_holding_overlay_lines():
             pool_id=1, pool_name="研究池", pool_dfs=pool,
         )
         db.flush()
-        active = db.execute(select(ResearchPlanItem).where(
-            ResearchPlanItem.plan_id == plan.id,
-            ResearchPlanItem.target_weight > 0,
-        )).scalars().all()
+        risk_overlay = next(
+            rule for rule in plan.risk_rules if rule["source"] == "overlay"
+        )
 
-        assert active
-        for item in active:
-            rules = item.risk_snapshot["rules"]
-            by_source = {rule["source"]: rule for rule in rules}
-            assert by_source["risk_overlay"]["reference_line"] > 0
-            assert by_source["take_profit"]["reference_line"] > 0
-            assert by_source["risk_overlay"]["data_date"] == "2024-07-01"
+        assert risk_overlay["enabled"] is True
+        assert risk_overlay["calculation_status"] == "pending_simulated_entry"
+        assert "reference_line" not in risk_overlay
+        assert plan.take_profit["enabled"] is True
+        assert plan.take_profit["calculation_status"] == "pending_simulated_entry"
 
 
 def test_triggered_portfolio_overlay_keeps_top_level_plan_snapshot():
@@ -825,7 +895,8 @@ def test_triggered_portfolio_overlay_keeps_top_level_plan_snapshot():
             pool_dfs={"a": _frame(prices, end="2024-07-01")},
         )
 
-        assert plan.strategy_version.startswith("rp1-")
+        assert plan.strategy_version == plan.strategy_spec_hash
+        assert len(plan.strategy_version) == 64
         assert plan.status == "exit_triggered"
         assert plan.status_reason["code"] == "portfolio_exit_condition_met"
         assert any(hit["code"] == "risk_overlay" for hit in plan.exit_hits)
@@ -907,18 +978,24 @@ def test_portfolio_evidence_requires_the_same_pool_and_default_fees():
                 id=31, user_id=USER, strategy_id=strategy.id,
                 params=params, costs=DEFAULT_COSTS, codes=["a", "b"],
                 pool_id=7, start=date(2023, 1, 1), end=date(2024, 1, 1),
+                strategy_spec_snapshot=plan.strategy_spec_snapshot,
+                strategy_spec_hash=plan.strategy_spec_hash,
                 metrics={"total_return": 0.1, "evidence": evidence},
             ),
             BacktestRun(
                 id=32, user_id=USER, strategy_id=strategy.id,
                 params=params, costs=DEFAULT_COSTS, codes=["a", "b"],
                 pool_id=8, start=date(2023, 1, 1), end=date(2024, 1, 1),
+                strategy_spec_snapshot=plan.strategy_spec_snapshot,
+                strategy_spec_hash=plan.strategy_spec_hash,
                 metrics={"total_return": 0.9, "evidence": evidence},
             ),
             BacktestRun(
                 id=33, user_id=USER, strategy_id=strategy.id,
                 params=params, costs=DEFAULT_COSTS, codes=["a"],
                 pool_id=7, start=date(2023, 1, 1), end=date(2024, 1, 1),
+                strategy_spec_snapshot=plan.strategy_spec_snapshot,
+                strategy_spec_hash=plan.strategy_spec_hash,
                 metrics={"total_return": 0.8, "evidence": evidence},
             ),
         ])

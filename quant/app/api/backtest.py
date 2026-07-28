@@ -1,6 +1,7 @@
 """回测:发起(同步执行)、参数扫描、批量评估排行、结果查询。"""
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,17 +9,25 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..backtest.engine import run_backtest, run_sweep
+from ..backtest.engine import run_backtest, run_sweep, validate_strategy_params
 from ..backtest.evaluate import leaderboard
 from ..auth import require_client, user_id_from_claims
-from ..api.pools import (default_pool, get_pool_or_404, pool_ref_out,
+from ..api.pools import (get_pool_or_404, pool_ref_out,
                          resolve_pool_codes, resolve_pool_codes_during)
 from ..api.strategies import get_strategy_or_404
 from ..db import get_db
+from ..catalog import STRATEGY_TEMPLATES
 from ..models import BacktestEquity, BacktestRun, Pool, Strategy
 from ..stock_repository import StockRepository
+from ..strategy.runtime import strategy_spec_for
+from ..strategy.spec import (
+    CapabilityStatus,
+    StrategyCapabilityError,
+    resolve_capabilities,
+)
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
+plural_router = APIRouter(prefix="/api/backtests", tags=["backtest"])
 
 
 class BacktestIn(BaseModel):
@@ -26,8 +35,8 @@ class BacktestIn(BaseModel):
     codes: list[str] = Field(default_factory=list, max_length=800)  # 可留空用动态池
     start: date
     end: date
-    pool_id: int | None = None  # 组合策略留空 codes 时的股票池,缺省落默认池
-    # 临时覆盖策略行的参数(回测页调参),不改策略本身
+    pool_id: int | None = None  # 组合策略可临时覆盖 spec.universe.pool_id
+    # 仅兼容旧客户端；结构化策略应先保存完整规格再运行。
     params: dict = Field(default_factory=dict)
     costs: dict = Field(default_factory=dict)  # 可选覆盖费用
 
@@ -37,7 +46,7 @@ class SweepIn(BaseModel):
     codes: list[str] = Field(max_length=800)
     start: date
     end: date
-    param_grid: dict  # {参数名: [候选值]},笛卡尔积逐组回测
+    param_grid: dict  # {"$.受控路径": [候选值]},笛卡尔积逐组回测
     costs: dict = Field(default_factory=dict)
 
 
@@ -68,6 +77,11 @@ def sweep(body: SweepIn, db: Session = Depends(get_db),
         result = run_sweep(db, strategy, [c.lower() for c in body.codes],
                            body.start, body.end, body.param_grid, body.costs)
         return _decorate_result(result, db)
+    except StrategyCapabilityError as exc:
+        raise HTTPException(400, {
+            "message": str(exc),
+            "capability": exc.report.model_dump(mode="json"),
+        })
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -84,25 +98,53 @@ def get_leaderboard(db: Session = Depends(get_db),
 
 
 @router.post("", status_code=201)
+@plural_router.post("", status_code=201)
 def create_backtest(body: BacktestIn, db: Session = Depends(get_db),
                     claims: dict = Depends(require_client)):
     if body.start >= body.end:
         raise HTTPException(400, "start 必须早于 end")
     user_id = user_id_from_claims(claims)
     strategy = get_strategy_or_404(db, body.strategy_id, user_id)
+    # 请求一进入就冻结规格。后续解析股票池和加载行情时即使策略被原地修改，
+    # 本次执行也只能使用这个不可变快照。
+    if body.params:
+        if strategy.template not in STRATEGY_TEMPLATES:
+            raise HTTPException(
+                400, "结构化策略不支持临时模板参数，请先保存规格后再回测",
+            )
+        from ..strategy.presets import get_preset_spec
+
+        try:
+            effective_params = validate_strategy_params(
+                strategy.template,
+                {**(strategy.params or {}), **body.params},
+            )
+            execution_spec = get_preset_spec(
+                strategy.template, effective_params,
+            ).model_copy(deep=True)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+    else:
+        execution_spec = strategy_spec_for(strategy).model_copy(deep=True)
+    capability = resolve_capabilities(execution_spec)
+    if capability.status != CapabilityStatus.SUPPORTED:
+        raise HTTPException(400, {
+            "message": "该策略当前不能回测",
+            "capability": capability.model_dump(mode="json"),
+        })
     codes = list(dict.fromkeys(c.lower() for c in body.codes))
 
-    # 组合策略且未显式指定 codes 时按股票池解析成分。
-    # pool_id 缺省落系统默认池(全A),与前端 pools.ts 的 defaultPool 同口径。
+    # 组合策略且未显式指定 codes 时按股票池解析成分。请求可临时选择范围，
+    # 未指定时必须使用本次冻结 StrategySpec 中的 pool_id。
     pool: Pool | None = None
     if body.pool_id is not None:
         pool = get_pool_or_404(db, body.pool_id, user_id)
     use_pool = strategy.kind == "portfolio" and not codes
     if use_pool:
         if pool is None:
-            pool = default_pool(db)
-        if pool is None:
-            raise HTTPException(400, "系统尚未初始化股票池，请先执行数据库迁移")
+            pool = get_pool_or_404(
+                db, execution_spec.universe.pool_id, user_id,
+            )
         if pool.kind == "index":
             # 指数口径:逐日 eligibility 掩码依赖成分历史,缺回填直接拒绝
             if not resolve_pool_codes(db, pool, body.start):
@@ -121,13 +163,20 @@ def create_backtest(body: BacktestIn, db: Session = Depends(get_db),
                               body.start, body.end, body.params, body.costs,
                               dynamic_universe=use_pool,
                               user_id=user_id,
-                              pool_id=pool.id if use_pool else None)
+                              pool_id=pool.id if use_pool else None,
+                              execution_spec=execution_spec)
+    except StrategyCapabilityError as exc:
+        raise HTTPException(400, {
+            "message": str(exc),
+            "capability": exc.report.model_dump(mode="json"),
+        })
     except ValueError as e:
         raise HTTPException(400, str(e))
     return _decorate_result(result, db, pool if use_pool else None)
 
 
 @router.get("/{run_id}")
+@plural_router.get("/{run_id}")
 def get_backtest(run_id: int, db: Session = Depends(get_db),
                  claims: dict = Depends(require_client)):
     user_id = user_id_from_claims(claims)
@@ -153,6 +202,14 @@ def get_backtest(run_id: int, db: Session = Depends(get_db),
         "template": strategy.template if strategy else None,
         "params": run.params,
         "parameter_snapshot": evidence.get("parameter_snapshot", run.params),
+        "strategy_spec_snapshot": deepcopy(run.strategy_spec_snapshot),
+        "strategy_spec_hash": run.strategy_spec_hash,
+        "compiler_version": run.compiler_version,
+        "component_versions": deepcopy(run.component_versions),
+        "data_fingerprint": run.data_fingerprint,
+        "universe_fingerprint": run.universe_fingerprint,
+        "cost_fingerprint": run.cost_fingerprint,
+        "execution_fingerprint": run.execution_fingerprint,
         "codes": run.codes,
         "stocks": StockRepository(db).items(run.codes),
         "start": str(run.start),

@@ -1,33 +1,39 @@
 <script setup lang="ts">
-/**
- * 策略管理:列表 + 新建 + 改名/调参 + 启停 + 另存为 + 删除。
- *
- * 策略 = 算法模板 + 一组参数 + 用户起的名字。公共策略全用户共享且只读,
- * 要调参就先「另存为我的策略」—— 与股票池的「另存为自定义池」同一套交互。
- * 已被回测引用的策略不能删,只能停用,否则历史回测会失去可追溯的策略行。
- */
-import { computed, reactive, ref, watch } from 'vue'
-import { Copy, Lock, Plus, Trash2 } from 'lucide-vue-next'
+import { computed, ref, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import {
+  CheckCircle2,
+  Code2,
+  Copy,
+  FlaskConical,
+  Lock,
+  Plus,
+  RefreshCw,
+  Trash2,
+  TriangleAlert,
+} from 'lucide-vue-next'
 import {
   api,
-  type CatalogEntry,
+  type Pool,
   type Strategy,
-  type StrategyOverlayConfig,
+  type StrategyCapabilityStatus,
+  type StrategySpec,
+  type StrategyValidationResult,
 } from '../api'
-import StrategyParamFields from '../components/StrategyParamFields.vue'
-import StrategyOverlayFields from '../components/StrategyOverlayFields.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import StrategySpecEditor from '../components/StrategySpecEditor.vue'
 import { useStrategies } from '../strategies'
-import { useAsyncAction } from '../useAsyncAction'
-import { useStrategyParamForm } from '../useStrategyParamForm'
 import {
-  DEFAULT_RISK_OVERLAY,
-  DEFAULT_TAKE_PROFIT,
-  overlayFromParams,
-  overlayParamSnapshot,
-} from '../researchPlans'
+  buildStrategySpec,
+  defaultStrategySpecForm,
+  isVolumeBreakoutSpec,
+  strategySpecToForm,
+  type StrategySpecFormState,
+} from '../strategySpecForm'
+import { useAsyncAction } from '../useAsyncAction'
 
+const router = useRouter()
 const {
   strategies,
   limits,
@@ -39,45 +45,46 @@ const {
   enabledCount,
 } = useStrategies()
 
-const templates = ref<CatalogEntry[]>([])
+const pools = ref<Pool[]>([])
 const selectedId = ref<number | null>(null)
 const creating = ref(false)
+const name = ref('')
+const form = ref<StrategySpecFormState>(defaultStrategySpecForm())
+const baseSpec = ref<StrategySpec | undefined>()
+const validation = ref<StrategyValidationResult | null>(null)
+const validating = ref(false)
+const validationError = ref('')
 const { busy, error, notice, clear, fail, run: runAction } = useAsyncAction()
-
-/** 新建表单 */
-const draft = reactive({ name: '', template: '' })
-
-/** 选中策略的编辑态,保存前不写回列表 */
-const editName = ref('')
-const draftRisk = ref<StrategyOverlayConfig>({ ...DEFAULT_RISK_OVERLAY })
-const draftTakeProfit = ref<StrategyOverlayConfig>({ ...DEFAULT_TAKE_PROFIT })
-const editRisk = ref<StrategyOverlayConfig>({ ...DEFAULT_RISK_OVERLAY })
-const editTakeProfit = ref<StrategyOverlayConfig>({ ...DEFAULT_TAKE_PROFIT })
 
 const selected = computed<Strategy | null>(
   () => strategies.value.find((strategy) => strategy.id === selectedId.value) ?? null
 )
 const readonlyStrategy = computed(() => !!selected.value && !selected.value.editable)
-/** 被回测引用时删除会 409,直接禁用按钮并说明原因 */
 const usedByBacktests = computed(() => selected.value?.backtest_count ?? 0)
 const quotaFull = computed(() => limits.value.max_total > 0 && customStrategies.value.length >= limits.value.max_total)
+const draftSpec = computed(() => buildStrategySpec(form.value, baseSpec.value))
+const supportsStructuredEditor = computed(() => creating.value || isVolumeBreakoutSpec(selected.value?.spec))
+const previewSpec = computed(() => validation.value?.normalized_spec
+  ?? (supportsStructuredEditor.value ? draftSpec.value : selected.value?.spec)
+  ?? draftSpec.value)
+const previewJson = computed(() => JSON.stringify(previewSpec.value, null, 2))
+const capability = computed(() => validation.value?.capability ?? selected.value?.capability ?? null)
 
-function templateOf(key: string): CatalogEntry | undefined {
-  return templates.value.find((entry) => entry.key === key)
+const capabilityText: Record<StrategyCapabilityStatus, string> = {
+  supported: '当前数据与引擎支持',
+  missing_data: '缺少所需数据',
+  missing_engine: '引擎尚未支持',
+  subjective_only: '仅适合作为主观研究记录',
+  boundary_denied: '超出日频研究边界',
 }
 
-function paramsOf(key: string) {
-  return (templateOf(key)?.params ?? []).filter((parameter) =>
-    parameter.value_type !== 'overlay'
-    && parameter.key !== 'risk_overlay'
-    && parameter.key !== 'take_profit'
-  )
+function kindName(strategy: Strategy) {
+  return strategy.kind === 'portfolio' ? '组合策略' : '单标的策略'
 }
 
-const draftParameterDefs = computed(() => paramsOf(draft.template))
-const draftParamForm = useStrategyParamForm(draftParameterDefs)
-const editParameterDefs = computed(() => paramsOf(selected.value?.template ?? ''))
-const editParamForm = useStrategyParamForm(editParameterDefs)
+function researchStatusName(strategy: Strategy) {
+  return strategy.research_status === 'verified' ? '已验证' : strategy.research_status === 'rejected' ? '已否决' : '未验证'
+}
 
 async function refreshStrategies(selectId?: number) {
   invalidate()
@@ -90,144 +97,146 @@ async function refreshStrategies(selectId?: number) {
   }
 }
 
-// 也监听 templates:参数表单要有模板的参数定义才能填初值,
-// 而模板元数据可能比策略列表后到
-watch([selected, templates], ([strategy]) => {
-  if (!strategy) return
-  editName.value = strategy.name
-  editParamForm.reset(strategy.effective_params)
-  editRisk.value = overlayFromParams(strategy.effective_params, 'risk_overlay')
-  editTakeProfit.value = overlayFromParams(strategy.effective_params, 'take_profit')
-})
+async function validateSaved(strategyId: number) {
+  validating.value = true
+  validationError.value = ''
+  try {
+    validation.value = await api.validateStrategy(strategyId)
+  } catch (caught) {
+    validationError.value = (caught as Error).message
+  } finally {
+    validating.value = false
+  }
+}
 
-watch(selectedId, () => {
-  clear()
-})
+watch([selected, creating], ([strategy, isCreating]) => {
+  if (!strategy || isCreating) return
+  name.value = strategy.name
+  baseSpec.value = strategy.spec
+  form.value = strategySpecToForm(strategy.spec)
+  validation.value = null
+  void validateSaved(strategy.id)
+}, { immediate: true })
 
 watch(strategies, (items) => {
   if (selectedId.value === null && items.length) selectedId.value = items[0].id
 }, { immediate: true })
 
-watch(() => draft.template, () => {
-  draftParamForm.reset()
-  draftRisk.value = { ...DEFAULT_RISK_OVERLAY }
-  draftTakeProfit.value = { ...DEFAULT_TAKE_PROFIT }
-})
+watch(selectedId, () => clear())
 
 function startCreate() {
   creating.value = true
+  selectedId.value = null
+  name.value = '20 日放量突破'
+  baseSpec.value = undefined
+  form.value = defaultStrategySpecForm()
+  form.value.poolId = pools.value[0]?.id ?? null
+  validation.value = null
+  validationError.value = ''
   clear()
-  draft.name = ''
-  draft.template = templates.value[0]?.key ?? ''
-  draftParamForm.reset()
+}
+
+async function validateDraft(): Promise<Extract<StrategyValidationResult, { valid: true }>> {
+  validating.value = true
+  validationError.value = ''
+  try {
+    const result = await api.validateStrategySpec(draftSpec.value)
+    validation.value = result
+    if (!result.valid) {
+      const details = result.errors.length ? result.errors.join('；') : '策略规格未通过校验'
+      throw new Error(details)
+    }
+    return result
+  } finally {
+    validating.value = false
+  }
+}
+
+async function validateCurrent(): Promise<StrategyValidationResult> {
+  const strategy = selected.value
+  if (strategy && !supportsStructuredEditor.value) {
+    validating.value = true
+    validationError.value = ''
+    try {
+      const result = await api.validateStrategy(strategy.id)
+      validation.value = result
+      if (!result.valid) throw new Error(result.errors.join('；') || '策略规格未通过校验')
+      return result
+    } finally {
+      validating.value = false
+    }
+  }
+  return validateDraft()
 }
 
 async function createStrategy() {
-  const name = draft.name.trim()
-  if (!name) {
+  const normalizedName = name.value.trim()
+  if (!normalizedName) {
     fail('请填写策略名称')
     return
   }
-  if (!draft.template) {
-    fail('请选择算法模板')
-    return
-  }
-  if (!draftParamForm.validate()) {
-    fail('请修正策略参数后再创建')
-    return
-  }
   await runAction(async () => {
+    const result = await validateDraft()
     const strategy = await api.createStrategy({
-      name,
-      template: draft.template,
-      params: {
-        ...draftParamForm.overrides.value,
-        ...overlayParamSnapshot(draftRisk.value, draftTakeProfit.value),
-      },
+      name: normalizedName,
+      spec: result.normalized_spec,
+      enabled: true,
     })
     await refreshStrategies(strategy.id)
     return strategy
-  }, { success: (strategy) => `已创建「${strategy.name}」，可在回测页选用。` })
+  }, { success: (strategy) => `已创建「${strategy.name}」，规则可直接进入回测验证。` })
 }
 
-/** 另存为我的策略:公共策略只读,调参前先复制一份 */
-async function saveAsMine() {
-  const source = selected.value
-  if (!source) return
-  if (paramsOf(source.template).length && !editParamForm.validate()) {
-    fail('请修正策略参数后再另存')
-    return
-  }
-  await runAction(async () => {
-    const copy = await api.duplicateStrategy(source.id, {
-      // 模板元数据未就绪时不传 params,让后端沿用源策略的参数而不是重置为默认值
-      ...(paramsOf(source.template).length || editRisk.value.enabled || editTakeProfit.value.enabled
-        ? {
-            params: {
-              ...editParamForm.overrides.value,
-              ...overlayParamSnapshot(editRisk.value, editTakeProfit.value, source.effective_params),
-            },
-          }
-        : {}),
-    })
-    await refreshStrategies(copy.id)
-    return copy
-  }, { success: (copy) => `已另存为「${copy.name}」，可自由改名和调参。` })
-}
-
-async function saveName() {
+async function saveStrategy() {
   const strategy = selected.value
   if (!strategy || readonlyStrategy.value) return
-  const name = editName.value.trim()
-  if (!name) {
+  const normalizedName = name.value.trim()
+  if (!normalizedName) {
     fail('请填写策略名称')
     return
   }
   await runAction(async () => {
-    await api.updateStrategy(strategy.id, { name })
-    await refreshStrategies(strategy.id)
-  }, { success: '已保存策略名称。' })
-}
-
-async function saveParams() {
-  const strategy = selected.value
-  if (!strategy || readonlyStrategy.value) return
-  if (!paramsOf(strategy.template).length) {
-    // 模板元数据还没到时 overrides() 会算出空对象,提交上去等于把参数重置为默认值
-    fail('算法模板元数据尚未加载完成，请稍后重试')
-    return
-  }
-  if (!editParamForm.validate()) {
-    fail('请修正策略参数后再保存')
-    return
-  }
-  await runAction(async () => {
+    if (!supportsStructuredEditor.value) {
+      await api.updateStrategy(strategy.id, { name: normalizedName })
+      await refreshStrategies(strategy.id)
+      return
+    }
+    const result = await validateDraft()
     await api.updateStrategy(strategy.id, {
-      params: {
-        ...editParamForm.overrides.value,
-        ...overlayParamSnapshot(editRisk.value, editTakeProfit.value, strategy.effective_params),
-      },
+      name: normalizedName,
+      spec: result.normalized_spec,
     })
     await refreshStrategies(strategy.id)
-  }, { success: '已保存策略参数。历史回测保留当时的参数快照，不受影响。' })
+  }, { success: '已原地保存当前策略规格。既有回测继续保留创建时的完整规格快照。' })
+}
+
+async function saveAsMine() {
+  const source = selected.value
+  if (!source) return
+  await runAction(async () => {
+    const copy = await api.duplicateStrategy(source.id)
+    await refreshStrategies(copy.id)
+    return copy
+  }, { success: (copy) => `已另存为「${copy.name}」，可编辑完整规则。` })
 }
 
 async function toggleEnabled(strategy: Strategy) {
   if (!strategy.editable) return
   await runAction(async () => {
+    if (!strategy.enabled) await validateCurrent()
     await api.updateStrategy(strategy.id, { enabled: !strategy.enabled })
     await refreshStrategies(strategy.id)
   }, {
     success: strategy.enabled
-      ? `已停用「${strategy.name}」，不再参与每日信号计算。`
-      : `已启用「${strategy.name}」，将参与每日信号计算。`,
+      ? `已停用「${strategy.name}」，不再参与每日研究信号。`
+      : `已启用「${strategy.name}」，将按当前规格参与每日研究信号。`,
   })
 }
 
 async function deleteStrategy() {
   const strategy = selected.value
   if (!strategy || readonlyStrategy.value || usedByBacktests.value > 0) return
-  if (!window.confirm(`确认删除策略「${strategy.name}」？该策略的信号记录会一并删除，操作不可撤销。`)) return
+  if (!window.confirm(`确认删除策略「${strategy.name}」？相关派生信号会一并删除，操作不可撤销。`)) return
   await runAction(async () => {
     await api.deleteStrategy(strategy.id)
     selectedId.value = null
@@ -235,11 +244,16 @@ async function deleteStrategy() {
   }, { success: `已删除「${strategy.name}」。` })
 }
 
+async function openBacktest() {
+  const strategy = selected.value
+  if (!strategy) return
+  await router.push({ name: 'strategies', query: { tab: 'backtest', strategy: String(strategy.id) } })
+}
+
 async function init() {
   await runAction(async () => {
-    const [templateResult] = await Promise.all([api.strategyTemplates(), loadStrategies(true)])
-    templates.value = templateResult.items ?? []
-    if (!draft.template) draft.template = templates.value[0]?.key ?? ''
+    const [, poolResult] = await Promise.all([loadStrategies(true), api.pools()])
+    pools.value = poolResult.items ?? []
   })
 }
 
@@ -251,9 +265,7 @@ void init()
     <div class="flex flex-wrap items-end justify-between gap-3">
       <div>
         <h2 class="text-base font-semibold">策略管理</h2>
-        <p class="mt-0.5 text-xs text-text-tertiary">
-          策略 = 算法模板 + 一组参数 + 你起的名字。公共策略由系统维护、全部用户共享，调参请先「另存为我的策略」。
-        </p>
+        <p class="mt-0.5 text-xs text-text-tertiary">数据库规格是当前策略定义的唯一来源，修改后原地生效。</p>
       </div>
       <p v-if="limits.max_total" class="text-xs text-text-tertiary">
         我的策略 {{ customStrategies.length }} / {{ limits.max_total }}
@@ -264,8 +276,7 @@ void init()
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
-    <div class="grid gap-5 lg:grid-cols-[18rem_1fr]">
-      <!-- 策略列表 + 新建入口 -->
+    <div class="grid gap-5 lg:grid-cols-[18rem_minmax(0,1fr)]">
       <section class="space-y-3" aria-labelledby="strategy-list-heading">
         <h3 id="strategy-list-heading" class="text-sm font-semibold">全部策略</h3>
         <LoadingRows v-if="strategiesLoading" :rows="3" />
@@ -290,7 +301,7 @@ void init()
                     <Lock v-if="!strategy.editable" :size="13" class="shrink-0 text-text-tertiary" aria-label="公共只读" />
                   </span>
                   <span class="mt-0.5 block text-xs text-text-tertiary">
-                    {{ strategy.template_name }} · {{ strategy.kind_name }}
+                    {{ kindName(strategy) }} · {{ researchStatusName(strategy) }}
                     <template v-if="!strategy.enabled"> · 已停用</template>
                   </span>
                 </button>
@@ -304,202 +315,176 @@ void init()
         <button
           type="button"
           :disabled="busy || quotaFull"
-          class="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
+          class="inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-md bg-accent px-3 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
           @click="startCreate"
         >
           <Plus :size="15" />
           新建策略
         </button>
-        <p v-if="quotaFull" class="text-xs text-text-tertiary">
-          策略数量已达上限 {{ limits.max_total }}，请先删除不用的策略。
-        </p>
-      </section>
-      <!-- 新建策略:先选算法模板,再按模板的参数定义填参数 -->
-      <section v-if="creating" class="space-y-4" aria-labelledby="strategy-create-heading">
-        <div class="flex flex-wrap items-end justify-between gap-3 border-b border-border-subtle pb-3">
-          <h3 id="strategy-create-heading" class="text-base font-semibold">新建策略</h3>
-          <button
-            type="button"
-            class="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover"
-            @click="creating = false"
-          >
-            取消
-          </button>
-        </div>
-
-        <form class="space-y-4" @submit.prevent="createStrategy">
-          <div class="flex flex-wrap items-end gap-3">
-            <label class="text-sm">
-              <span class="mb-1 block text-xs text-text-tertiary">策略名称</span>
-              <input
-                v-model="draft.name"
-                placeholder="名称，如 我的双均线（快5慢30）"
-                class="w-64 rounded-md border border-border px-2.5 py-1.5 text-sm"
-              />
-            </label>
-            <label class="text-sm">
-              <span class="mb-1 block text-xs text-text-tertiary">算法模板</span>
-              <select v-model="draft.template" class="min-w-56 rounded-md border border-border px-2.5 py-1.5 text-sm">
-                <option v-for="entry in templates" :key="entry.key" :value="entry.key">{{ entry.name }}</option>
-              </select>
-            </label>
-            <button
-              type="submit"
-              :disabled="busy"
-              class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
-            >
-              创建
-            </button>
-          </div>
-
-          <div v-if="templateOf(draft.template)" class="max-w-3xl text-xs leading-5 text-text-secondary">
-            <p>{{ templateOf(draft.template)?.description }}</p>
-            <p v-if="templateOf(draft.template)?.caveat ?? templateOf(draft.template)?.limits" class="mt-1 text-text-tertiary">
-              限制：{{ templateOf(draft.template)?.caveat ?? templateOf(draft.template)?.limits }}
-            </p>
-            <p v-if="templateOf(draft.template)?.constraints?.length" class="mt-1 text-text-tertiary">
-              参数约束：{{ templateOf(draft.template)?.constraints?.join('；') }}
-            </p>
-          </div>
-
-          <div class="rounded-md border border-border bg-surface-raised p-4">
-            <section v-if="paramsOf(draft.template).length" aria-labelledby="draft-native-params-heading">
-              <h4 id="draft-native-params-heading" class="mb-2 text-sm font-semibold">模板原生参数</h4>
-              <StrategyParamFields
-                v-model="draftParamForm.values"
-                :parameters="draftParameterDefs"
-                :errors="draftParamForm.errors"
-                id-prefix="draft-strategy-param"
-              />
-            </section>
-            <StrategyOverlayFields
-              v-model:risk="draftRisk"
-              v-model:take-profit="draftTakeProfit"
-              id-prefix="draft-strategy-overlay"
-            />
-          </div>
-        </form>
+        <p v-if="quotaFull" class="text-xs text-text-tertiary">策略数量已达上限 {{ limits.max_total }}。</p>
       </section>
 
-      <!-- 选中策略详情 -->
-      <section v-else-if="selected" class="space-y-4" aria-labelledby="strategy-detail-heading">
+      <section v-if="creating || selected" class="min-w-0 space-y-4" aria-labelledby="strategy-detail-heading">
         <div class="flex flex-wrap items-end justify-between gap-3 border-b border-border-subtle pb-3">
-          <div>
-            <h3 id="strategy-detail-heading" class="text-base font-semibold">{{ selected.name }}</h3>
+          <div class="min-w-0">
+            <h3 id="strategy-detail-heading" class="text-base font-semibold">
+              {{ creating ? '新建策略' : selected?.name }}
+            </h3>
             <p class="mt-0.5 text-xs text-text-tertiary">
-              算法模板：{{ selected.template_name }} · {{ selected.kind_name }}
-              <template v-if="selected.created_at"> · 创建于 {{ selected.created_at }}</template>
+              <template v-if="creating">默认规则：20 日价格与成交量突破，跌破 10 日低点退出</template>
+              <template v-else>
+                {{ selected ? kindName(selected) : '' }}
+                <template v-if="selected?.spec_hash"> · 规格 {{ selected.spec_hash.slice(0, 12) }}</template>
+                <template v-if="selected?.evidence_backtest_count !== undefined">
+                  · 同规格回测证据 {{ selected.evidence_backtest_count ?? 0 }} 条
+                </template>
+              </template>
             </p>
           </div>
           <div class="flex flex-wrap items-center gap-2">
             <button
+              v-if="!creating && selected"
               type="button"
               :disabled="busy || quotaFull"
-              class="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
               @click="saveAsMine"
             >
               <Copy :size="14" />
-              另存为我的策略
+              另存为
             </button>
             <button
-              v-if="!readonlyStrategy"
+              v-if="!creating && selected"
               type="button"
-              :disabled="busy"
-              class="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
-              @click="toggleEnabled(selected)"
+              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover"
+              @click="openBacktest"
             >
-              {{ selected.enabled ? '停用' : '启用' }}
+              <FlaskConical :size="14" />
+              回测验证
             </button>
             <button
-              v-if="!readonlyStrategy"
+              v-if="creating"
               type="button"
-              :disabled="busy || usedByBacktests > 0"
-              class="inline-flex items-center gap-1.5 rounded-md border border-up/40 px-3 py-1.5 text-sm text-up hover:bg-up/5 disabled:opacity-40"
-              :title="usedByBacktests > 0
-                ? `已被 ${usedByBacktests} 条回测记录引用，不能删除，可改为停用`
-                : '删除该策略'"
-              @click="deleteStrategy"
+              class="h-9 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover"
+              @click="creating = false; selectedId = strategies[0]?.id ?? null"
             >
-              <Trash2 :size="14" />
-              删除策略
+              取消
             </button>
           </div>
         </div>
 
         <div v-if="readonlyStrategy" class="flex items-start gap-2 rounded-md border border-border bg-info-soft px-4 py-3 text-sm leading-6 text-text-secondary">
-          <Lock :size="16" class="mt-0.5 shrink-0 text-text-tertiary" />
-          <span>公共策略由系统维护、全部用户共享，不可改名、调参或删除。如需自己的参数，请「另存为我的策略」。</span>
+          <Lock :size="16" class="mt-1 shrink-0 text-text-tertiary" />
+          <span>公共策略只读。另存为自定义策略后可修改完整规格。</span>
         </div>
-
-        <p v-else-if="usedByBacktests > 0" class="rounded-md border border-border bg-warning-soft px-4 py-3 text-sm leading-6 text-text-secondary">
-          该策略已被 <strong class="font-medium text-text-primary">{{ usedByBacktests }}</strong> 条回测记录引用，
-          因此不能删除，只能<strong class="font-medium text-text-primary">停用</strong>。停用后不再参与每日信号计算，历史回测保持可查。
-        </p>
-
-        <InlineFeedback v-if="!selected.params_valid" tone="error">
-          该策略保存的参数与当前算法模板不匹配（模板参数可能已调整）。请在下方确认参数后重新保存。
+        <InlineFeedback v-else-if="!creating && usedByBacktests > 0" tone="warning">
+          历史回测共 {{ usedByBacktests }} 条，其中 {{ selected?.evidence_backtest_count ?? 0 }} 条与当前规格哈希一致。
+          修改会影响后续运行，既有回测继续使用创建时的规格快照。
         </InlineFeedback>
 
-        <div v-if="templateOf(selected.template)" class="max-w-3xl text-xs leading-5 text-text-secondary">
-          <p>{{ templateOf(selected.template)?.description }}</p>
-          <p v-if="templateOf(selected.template)?.caveat ?? templateOf(selected.template)?.limits" class="mt-1 text-text-tertiary">
-            限制：{{ templateOf(selected.template)?.caveat ?? templateOf(selected.template)?.limits }}
-          </p>
-        </div>
+        <label class="block max-w-xl text-xs font-medium text-text-secondary">
+          策略名称
+          <input
+            v-model="name"
+            :disabled="readonlyStrategy"
+            maxlength="64"
+            class="mt-1 h-9 w-full rounded-md border border-border bg-surface-raised px-2.5 text-sm outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:opacity-55"
+          />
+        </label>
 
-        <template v-if="!readonlyStrategy">
-          <div class="flex flex-wrap items-end gap-3 rounded-md border border-border bg-surface-raised p-4">
-            <label class="text-sm">
-              <span class="mb-1 block text-xs text-text-tertiary">策略名称</span>
-              <input v-model="editName" class="w-64 rounded-md border border-border px-2.5 py-1.5 text-sm" />
-            </label>
+        <InlineFeedback v-if="!supportsStructuredEditor" tone="warning">
+          该策略使用当前最小编辑器尚未覆盖的受控组件。页面保持原规格只读，可校验、回测或另存，不会将其改写为突破规则。
+        </InlineFeedback>
+
+        <StrategySpecEditor
+          v-if="supportsStructuredEditor"
+          v-model="form"
+          :pools="pools"
+          :disabled="readonlyStrategy"
+          :id-prefix="creating ? 'create-spec' : 'edit-spec'"
+        />
+
+        <section class="rounded-md border border-border bg-surface-raised" aria-labelledby="capability-heading">
+          <div class="flex flex-wrap items-center justify-between gap-3 border-b border-border-subtle px-4 py-3">
+            <div class="flex items-center gap-2">
+              <CheckCircle2 v-if="capability?.status === 'supported'" :size="17" class="text-down" />
+              <TriangleAlert v-else :size="17" class="text-warning" />
+              <div>
+                <h4 id="capability-heading" class="text-sm font-semibold">校验与能力</h4>
+                <p class="text-xs text-text-tertiary">
+                  {{ capability ? capabilityText[capability.status] : '尚未校验当前修改' }}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              :disabled="busy || validating"
+              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              @click="runAction(validateCurrent)"
+            >
+              <RefreshCw :size="14" :class="validating ? 'animate-spin' : ''" />
+              校验当前规格
+            </button>
+          </div>
+          <div class="p-4">
+            <InlineFeedback v-if="validationError" tone="error">{{ validationError }}</InlineFeedback>
+            <ul v-if="capability?.issues.length" class="space-y-2">
+              <li v-for="issue in capability.issues" :key="`${issue.code}-${issue.path}`" class="rounded-md bg-surface-muted px-3 py-2 text-sm text-text-secondary">
+                <span class="font-medium text-text-primary">{{ issue.message }}</span>
+                <code class="ml-2 text-xs text-text-tertiary">{{ issue.path }}</code>
+              </li>
+            </ul>
+            <p v-else-if="capability?.status === 'supported'" class="text-sm text-text-secondary">
+              规格结构、数据依赖、受控操作符和日频研究边界均通过。
+            </p>
+            <p v-else-if="validating" class="text-sm text-text-tertiary">正在校验当前规格…</p>
+            <p v-else class="text-sm text-text-tertiary">保存或启用前必须通过服务端校验。</p>
+          </div>
+        </section>
+
+        <details class="rounded-md border border-border bg-surface-raised">
+          <summary class="flex cursor-pointer list-none items-center gap-2 px-4 py-3 text-sm font-medium text-text-secondary hover:bg-hover">
+            <Code2 :size="15" />
+            规范化 JSON 只读预览
+          </summary>
+          <pre class="max-h-96 overflow-auto border-t border-border-subtle bg-surface-muted p-4 text-xs leading-5 text-text-secondary">{{ previewJson }}</pre>
+        </details>
+
+        <div class="flex flex-wrap items-center justify-between gap-3 border-t border-border-subtle pt-4">
+          <div v-if="!creating && !readonlyStrategy" class="flex items-center gap-2">
             <button
               type="button"
               :disabled="busy"
-              class="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
-              @click="saveName"
+              class="h-9 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              @click="selected && toggleEnabled(selected)"
             >
-              保存名称
+              {{ selected?.enabled ? '停用策略' : '启用策略' }}
+            </button>
+            <button
+              type="button"
+              :disabled="busy || usedByBacktests > 0"
+              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-up/40 px-3 text-sm text-up hover:bg-danger-soft disabled:opacity-40"
+              :title="usedByBacktests > 0 ? '已有回测引用，不能删除，可改为停用' : '删除策略'"
+              @click="deleteStrategy"
+            >
+              <Trash2 :size="14" />
+              删除
             </button>
           </div>
-        </template>
-
-        <div class="space-y-3 rounded-md border border-border bg-surface-raised p-4">
-          <section v-if="paramsOf(selected.template).length" aria-labelledby="edit-native-params-heading">
-            <div class="mb-3 flex items-baseline justify-between gap-3">
-              <h4 id="edit-native-params-heading" class="text-sm font-semibold">模板原生参数</h4>
-              <span v-if="templateOf(selected.template)?.constraints?.length" class="text-xs text-text-tertiary">
-                约束：{{ templateOf(selected.template)?.constraints?.join('；') }}
-              </span>
-            </div>
-            <StrategyParamFields
-              v-model="editParamForm.values"
-              :parameters="editParameterDefs"
-              :errors="editParamForm.errors"
-              :disabled="readonlyStrategy"
-              id-prefix="edit-strategy-param"
-            />
-          </section>
-          <StrategyOverlayFields
-            v-model:risk="editRisk"
-            v-model:take-profit="editTakeProfit"
-            :disabled="readonlyStrategy"
-            id-prefix="edit-strategy-overlay"
-          />
+          <span v-else />
           <button
-            v-if="!readonlyStrategy"
+            v-if="creating || !readonlyStrategy"
             type="button"
-            :disabled="busy"
-            class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
-            @click="saveParams"
+            :disabled="busy || validating"
+            class="h-9 rounded-md bg-accent px-4 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
+            @click="creating ? createStrategy() : saveStrategy()"
           >
-            保存参数
+            {{ creating ? '校验并创建' : supportsStructuredEditor ? '校验并保存' : '保存名称' }}
           </button>
         </div>
       </section>
 
       <section v-else class="rounded-md border border-dashed border-border px-5 py-12 text-center text-sm text-text-tertiary">
-        选择左侧策略查看详情，或新建一个自己的策略。
+        选择左侧策略查看详情，或新建一个自定义策略。
       </section>
     </div>
   </div>

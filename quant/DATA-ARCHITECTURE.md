@@ -243,27 +243,35 @@ quant_pool_member(pool_id, code)              ← 池与股票,只存代码
 ## 7. 策略抽象
 
 ```
-quant_strategy(id, owner_id NOT NULL, is_system, name, template, kind, params, enabled)
-quant_signal(..., strategy_id → quant_strategy)        ← ON DELETE CASCADE
-quant_strategy_eval(..., strategy_id → quant_strategy) ← ON DELETE CASCADE
-quant_backtest_run(..., strategy_id → quant_strategy)  ← ON DELETE RESTRICT
+quant_strategy(id, owner_id, is_system, name, kind,
+               spec_schema_version, spec, spec_hash, research_status, enabled)
+quant_signal(..., strategy_id → quant_strategy, spec_hash)        ← ON DELETE CASCADE
+quant_strategy_eval(..., strategy_id → quant_strategy, spec_hash) ← ON DELETE CASCADE
+quant_backtest_run(..., strategy_id → quant_strategy,
+                   strategy_spec_snapshot, strategy_spec_hash,
+                   compiler_version, component_versions,
+                   data/universe/cost/execution_fingerprint)      ← ON DELETE RESTRICT
+quant_research_plan(..., strategy_spec_snapshot, strategy_spec_hash)
 ```
 
-策略从「代码里的常量」变成了行（`0012_strategy_table`）。动机很直接：用户能在回测页
-临时改参数，但**改完的参数无处安放**，更不可能让夜间信号引擎按用户自己的参数出信号。
+`0014_dynamic_strategy_spec` 之后，`quant_strategy.spec` 是当前完整策略定义的唯一事实
+来源。用户编辑时原地更新这一个 JSON，不创建草稿、发布记录或策略历史版本；历史可复现
+由每次回测和研究计划自己的完整规格快照承担。
 
 可见性沿用第 6 节股票池那套 `is_system` + `owner_id`（哨兵 UUID 归属系统行），
 收成 `app/strategy/store.py` 的 `visible_to(user_id)`。三个取舍值得记住：
 
 - **没有 `grant` 表。** 池有「分享给特定用户」的需求，策略当前只需要「公共」和
   「我的」两档。不预先建一张没人写的表 —— 真有需求时照 `quant_pool_grant` 补。
-- **算法仍在代码里，表只存参数组合。** `template` 指向 `app/strategy/strategies/`
-  的模块，`kind` 是模块 `KIND` 的冗余（写入时由 API 回填，用户改不到）。冗余是刻意
-  的：夜间引擎要按「所有启用的单标的策略」取行，有这一列就是一条带索引的查询。
-  这也是后续规则构建器的扩展点 —— 新增 `template='rule'` 加一列 `rules JSON` 即可。
-- **`params` 只存用户显式覆盖的键。** 模板默认值调整后，用户没碰过的参数应当跟着
-  变。实际生效值在跑的时候合并；回测落库时才固化成全量快照，否则默认参数一改，
-  历史结果就无法审计复现。
+- **规则在数据库，代码只提供通用组件。** 受控 `StrategySpec` AST 经严格校验后编译为
+  单标的目标仓位或组合目标权重，再交给原有 T+1 撮合。新增普通策略只写数据库 JSON，
+  不新增策略专用 Python 文件，也不按策略名进入不同执行分支。
+- **`kind`、`spec_hash` 和能力状态由服务端派生。** `kind` 保留为带索引的查询列，供
+  夜间任务筛出所有启用的 single / portfolio 策略；客户端不能伪造这些派生值。
+- **`template` / `params` 仅为迁移兼容字段。** 六个旧系统模板已转换为完整 spec 种子；
+  旧客户端参数在 API 边界一次性转换成完整规格，实时编译器不读取模板模块。
+- **历史证据按内容寻址。** `spec_hash` 是规范化完整规格的 SHA-256；回测另外保存编译器、
+  组件、数据、股票池和费用指纹。策略页面只把哈希完全相同的回测计为当前证据。
 
 ### 两种 ON DELETE 不同，是因为两种数据的性质不同
 

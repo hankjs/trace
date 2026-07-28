@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import sys
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from fastapi import HTTPException
 
@@ -27,8 +29,11 @@ from app.api.strategies import (StrategyCreateIn, StrategyDuplicateIn,
                                 delete_strategy, duplicate_strategy,
                                 get_strategy, list_strategies, list_templates,
                                 update_strategy)
+from app.api.backtest import BacktestIn, create_backtest
 from app.db import Base
 from app.models import SYSTEM_OWNER_ID, BacktestRun, Strategy
+from app.strategy.presets import SYSTEM_STRATEGY_SPECS, get_preset_spec
+from app.strategy.spec import strategy_spec_hash
 from app.strategy.store import MAX_ENABLED_PER_USER, MAX_STRATEGIES_PER_USER
 from app.strategy.strategies import REGISTRY
 
@@ -37,7 +42,7 @@ USER_B = "22222222-2222-2222-2222-222222222222"
 CLAIMS_A = {"sub": USER_A, "username": "a", "can_client": True}
 CLAIMS_B = {"sub": USER_B, "username": "b", "can_client": True}
 
-# 对齐 Alembic 0012 的 seed
+# 对齐 Alembic 0014 的完整 StrategySpec seed
 PRESETS = [
     (1, "ma_cross", "single", "双均线趋势策略"),
     (2, "breakout", "single", "价格突破策略"),
@@ -60,10 +65,52 @@ def _session() -> Session:
 def _seed(db: Session) -> None:
     db.add_all([
         Strategy(id=sid, owner_id=SYSTEM_OWNER_ID, is_system=True, name=name,
-                 template=template, kind=kind, params={}, enabled=True)
+                 template=template, kind=kind, params={},
+                 spec=SYSTEM_STRATEGY_SPECS[template],
+                 spec_hash=strategy_spec_hash(SYSTEM_STRATEGY_SPECS[template]),
+                 enabled=True)
         for sid, template, kind, name in PRESETS
     ])
     db.commit()
+
+
+def _volume_confirmed_breakout_spec() -> dict:
+    raw = get_preset_spec(
+        "breakout", {"entry": 20, "exit": 10},
+    ).model_dump(mode="json")
+    raw["metadata"].update({
+        "canonical_id": "USER-VOLUME-BREAKOUT-20-10",
+        "sources": [{"book": "用户研究", "candidate_id": "volume-breakout"}],
+        "hypothesis": "20 日价格突破且成交量放大时进入，跌破 10 日低点退出。",
+    })
+    raw["data_requirements"].append({
+        "field": "volume", "availability": "daily_close", "required": True,
+    })
+    price_breakout = deepcopy(raw["entry"]["condition"])
+    raw["entry"] = {
+        "reason_code": "volume_confirmed_breakout",
+        "condition": {
+            "op": "all",
+            "args": [
+                price_breakout,
+                {
+                    "op": "gt",
+                    "left": {"op": "field", "name": "volume"},
+                    "right": {
+                        "op": "multiply",
+                        "left": {"op": "literal", "value": 1.5},
+                        "right": {
+                            "op": "rolling_mean",
+                            "input": {"op": "field", "name": "volume"},
+                            "window": 20,
+                            "shift": 1,
+                        },
+                    },
+                },
+            ],
+        },
+    }
+    return raw
 
 
 def test_templates_cover_all_code_modules():
@@ -365,3 +412,122 @@ def test_quota_counts_only_own_strategies():
             db=db, claims=CLAIMS_A,
         )
         assert created["enabled"] is True
+
+
+def test_dynamic_volume_breakout_edit_keeps_prior_backtest_immutable(monkeypatch):
+    start = date(2024, 1, 1)
+    dates = pd.bdate_range(start, periods=100)
+    prices = [10 + index * 0.05 for index in range(len(dates))]
+    frame = pd.DataFrame({
+        "date": dates.date,
+        "open": prices,
+        "high": [value * 1.01 for value in prices],
+        "low": [value * 0.99 for value in prices],
+        "close": prices,
+        "raw_close": prices,
+        "volume": [1_000_000.0] * 99 + [2_000_000.0],
+        "amount": [10_000_000.0] * len(dates),
+        "is_st": [False] * len(dates),
+    })
+    monkeypatch.setattr(
+        "app.backtest.engine.load_bars_df",
+        lambda db, code, start=None, end=None: frame,
+    )
+
+    with _session() as db:
+        _seed(db)
+        original_spec = _volume_confirmed_breakout_spec()
+        created = create_strategy(
+            StrategyCreateIn(
+                name="20 日放量突破 10 日退出",
+                spec=original_spec,
+                enabled=True,
+            ),
+            db=db,
+            claims=CLAIMS_A,
+        )
+        first = create_backtest(
+            BacktestIn(
+                strategy_id=created["id"],
+                codes=["sh.600519"],
+                start=dates[0].date(),
+                end=dates[-1].date(),
+            ),
+            db=db,
+            claims=CLAIMS_A,
+        )
+        first_run = db.get(BacktestRun, first["run_id"])
+        first_snapshot = deepcopy(first_run.strategy_spec_snapshot)
+        first_hash = first_run.strategy_spec_hash
+        first_execution = first_run.execution_fingerprint
+        before_edit = get_strategy(created["id"], db=db, claims=CLAIMS_A)
+
+        edited_spec = deepcopy(original_spec)
+        edited_spec["native_exit"]["condition"]["right"]["window"] = 8
+        updated = update_strategy(
+            created["id"],
+            StrategyPatchIn(spec=edited_spec),
+            db=db,
+            claims=CLAIMS_A,
+        )
+        after_edit = get_strategy(created["id"], db=db, claims=CLAIMS_A)
+        second = create_backtest(
+            BacktestIn(
+                strategy_id=created["id"],
+                codes=["sh.600519"],
+                start=dates[0].date(),
+                end=dates[-1].date(),
+            ),
+            db=db,
+            claims=CLAIMS_A,
+        )
+
+        assert created["template"] == "strategy_spec"
+        assert created["enabled"] is True
+        assert first_snapshot == original_spec
+        assert first_hash == created["spec_hash"]
+        assert first_execution == first["execution_fingerprint"]
+        assert before_edit["evidence_backtest_count"] == 1
+        assert first_run.strategy_spec_snapshot == first_snapshot
+        assert first_run.execution_fingerprint == first_execution
+        assert updated["spec_hash"] != first_hash
+        assert after_edit["backtest_count"] == 1
+        assert after_edit["evidence_backtest_count"] == 0
+        assert second["strategy_spec_hash"] == updated["spec_hash"]
+        assert second["execution_fingerprint"] != first_execution
+
+
+def test_backtest_request_freezes_spec_before_execution_starts(monkeypatch):
+    original_spec = _volume_confirmed_breakout_spec()
+    edited_spec = deepcopy(original_spec)
+    edited_spec["native_exit"]["condition"]["right"]["window"] = 7
+    captured: dict = {}
+
+    def fake_run_backtest(db, strategy, codes, start, end, *args, **kwargs):
+        captured["spec"] = kwargs["execution_spec"].model_dump(mode="json")
+        # 模拟任务排队后策略被原地修改；传入执行器的快照不能随 ORM 行变化。
+        strategy.spec = deepcopy(edited_spec)
+        return {"codes": codes, "strategy_spec_hash": strategy_spec_hash(captured["spec"])}
+
+    monkeypatch.setattr("app.api.backtest.run_backtest", fake_run_backtest)
+    with _session() as db:
+        _seed(db)
+        created = create_strategy(
+            StrategyCreateIn(name="请求入口快照", spec=original_spec),
+            db=db,
+            claims=CLAIMS_A,
+        )
+        result = create_backtest(
+            BacktestIn(
+                strategy_id=created["id"],
+                codes=["sh.600519"],
+                start=date(2024, 1, 1),
+                end=date(2024, 6, 30),
+            ),
+            db=db,
+            claims=CLAIMS_A,
+        )
+
+    assert captured["spec"] == original_spec
+    assert result["strategy_spec_hash"] == strategy_spec_hash(original_spec)
+    assert captured["spec"] != edited_spec

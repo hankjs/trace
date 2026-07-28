@@ -43,16 +43,31 @@ from ..data.universe import (INDEX_NAMES, membership_intervals,
 from ..catalog import STRATEGY_TEMPLATES
 from ..models import BacktestEquity, BacktestRun, Pool
 from ..strategy.overlays import (
-    apply_portfolio_overlays,
-    apply_single_overlays,
-    portfolio_base_exit_reasons,
     reason as exit_reason,
-    single_entry_price_ceiling,
-    single_entry_price_floor,
     sort_exit_reasons,
     validate_overlay,
 )
-from ..strategy.strategies import resolve_module
+from ..strategy.compiler import (
+    COMPILER_VERSION,
+    compile_portfolio,
+    compile_single,
+    component_versions_for_spec,
+)
+from ..strategy.runtime import (
+    build_execution_snapshot,
+    cost_fingerprint,
+    data_fingerprint,
+    execution_fingerprint,
+    strategy_spec_for,
+    universe_fingerprint,
+)
+from ..strategy.spec import (
+    CapabilityStatus,
+    StrategyCapabilityError,
+    StrategySpec,
+    parse_strategy_spec,
+    resolve_capabilities,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,22 +183,10 @@ def _validate_params(template: str, params: dict | None) -> dict:
     return merged
 
 
-# 公开别名:策略 CRUD 也要按同一套规则校验参数,不该跨包导私有名。
+# 公开别名:策略 CRUD 的迁移入口也要按同一套规则校验 legacy 参数。
 # 引擎内部沿用 `_validate_params`(旧测试按该名断言错误消息)。
 validate_params = _validate_params
 validate_strategy_params = _validate_params
-
-
-def _strategy_version_for_evidence(strategy, effective_params: dict) -> str | None:
-    """仅当前策略实例的精确生效参数可声明其研究计划版本。"""
-    current = validate_strategy_params(strategy.template, strategy.params)
-    if effective_params != current:
-        return None
-    # 延迟导入避免研究计划参数快照反向导入本模块时形成初始化环。
-    from ..research_plan.domain import parameter_snapshot, strategy_version
-
-    snapshot = parameter_snapshot(strategy)
-    return strategy_version(strategy, snapshot)
 
 
 def _equity_statistics(eq: pd.Series, initial_cash: float = 1.0
@@ -545,24 +548,45 @@ def run_backtest(db: Session, strategy, codes: list[str],
                  costs: dict | None = None, save: bool = True,
                  dynamic_universe: bool = False,
                  user_id: str | None = None,
-                 pool_id: int | None = None) -> dict:
-    """跑回测并(默认)落库。多标的时资金等分,组合净值为各标的净值平均。
+                 pool_id: int | None = None,
+                 execution_spec: StrategySpec | dict | None = None) -> dict:
+    """编译当前 StrategySpec，并复用既有 T+1 撮合完成回测。
 
-    `strategy` 是 `quant_strategy` 的行(模板 + 参数)。`params` 为可选的临时
-    覆盖(回测页调参),覆盖优先于策略行自身的 params —— 这让「试参数」不必先
-    存策略,存策略也不妨碍临时试别的值。
-
-    组合模板(KIND=portfolio)走 target_weights + vectorbt 组合回测。
+    规格在函数入口立即解析成不可变快照；数据加载期间即使策略行被原地更新，
+    本次运行也不会重新读取。`params` 仅保留给迁移期旧客户端，先转换成完整规格。
     """
-    mod = resolve_module(strategy)
     costs = _validate_costs(costs)
-    # 策略行的 params 打底,调用方的临时覆盖在上
-    params = _validate_params(
-        strategy.template, {**(strategy.params or {}), **(params or {})})
+    legacy_params: dict = {}
+    if execution_spec is not None:
+        spec = parse_strategy_spec(execution_spec)
+        if params and strategy.template in STRATEGY_TEMPLATES:
+            legacy_params = _validate_params(
+                strategy.template, {**(strategy.params or {}), **params},
+            )
+    elif params:
+        if strategy.template not in STRATEGY_TEMPLATES:
+            raise ValueError("数据库策略不支持临时模板参数，请先保存结构化规格")
+        legacy_params = _validate_params(
+            strategy.template, {**(strategy.params or {}), **params},
+        )
+        from ..strategy.presets import get_preset_spec
 
-    if mod.KIND == "portfolio":
+        spec = get_preset_spec(strategy.template, legacy_params)
+    else:
+        spec = strategy_spec_for(strategy)
+        if strategy.template in STRATEGY_TEMPLATES:
+            legacy_params = _validate_params(strategy.template, strategy.params)
+    versions = component_versions_for_spec(spec)
+    snapshot = build_execution_snapshot(
+        strategy,
+        compiler_version=COMPILER_VERSION,
+        component_versions=versions,
+        spec_override=spec,
+    )
+
+    if snapshot.spec.kind == "portfolio":
         return _run_portfolio(
-            db, strategy, codes, start, end, params, costs, save,
+            db, strategy, codes, start, end, snapshot, legacy_params, costs, save,
             dynamic_universe=dynamic_universe, user_id=user_id,
             pool_id=pool_id,
         )
@@ -577,16 +601,28 @@ def run_backtest(db: Session, strategy, codes: list[str],
         if len(df) == 0 or int((df["date"] >= start).sum()) < MIN_BARS:
             logger.warning("回测 %s 区间内数据不足,跳过", code)
             continue
-        dfs[code] = df
-        native = mod.positions(df, params)
-        dates = pd.DatetimeIndex(df["date"])
-        entry_tradable = opening_buy_tradable_mask({code: df}, dates)[code]
-        positions[code], exit_reasons[code] = apply_single_overlays(
-            df, native, params, slippage=costs["slippage"],
-            entry_tradable=entry_tradable,
-            entry_price_ceiling=single_entry_price_ceiling(mod, df, params),
-            entry_price_floor=single_entry_price_floor(mod, df, params),
+        capability = resolve_capabilities(
+            snapshot.spec, available_fields=set(df.columns),
         )
+        if capability.status != CapabilityStatus.SUPPORTED:
+            raise StrategyCapabilityError(
+                capability, "本次数据快照不满足 StrategySpec 要求",
+            )
+        dfs[code] = df
+        dates = pd.DatetimeIndex(df["date"])
+        compiled = compile_single(
+            snapshot.spec,
+            df,
+            slippage=costs["slippage"],
+            entry_tradable=opening_buy_tradable_mask({code: df}, dates)[code],
+        )
+        positions[code] = compiled.positions
+        exit_reasons[code] = {
+            day: _normalize_compiler_reasons(items)
+            for day, items in compiled.reasons.items()
+            if any(item.get("code") in {"native_exit", "risk_overlay", "take_profit"}
+                   for item in items)
+        }
     if not dfs:
         raise ValueError("所有标的都数据不足,无法回测")
 
@@ -609,9 +645,25 @@ def run_backtest(db: Session, strategy, codes: list[str],
     )
     reason_distribution = _exit_reason_distribution(trade_details)
     fee_assumptions = _fee_assumptions(costs)
+    fingerprints = _fingerprints(
+        snapshot=snapshot,
+        frames=dfs,
+        costs=costs,
+        requested_codes=codes,
+        actual_codes=list(results),
+        start=start,
+        end=end,
+        pool_id=pool_id,
+        dynamic_universe=dynamic_universe,
+    )
     evidence = {
-        "strategy_version": _strategy_version_for_evidence(strategy, params),
-        "parameter_snapshot": deepcopy(params),
+        "strategy_version": snapshot.spec_hash,
+        "strategy_spec_snapshot": deepcopy(snapshot.spec_snapshot),
+        "strategy_spec_hash": snapshot.spec_hash,
+        "compiler_version": snapshot.compiler_version,
+        "component_versions": deepcopy(snapshot.component_versions),
+        **fingerprints,
+        "parameter_snapshot": deepcopy(legacy_params),
         "fee_assumptions": fee_assumptions,
         "trade_details": trade_details,
         "exit_reason_distribution": reason_distribution,
@@ -626,10 +678,14 @@ def run_backtest(db: Session, strategy, codes: list[str],
         "strategy_id": strategy.id,
         "strategy_name": strategy.name,
         "template": strategy.template,
-        # params 存**实际生效**的全量参数(_validate_params 已合并默认值),
-        # 不是用户显式填写的子集:默认值一改历史结果就无法复现
-        "params": params,
-        "parameter_snapshot": deepcopy(params),
+        "kind": snapshot.spec.kind,
+        "strategy_spec_snapshot": deepcopy(snapshot.spec_snapshot),
+        "strategy_spec_hash": snapshot.spec_hash,
+        "compiler_version": snapshot.compiler_version,
+        "component_versions": deepcopy(snapshot.component_versions),
+        **fingerprints,
+        "params": legacy_params,
+        "parameter_snapshot": deepcopy(legacy_params),
         # codes 存剔除数据不足标的后的实际样本;requested_codes 留存请求列表
         "codes": list(results),
         "requested_codes": codes,
@@ -650,6 +706,57 @@ def run_backtest(db: Session, strategy, codes: list[str],
         _save_run(db, result, start, end, combo, user_id=user_id,
                   pool_id=pool_id)
     return result
+
+
+def _normalize_compiler_reasons(items: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for item in items:
+        nested = item.get("all_reasons")
+        if item.get("type") in {"exit", "reduce"} and isinstance(nested, list):
+            normalized.extend(_normalize_compiler_reasons(nested))
+            continue
+        code = item.get("code")
+        if code == "native_exit":
+            normalized.append({**item, "code": "native", "name": "策略原生退出"})
+        elif code == "risk_overlay":
+            normalized.append({**item, "code": code, "name": "风险覆盖层"})
+        elif code == "take_profit":
+            normalized.append({**item, "code": code, "name": "止盈覆盖层"})
+        elif code == "rebalance":
+            normalized.append({**item, "code": code, "name": "组合调仓或资格变化"})
+        elif item.get("type") in {"exit", "reduce"}:
+            normalized.append({**item, "code": "rebalance", "name": "组合调仓或资格变化"})
+    return normalized or [exit_reason("native")]
+
+
+def _fingerprints(*, snapshot, frames: dict[str, pd.DataFrame], costs: dict,
+                  requested_codes: list[str], actual_codes: list[str], start: date,
+                  end: date, pool_id: int | None, dynamic_universe: bool,
+                  eligibility: pd.DataFrame | None = None) -> dict[str, str]:
+    data_hash = data_fingerprint(frames)
+    universe_hash = universe_fingerprint(
+        requested_codes=requested_codes,
+        actual_codes=actual_codes,
+        start=start,
+        end=end,
+        pool_id=pool_id,
+        dynamic_universe=dynamic_universe,
+        eligibility=eligibility,
+    )
+    cost_hash = cost_fingerprint(costs)
+    return {
+        "data_fingerprint": data_hash,
+        "universe_fingerprint": universe_hash,
+        "cost_fingerprint": cost_hash,
+        "execution_fingerprint": execution_fingerprint(
+            spec_hash=snapshot.spec_hash,
+            compiler_version=snapshot.compiler_version,
+            component_versions=snapshot.component_versions,
+            data_hash=data_hash,
+            universe_hash=universe_hash,
+            cost_hash=cost_hash,
+        ),
+    }
 
 
 def _fee_assumptions(costs: dict[str, float]) -> dict:
@@ -916,14 +1023,10 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
 
 
 def _run_portfolio(db: Session, strategy, codes: list[str],
-                   start: date, end: date, params: dict | None,
+                   start: date, end: date, snapshot, legacy_params: dict,
                    costs: dict, save: bool, *, dynamic_universe: bool,
                    user_id: str | None, pool_id: int | None = None) -> dict:
-    """组合策略回测:target_weights -> T+1 开盘按目标权重调仓。
-
-    params 已由 run_backtest 校验合并,这里不再重复校验。
-    """
-    mod = resolve_module(strategy)
+    """组合规格编译为目标权重，再交给既有 T+1 组合撮合。"""
     warmup_start = start - timedelta(days=PORTFOLIO_WARMUP_DAYS)
     pool_dfs: dict[str, pd.DataFrame] = {}
     for code in codes:
@@ -933,6 +1036,17 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         pool_dfs[code] = df
     if not pool_dfs:
         raise ValueError("所有标的都数据不足,无法回测")
+
+    available_fields = set.intersection(
+        *(set(frame.columns) for frame in pool_dfs.values())
+    )
+    capability = resolve_capabilities(
+        snapshot.spec, available_fields=available_fields,
+    )
+    if capability.status != CapabilityStatus.SUPPORTED:
+        raise StrategyCapabilityError(
+            capability, "本次数据快照不满足 StrategySpec 要求",
+        )
 
     all_dates = sorted({d for df in pool_dfs.values() for d in df["date"]})
     eligibility = None
@@ -955,37 +1069,52 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
                 index_name=pool.ref if pool.ref in INDEX_NAMES else None,
                 min_list_days=pool.min_list_days, daily_frames=pool_dfs,
             )
-    weights_full = mod.target_weights(
-        all_dates, pool_dfs, params, eligibility=eligibility,
-    )
-    base_exit_reasons = portfolio_base_exit_reasons(
-        strategy.template, weights_full, pool_dfs,
-        mod.rebalance_mask(all_dates),
-    )
-    weights_full, overlay_exit_reasons, _ = apply_portfolio_overlays(
-        weights_full,
+    compiled = compile_portfolio(
+        snapshot.spec,
+        all_dates,
         pool_dfs,
-        params,
-        mod.rebalance_mask(all_dates),
+        eligibility=eligibility,
         slippage=costs["slippage"],
         entry_tradable=opening_buy_tradable_mask(
             pool_dfs, pd.DatetimeIndex(all_dates),
         ),
-        base_exit_reasons=base_exit_reasons,
     )
+    weights_full = compiled.weights
+    exit_reasons = {
+        key: _normalize_compiler_reasons(items)
+        for key, items in compiled.reasons.items()
+        if any(item.get("type") in {"exit", "reduce"} for item in items)
+    }
     bt_idx = pd.DatetimeIndex([d for d in all_dates if start <= d <= end])
     if len(bt_idx) < 3:
         raise ValueError("回测区间交易日不足")
 
     sim = _portfolio_sim(
         weights_full, pool_dfs, bt_idx, costs,
-        exit_reasons=overlay_exit_reasons,
+        exit_reasons=exit_reasons,
     )
     eq = sim["equity"]
     fee_assumptions = _fee_assumptions(costs)
+    fingerprints = _fingerprints(
+        snapshot=snapshot,
+        frames=pool_dfs,
+        costs=costs,
+        requested_codes=codes,
+        actual_codes=list(pool_dfs),
+        start=start,
+        end=end,
+        pool_id=pool_id,
+        dynamic_universe=dynamic_universe,
+        eligibility=eligibility,
+    )
     evidence = {
-        "strategy_version": _strategy_version_for_evidence(strategy, params),
-        "parameter_snapshot": deepcopy(params),
+        "strategy_version": snapshot.spec_hash,
+        "strategy_spec_snapshot": deepcopy(snapshot.spec_snapshot),
+        "strategy_spec_hash": snapshot.spec_hash,
+        "compiler_version": snapshot.compiler_version,
+        "component_versions": deepcopy(snapshot.component_versions),
+        **fingerprints,
+        "parameter_snapshot": deepcopy(legacy_params),
         "fee_assumptions": fee_assumptions,
         "trade_details": sim["trade_details"],
         "exit_reason_distribution": sim["exit_reason_distribution"],
@@ -998,9 +1127,14 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         "strategy_id": strategy.id,
         "strategy_name": strategy.name,
         "template": strategy.template,
-        # 同 run_backtest:params 为实际生效的全量参数,codes 为实际样本
-        "params": params,
-        "parameter_snapshot": deepcopy(params),
+        "kind": snapshot.spec.kind,
+        "strategy_spec_snapshot": deepcopy(snapshot.spec_snapshot),
+        "strategy_spec_hash": snapshot.spec_hash,
+        "compiler_version": snapshot.compiler_version,
+        "component_versions": deepcopy(snapshot.component_versions),
+        **fingerprints,
+        "params": legacy_params,
+        "parameter_snapshot": deepcopy(legacy_params),
         "codes": list(pool_dfs),
         "requested_codes": codes,
         "start": str(start),
@@ -1066,6 +1200,14 @@ def _save_run(db: Session, result: dict, start: date, end: date,
         codes=result["codes"], start=start, end=end,
         metrics=result["metrics"], user_id=user_id,
         costs=result["costs"], pool_id=pool_id,
+        strategy_spec_snapshot=result["strategy_spec_snapshot"],
+        strategy_spec_hash=result["strategy_spec_hash"],
+        compiler_version=result["compiler_version"],
+        component_versions=result["component_versions"],
+        data_fingerprint=result["data_fingerprint"],
+        universe_fingerprint=result["universe_fingerprint"],
+        cost_fingerprint=result["cost_fingerprint"],
+        execution_fingerprint=result["execution_fingerprint"],
     )
     db.add(run)
     db.flush()
@@ -1081,13 +1223,9 @@ def _save_run(db: Session, result: dict, start: date, end: date,
 def run_sweep(db: Session, strategy, codes: list[str],
               start: date, end: date, param_grid: dict,
               costs: dict | None = None) -> dict:
-    """参数扫描:param_grid = {参数名: [候选值]},笛卡尔积逐组批量回测(不落库)。
-
-    扫描的是**模板参数**,策略行只用来定模板 —— 每组候选值都是完整的一组参数,
-    策略行自身的 params 不参与合并(否则扫描结果取决于当前存的值,不可复现)。
-    """
-    mod = resolve_module(strategy)
-    if mod.KIND != "single":
+    """按受限 JSON 路径扫描 StrategySpec，最多 200 个组合且不落库。"""
+    base_spec = strategy_spec_for(strategy)
+    if base_spec.kind != "single":
         raise ValueError("参数扫描目前只支持单标的策略")
     costs = _validate_costs(costs)
     if not param_grid:
@@ -1100,18 +1238,31 @@ def run_sweep(db: Session, strategy, codes: list[str],
     count = math.prod(len(param_grid[key]) for key in keys)
     if count > 200:
         raise ValueError(f"参数组合过多({count}),上限 200")
-    combos = []
+    combos: list[tuple[dict, StrategySpec]] = []
     for vals in itertools.product(*(param_grid[k] for k in keys)):
-        candidate: dict = {}
-        for key, value in zip(keys, vals):
-            if "." not in key:
-                candidate[key] = value
-                continue
-            parent, child = key.split(".", 1)
-            if parent not in {"risk_overlay", "take_profit"}:
-                raise ValueError(f"不支持嵌套扫描参数: {key}")
-            candidate.setdefault(parent, {})[child] = value
-        combos.append(_validate_params(strategy.template, candidate))
+        display = dict(zip(keys, vals))
+        if all(key.startswith("$.") for key in keys):
+            raw = deepcopy(base_spec.model_dump(mode="json"))
+            for key, value in display.items():
+                _set_spec_path(raw, key, value)
+            combos.append((display, parse_strategy_spec(raw)))
+        elif strategy.template in STRATEGY_TEMPLATES:
+            # 旧客户端参数名只在入口转换一次，后续仍统一走 StrategySpec 编译器。
+            legacy: dict = {}
+            for key, value in display.items():
+                if "." not in key:
+                    legacy[key] = value
+                    continue
+                parent, child = key.split(".", 1)
+                if parent not in {"risk_overlay", "take_profit"}:
+                    raise ValueError(f"不支持嵌套扫描参数: {key}")
+                legacy.setdefault(parent, {})[child] = value
+            effective = _validate_params(strategy.template, legacy)
+            from ..strategy.presets import get_preset_spec
+
+            combos.append((effective, get_preset_spec(strategy.template, effective)))
+        else:
+            raise ValueError("规格参数扫描路径必须以 $. 开头")
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
     full_dfs: dict[str, pd.DataFrame] = {}  # 含预热段,信号在完整序列上计算
@@ -1123,28 +1274,34 @@ def run_sweep(db: Session, strategy, codes: list[str],
         raise ValueError("所有标的都数据不足,无法回测")
 
     rows = []
-    for combo in combos:
+    for display, candidate_spec in combos:
         positions = {}
         exit_reasons = {}
         for code, df in full_dfs.items():
-            native = mod.positions(df, combo)
             dates = pd.DatetimeIndex(df["date"])
-            positions[code], exit_reasons[code] = apply_single_overlays(
-                df, native, combo, slippage=costs["slippage"],
+            compiled = compile_single(
+                candidate_spec,
+                df,
+                slippage=costs["slippage"],
                 entry_tradable=opening_buy_tradable_mask(
-                    {code: df}, dates)[code],
-                entry_price_ceiling=single_entry_price_ceiling(
-                    mod, df, combo),
-                entry_price_floor=single_entry_price_floor(
-                    mod, df, combo),
+                    {code: df}, dates,
+                )[code],
             )
+            positions[code] = compiled.positions
+            exit_reasons[code] = {
+                day: _normalize_compiler_reasons(items)
+                for day, items in compiled.reasons.items()
+                if any(item.get("code") in {
+                    "native_exit", "risk_overlay", "take_profit",
+                } for item in items)
+            }
         results = _batch_single(
             full_dfs, positions, costs, start,
             exit_reasons_by_code=exit_reasons,
         )
         per = [r["metrics"] for r in results.values()]
         rows.append({
-            "params": combo,
+            "params": display,
             "metrics": {
                 # 短序列的 annual_return 为 None(见 MIN_STAT_BARS),聚合要跳过
                 "annual_return_mean": _mean_or_none(
@@ -1169,6 +1326,22 @@ def run_sweep(db: Session, strategy, codes: list[str],
             "template": strategy.template,
             "codes": list(full_dfs), "start": str(start),
             "end": str(end), "costs": costs, "results": rows}
+
+
+def _set_spec_path(raw: dict, path: str, value) -> None:
+    if not path.startswith("$."):
+        raise ValueError(f"规格参数扫描路径必须以 $. 开头: {path}")
+    parts = path[2:].split(".")
+    target = raw
+    for part in parts[:-1]:
+        child = target.get(part)
+        if not isinstance(child, dict):
+            raise ValueError(f"规格参数扫描路径不存在: {path}")
+        target = child
+    leaf = parts[-1]
+    if leaf not in target:
+        raise ValueError(f"规格参数扫描路径不存在: {path}")
+    target[leaf] = value
 
 
 def _median_or_none(vals: list) -> float | None:

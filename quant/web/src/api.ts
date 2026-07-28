@@ -47,6 +47,7 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
     try {
       const json = await res.json()
       if (typeof json.detail === 'string') msg = json.detail
+      else if (json.detail && typeof json.detail.message === 'string') msg = json.detail.message
       else if (Array.isArray(json.detail) && json.detail[0]?.msg) msg = json.detail[0].msg
     } catch {
       /* 非 JSON 错误体 */
@@ -116,11 +117,87 @@ export function hasSurvivorshipBias(pool: Pool | PoolRef | null | undefined): bo
   return pool.kind === 'static'
 }
 
+export type StrategyResearchStatus = 'unverified' | 'verified' | 'rejected'
+
+export type StrategyCapabilityStatus =
+  | 'supported'
+  | 'missing_data'
+  | 'missing_engine'
+  | 'subjective_only'
+  | 'boundary_denied'
+
+export interface StrategyCapabilityIssue {
+  status: StrategyCapabilityStatus
+  code: string
+  path: string
+  message: string
+  operator?: string | null
+  field?: string | null
+}
+
+export interface StrategyCapability {
+  status: StrategyCapabilityStatus
+  issues: StrategyCapabilityIssue[]
+}
+
+export interface StrategyAstNode {
+  op?: string
+  args?: StrategyAstNode[]
+  arg?: StrategyAstNode
+  all?: StrategyAstNode[]
+  any?: StrategyAstNode[]
+  input?: StrategyAstNode
+  left?: StrategyAstNode
+  right?: StrategyAstNode
+  [key: string]: unknown
+}
+
 /**
- * 策略实例 = 算法模板 + 一组参数 + 用户起的名字。
- *
- * 与股票池同一套归属模型:公共策略(is_system)全用户可读且只读,
- * 自定义策略按 owner_id 归属。别人的策略后端返回 404 而不是 403。
+ * 数据库中的完整策略定义。具体节点由服务端受控注册表校验，前端只构造已知节点，
+ * 同时保留未知扩展字段，避免查看新版规格时丢失信息。
+ */
+export interface StrategySpec {
+  schema_version: number
+  kind?: StrategyKind
+  metadata: Record<string, unknown>
+  universe: Record<string, unknown>
+  data_requirements: unknown[]
+  entry: StrategyAstNode
+  positioning: Record<string, unknown>
+  holding: Record<string, unknown>
+  native_exit: StrategyAstNode
+  overlays: Record<string, unknown>
+  portfolio_constraints: Record<string, unknown>
+  execution: Record<string, unknown>
+  validation: Record<string, unknown>
+  [key: string]: unknown
+}
+
+interface StrategyValidationBase {
+  capability: StrategyCapability
+  errors: string[]
+}
+
+export type StrategyValidationResult = StrategyValidationBase & (
+  | {
+      valid: true
+      kind: StrategyKind
+      spec_schema_version: number
+      normalized_spec: StrategySpec
+      spec_hash: string
+    }
+  | {
+      valid: false
+      kind: StrategyKind | null
+      spec_schema_version: number | null
+      normalized_spec: StrategySpec | null
+      spec_hash: string | null
+    }
+)
+
+/**
+ * 策略实例以 spec 为唯一规则来源。公共策略(is_system)全用户可读且只读，
+ * 自定义策略按 owner_id 归属。legacy 模板字段仅供迁移期旧页面读取。
  */
 export interface Strategy {
   id: number
@@ -148,7 +225,15 @@ export interface Strategy {
   editable: boolean
   /** 被多少条回测引用;>0 时删除会 409,只能改为停用 */
   backtest_count?: number | null
+  /** 其中 spec_hash 与当前规格完全一致、可作为当前证据的回测数。 */
+  evidence_backtest_count?: number | null
   created_at?: string | null
+  updated_at?: string | null
+  spec_schema_version?: number
+  spec?: StrategySpec
+  spec_hash?: string
+  research_status?: StrategyResearchStatus
+  capability?: StrategyCapability
   /** 模板可生成哪些研究线/条件，由后端按模板声明。 */
   plan_capabilities?: ResearchPlanCapabilities | null
   research_plan_capabilities?: ResearchPlanCapabilities | null
@@ -686,6 +771,17 @@ export interface BacktestResult {
   /** 策略实例名;策略行已被删除时后端回显 null */
   strategy_name?: string | null
   template?: string | null
+  kind?: StrategyKind
+  strategy_spec_snapshot?: StrategySpec
+  strategy_spec_hash?: string
+  compiler_version?: string
+  component_versions?: Record<string, string>
+  data_fingerprint?: string
+  universe_fingerprint?: string
+  cost_fingerprint?: string
+  execution_fingerprint?: string
+  requested_codes?: string[]
+  created_at?: string
   /** 本次实际生效的全量参数快照 */
   params?: Record<string, StrategyParamValue>
   /** 本次回测实际使用的覆盖层与费用快照。 */
@@ -736,6 +832,14 @@ export interface BacktestExitReasonDistribution {
 }
 
 export interface BacktestRunEvidence {
+  strategy_spec_snapshot?: StrategySpec
+  strategy_spec_hash?: string
+  compiler_version?: string
+  component_versions?: Record<string, string>
+  data_fingerprint?: string
+  universe_fingerprint?: string
+  cost_fingerprint?: string
+  execution_fingerprint?: string
   parameter_snapshot?: Record<string, StrategyParamValue>
   fee_assumptions?: Record<string, unknown>
   trade_details?: BacktestTradeDetail[]
@@ -982,6 +1086,7 @@ export interface SweepResult {
   strategy_id: number
   strategy_name: string
   template: string
+  strategy_spec_hash?: string
   codes: string[]
   stocks?: StockRef[]
   start: string
@@ -1117,11 +1222,9 @@ export const api = {
     return request<{ items: CatalogEntry[] }>('/api/strategies/templates')
   },
 
-  /** params 只需给要覆盖模板默认值的键 */
   createStrategy(body: {
     name: string
-    template: string
-    params?: Record<string, StrategyParamValue>
+    spec: StrategySpec
     enabled?: boolean
   }) {
     return request<Strategy>('/api/strategies', {
@@ -1130,19 +1233,23 @@ export const api = {
     })
   },
 
-  /** 另存为我的策略。公共策略只读,调参前先复制一份;name 留空由后端加「副本」 */
-  duplicateStrategy(id: number, body: { name?: string; params?: Record<string, StrategyParamValue> } = {}) {
+  /** 另存为我的策略。服务端复制当前完整 spec，name 留空时自动加「副本」。 */
+  duplicateStrategy(
+    id: number,
+    body: { name?: string; spec?: StrategySpec } = {}
+  ) {
     return request<Strategy>(`/api/strategies/${id}/duplicate`, {
       method: 'POST',
       body: JSON.stringify(body),
     })
   },
 
-  /** 改名 / 改参数 / 启停。模板不可改,换算法请新建 */
+  /** 原地更新当前完整规格，不创建策略历史版本。 */
   updateStrategy(id: number, body: {
     name?: string
-    params?: Record<string, StrategyParamValue>
+    spec?: StrategySpec
     enabled?: boolean
+    research_status?: StrategyResearchStatus
   }) {
     return request<Strategy>(`/api/strategies/${id}`, {
       method: 'PATCH',
@@ -1153,6 +1260,19 @@ export const api = {
   /** 被回测引用时后端返回 409,提示改为停用 */
   deleteStrategy(id: number) {
     return request<{ deleted: number; id: number }>(`/api/strategies/${id}`, { method: 'DELETE' })
+  },
+
+  validateStrategySpec(spec: StrategySpec) {
+    return request<StrategyValidationResult>('/api/strategies/validate', {
+      method: 'POST',
+      body: JSON.stringify({ spec }),
+    })
+  },
+
+  validateStrategy(id: number) {
+    return request<StrategyValidationResult>(`/api/strategies/${id}/validate`, {
+      method: 'POST',
+    })
   },
 
   // ---- 股票池组 ----
@@ -1205,18 +1325,16 @@ export const api = {
     start: string
     end: string
     pool_id?: number
-    /** 临时覆盖策略自身的参数,不改策略行 */
-    params?: Record<string, unknown>
     costs?: BacktestCostSnapshot
   }) {
-    return request<BacktestResult>('/api/backtest', {
+    return request<BacktestResult>('/api/backtests', {
       method: 'POST',
       body: JSON.stringify(body),
     })
   },
 
   getBacktest(runId: number) {
-    return request<BacktestResult>(`/api/backtest/${runId}`)
+    return request<BacktestResult>(`/api/backtests/${runId}`)
   },
 
   picks(date?: string) {
@@ -1247,7 +1365,7 @@ export const api = {
     codes: string[]
     start: string
     end: string
-    param_grid: Record<string, Array<number | string | boolean>>
+    param_grid: Record<string, Array<number | boolean>>
     costs?: BacktestCostSnapshot
   }) {
     return request<SweepResult>('/api/backtest/sweep', {

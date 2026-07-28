@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -57,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0013_research_plan"}
+    assert heads == {"0014_dynamic_strategy_spec"}
     assert current_heads(migrated_db) == heads
 
 
@@ -303,6 +304,56 @@ def test_backtest_run_has_costs_and_pool_id(migrated_db):
     assert "pool_id" in columns
 
 
+def test_dynamic_strategy_persistence_shape(migrated_db):
+    """当前策略是唯一事实源；历史执行证据另存快照、哈希和指纹。"""
+    strategy = _columns(migrated_db, "quant_strategy")
+    assert {
+        "spec_schema_version", "spec", "spec_hash", "research_status",
+        "updated_at",
+    } <= set(strategy)
+    assert all(not strategy[name]["nullable"] for name in (
+        "spec_schema_version", "spec", "spec_hash", "research_status",
+        "updated_at",
+    ))
+
+    backtest = _columns(migrated_db, "quant_backtest_run")
+    assert {
+        "strategy_spec_snapshot", "strategy_spec_hash", "compiler_version",
+        "component_versions", "data_fingerprint", "universe_fingerprint",
+        "cost_fingerprint", "execution_fingerprint",
+    } <= set(backtest)
+    # 0014 前的历史运行没有可靠创建时快照，迁移不能用当前策略伪造证据。
+    assert all(backtest[name]["nullable"] for name in (
+        "strategy_spec_snapshot", "strategy_spec_hash", "compiler_version",
+        "component_versions", "data_fingerprint", "universe_fingerprint",
+        "cost_fingerprint", "execution_fingerprint",
+    ))
+
+    plan = _columns(migrated_db, "quant_research_plan")
+    assert {"strategy_spec_snapshot", "strategy_spec_hash"} <= set(plan)
+    assert plan["strategy_spec_snapshot"]["nullable"]
+    assert plan["strategy_spec_hash"]["nullable"]
+    assert _columns(migrated_db, "quant_signal")["spec_hash"]["nullable"]
+    assert _columns(migrated_db, "quant_strategy_eval")["spec_hash"]["nullable"]
+
+    expected_indexes = {
+        "quant_strategy": {
+            "ix_quant_strategy_spec_hash",
+            "ix_quant_strategy_research_status",
+        },
+        "quant_backtest_run": {
+            "ix_quant_backtest_run_strategy_spec_hash",
+            "ix_quant_backtest_run_execution_fingerprint",
+        },
+        "quant_research_plan": {"ix_quant_research_plan_strategy_spec_hash"},
+        "quant_signal": {"ix_quant_signal_spec_hash"},
+        "quant_strategy_eval": {"ix_quant_strategy_eval_spec_hash"},
+    }
+    for table, names in expected_indexes.items():
+        actual = {item["name"] for item in inspect(migrated_db).get_indexes(table)}
+        assert names <= actual
+
+
 def test_strategy_eval_has_indexed_batch_id(migrated_db):
     """排行榜混批修复依赖 batch_id(REVIEW 4.2)。"""
     columns = _columns(migrated_db, "quant_strategy_eval")
@@ -387,6 +438,137 @@ def test_system_strategies_are_seeded(migrated_db):
     ]
 
 
+def test_system_strategies_have_complete_hashed_specs(migrated_db):
+    """六个公共策略必须是可校验的完整 StrategySpec，而非模板名占位。"""
+    from app.strategy.spec import validate_strategy_spec
+
+    with migrated_db.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT template, kind, spec_schema_version, spec, spec_hash, "
+            "research_status, updated_at FROM quant_strategy "
+            "WHERE is_system = 1 ORDER BY id"
+        )).mappings().all()
+
+    assert len(rows) == 6
+    for row in rows:
+        raw_spec = row["spec"]
+        spec = raw_spec if isinstance(raw_spec, dict) else json.loads(raw_spec)
+        result = validate_strategy_spec(spec)
+        assert result.valid, (row["template"], result.capability)
+        assert spec["kind"] == row["kind"]
+        assert row["spec_schema_version"] == spec["schema_version"] == 1
+        assert row["spec_hash"] == result.spec_hash
+        assert row["research_status"] == "unverified"
+        assert row["updated_at"] is not None
+
+
+def test_init_sql_uses_same_strategy_specs_and_head():
+    """空库初始化种子必须与运行时预置规格、Alembic head 完全一致。"""
+    from app.strategy.presets import SYSTEM_STRATEGY_SPECS
+    from app.strategy.spec import canonical_spec_json, strategy_spec_hash
+
+    source = (QUANT_DIR / "sql" / "init.sql").read_text()
+    assert "Schema revision: 0014_dynamic_strategy_spec" in source
+    assert "VALUES ('0014_dynamic_strategy_spec');" in source
+    for template, spec in SYSTEM_STRATEGY_SPECS.items():
+        canonical = canonical_spec_json(spec).replace("'", "''")
+        assert f"'{template}'" in source
+        assert f"'{canonical}'" in source
+        assert f"'{strategy_spec_hash(spec)}'" in source
+
+
+def test_legacy_strategy_params_migrate_into_complete_spec():
+    """已有用户策略的显式参数必须写进规格，不能退回系统默认值。"""
+    from app.strategy.presets import get_preset_spec
+    from app.strategy.spec import strategy_spec_hash
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "legacy-strategy.db"
+        result = _alembic(db_path, "upgrade", "0013_research_plan")
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+        engine = create_engine(f"sqlite+pysqlite:///{db_path}")
+        params = {
+            "entry": 55,
+            "exit": 15,
+            "max_entry_premium": 0.03,
+            "risk_overlay": {
+                "enabled": True,
+                "type": "fixed_pct",
+                "value": 0.1,
+                "atr_period": 14,
+            },
+        }
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO quant_strategy "
+                "(owner_id, is_system, name, template, kind, params, enabled, "
+                " created_at) VALUES "
+                "('user-a', 0, '自定义突破', 'breakout', 'single', :params, 1, "
+                " '2026-07-25 00:00:00')"
+            ), {"params": json.dumps(params)})
+        engine.dispose()
+
+        result = _alembic(db_path, "upgrade", "head")
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+        engine = create_engine(f"sqlite+pysqlite:///{db_path}")
+        try:
+            with engine.connect() as conn:
+                row = conn.execute(text(
+                    "SELECT template, params, spec, spec_hash, research_status "
+                    "FROM quant_strategy WHERE owner_id = 'user-a'"
+                )).mappings().one()
+            migrated_spec = (
+                row["spec"] if isinstance(row["spec"], dict)
+                else json.loads(row["spec"])
+            )
+            expected = get_preset_spec("breakout", params)
+            assert migrated_spec == expected.model_dump(mode="json")
+            assert row["spec_hash"] == strategy_spec_hash(expected)
+            assert row["research_status"] == "unverified"
+            assert json.loads(row["params"]) == params
+        finally:
+            engine.dispose()
+
+
+def test_dynamic_strategy_migration_refuses_unknown_template_before_ddl():
+    """未知模板必须在 ALTER TABLE 前中止，避免 MySQL 留下半套 0014 schema。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "unknown-strategy.db"
+        result = _alembic(db_path, "upgrade", "0013_research_plan")
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+        engine = create_engine(f"sqlite+pysqlite:///{db_path}")
+        with engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO quant_strategy "
+                "(owner_id, is_system, name, template, kind, params, enabled, "
+                " created_at) VALUES "
+                "('user-a', 0, '未知策略', 'missing_template', 'single', '{}', 1, "
+                " '2026-07-25 00:00:00')"
+            ))
+        engine.dispose()
+
+        result = _alembic(db_path, "upgrade", "head")
+        assert result.returncode != 0
+        assert "未知模板" in result.stderr
+
+        engine = create_engine(f"sqlite+pysqlite:///{db_path}")
+        try:
+            assert "spec" not in _columns(engine, "quant_strategy")
+            with engine.connect() as conn:
+                assert conn.execute(text(
+                    "SELECT version_num FROM alembic_version"
+                )).scalar_one() == "0013_research_plan"
+                assert conn.execute(text(
+                    "SELECT COUNT(*) FROM quant_strategy "
+                    "WHERE template = 'missing_template'"
+                )).scalar_one() == 1
+        finally:
+            engine.dispose()
+
+
 def test_seeded_strategies_match_code_templates(migrated_db):
     """seed 的 template/kind 必须与代码里的模块一致。
 
@@ -410,9 +592,13 @@ def test_strategy_name_is_unique_per_owner(migrated_db):
 
     insert = text(
         "INSERT INTO quant_strategy "
-        "(owner_id, is_system, name, template, kind, params, enabled, created_at) "
-        "VALUES (:owner, 0, '我的策略', 'ma_cross', 'single', '{}', 1,"
-        " '2026-07-25 00:00:00')"
+        "(owner_id, is_system, name, template, kind, params, "
+        " spec_schema_version, spec, spec_hash, research_status, enabled, "
+        " created_at, updated_at) "
+        "SELECT :owner, 0, '我的策略', template, kind, params, "
+        " spec_schema_version, spec, spec_hash, 'unverified', 1, "
+        " '2026-07-25 00:00:00', '2026-07-25 00:00:00' "
+        "FROM quant_strategy WHERE id = 1"
     )
     with migrated_db.begin() as conn:
         conn.execute(insert.bindparams(owner="user-a"))

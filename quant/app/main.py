@@ -72,6 +72,7 @@ app.include_router(signals.router, dependencies=_auth)
 app.include_router(research_plans.router, dependencies=_auth)
 app.include_router(portfolio.router, dependencies=_auth)
 app.include_router(backtest.router, dependencies=_auth)
+app.include_router(backtest.plural_router, dependencies=_auth)
 app.include_router(selection.router, dependencies=_auth)
 app.include_router(admin.router, dependencies=[Depends(require_admin)])
 

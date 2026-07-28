@@ -15,7 +15,6 @@ import logging
 import uuid
 from datetime import date, timedelta
 
-import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -23,14 +22,9 @@ from ..data.universe import current_pool, pool_at, pool_during
 from ..models import FactorDaily, Strategy, StrategyEval
 from ..selection.pipeline import score_cross_section
 from ..strategy.store import enabled_strategies, visible_to
-from ..strategy.strategies import resolve_module
-from ..strategy.overlays import (apply_single_overlays,
-                                 single_entry_price_ceiling,
-                                 single_entry_price_floor)
-from .engine import (DEFAULT_COSTS, SINGLE_WARMUP_DAYS, _batch_single,
-                     _median_or_none, _mean_or_none, opening_buy_tradable_mask,
-                     run_backtest, validate_params)
-from ..data.ingest import load_bars_df
+from ..strategy.runtime import strategy_spec_for
+from ..strategy.spec import strategy_spec_hash
+from .engine import _median_or_none, _mean_or_none, run_backtest
 
 logger = logging.getLogger(__name__)
 
@@ -70,33 +64,14 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
 
 def _eval_single(db: Session, strategy: Strategy, codes: list[str],
                  start: date, end: date) -> dict:
-    """单标的策略批量评估。与普通回测同一口径:预热 + 完整序列算信号。"""
-    mod = resolve_module(strategy)
-    params = validate_params(strategy.template, strategy.params)
-    warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
-    dfs, positions = {}, {}
-    for code in codes:
-        df = load_bars_df(db, code, start=warmup_start, end=end)
-        if len(df) == 0 or int((df["date"] >= start).sum()) < 60:
-            continue
-        dfs[code] = df
-        native = mod.positions(df, params)
-        positions[code] = apply_single_overlays(
-            df, native, params, slippage=DEFAULT_COSTS["slippage"],
-            entry_tradable=opening_buy_tradable_mask(
-                {code: df}, pd.DatetimeIndex(df["date"]),
-            )[code],
-            entry_price_ceiling=single_entry_price_ceiling(
-                mod, df, params),
-            entry_price_floor=single_entry_price_floor(
-                mod, df, params),
-        )[0]
-    if not dfs:
+    """单标的批量评估与普通回测共享同一个 StrategySpec 编译入口。"""
+    result = run_backtest(db, strategy, codes, start, end, save=False)
+    per_code = result["metrics"].get("per_code", {})
+    per = list(per_code.values())
+    if not per:
         return {"error": "数据不足"}
-    results = _batch_single(dfs, positions, DEFAULT_COSTS, start)
-    per = [r["metrics"] for r in results.values()]
     return {
-        "codes": len(dfs),
+        "codes": len(per_code),
         # 短序列指标为 None(engine.MIN_STAT_BARS),聚合统一走 None 容忍的 helper
         "annual_return_median": _median_or_none([m["annual_return"] for m in per]),
         "annual_return_mean": _mean_or_none([m["annual_return"] for m in per]),
@@ -105,7 +80,7 @@ def _eval_single(db: Session, strategy: Strategy, codes: list[str],
         "sharpe_median": _median_or_none([m["sharpe"] for m in per]),
         "win_rate_mean": _mean_or_none([m["win_rate"] for m in per]),
         "trade_count": sum(m["trade_count"] for m in per),
-        "per_code": {c: r["metrics"] for c, r in results.items()},
+        "per_code": per_code,
     }
 
 
@@ -126,6 +101,7 @@ def run_evaluation(db: Session, day: date | None = None,
 
     saved = []
     for strategy in enabled_strategies(db, kind="single"):
+        spec_hash = strategy_spec_hash(strategy_spec_for(strategy))
         try:
             metrics = _eval_single(db, strategy, top_codes, start, end)
         except Exception as e:  # noqa: BLE001 - 单个策略失败不影响本轮其余
@@ -136,13 +112,14 @@ def run_evaluation(db: Session, day: date | None = None,
         db.add(StrategyEval(strategy_id=strategy.id,
                             params=strategy.params or {}, scope="pool_top50",
                             start=start, end=end, metrics=metrics,
-                            batch_id=batch_id))
+                            batch_id=batch_id, spec_hash=spec_hash))
         saved.append({"strategy_id": strategy.id, "strategy": strategy.name,
                       "scope": "pool_top50"})
         logger.info("评估 %s: %s", strategy.name,
                     {k: v for k, v in metrics.items() if k != "per_code"})
 
     for strategy in enabled_strategies(db, kind="portfolio"):
+        spec_hash = strategy_spec_hash(strategy_spec_for(strategy))
         try:
             res = run_backtest(
                 db, strategy, pool, start, end, save=False,
@@ -155,7 +132,7 @@ def run_evaluation(db: Session, day: date | None = None,
         db.add(StrategyEval(strategy_id=strategy.id,
                             params=strategy.params or {}, scope="pool",
                             start=start, end=end, metrics=metrics,
-                            batch_id=batch_id))
+                            batch_id=batch_id, spec_hash=spec_hash))
         saved.append({"strategy_id": strategy.id, "strategy": strategy.name,
                       "scope": "pool"})
         logger.info("评估 %s: %s", strategy.name, metrics)
@@ -186,7 +163,11 @@ def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
     rows = db.execute(
         select(StrategyEval, Strategy)
         .join(Strategy, Strategy.id == StrategyEval.strategy_id)
-        .where(StrategyEval.batch_id == batch_id, visible_to(user_id))
+        .where(
+            StrategyEval.batch_id == batch_id,
+            StrategyEval.spec_hash == Strategy.spec_hash,
+            visible_to(user_id),
+        )
     ).all()
 
     def sort_key(row) -> float:
@@ -199,6 +180,7 @@ def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
             "strategy_id": r.strategy_id,
             "strategy": s.name,
             "template": s.template,
+            "spec_hash": r.spec_hash,
             "is_system": bool(s.is_system),
             "scope": r.scope,
             "start": str(r.start),
