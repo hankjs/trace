@@ -311,10 +311,58 @@ class PortfolioPositioningSpec(StrictModel):
 
 
 class HoldingSpec(StrictModel):
+    """持仓期间的行为规则。
+
+    加仓/减仓语义(仅 single 策略):
+    - entry 触发建仓 ``positioning.target``(单档基准);
+    - 持仓期间(非 entry 当日)``add_rule`` 触发时目标仓位上调 ``step``(占总资金
+      比例),上限 ``max_position``;``reduce_rule`` 触发时下调 ``step``,减到 0
+      等同清仓,按原生离场的既有语义等待下一次入场事件;
+    - 同一日多条件冲突的优先级:exit/overlay > reduce > add。
+    """
+
     allow_add: bool
     allow_reduce: bool
+    add_rule: RuleSpec | None = None
+    reduce_rule: RuleSpec | None = None
+    step: float = Field(default=0.5, gt=0, lt=1)
+    max_position: float = Field(default=1.0, gt=0, le=1)
     cooldown_days: int = Field(ge=0, le=250)
     risk_reentry: Literal["native_reset"]
+
+    @model_validator(mode="after")
+    def validate_adjust_rules(self) -> HoldingSpec:
+        if self.allow_add and self.add_rule is None:
+            raise ValueError("allow_add 为 true 时必须提供 add_rule")
+        if not self.allow_add and self.add_rule is not None:
+            raise ValueError("allow_add 为 false 时 add_rule 必须为 null")
+        if self.allow_reduce and self.reduce_rule is None:
+            raise ValueError("allow_reduce 为 true 时必须提供 reduce_rule")
+        if not self.allow_reduce and self.reduce_rule is not None:
+            raise ValueError("allow_reduce 为 false 时 reduce_rule 必须为 null")
+        return self
+
+    @model_serializer(mode="plain")
+    def serialize_compat(self) -> dict[str, Any]:
+        """无加减档规则时保持首期序列化形状,旧规格的规范化哈希不变。"""
+        result: dict[str, Any] = {
+            "allow_add": self.allow_add,
+            "allow_reduce": self.allow_reduce,
+            "cooldown_days": self.cooldown_days,
+            "risk_reentry": self.risk_reentry,
+        }
+        if self.add_rule is not None or self.reduce_rule is not None:
+            result["add_rule"] = (
+                self.add_rule.model_dump(mode="json")
+                if self.add_rule is not None else None
+            )
+            result["reduce_rule"] = (
+                self.reduce_rule.model_dump(mode="json")
+                if self.reduce_rule is not None else None
+            )
+            result["step"] = self.step
+            result["max_position"] = self.max_position
+        return result
 
 
 class OverlayRuleSpec(StrictModel):
@@ -367,11 +415,49 @@ class ParameterScanSpec(StrictModel):
         return self
 
 
+# 结构化否决规则可用的指标。excess_annual_return_vs_best_baseline 依赖对照
+# 基线已成功计算,缺少基线时该条规则如实记为不可评估(见 backtest/validation.py)。
+REJECTION_RULE_METRICS = frozenset({
+    "total_return", "annual_return", "max_drawdown", "sharpe", "win_rate",
+    "trade_count", "round_trips", "excess_annual_return_vs_best_baseline",
+})
+
+
+class RejectionRuleSpec(StrictModel):
+    """结构化否决规则:回测指标命中比较式即否决。
+
+    op 刻意只取 SUPPORTED_OPERATORS 子集:能力扫描把规格里任何 ``op`` 键都按
+    表达式操作符校验,引入 "eq" 之类新词会被误报为 unknown_operator。
+    """
+
+    metric: str
+    op: Literal["lt", "lte", "gt", "gte"]
+    threshold: float
+    segment: Literal["full", "in_sample", "oos"] = "full"
+    description: str = Field(default="", max_length=200)
+
+    @model_validator(mode="after")
+    def validate_rule(self) -> RejectionRuleSpec:
+        if self.metric not in REJECTION_RULE_METRICS:
+            raise ValueError(
+                f"否决规则不支持指标 {self.metric},可选: "
+                f"{', '.join(sorted(REJECTION_RULE_METRICS))}"
+            )
+        if not math.isfinite(self.threshold):
+            raise ValueError("否决规则 threshold 必须是有限数字")
+        return self
+
+
 class ValidationSpec(StrictModel):
     baseline_ids: list[str] = Field(min_length=1, max_length=20)
     locked_oos: bool
     rejection_criteria: list[str] = Field(min_length=1, max_length=20)
     parameter_scans: list[ParameterScanSpec] = Field(max_length=20)
+    # 结构化否决规则;旧字符串条件保持原样,由 backtest/validation.py 的
+    # 兼容映射解释,两者并存时逐条评估。
+    rejection_rules: list[RejectionRuleSpec] = Field(
+        default_factory=list, max_length=20,
+    )
 
     @model_validator(mode="after")
     def limit_scan_combinations(self) -> ValidationSpec:
@@ -381,6 +467,23 @@ class ValidationSpec(StrictModel):
                 f"参数扫描组合数 {combinations} 超过 {MAX_PARAMETER_COMBINATIONS}"
             )
         return self
+
+    @model_serializer(mode="plain")
+    def serialize_compat(self) -> dict[str, Any]:
+        """无结构化否决规则时保持首期序列化形状,六个预设的规范化哈希不变。"""
+        result: dict[str, Any] = {
+            "baseline_ids": list(self.baseline_ids),
+            "locked_oos": self.locked_oos,
+            "parameter_scans": [
+                item.model_dump(mode="json") for item in self.parameter_scans
+            ],
+            "rejection_criteria": list(self.rejection_criteria),
+        }
+        if self.rejection_rules:
+            result["rejection_rules"] = [
+                item.model_dump(mode="json") for item in self.rejection_rules
+            ]
+        return result
 
 
 class StrategySpec(StrictModel):
@@ -407,8 +510,10 @@ class StrategySpec(StrictModel):
                 raise ValueError("single 策略必须包含原生离场")
         elif not isinstance(self.positioning, PortfolioPositioningSpec):
             raise ValueError("portfolio 策略必须使用 portfolio positioning")
-        if self.holding.allow_add or self.holding.allow_reduce:
-            raise ValueError("首期规格尚未定义单独的加仓/减仓触发规则")
+        if self.kind == "portfolio" and (
+            self.holding.allow_add or self.holding.allow_reduce
+        ):
+            raise ValueError("组合策略暂不支持加仓/减仓(allow_add/allow_reduce)")
 
         expressions = list(_iter_spec_expressions(self))
         node_count = sum(_expression_stats(expr)[0] for expr in expressions)
@@ -452,6 +557,10 @@ def _iter_spec_expressions(spec: StrategySpec):
     yield spec.entry.condition
     if spec.native_exit is not None:
         yield spec.native_exit.condition
+    if spec.holding.add_rule is not None:
+        yield spec.holding.add_rule.condition
+    if spec.holding.reduce_rule is not None:
+        yield spec.holding.reduce_rule.condition
     if isinstance(spec.positioning, PortfolioPositioningSpec):
         yield spec.positioning.score
         if spec.positioning.risk_filter is not None:
@@ -516,6 +625,7 @@ def resolve_capabilities(
             issues.append(item)
 
     _scan_raw_capabilities(value, "$", add)
+    _scan_holding_rules(value, add)
     _scan_overlay_requirements(value, add)
     try:
         spec = parse_strategy_spec(value)
@@ -650,12 +760,6 @@ def _scan_raw_capabilities(value: Any, path: str, add) -> None:
                     CapabilityStatus.BOUNDARY_DENIED, child_path,
                     "product_boundary", "当前产品只允许 T+1 开盘模拟成交",
                 )
-            if key in {"allow_add", "allow_reduce"} and child is True:
-                add(
-                    CapabilityStatus.MISSING_ENGINE, child_path,
-                    "holding_rule_missing",
-                    f"{key} 需要配套的加减权触发规则，首期引擎尚未提供",
-                )
             if key == "availability" and child == "subjective":
                 add(
                     CapabilityStatus.SUBJECTIVE_ONLY, child_path,
@@ -675,6 +779,32 @@ def _scan_raw_capabilities(value: Any, path: str, add) -> None:
                     "检测到任意代码、SQL、脚本、shell 或网络表达式",
                 )
                 break
+
+
+def _scan_holding_rules(value: Any, add) -> None:
+    """加仓/减仓规则的结构性能力检查:精确到 holding 下的具体字段。"""
+    if not isinstance(value, dict):
+        return
+    holding = value.get("holding")
+    if not isinstance(holding, dict):
+        return
+    for flag, rule_key in (("allow_add", "add_rule"), ("allow_reduce", "reduce_rule")):
+        if holding.get(flag) is True and holding.get(rule_key) is None:
+            add(
+                CapabilityStatus.MISSING_ENGINE,
+                f"$.holding.{rule_key}",
+                "holding_rule_missing",
+                f"{flag} 为 true 时必须提供 {rule_key}",
+            )
+    if value.get("kind") == "portfolio":
+        for flag in ("allow_add", "allow_reduce"):
+            if holding.get(flag) is True:
+                add(
+                    CapabilityStatus.MISSING_ENGINE,
+                    f"$.holding.{flag}",
+                    "holding_adjust_portfolio",
+                    "组合策略暂不支持加仓/减仓",
+                )
 
 
 def _scan_overlay_requirements(value: Any, add) -> None:
@@ -708,7 +838,8 @@ __all__ = [
     "CapabilityIssue", "CapabilityReport", "CapabilityStatus", "DataRequirementSpec",
     "ExecutionSpec", "Expression", "HoldingSpec", "MAX_AST_DEPTH", "MAX_AST_NODES",
     "MAX_PARAMETER_COMBINATIONS", "MAX_WINDOW", "MetadataSpec", "OverlaysSpec",
-    "PortfolioConstraintsSpec", "PortfolioPositioningSpec", "RuleSpec", "SCHEMA_VERSION",
+    "PortfolioConstraintsSpec", "PortfolioPositioningSpec", "REJECTION_RULE_METRICS",
+    "RejectionRuleSpec", "RuleSpec", "SCHEMA_VERSION",
     "SUPPORTED_FIELDS", "SUPPORTED_OPERATORS", "SinglePositioningSpec", "StrategySpec",
     "StrategyCapabilityError", "StrategyValidationResult", "UniverseSpec",
     "ValidationSpec", "canonical_spec_json",

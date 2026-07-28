@@ -37,7 +37,7 @@ import pandas as pd
 import vectorbt as vbt
 from sqlalchemy.orm import Session
 
-from ..data.ingest import load_bars_df
+from ..data.ingest import load_bars_df, required_snapshot_fields
 from ..data.universe import (INDEX_NAMES, membership_intervals,
                              pool_eligibility_matrix)
 from ..catalog import STRATEGY_TEMPLATES
@@ -68,6 +68,7 @@ from ..strategy.spec import (
     parse_strategy_spec,
     resolve_capabilities,
 )
+from .validation import evaluate_validation
 
 logger = logging.getLogger(__name__)
 
@@ -488,6 +489,15 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
 
     返回 {code: {"metrics": ..., "equity": Series}}
     """
+    # 含 (0,1) 中间档位(加仓/减仓规则)时改用目标仓位撮合,二值序列维持原路径
+    fractional = any(
+        not set(pd.Series(pos.to_numpy(float)).unique()).issubset({0.0, 1.0})
+        for pos in positions.values()
+    )
+    if fractional:
+        return _batch_single_fractional(
+            dfs, positions, costs, start, exit_reasons_by_code,
+        )
     idx = pd.DatetimeIndex(
         sorted({d for df in dfs.values() for d in df["date"] if d >= start})
     )
@@ -526,6 +536,95 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
         fees=_signal_fee_matrix(entries, exits, costs),
         slippage=costs["slippage"], freq="1D",
     )
+    eq_all = pf.value()
+    details = _trade_details(pf, dfs, reason_map, exit_events=exit_events)
+    out: dict[str, dict] = {}
+    for code in close.columns:
+        eq = eq_all[code].dropna()
+        if len(eq) < 3:
+            continue
+        code_details = [item for item in details if item["code"] == code]
+        out[code] = {
+            "equity": eq,
+            "metrics": _metrics_from_equity(eq, pf[code], trade_details=code_details),
+            "trade_details": code_details,
+            "exit_reason_distribution": _exit_reason_distribution(code_details),
+        }
+    return out
+
+
+def _batch_single_fractional(
+    dfs: dict[str, pd.DataFrame],
+    positions: dict[str, pd.Series],
+    costs: dict,
+    start: date,
+    exit_reasons_by_code: dict[
+        str, dict[pd.Timestamp, list[dict]]
+    ] | None = None,
+) -> dict[str, dict]:
+    """含中间档位的单标的回测:目标仓位矩阵 -> T+1 开盘 targetpercent 调仓。
+
+    与二值路径同一撮合口径(T 日信号 T+1 开盘、开盘涨停/停牌买入丢弃不顺延、
+    卖出不可成交逐日重试、佣金/印花税/滑点相同),只是目标仓位可以取 (0,1]
+    的任意档位:加仓产生买入单、减仓产生对应比例的卖出单。每列独立核算
+    (init_cash=1.0,不共享现金),与二值路径的资金口径一致。
+    """
+    idx = pd.DatetimeIndex(
+        sorted({d for df in dfs.values() for d in df["date"] if d >= start})
+    )
+    close = _to_price_matrix(dfs, "close", idx)
+    open_ = _to_price_matrix(dfs, "open", idx)
+    w_full = pd.DataFrame({
+        code: pd.Series(
+            pos.to_numpy(float), index=pd.DatetimeIndex(dfs[code]["date"]),
+        )
+        for code, pos in positions.items()
+        if code in close.columns
+    }).reindex(columns=close.columns)
+    # T 日目标 -> T+1 开盘成交;只在目标变化的行下单(其余行 NaN 则当日不下单)
+    w_exec = w_full.shift(1).reindex(idx)
+    filled = w_exec.fillna(0.0)
+    changed = filled.ne(filled.shift())
+    if len(changed):
+        changed.iloc[0] = False
+    planned = w_exec.where(changed)
+    synthetic_entries = pd.DataFrame(False, index=idx, columns=w_exec.columns)
+    if len(idx):
+        # 首日强制一行:起点前已持有的档位以首日开盘价合成建仓(同二值路径口径,
+        # 判定看 start 之前那根 bar,避免窗口首日收盘价信号的前视偏差)。
+        planned.loc[idx[0]] = w_exec.loc[idx[0]]
+        if (w_full.index < idx[0]).any():
+            synthetic_entries.loc[idx[0]] = (
+                w_exec.loc[idx[0]].fillna(0.0).gt(0)
+            )
+
+    reason_map = {
+        (pd.Timestamp(day), code): reasons
+        for code, by_day in (exit_reasons_by_code or {}).items()
+        for day, reasons in by_day.items()
+    }
+    actual, exit_events = _portfolio_execution_schedule(
+        w_full, dfs, idx, w_exec, planned, reason_map, synthetic_entries,
+    )
+
+    commission_fees = np.full(close.shape, costs["commission"], dtype=float)
+    probe = vbt.Portfolio.from_orders(
+        close, size=actual, size_type="targetpercent", price=open_,
+        init_cash=1.0, fees=commission_fees,
+        slippage=costs["slippage"], freq="1D",
+    )
+    fees = commission_fees.copy()
+    pf = probe
+    if costs["stamp_tax"]:
+        for order in probe.orders.records_readable.to_dict("records"):
+            if order["Side"] == "Sell":
+                row = close.index.get_loc(order["Timestamp"])
+                col = close.columns.get_loc(order["Column"])
+                fees[row, col] += costs["stamp_tax"]
+        pf = vbt.Portfolio.from_orders(
+            close, size=actual, size_type="targetpercent", price=open_,
+            init_cash=1.0, fees=fees, slippage=costs["slippage"], freq="1D",
+        )
     eq_all = pf.value()
     details = _trade_details(pf, dfs, reason_map, exit_events=exit_events)
     out: dict[str, dict] = {}
@@ -592,12 +691,15 @@ def run_backtest(db: Session, strategy, codes: list[str],
         )
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
+    # 按规格的 data_requirements 供给估值/财务快照字段(PIT join,不用未来数据)
+    extra_fields = required_snapshot_fields(snapshot.spec)
     dfs: dict[str, pd.DataFrame] = {}
     positions: dict[str, pd.Series] = {}
     exit_reasons: dict[str, dict[pd.Timestamp, list[dict]]] = {}
     for code in codes:
         # 多加载 start 之前的历史做指标预热;信号在完整序列上计算,引擎内切窗口
-        df = load_bars_df(db, code, start=warmup_start, end=end)
+        df = load_bars_df(db, code, start=warmup_start, end=end,
+                          extra_fields=extra_fields)
         if len(df) == 0 or int((df["date"] >= start).sum()) < MIN_BARS:
             logger.warning("回测 %s 区间内数据不足,跳过", code)
             continue
@@ -620,8 +722,11 @@ def run_backtest(db: Session, strategy, codes: list[str],
         exit_reasons[code] = {
             day: _normalize_compiler_reasons(items)
             for day, items in compiled.reasons.items()
-            if any(item.get("code") in {"native_exit", "risk_overlay", "take_profit"}
-                   for item in items)
+            if any(
+                item.get("code") in {"native_exit", "risk_overlay", "take_profit"}
+                or item.get("type") in {"add", "reduce"}
+                for item in items
+            )
         }
     if not dfs:
         raise ValueError("所有标的都数据不足,无法回测")
@@ -673,6 +778,13 @@ def run_backtest(db: Session, strategy, codes: list[str],
     # BacktestRun 现有 schema 将 metrics 持久化；把证据嵌入其中，历史查询不会
     # 因策略参数或默认费率变化而丢失复现依据。
     metrics["evidence"] = evidence
+    # 规格 validation 段的执行结果(基线对比 / OOS 分段 / 否决判定)同样嵌入
+    # metrics JSON 列持久化,不新建表。
+    validation_report = evaluate_validation(
+        snapshot.spec, frames=dfs, start=start, end=end,
+        equity=combo, metrics=metrics,
+    )
+    metrics["validation"] = validation_report
 
     result: dict = {
         "strategy_id": strategy.id,
@@ -695,6 +807,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
         "fee_assumptions": fee_assumptions,
         "metrics": metrics,
         "evidence": evidence,
+        "validation": validation_report,
         "trade_details": trade_details,
         "exit_reason_distribution": reason_distribution,
         "equity": [
@@ -724,6 +837,10 @@ def _normalize_compiler_reasons(items: list[dict]) -> list[dict]:
             normalized.append({**item, "code": code, "name": "止盈覆盖层"})
         elif code == "rebalance":
             normalized.append({**item, "code": code, "name": "组合调仓或资格变化"})
+        elif item.get("type") == "add":
+            normalized.append({**item, "code": "add", "name": "加仓规则触发"})
+        elif item.get("type") == "reduce":
+            normalized.append({**item, "code": "reduce", "name": "减仓规则触发"})
         elif item.get("type") in {"exit", "reduce"}:
             normalized.append({**item, "code": "rebalance", "name": "组合调仓或资格变化"})
     return normalized or [exit_reason("native")]
@@ -1028,9 +1145,11 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
                    user_id: str | None, pool_id: int | None = None) -> dict:
     """组合规格编译为目标权重，再交给既有 T+1 组合撮合。"""
     warmup_start = start - timedelta(days=PORTFOLIO_WARMUP_DAYS)
+    extra_fields = required_snapshot_fields(snapshot.spec)
     pool_dfs: dict[str, pd.DataFrame] = {}
     for code in codes:
-        df = load_bars_df(db, code, start=warmup_start, end=end)
+        df = load_bars_df(db, code, start=warmup_start, end=end,
+                          extra_fields=extra_fields)
         if len(df) < MIN_BARS:
             continue
         pool_dfs[code] = df
@@ -1122,6 +1241,12 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         "end": str(end),
     }
     sim["metrics"]["evidence"] = evidence
+    # 与单标的路径同口径:规格 validation 段执行结果嵌入 metrics JSON 列
+    validation_report = evaluate_validation(
+        snapshot.spec, frames=pool_dfs, start=start, end=end,
+        equity=eq, metrics=sim["metrics"],
+    )
+    sim["metrics"]["validation"] = validation_report
 
     result: dict = {
         "strategy_id": strategy.id,
@@ -1143,6 +1268,7 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         "fee_assumptions": fee_assumptions,
         "metrics": sim["metrics"],
         "evidence": evidence,
+        "validation": validation_report,
         "trade_details": sim["trade_details"],
         "exit_reason_distribution": sim["exit_reason_distribution"],
         "equity": [
@@ -1265,9 +1391,16 @@ def run_sweep(db: Session, strategy, codes: list[str],
             raise ValueError("规格参数扫描路径必须以 $. 开头")
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
+    # 扫描可能改动比较侧引用的字段,取所有候选规格的快照字段并集一次加载
+    extra_fields = sorted({
+        field
+        for candidate in [base_spec, *(spec for _, spec in combos)]
+        for field in required_snapshot_fields(candidate)
+    })
     full_dfs: dict[str, pd.DataFrame] = {}  # 含预热段,信号在完整序列上计算
     for code in codes:
-        df = load_bars_df(db, code, start=warmup_start, end=end)
+        df = load_bars_df(db, code, start=warmup_start, end=end,
+                          extra_fields=extra_fields)
         if len(df) and int((df["date"] >= start).sum()) >= MIN_BARS:
             full_dfs[code] = df
     if not full_dfs:
@@ -1291,9 +1424,13 @@ def run_sweep(db: Session, strategy, codes: list[str],
             exit_reasons[code] = {
                 day: _normalize_compiler_reasons(items)
                 for day, items in compiled.reasons.items()
-                if any(item.get("code") in {
-                    "native_exit", "risk_overlay", "take_profit",
-                } for item in items)
+                if any(
+                    item.get("code") in {
+                        "native_exit", "risk_overlay", "take_profit",
+                    }
+                    or item.get("type") in {"add", "reduce"}
+                    for item in items
+                )
             }
         results = _batch_single(
             full_dfs, positions, costs, start,

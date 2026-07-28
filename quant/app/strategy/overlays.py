@@ -19,7 +19,8 @@ EXIT_REASON_PRIORITY = {
     "risk_overlay": 0,
     "take_profit": 1,
     "native": 2,
-    "rebalance": 3,
+    "reduce": 3,
+    "rebalance": 4,
 }
 
 DEFAULT_OVERLAYS: dict[str, dict[str, Any]] = {
@@ -96,6 +97,7 @@ def reason(code: str, *, price_line: float | None = None) -> dict[str, Any]:
         "risk_overlay": "风险覆盖层",
         "take_profit": "止盈覆盖层",
         "native": "策略原生退出",
+        "reduce": "减仓规则触发",
         "rebalance": "组合调仓或资格变化",
     }
     item: dict[str, Any] = {"code": code, "name": labels[code]}
@@ -197,6 +199,9 @@ def apply_single_overlays(
     成交日收盘开始检查。覆盖退出后，必须观察到原生入场条件失效（原生仓位为
     0），之后再次形成 0->1 上升沿才可重新进入。
 
+    原生仓位可以是 (0,1] 的中间档位(加仓/减仓规则):档位变化在信号日直接跟随
+    原生序列,覆盖层风险线始终锚定最初的模拟入场价,不随加仓移动。
+
     返回覆盖后的每日目标仓位，以及以信号日为键的全部退出原因。
     """
     if len(df) != len(native_positions):
@@ -204,9 +209,10 @@ def apply_single_overlays(
     risk = validate_overlay("risk_overlay", params.get("risk_overlay"))
     take = validate_overlay("take_profit", params.get("take_profit"))
     native = pd.Series(
-        native_positions.to_numpy(dtype=int), index=pd.DatetimeIndex(df["date"]), dtype=int,
+        native_positions.to_numpy(dtype=float),
+        index=pd.DatetimeIndex(df["date"]), dtype=float,
     )
-    result = pd.Series(0, index=native.index, dtype=int)
+    result = pd.Series(0.0, index=native.index, dtype=float)
     tradable = (
         entry_tradable.reindex(native.index, fill_value=False).astype(bool)
         if entry_tradable is not None
@@ -231,16 +237,18 @@ def apply_single_overlays(
     }
 
     holding = False
+    level = 0.0  # 当前目标档位(跟随原生序列的中间档位)
     entry_price: float | None = None
     entry_atr_by_period: dict[int, float | None] = {}
     pending_entry = False
+    pending_level = 0.0
     blocked_until_reset = False
     exit_reasons: dict[pd.Timestamp, list[dict[str, Any]]] = {}
     latest_state: dict[str, Any] = {}
 
     for i, day in enumerate(native.index):
-        native_now = bool(native.iat[i])
-        native_prev = bool(native.iat[i - 1]) if i else False
+        native_now = float(native.iat[i])
+        native_prev = float(native.iat[i - 1]) if i else 0.0
         entry_blocked_today = False
 
         # 上一收盘日形成的进入信号，在今日开盘模拟成交。
@@ -259,6 +267,7 @@ def apply_single_overlays(
             if (tradable.iat[i] and math.isfinite(open_price)
                     and open_price > 0 and within_range):
                 holding = True
+                level = pending_level
                 entry_price = open_price * (1 + slippage)
                 entry_atr_by_period = {}
                 for period, values in atr_values.items():
@@ -268,11 +277,11 @@ def apply_single_overlays(
                     )
             else:
                 # 入场信号不顺延；原生条件必须先失效后再形成新上升沿。
-                blocked_until_reset = native_now
+                blocked_until_reset = native_now > 0
                 entry_blocked_today = True
             pending_entry = False
 
-        if blocked_until_reset and not native_now:
+        if blocked_until_reset and native_now <= 0:
             blocked_until_reset = False
 
         reasons: list[dict[str, Any]] = []
@@ -321,28 +330,34 @@ def apply_single_overlays(
                 reasons.append(reason("risk_overlay", price_line=risk_line))
             if take_line is not None and close >= take_line:
                 reasons.append(reason("take_profit", price_line=take_line))
-            if not native_now:
+            if native_now <= 0:
                 reasons.append(reason("native"))
             if reasons:
                 ordered = sort_exit_reasons(reasons)
                 exit_reasons[day] = ordered
                 holding = False
+                level = 0.0
                 entry_price = None
                 # 覆盖层退出要求重新武装；纯原生退出按模板自己的新上升沿即可。
                 if any(item["code"] in {"risk_overlay", "take_profit"}
                        for item in ordered):
-                    blocked_until_reset = native_now
-        elif holding and not native_now:
+                    blocked_until_reset = native_now > 0
+            elif abs(native_now - level) > 1e-9:
+                # 加减仓信号:目标档位跟随原生序列,覆盖层风险线不随加仓移动。
+                level = native_now
+        elif holding and native_now <= 0:
             exit_reasons[day] = [reason("native")]
             holding = False
+            level = 0.0
 
-        # 仅接受原生上升沿。退出信号当天不能同时预约再次进入。
+        # 仅接受原生上升沿(0 -> 正档位)。退出信号当天不能同时预约再次进入。
         if (not holding and not reasons and not blocked_until_reset
-                and native_now and not native_prev):
+                and native_now > 0 and native_prev <= 0):
             pending_entry = True
+            pending_level = native_now
 
         # 目标仓位在信号日即变化，回测执行层统一 shift 到下一开盘。
-        result.iat[i] = int(holding or pending_entry)
+        result.iat[i] = level if holding else (pending_level if pending_entry else 0.0)
         latest_state = day_state
 
     if state_out is not None:

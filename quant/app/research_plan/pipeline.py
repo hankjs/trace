@@ -8,16 +8,26 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..data.calendar import is_trading_day
-from ..data.ingest import load_bars_df
+from ..data.ingest import load_bars_df, required_snapshot_fields
 from ..data.universe import (INDEX_NAMES, pool_eligibility_matrix,
                              resolve_pool, resolve_pool_during)
 from ..models import Pool, Strategy
+from ..strategy.runtime import strategy_spec_for
 from ..strategy.store import enabled_strategies
 from .service import create_portfolio_plan
 
 logger = logging.getLogger(__name__)
 
 PORTFOLIO_LOOKBACK_DAYS = 400
+
+
+def _strategy_snapshot_fields(strategy: Strategy) -> list[str]:
+    """策略规格声明的快照字段；规格无法解析时按空集,由计划生成路径报错。"""
+    try:
+        return required_snapshot_fields(strategy_spec_for(strategy))
+    except Exception:  # noqa: BLE001 - 与 create_portfolio_plan 的容错一致
+        logger.warning("策略「%s」的 StrategySpec 无法解析", strategy.name)
+        return []
 
 
 def _default_pool(db: Session) -> Pool | None:
@@ -69,8 +79,15 @@ def run_portfolio_plans(
     if not codes:
         raise ValueError(f"股票池「{pool.name}」在 {day} 没有可用成分")
     pool_dfs = {}
+    # 组合策略同样按规格的 data_requirements 供给估值/财务快照字段
+    extra_fields = sorted({
+        field
+        for strategy in targets
+        for field in _strategy_snapshot_fields(strategy)
+    })
     for code in codes:
-        frame = load_bars_df(db, code, start=start, end=day)
+        frame = load_bars_df(db, code, start=start, end=day,
+                             extra_fields=extra_fields)
         if not frame.empty:
             pool_dfs[code] = frame
     if not pool_dfs:

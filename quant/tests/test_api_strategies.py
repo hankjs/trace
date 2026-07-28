@@ -431,7 +431,7 @@ def test_dynamic_volume_breakout_edit_keeps_prior_backtest_immutable(monkeypatch
     })
     monkeypatch.setattr(
         "app.backtest.engine.load_bars_df",
-        lambda db, code, start=None, end=None: frame,
+        lambda db, code, start=None, end=None, **kwargs: frame,
     )
 
     with _session() as db:

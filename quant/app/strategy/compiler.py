@@ -173,6 +173,21 @@ def _compile_single_native(
     native_exit = _as_bool_series(
         evaluate_expression(parsed.native_exit.condition, fields), df.index,
     )
+    # 加减仓触发序列(仅当规格声明了对应规则;allow 与 rule 的一致性由规格校验保证)
+    add_trigger = (
+        _as_bool_series(
+            evaluate_expression(parsed.holding.add_rule.condition, fields), df.index,
+        )
+        if parsed.holding.add_rule is not None else None
+    )
+    reduce_trigger = (
+        _as_bool_series(
+            evaluate_expression(parsed.holding.reduce_rule.condition, fields), df.index,
+        )
+        if parsed.holding.reduce_rule is not None else None
+    )
+    step = float(parsed.holding.step)
+    max_position = min(float(parsed.holding.max_position), 1.0)
     dates = pd.DatetimeIndex(df["date"])
     close = fields["close"]
     target = float(parsed.positioning.target)  # validated as SinglePositioningSpec
@@ -194,6 +209,7 @@ def _compile_single_native(
     state = "flat"
     blocked_until_reset = False
     reset_bars = 0
+    level = 0.0  # 当前目标档位;entry 建仓 target,持仓期间按 step 上下调整
     entry_price: float | None = None
     entry_atr: dict[int, float | None] = {}
     risk_line: float | None = None
@@ -270,6 +286,22 @@ def _compile_single_native(
                     "reason_code": parsed.native_exit.reason_code,
                     "tree": build_reason_tree(parsed.native_exit.condition, fields, i),
                 })
+            # 同一日多条件冲突的优先级:exit/overlay > reduce > add。
+            # 减仓减到 0 等同清仓,按原生离场的既有语义等待下一次入场事件。
+            if (
+                not exit_items
+                and reduce_trigger is not None and bool(reduce_trigger.iat[i])
+                and level - step <= 1e-9
+            ):
+                assert parsed.holding.reduce_rule is not None
+                exit_items.append({
+                    "code": "native_exit",
+                    "reason_code": parsed.holding.reduce_rule.reason_code,
+                    "tree": build_reason_tree(
+                        parsed.holding.reduce_rule.condition, fields, i,
+                    ),
+                    "via": "reduce_to_zero",
+                })
             if exit_items:
                 # 同一日同时命中内生 ATR 线和原生条件时，legacy 模板只产生一次
                 # native 退出；保留首个原因及其参考线，避免重复计数。
@@ -291,13 +323,45 @@ def _compile_single_native(
                 transition(i, "exit_pending", 0.0, {
                     "type": "exit", "all_reasons": exit_items,
                 })
+                level = 0.0
                 entry_price = None
                 entry_atr = {}
                 risk_line = None
                 take_line = None
                 continue
-            positions.iat[i] = target
-            transition(i, "holding", target, {"type": "target_unchanged"})
+            # 无 exit:按 reduce > add 的顺序调整档位;已在档位边界时不产生事件。
+            adjust_item: dict[str, Any] | None = None
+            if reduce_trigger is not None and bool(reduce_trigger.iat[i]):
+                assert parsed.holding.reduce_rule is not None
+                new_level = round(level - step, 12)
+                adjust_item = {
+                    "type": "reduce",
+                    "reason_code": parsed.holding.reduce_rule.reason_code,
+                    "tree": build_reason_tree(
+                        parsed.holding.reduce_rule.condition, fields, i,
+                    ),
+                    "prev_target": level,
+                    "cur_target": new_level,
+                }
+                level = new_level
+            elif add_trigger is not None and bool(add_trigger.iat[i]):
+                assert parsed.holding.add_rule is not None
+                new_level = min(round(level + step, 12), max_position)
+                if new_level > level + 1e-9:
+                    adjust_item = {
+                        "type": "add",
+                        "reason_code": parsed.holding.add_rule.reason_code,
+                        "tree": build_reason_tree(
+                            parsed.holding.add_rule.condition, fields, i,
+                        ),
+                        "prev_target": level,
+                        "cur_target": new_level,
+                    }
+                    level = new_level
+            positions.iat[i] = level
+            if adjust_item is not None:
+                reasons[day] = [adjust_item]
+            transition(i, "holding", level, {"type": "target_unchanged"})
             continue
 
         if blocked_until_reset:
@@ -317,6 +381,7 @@ def _compile_single_native(
         if entry_now:
             holding = True
             positions.iat[i] = target
+            level = target
             entry_price = _finite_or_none(close.iat[i])
             entry_atr = {
                 period: _finite_or_none(value.iat[i])
@@ -551,6 +616,10 @@ def component_versions_for_spec(
     expressions = [parsed.entry.condition]
     if parsed.native_exit is not None:
         expressions.append(parsed.native_exit.condition)
+    if parsed.holding.add_rule is not None:
+        expressions.append(parsed.holding.add_rule.condition)
+    if parsed.holding.reduce_rule is not None:
+        expressions.append(parsed.holding.reduce_rule.condition)
     if isinstance(parsed.positioning, PortfolioPositioningSpec):
         expressions.append(parsed.positioning.score)
         if parsed.positioning.risk_filter is not None:

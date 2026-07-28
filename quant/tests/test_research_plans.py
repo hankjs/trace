@@ -23,6 +23,7 @@ from app.research_plan.domain import (PRODUCT_BOUNDARY,
                                       build_portfolio_snapshot,
                                       build_single_snapshot,
                                       evaluate_single_entry_condition,
+                                      evaluate_single_spec_condition,
                                       parameter_snapshot, strategy_version)
 from app.research_plan.service import (create_portfolio_plan,
                                        create_single_plan, effective_status,
@@ -1162,7 +1163,7 @@ def test_portfolio_pipeline_generates_enabled_strategy_plan(monkeypatch):
                             lambda *args, **kwargs: ["a", "b"])
         monkeypatch.setattr(
             plan_pipeline, "load_bars_df",
-            lambda db_, code, start=None, end=None: frames[code],
+            lambda db_, code, start=None, end=None, **kwargs: frames[code],
         )
 
         result = plan_pipeline.run_portfolio_plans(
@@ -1172,3 +1173,58 @@ def test_portfolio_pipeline_generates_enabled_strategy_plan(monkeypatch):
         plan = db.get(ResearchPlan, result["plans"][0]["plan_id"])
         assert plan is not None
         assert plan.plan_type == "portfolio_rebalance"
+
+
+def test_watch_plan_reevaluation_stays_satisfied_while_condition_is_near():
+    """规格化 watch 重评:入场条件未成立但仍在临近容差内时,计划保持有效。"""
+    spec = get_preset_spec("breakout").model_dump(mode="json")
+    # 收盘 10.0,20 日前高 10.1:未突破,但归一化间距约 0.99% 在容差内
+    frame = _frame([10.0] * 30)
+
+    result = evaluate_single_spec_condition(spec, frame, "watch")
+
+    assert result["satisfied"] is True
+    assert result["watch"]["near"] is True
+
+
+def test_watch_plan_reevaluation_fails_when_condition_moves_away():
+    """规格化 watch 重评:间距超出容差时不再「永远有效」,如实判失效。"""
+    spec = get_preset_spec("breakout").model_dump(mode="json")
+    # 收盘跌到 8.0,前高仍为 10.1:间距约 20.8%,超出容差
+    frame = _frame([10.0] * 29 + [8.0])
+
+    result = evaluate_single_spec_condition(spec, frame, "watch")
+
+    assert result["satisfied"] is False
+    assert result["watch"]["near"] is False
+    assert "超出临近观察容差" in result["text"]
+
+
+def test_new_confirmed_close_invalidates_watch_plan_that_moved_away():
+    """全链路:watch 计划在新确认收盘后不再临近 -> effective_status 判 invalid。"""
+    with _session() as db:
+        strategy = _strategy("breakout")
+        initial = _frame([10.0] * 30)  # 贴近前高,处于临近观察状态
+        later = _frame([8.0], end="2026-07-27")  # 新确认收盘大幅走低
+        db.add_all([
+            strategy,
+            TradeCalendar(date=date(2026, 7, 24), is_open=True),
+            TradeCalendar(date=date(2026, 7, 27), is_open=True),
+            *_daily_bar_rows("sh.600000", initial),
+            *_daily_bar_rows("sh.600000", later),
+        ])
+        signal = Signal(
+            code="sh.600000", date=date(2026, 7, 24), strategy_id=1,
+            side="watch", price=10.0,
+            reason={"type": "watch_proximity", "prev_position": 0,
+                    "cur_position": 0},
+        )
+        db.add(signal)
+        db.flush()
+        plan = create_single_plan(db, strategy, signal, initial)
+        assert plan.signal_type == "watch"
+
+        status, reason = effective_status(plan, date(2026, 7, 27), db=db)
+
+        assert status == "invalid"
+        assert reason["code"] == "native_entry_condition_lost"

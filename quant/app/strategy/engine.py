@@ -2,7 +2,8 @@
 
 信号定义:目标仓位相对前一交易日发生跳变时产生
   0 -> 1: buy;1 -> 0: sell;不变: 无信号。
-watch 信号:仓位未跳变但临近触发条件时(由策略的 watch() 判断)产出 side=watch。
+watch 信号:仓位未跳变且空仓时,若入场条件尚未触发但距触发的归一化间距在
+容差内(通用判定见 strategy/watch.py),产出 side=watch。
 组合策略(kind=portfolio)不按个股出信号,不在此跑。
 
 跑的是 `quant_strategy` 里**所有启用的**单标的策略(公共 + 用户自建),每行按
@@ -24,7 +25,7 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from ..data.calendar import is_trading_day
-from ..data.ingest import load_bars_df
+from ..data.ingest import load_bars_df, required_snapshot_fields
 from ..backtest.engine import opening_buy_tradable_mask
 from ..models import Signal, Strategy, WatchlistItem
 from ..research_plan.service import create_holding_plan, create_single_plan
@@ -33,6 +34,7 @@ from .compiler import compile_single
 from .overlays import DEFAULT_SIMULATION_SLIPPAGE
 from .runtime import strategy_spec_for
 from .spec import CapabilityStatus, resolve_capabilities, strategy_spec_hash
+from .watch import assess_entry_watch
 
 logger = logging.getLogger(__name__)
 
@@ -127,10 +129,18 @@ def run_signals(db: Session, day: date | None = None,
         for strategy_id, spec in specs.items()
     }
     produced: dict[tuple[int, str], set[str]] = {}  # (strategy_id, code) -> 当日 side 集
+    # 所有目标策略声明的估值/财务字段并集:一次查询喂给全部策略,缺的字段
+    # 仍由编译器的「缺少字段」报错路径如实报(夜间逐策略跳过并记日志)。
+    extra_fields = sorted({
+        field
+        for strategy in targets
+        for field in required_snapshot_fields(specs[strategy.id])
+    })
 
     for code in codes:
         # 每只股票只查一次库,再喂给全部策略(见模块文档字符串)
-        df = load_bars_df(db, code, start=start, end=day)
+        df = load_bars_df(db, code, start=start, end=day,
+                          extra_fields=extra_fields)
         if len(df) < MIN_BARS:
             continue
         if df["date"].iat[-1] != day:
@@ -155,10 +165,10 @@ def run_signals(db: Session, day: date | None = None,
             if pos.empty:
                 continue
             produced.setdefault((strategy.id, code), set())  # 已重算,允许清理旧 side
-            cur, prev = int(pos.iat[-1]), int(pos.iat[-2])
-            if cur != prev:
+            cur, prev = float(pos.iat[-1]), float(pos.iat[-2])
+            if abs(cur - prev) > 1e-9:
                 blocked_entry = (
-                    cur < prev
+                    cur < prev - 1e-9
                     and compiled.state.get("entry_blocked") is True
                     and not any(
                         item.get("code") in {
@@ -171,7 +181,15 @@ def run_signals(db: Session, day: date | None = None,
                     logger.info("模拟入场未成交 %s %s，等待原生条件重置",
                                 strategy.name, code)
                     continue
-                side = "buy" if cur == 1 else "sell"
+                # 0 -> 正档位: buy;正档位 -> 0: sell;档位上调/下调: add/reduce
+                if prev <= 1e-9 < cur:
+                    side = "buy"
+                elif cur <= 1e-9 < prev:
+                    side = "sell"
+                elif cur > prev:
+                    side = "add"
+                else:
+                    side = "reduce"
                 reason_items = compiled.reasons.get(pd.Timestamp(day), [])
                 reason = {
                     "spec_hash": spec_hashes[strategy.id],
@@ -182,7 +200,7 @@ def run_signals(db: Session, day: date | None = None,
                     "params": strategy.params or {},
                     "reason_tree": reason_items,
                 }
-                if side == "sell" and reason_items:
+                if side in {"sell", "reduce"} and reason_items:
                     reason["primary_exit_reason"] = reason_items[0]
                     reason["all_exit_reasons"] = reason_items
                 _save_signal_and_plan(
@@ -193,7 +211,8 @@ def run_signals(db: Session, day: date | None = None,
                 summary[strategy.id][code] = side
                 logger.info("信号 %s %s %s @ %.2f",
                             strategy.name, code, side, price)
-            elif cur == prev == 1:
+            elif cur > 1e-9:
+                # 档位未变且仍持有:刷新每日风险/退出快照,不制造新信号
                 create_holding_plan(
                     db, strategy, code=code, data_date=day,
                     df=df,
@@ -202,6 +221,38 @@ def run_signals(db: Session, day: date | None = None,
                     ),
                     overlay_state_rules=compiled.state.get("rules") or [],
                 )
+            else:
+                # 空仓且仓位无跳变:入场条件未触发但归一化间距在容差内时,
+                # 产出 watch 信号供继续观察(语义见 strategy/watch.py)。
+                try:
+                    assessment = assess_entry_watch(
+                        specs[strategy.id].entry.condition, df,
+                    )
+                except Exception:  # noqa: BLE001 - 单个策略出错不影响其他策略和股票
+                    logger.exception(
+                        "策略 %s watch 判定失败 %s", strategy.name, code,
+                    )
+                    continue
+                if not assessment["near"]:
+                    continue
+                reason = {
+                    "spec_hash": spec_hashes[strategy.id],
+                    "type": "watch_proximity",
+                    "prev_position": prev,
+                    "cur_position": cur,
+                    "close": price,
+                    # 只用于迁移期的人类可读措辞；判定依据是上方冻结的 spec。
+                    "params": strategy.params or {},
+                    "watch": assessment,
+                }
+                _save_signal_and_plan(
+                    db, code, day, strategy, "watch", price, reason, df,
+                    spec_hashes[strategy.id],
+                )
+                produced[(strategy.id, code)].add("watch")
+                summary[strategy.id][code] = "watch"
+                logger.info("watch %s %s @ %.2f %s",
+                            strategy.name, code, price, assessment["summary"])
 
     # 清理重算后已失效的 side:唯一键含 side,数据修正后 buy -> watch/sell/
     # 无信号时旧记录不会被 on_duplicate_key_update 覆盖,需要显式删除

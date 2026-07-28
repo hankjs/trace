@@ -129,9 +129,9 @@ def test_loads_each_stock_bars_only_once():
 
         original = signal_engine.load_bars_df
 
-        def counting(db_, code, start=None, end=None):
+        def counting(db_, code, start=None, end=None, **kwargs):
             calls.append(code)
-            return original(db_, code, start=start, end=end)
+            return original(db_, code, start=start, end=end, **kwargs)
 
         signal_engine.load_bars_df = counting
         try:
@@ -297,3 +297,199 @@ def test_blocked_t_plus_one_entry_does_not_create_fake_sell_signal():
         assert second["total"] == 0
         assert [signal.side for signal in signals] == ["buy"]
         assert [plan.signal_type for plan in plans] == ["buy"]
+
+
+def _seed_flat_bars(db: Session, close: float, days: int = 120) -> date:
+    """长期平盘:收盘贴近但尚未突破 20 日前高(高点 = 收盘 + 0.1)。"""
+    db.add(Stock(code=CODE, name="浦发银行", industry="银行"))
+    day = date(2026, 7, 24) - timedelta(days=200)
+    last = day
+    for _ in range(days):
+        while day.weekday() >= 5:  # 跳过周末,贴近真实交易日序列
+            day += timedelta(days=1)
+        db.add(DailyBar(code=CODE, date=day, open=close, high=close + 0.1,
+                        low=close - 0.1, close=close, volume=1e6, amount=1e7))
+        last = day
+        day += timedelta(days=1)
+    db.commit()
+    return last
+
+
+def _breakout_strategy(strategy_id: int = 1) -> Strategy:
+    return Strategy(id=strategy_id, owner_id=USER_A, is_system=False,
+                    name="我的突破", template="breakout", kind="single",
+                    params={}, enabled=True)
+
+
+def test_flat_near_entry_line_produces_watch_signal():
+    """空仓、仓位无跳变、入场条件未触发但距前高在容差内 -> watch。"""
+    with _session() as db:
+        last = _seed_flat_bars(db, close=10.0)
+        db.add(_breakout_strategy())
+        db.commit()
+
+        result = signal_engine.run_signals(db, day=last, codes=[CODE])
+        rows = db.execute(select(Signal)).scalars().all()
+        plans = db.execute(select(ResearchPlan)).scalars().all()
+        listed = list_signals(date_=None, code=None, strategy_id=None,
+                              side=None, limit=200, db=db, claims=CLAIMS_A)
+
+    assert result["signals"]["我的突破#1"] == {CODE: "watch"}
+    assert [row.side for row in rows] == ["watch"]
+    reason = rows[0].reason
+    # 归一化间距 (10.1 - 10.0) / 10.1 ≈ 0.99%,在 2% 容差内
+    assert reason["watch"]["near"] is True
+    assert reason["watch"]["gap"] == pytest.approx(0.0099, abs=1e-3)
+    assert "临近触发" in reason["watch"]["summary"]
+    # watch 信号同样落一版研究计划,reason_text 用可读临近说明
+    assert [plan.signal_type for plan in plans] == ["watch"]
+    assert "临近触发" in listed["items"][0]["reason_text"]
+
+
+def _adjust_spec_dict() -> dict:
+    """close>10 入场 0.4 档,close>12 加 0.2 档(上限 1.0),close<9.5 减档,close<8 离场。"""
+    field = lambda name: {"op": "field", "name": name}  # noqa: E731
+    rule = lambda condition, code: {"condition": condition, "reason_code": code}  # noqa: E731
+    gt = lambda name, value: {"op": "gt", "left": field(name),  # noqa: E731
+                              "right": {"op": "literal", "value": value}}
+    lt = lambda name, value: {"op": "lt", "left": field(name),  # noqa: E731
+                              "right": {"op": "literal", "value": value}}
+    return {
+        "schema_version": 1,
+        "kind": "single",
+        "metadata": {
+            "canonical_id": "USER-ADJUST-01",
+            "sources": [{"book": "测试", "candidate_id": "ADJUST-01"}],
+            "evidence_status": "unverified",
+            "hypothesis": "趋势走强加档、走弱减档。",
+        },
+        "universe": {"pool_id": 2, "exclude_st": True,
+                     "min_listing_days": 60, "min_amount_avg20": 0.0},
+        "data_requirements": [
+            {"field": "close", "availability": "daily_close", "required": True},
+        ],
+        "entry": rule(gt("close", 10.0), "entry_rule"),
+        "positioning": {"type": "fixed", "target": 0.4},
+        "holding": {
+            "allow_add": True,
+            "allow_reduce": True,
+            "add_rule": rule(gt("close", 12.0), "add_on_strength"),
+            "reduce_rule": rule(lt("close", 9.5), "reduce_on_weakness"),
+            "step": 0.2,
+            "max_position": 1.0,
+            "cooldown_days": 0,
+            "risk_reentry": "native_reset",
+        },
+        "native_exit": rule(lt("close", 8.0), "exit_rule"),
+        "overlays": {
+            "risk": {"enabled": False, "type": "fixed_pct", "value": 0.08,
+                     "atr_period": 14, "trailing": False},
+            "take_profit": {"enabled": False, "type": "fixed_pct", "value": 0.2,
+                            "atr_period": 14, "trailing": False},
+        },
+        "portfolio_constraints": {"long_only": True, "max_positions": 500,
+                                  "max_single_weight": 1.0, "max_total_weight": 1.0},
+        "execution": {
+            "signal_time": "close", "execution_time": "next_open",
+            "buy_limit_policy": "reject", "sell_limit_policy": "retry",
+            "suspension_policy": "reject_entry_retry_exit",
+            "missing_bar_policy": "reject_entry_retry_exit",
+            "cost_model": "a_share_daily_v1", "max_entry_premium": 0.0,
+        },
+        "validation": {
+            "baseline_ids": ["buy_and_hold"], "locked_oos": True,
+            "rejection_criteria": ["no_net_oos_increment"], "parameter_scans": [],
+        },
+    }
+
+
+def _seed_closes(db: Session, closes: list[float]) -> date:
+    db.add(Stock(code=CODE, name="浦发银行", industry="银行"))
+    day = date(2026, 7, 24) - timedelta(days=400)
+    last = day
+    for price in closes:
+        while day.weekday() >= 5:
+            day += timedelta(days=1)
+        db.add(DailyBar(code=CODE, date=day, open=price, high=price,
+                        low=price, close=price, volume=1e6, amount=1e7))
+        last = day
+        day += timedelta(days=1)
+    db.commit()
+    return last
+
+
+def _adjust_strategy() -> Strategy:
+    return Strategy(id=1, owner_id=USER_A, is_system=False, name="档位策略",
+                    template="custom_adjust", kind="single", params={},
+                    spec=_adjust_spec_dict(), enabled=True)
+
+
+def test_position_level_up_produces_add_signal():
+    """持仓期间加仓规则触发:目标档位 0.4 -> 0.6,产 side=add。"""
+    with _session() as db:
+        last = _seed_closes(db, [11.0] * 119 + [13.0])
+        db.add(_adjust_strategy())
+        db.commit()
+
+        result = signal_engine.run_signals(db, day=last, codes=[CODE])
+        rows = db.execute(select(Signal)).scalars().all()
+        plans = db.execute(select(ResearchPlan)).scalars().all()
+        listed = list_signals(date_=None, code=None, strategy_id=None,
+                              side=None, limit=200, db=db, claims=CLAIMS_A)
+
+    assert result["signals"]["档位策略#1"] == {CODE: "add"}
+    assert [row.side for row in rows] == ["add"]
+    reason = rows[0].reason
+    assert reason["prev_position"] == pytest.approx(0.4)
+    assert reason["cur_position"] == pytest.approx(0.6)
+    assert [plan.signal_type for plan in plans] == ["add"]
+    assert "上调" in listed["items"][0]["reason_text"]
+
+
+def test_position_level_down_produces_reduce_signal():
+    """持仓期间减仓规则触发:目标档位 1.0 -> 0.8,产 side=reduce。"""
+    with _session() as db:
+        last = _seed_closes(db, [13.0] * 119 + [9.2])
+        db.add(_adjust_strategy())
+        db.commit()
+
+        result = signal_engine.run_signals(db, day=last, codes=[CODE])
+        rows = db.execute(select(Signal)).scalars().all()
+        plans = db.execute(select(ResearchPlan)).scalars().all()
+        listed = list_signals(date_=None, code=None, strategy_id=None,
+                              side="reduce", limit=200, db=db, claims=CLAIMS_A)
+
+    assert result["signals"]["档位策略#1"] == {CODE: "reduce"}
+    assert [row.side for row in rows] == ["reduce"]
+    reason = rows[0].reason
+    assert reason["prev_position"] == pytest.approx(1.0)
+    assert reason["cur_position"] == pytest.approx(0.8)
+    assert reason["primary_exit_reason"]["reason_code"] == "reduce_on_weakness"
+    assert [plan.signal_type for plan in plans] == ["reduce"]
+    assert listed["count"] == 1
+    assert "下调" in listed["items"][0]["reason_text"]
+
+
+def test_gap_beyond_tolerance_produces_no_watch():
+    """收盘明显低于前高(间距约 17%),超出容差,不产 watch。"""
+    with _session() as db:
+        db.add(Stock(code=CODE, name="浦发银行", industry="银行"))
+        day = date(2026, 7, 24) - timedelta(days=200)
+        last = day
+        prices = [10.0] * 119 + [8.0]
+        for price in prices:
+            while day.weekday() >= 5:
+                day += timedelta(days=1)
+            db.add(DailyBar(code=CODE, date=day, open=price, high=price + 0.1,
+                            low=price - 0.1, close=price, volume=1e6,
+                            amount=1e7))
+            last = day
+            day += timedelta(days=1)
+        db.add(_breakout_strategy())
+        db.commit()
+
+        result = signal_engine.run_signals(db, day=last, codes=[CODE])
+        rows = db.execute(select(Signal)).scalars().all()
+
+    assert result["total"] == 0
+    assert rows == []

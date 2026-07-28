@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from ..data.clock import naive_now_cst, today_cst
 from ..data.calendar import is_trading_day
+from ..data.ingest import load_bars_df, required_snapshot_fields
 from ..models import (BacktestRun, DailyBar, Pool, ResearchPlan,
                       ResearchPlanItem, Signal, Snapshot, Stock, Strategy,
                       TradeCalendar)
@@ -562,29 +563,23 @@ def _native_condition_reevaluation(
     if latest_date is None:
         return None
 
-    history_start = plan.data_date - timedelta(days=550)
-    rows = db.execute(
-        select(DailyBar).where(
-            DailyBar.code == plan.code,
-            DailyBar.date >= history_start,
-            DailyBar.date <= latest_date,
-        ).order_by(DailyBar.date)
-    ).scalars().all()
-    frame = pd.DataFrame([{
-        "date": row.date,
-        "open": row.open,
-        "high": row.high,
-        "low": row.low,
-        "close": row.close,
-        "raw_close": row.raw_close,
-        "volume": row.volume,
-        "amount": row.amount,
-    } for row in rows])
     if not plan.strategy_spec_snapshot:
         return "reevaluate", {
             "code": "strategy_spec_snapshot_missing",
             "text": "历史计划没有完整 StrategySpec 快照，不能可靠重算原生条件。",
         }
+    # 重评帧与编译入口同口径:按快照规格的 data_requirements 补齐估值/财务
+    # 字段(PIT join,不用未来数据),否则用这些字段的策略永远缺列。
+    from ..strategy.spec import parse_strategy_spec
+
+    history_start = plan.data_date - timedelta(days=550)
+    extra_fields = required_snapshot_fields(
+        parse_strategy_spec(plan.strategy_spec_snapshot),
+    )
+    frame = load_bars_df(
+        db, plan.code, start=history_start, end=latest_date,
+        extra_fields=extra_fields,
+    )
     result = evaluate_single_spec_condition(
         plan.strategy_spec_snapshot, frame, plan.signal_type,
     )

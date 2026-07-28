@@ -11,7 +11,8 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
-from ..models import AdjustFactor, DailyBar, Snapshot, Stock, WatchlistItem
+from ..models import (AdjustFactor, DailyBar, FundamentalSnapshot, Snapshot,
+                      Stock, ValuationSnapshot, WatchlistItem)
 from . import akshare_client, baostock_client
 from .clock import naive_now_cst, today_cst
 
@@ -760,15 +761,21 @@ def cleanup_snapshots(db: Session, retention_days: int) -> int:
 
 
 def load_bars_df(db: Session, code: str, start: date | None = None,
-                 end: date | None = None) -> pd.DataFrame:
-    """从库里读日线为 DataFrame(按日期升序),供指标/回测用。"""
+                 end: date | None = None,
+                 *, extra_fields: list[str] | None = None) -> pd.DataFrame:
+    """从库里读日线为 DataFrame(按日期升序),供指标/回测用。
+
+    extra_fields 为 None 时只返回 OHLCV 列,不产生额外查询;传入由
+    `required_snapshot_fields` 计算出的估值/财务字段列表时,按 PIT 语义
+    left-join 快照表(见 `attach_snapshot_fields`)。
+    """
     q = select(DailyBar).where(DailyBar.code == code).order_by(DailyBar.date)
     if start:
         q = q.where(DailyBar.date >= start)
     if end:
         q = q.where(DailyBar.date <= end)
     rows = db.execute(q).scalars().all()
-    return pd.DataFrame(
+    df = pd.DataFrame(
         [
             {"date": r.date, "open": r.open, "high": r.high, "low": r.low,
              "close": r.close, "raw_close": r.raw_close,
@@ -776,3 +783,166 @@ def load_bars_df(db: Session, code: str, start: date | None = None,
             for r in rows
         ]
     )
+    if extra_fields:
+        df = attach_snapshot_fields(db, df, code, extra_fields)
+    return df
+
+
+# load_bars_df 始终提供的日线列(去掉 date),capability 的 available_fields 基数
+BAR_FIELDS = frozenset({
+    "open", "high", "low", "close", "raw_close", "volume", "amount", "is_st",
+})
+
+# StrategySpec 字段 -> 估值快照列(按交易日粒度发布)
+VALUATION_SPEC_FIELDS = {
+    "pe_ttm": "pe_ttm",
+    "pb": "pb",
+    "ps_ttm": "ps_ttm",
+    "market_cap": "total_market_cap",
+}
+
+# StrategySpec 字段 -> 财务快照列(按 report_period + available_date 版本化)
+FUNDAMENTAL_SPEC_FIELDS = {
+    "roe": "roe",
+    "revenue_growth": "revenue_yoy",
+    "profit_growth": "profit_yoy",
+    "gross_margin": "gross_margin",
+    "debt_ratio": "debt_ratio",
+    "cashflow_quality": "cashflow_ratio",
+}
+
+SNAPSHOT_SPEC_FIELDS = {**VALUATION_SPEC_FIELDS, **FUNDAMENTAL_SPEC_FIELDS}
+
+
+def required_snapshot_fields(spec) -> list[str]:
+    """spec.data_requirements 中由快照表供给的必需字段(鸭子类型,不依赖 spec 类)。"""
+    return sorted({
+        item.field
+        for item in getattr(spec, "data_requirements", None) or []
+        if getattr(item, "required", True) and item.field in SNAPSHOT_SPEC_FIELDS
+    })
+
+
+def attach_snapshot_fields(db: Session, df: pd.DataFrame, code: str,
+                           fields: list[str]) -> pd.DataFrame:
+    """把估值/财务快照列按 point-in-time 语义 left-join 到日线帧。
+
+    这是量化系统的生命线:任一交易日只允许看到当日及之前已可用的数据。
+
+    - 估值快照(quant_valuation_snapshot)按交易日发布:对每个交易日取
+      `available_date <= 当日` 的最新一条(同 available_date 取 data_date
+      最新),且 data_date 不得晚于当日(防御数据口径不一致的脏行);
+    - 财务快照(quant_fundamental_snapshot)是报告期的版本化记录:对每个
+      交易日取 `available_date <= 当日` 的最新版本(同 available_date 取
+      report_period 最新),即「当日收盘时市场已经知道」的财务口径,修订值
+      只从其 available_date 起生效。
+
+    没有可用记录的交易日为 NaN(沿用 components.py 的 NaN 传播语义),绝不
+    回填 0 或前向填充未发布的值。未知字段名直接报错,避免静默缺列。
+    """
+    unknown = sorted(set(fields) - set(SNAPSHOT_SPEC_FIELDS))
+    if unknown:
+        raise ValueError(f"快照表不供给字段: {unknown}")
+    requested = list(dict.fromkeys(fields))
+    result = df.reset_index(drop=True).copy()
+    if result.empty or not requested:
+        for field in requested:
+            result[field] = float("nan")
+        return result
+
+    end = result["date"].max()
+    left = pd.DataFrame({"date": pd.to_datetime(result["date"])})
+    valuation = {
+        field: VALUATION_SPEC_FIELDS[field]
+        for field in requested if field in VALUATION_SPEC_FIELDS
+    }
+    fundamental = {
+        field: FUNDAMENTAL_SPEC_FIELDS[field]
+        for field in requested if field in FUNDAMENTAL_SPEC_FIELDS
+    }
+    if valuation:
+        rows = db.execute(
+            select(ValuationSnapshot).where(
+                ValuationSnapshot.code == code,
+                ValuationSnapshot.available_date <= end,
+            )
+        ).scalars().all()
+        merged = _asof_join(
+            left, rows, valuation,
+            key=lambda row: row.available_date,
+            tie=lambda row: row.data_date,
+        )
+        # 防御:data_date 晚于当日的估值行属于口径异常,按无数据置 NaN
+        stale = merged["_tie"].notna() & (merged["_tie"] > merged["date"])
+        for field in valuation:
+            column = merged[f"__{field}"].mask(stale)
+            result[field] = pd.to_numeric(column, errors="coerce").to_numpy()
+    if fundamental:
+        rows = db.execute(
+            select(FundamentalSnapshot).where(
+                FundamentalSnapshot.code == code,
+                FundamentalSnapshot.available_date <= end,
+            )
+        ).scalars().all()
+        merged = _asof_join(
+            left, rows, fundamental,
+            key=lambda row: row.available_date,
+            tie=lambda row: row.report_period,
+        )
+        for field in fundamental:
+            result[field] = pd.to_numeric(
+                merged[f"__{field}"], errors="coerce",
+            ).to_numpy()
+    return result
+
+
+def _asof_join(left: pd.DataFrame, rows: list, column_map: dict[str, str],
+               *, key, tie) -> pd.DataFrame:
+    """按 (key, tie) 排序后做 backward as-of 合并:每个交易日取 key <= 当日
+    的最后一条,同 key 取 tie 最新。key 是生效日(available_date),保证不读
+    未来数据。"""
+    records = pd.DataFrame([
+        {
+            "_key": key(row),
+            "_tie": tie(row),
+            **{f"__{field}": getattr(row, column)
+               for field, column in column_map.items()},
+        }
+        for row in rows
+    ])
+    if records.empty:
+        empty = left.copy()
+        empty["_key"] = pd.NaT
+        empty["_tie"] = pd.NaT
+        for field in column_map:
+            empty[f"__{field}"] = float("nan")
+        return empty
+    records["_key"] = pd.to_datetime(records["_key"])
+    records["_tie"] = pd.to_datetime(records["_tie"])
+    records = records.sort_values(["_key", "_tie"], kind="stable")
+    return pd.merge_asof(left, records, left_on="date", right_on="_key")
+
+
+def snapshot_available_fields(db: Session) -> frozenset[str]:
+    """库里实际有非空数据的快照字段,供 capability 的 available_fields 使用。
+
+    逐字段一条 limit 1 查询,只在策略保存/启用等低频路径调用。
+    """
+    available: set[str] = set()
+    for field, column in VALUATION_SPEC_FIELDS.items():
+        value = db.execute(
+            select(getattr(ValuationSnapshot, column)).where(
+                getattr(ValuationSnapshot, column).is_not(None),
+            ).limit(1)
+        ).scalars().first()
+        if value is not None:
+            available.add(field)
+    for field, column in FUNDAMENTAL_SPEC_FIELDS.items():
+        value = db.execute(
+            select(getattr(FundamentalSnapshot, column)).where(
+                getattr(FundamentalSnapshot, column).is_not(None),
+            ).limit(1)
+        ).scalars().first()
+        if value is not None:
+            available.add(field)
+    return frozenset(available)

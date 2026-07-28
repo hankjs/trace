@@ -1,6 +1,7 @@
 """回测:发起(同步执行)、参数扫描、批量评估排行、结果查询。"""
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from datetime import date
 
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ..backtest.engine import run_backtest, run_sweep, validate_strategy_params
 from ..backtest.evaluate import leaderboard
+from ..backtest.validation import evaluate_declared_sweep
 from ..auth import require_client, user_id_from_claims
 from ..api.pools import (get_pool_or_404, pool_ref_out,
                          resolve_pool_codes, resolve_pool_codes_during)
@@ -19,15 +21,19 @@ from ..db import get_db
 from ..catalog import STRATEGY_TEMPLATES
 from ..models import BacktestEquity, BacktestRun, Pool, Strategy
 from ..stock_repository import StockRepository
+from ..strategy.evidence import advance_after_backtest
 from ..strategy.runtime import strategy_spec_for
 from ..strategy.spec import (
     CapabilityStatus,
     StrategyCapabilityError,
     resolve_capabilities,
+    strategy_spec_hash,
 )
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 plural_router = APIRouter(prefix="/api/backtests", tags=["backtest"])
+
+logger = logging.getLogger(__name__)
 
 
 class BacktestIn(BaseModel):
@@ -46,8 +52,10 @@ class SweepIn(BaseModel):
     codes: list[str] = Field(max_length=800)
     start: date
     end: date
-    param_grid: dict  # {"$.受控路径": [候选值]},笛卡尔积逐组回测
+    param_grid: dict = Field(default_factory=dict)  # {"$.受控路径": [候选值]},笛卡尔积逐组回测
     costs: dict = Field(default_factory=dict)
+    # true 时忽略 param_grid,按规格 validation.parameter_scans 声明执行扫描
+    declared: bool = False
 
 
 def _decorate_result(result: dict, db: Session, pool: Pool | None = None) -> dict:
@@ -68,14 +76,36 @@ def _decorate_result(result: dict, db: Session, pool: Pool | None = None) -> dic
 @router.post("/sweep")
 def sweep(body: SweepIn, db: Session = Depends(get_db),
           claims: dict = Depends(require_client)):
-    """参数扫描:逐组参数批量回测,返回各组 metrics(不落库)"""
+    """参数扫描:逐组参数批量回测,返回各组 metrics(不落库)。
+
+    declared=true 时按规格 validation.parameter_scans 的声明执行,响应附带
+    spec_hash(与回测结果同一关联键)与参数稳定性评估;扫描仍是探索性动作,
+    不推进证据状态。
+    """
     if body.start >= body.end:
         raise HTTPException(400, "start 必须早于 end")
     strategy = get_strategy_or_404(
         db, body.strategy_id, user_id_from_claims(claims))
+    param_grid = body.param_grid
+    spec = strategy_spec_for(strategy)
+    if body.declared:
+        scans = spec.validation.parameter_scans
+        if not scans:
+            raise HTTPException(400, "该策略规格未声明 parameter_scans")
+        param_grid = {scan.path: list(scan.values) for scan in scans}
     try:
         result = run_sweep(db, strategy, [c.lower() for c in body.codes],
-                           body.start, body.end, body.param_grid, body.costs)
+                           body.start, body.end, param_grid, body.costs)
+        result["strategy_spec_hash"] = strategy_spec_hash(spec)
+        result["declared"] = body.declared
+        if body.declared:
+            result["declared_scans"] = [
+                {"path": scan.path, "values": list(scan.values)}
+                for scan in spec.validation.parameter_scans
+            ]
+            result["stability"] = evaluate_declared_sweep(
+                spec, result["results"],
+            )
         return _decorate_result(result, db)
     except StrategyCapabilityError as exc:
         raise HTTPException(400, {
@@ -172,6 +202,17 @@ def create_backtest(body: BacktestIn, db: Session = Depends(get_db),
         })
     except ValueError as e:
         raise HTTPException(400, str(e))
+    # 回测完成即按身份哈希推进证据状态(strategy/evidence.py);
+    # 推进失败不影响本次结果返回
+    transition = None
+    try:
+        transition = advance_after_backtest(db, strategy, result)
+        if transition:
+            db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("证据状态推进失败 strategy=%s", strategy.id)
+        db.rollback()
+    result["evidence_transition"] = transition
     return _decorate_result(result, db, pool if use_pool else None)
 
 
@@ -218,6 +259,7 @@ def get_backtest(run_id: int, db: Session = Depends(get_db),
         "fee_assumptions": evidence.get("fee_assumptions", {}),
         "metrics": metrics,
         "evidence": evidence or None,
+        "validation": metrics.get("validation"),
         "trade_details": evidence.get("trade_details", []),
         "exit_reason_distribution": evidence.get(
             "exit_reason_distribution", {"by_primary": {}, "all_hits": {}},

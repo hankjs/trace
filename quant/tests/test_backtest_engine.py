@@ -221,7 +221,7 @@ def test_backtest_evidence_hashes_exact_and_temporary_specs(monkeypatch):
     )
     monkeypatch.setattr(
         "app.backtest.engine.load_bars_df",
-        lambda db, code, start=None, end=None: df,
+        lambda db, code, start=None, end=None, **kwargs: df,
     )
 
     exact = run_backtest(
@@ -252,7 +252,7 @@ def test_editing_current_spec_does_not_change_prior_backtest_snapshot(monkeypatc
     df = _mk_df(date(2024, 1, 1), [10 + index * 0.1 for index in range(80)])
     monkeypatch.setattr(
         "app.backtest.engine.load_bars_df",
-        lambda db, code, start=None, end=None: df,
+        lambda db, code, start=None, end=None, **kwargs: df,
     )
     original = get_preset_spec(
         "ma_cross", {"fast": 2, "slow": 5},

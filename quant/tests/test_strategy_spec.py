@@ -199,13 +199,13 @@ def test_capability_resolver_checks_fields_present_in_the_data_snapshot():
     )
 
 
-def test_unimplemented_holding_trigger_is_not_silently_ignored():
+def test_holding_adjust_requires_rule_and_reports_precise_path():
     raw = deepcopy(SYSTEM_STRATEGY_SPECS["ma_cross"])
     raw["holding"]["allow_add"] = True
     report = resolve_capabilities(raw)
     assert report.status == CapabilityStatus.MISSING_ENGINE
     assert any(
-        issue.path == "$.holding.allow_add" and issue.code == "holding_rule_missing"
+        issue.path == "$.holding.add_rule" and issue.code == "holding_rule_missing"
         for issue in report.issues
     )
 

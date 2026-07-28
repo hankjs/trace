@@ -26,6 +26,7 @@ from ..strategy.overlays import overlay_price_line
 from ..strategy.runtime import build_execution_snapshot, strategy_spec_for
 from ..strategy.spec import Expression, PortfolioPositioningSpec, StrategySpec
 from ..strategy.strategies import REGISTRY
+from ..strategy.watch import assess_entry_watch
 
 PRODUCT_BOUNDARY = (
     "本计划根据日频数据和策略规则生成，仅用于研究。真实买卖、价格、数量和风险决策"
@@ -519,21 +520,33 @@ def evaluate_single_spec_condition(
             "text": "规格所需指标或历史窗口不足，无法重算入场条件。",
             "reason_tree": tree,
         }
-    # 动态规格不再定义模板私有的“临近触发”函数。历史 watch 计划只要规格
-    # 仍可完整计算就进入常规重评，而不会调用已删除的模板旁路。
     # 计划尚未在真实世界自动执行；重评关注的是最新收盘下入场表达式是否仍
     # 成立，不能把编译器历史模拟中已经进入持仓误当成当前条件仍成立。
+    # watch 计划额外接受「临近触发」:入场条件不再成立时,用通用临近判定
+    # (strategy/watch.py)重算,距离超出观察容差则正常判失效。
     satisfied = bool(tree.get("value"))
+    watch_assessment: dict[str, Any] | None = None
     if signal_type == "watch" and not satisfied:
-        satisfied = True
-    return {
-        "satisfied": satisfied,
-        "text": (
+        watch_assessment = assess_entry_watch(parsed.entry.condition, df)
+        satisfied = watch_assessment["near"]
+    if signal_type == "watch" and not satisfied:
+        text = (
+            f"入场规则 {parsed.entry.reason_code} 当前不再成立，且与触发条件的"
+            "距离已超出临近观察容差。"
+        )
+    else:
+        text = (
             f"入场规则 {parsed.entry.reason_code} 当前不再成立。"
             if not satisfied else f"入场规则 {parsed.entry.reason_code} 仍可计算。"
-        ),
+        )
+    result: dict[str, Any] = {
+        "satisfied": satisfied,
+        "text": text,
         "reason_tree": tree,
     }
+    if watch_assessment is not None:
+        result["watch"] = watch_assessment
+    return result
 
 
 def _apply_compiler_overlay_state(

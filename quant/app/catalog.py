@@ -530,6 +530,14 @@ SIGNAL_SIDES: dict[str, dict[str, Any]] = {
         "key": "watch", "name": "临近触发", "description": "条件接近策略阈值，但尚未形成状态变化。",
         "unit": None, "direction": "继续观察", "limits": "条件可能在后续交易日失效，不表示必须采取行动。",
     },
+    "add": {
+        "key": "add", "name": "加仓提示", "description": "持有期间加仓规则触发，策略模拟目标仓位上调一个档位。",
+        "unit": None, "direction": "提高模拟持有比例", "limits": "不是实际买入指令，需由用户自行研究和决定。",
+    },
+    "reduce": {
+        "key": "reduce", "name": "减仓提示", "description": "持有期间减仓规则触发，策略模拟目标仓位下调一个档位。",
+        "unit": None, "direction": "降低模拟持有比例", "limits": "不是实际卖出指令，系统不会连接券商或提交订单。",
+    },
 }
 
 
@@ -570,6 +578,11 @@ SIGNAL_REASON_TYPES: dict[str, dict[str, Any]] = {
         "key": "near_platform_high", "name": "接近整理平台上沿",
         "description": "缩量整理平台已形成，收盘价接近平台最高价。", "unit": "%",
         "direction": "可能接近放量突破条件", "limits": "尚未同时满足放量和突破要求。",
+    },
+    "watch_proximity": {
+        "key": "watch_proximity", "name": "临近触发",
+        "description": "入场表达式与触发条件的归一化间距在临近容差内。", "unit": "%",
+        "direction": "可能接近策略入场条件", "limits": "临近不代表下一交易日一定触发，条件也可能走远失效。",
     },
     "unknown": {
         "key": "unknown", "name": "策略规则触发",
@@ -717,6 +730,25 @@ def render_signal_reason(template: str, side: str,
     (「我的双均线 10/30」),句子里该出现用户起的名字,不是模板名。
     """
     reason = reason if isinstance(reason, dict) else {}
+    # 通用 watch 信号(规格化临近判定)优先使用引擎生成的可读说明;
+    # 其 reason 也带 prev_position,不能落入下方 position_change 措辞。
+    watch = reason.get("watch")
+    if (
+        side == "watch" and isinstance(watch, dict)
+        and isinstance(watch.get("summary"), str)
+    ):
+        return watch["summary"]
+    # 加减仓是档位变化而非状态翻转,先于下方 buy/sell 的模板措辞处理。
+    if side in {"add", "reduce"} and (
+        "prev_position" in reason or "cur_position" in reason
+    ):
+        prev_text = _fmt_number(reason.get("prev_position")) or "0"
+        cur_text = _fmt_number(reason.get("cur_position")) or "0"
+        if side == "add":
+            return (f"持有期间加仓规则触发，策略模拟目标仓位从{prev_text}"
+                    f"上调至{cur_text}。")
+        return (f"持有期间减仓规则触发，策略模拟目标仓位从{prev_text}"
+                f"下调至{cur_text}。")
     reason_type = signal_reason_type(reason)
     defaults = template_defaults(template)
     params = {**defaults, **(reason.get("params") if isinstance(reason.get("params"), dict) else {})}

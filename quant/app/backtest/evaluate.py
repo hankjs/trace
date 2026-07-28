@@ -23,6 +23,7 @@ from ..models import FactorDaily, Strategy, StrategyEval
 from ..selection.pipeline import score_cross_section
 from ..strategy.store import enabled_strategies, visible_to
 from ..strategy.runtime import strategy_spec_for
+from ..strategy.evidence import advance_after_backtest, candidate_spec_hashes
 from ..strategy.spec import strategy_spec_hash
 from .engine import _median_or_none, _mean_or_none, run_backtest
 
@@ -63,13 +64,17 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
 
 
 def _eval_single(db: Session, strategy: Strategy, codes: list[str],
-                 start: date, end: date) -> dict:
-    """单标的批量评估与普通回测共享同一个 StrategySpec 编译入口。"""
+                 start: date, end: date) -> tuple[dict, dict]:
+    """单标的批量评估与普通回测共享同一个 StrategySpec 编译入口。
+
+    返回 (聚合指标, 完整回测结果):完整结果里的 validation 报告(基线/OOS/
+    否决)与 spec_hash 供证据状态推进复用。
+    """
     result = run_backtest(db, strategy, codes, start, end, save=False)
     per_code = result["metrics"].get("per_code", {})
     per = list(per_code.values())
     if not per:
-        return {"error": "数据不足"}
+        return {"error": "数据不足"}, result
     return {
         "codes": len(per_code),
         # 短序列指标为 None(engine.MIN_STAT_BARS),聚合统一走 None 容忍的 helper
@@ -81,7 +86,22 @@ def _eval_single(db: Session, strategy: Strategy, codes: list[str],
         "win_rate_mean": _mean_or_none([m["win_rate"] for m in per]),
         "trade_count": sum(m["trade_count"] for m in per),
         "per_code": per_code,
-    }
+    }, result
+
+
+def _advance_evidence(db: Session, strategy: Strategy,
+                      result: dict | None) -> None:
+    """周度评估与手动回测走同一套证据状态推进;失败不拖垮本轮评估。"""
+    if result is None:
+        return
+    try:
+        transition = advance_after_backtest(db, strategy, result)
+    except Exception:  # noqa: BLE001
+        logger.exception("证据状态推进失败 %s", strategy.name)
+        return
+    if transition:
+        logger.info("证据状态推进 %s: %s -> %s",
+                    strategy.name, transition["from"], transition["to"])
 
 
 def run_evaluation(db: Session, day: date | None = None,
@@ -102,30 +122,38 @@ def run_evaluation(db: Session, day: date | None = None,
     saved = []
     for strategy in enabled_strategies(db, kind="single"):
         spec_hash = strategy_spec_hash(strategy_spec_for(strategy))
+        result: dict | None = None
         try:
-            metrics = _eval_single(db, strategy, top_codes, start, end)
+            metrics, result = _eval_single(db, strategy, top_codes, start, end)
         except Exception as e:  # noqa: BLE001 - 单个策略失败不影响本轮其余
             logger.exception("评估失败 %s", strategy.name)
             metrics = {"error": str(e)}
         # params 存实际生效的全量参数,与回测落库同口径:策略行之后被改,
-        # 这一轮的评估结果仍能解释是按什么参数跑出来的
+        # 这一轮的评估结果仍能解释是按什么参数跑出来的。
+        # validation 报告(基线对比/OOS/否决判定)随 metrics JSON 一并落库。
+        if result is not None and result.get("validation"):
+            metrics = {**metrics, "validation": result["validation"]}
         db.add(StrategyEval(strategy_id=strategy.id,
                             params=strategy.params or {}, scope="pool_top50",
                             start=start, end=end, metrics=metrics,
                             batch_id=batch_id, spec_hash=spec_hash))
+        if "error" not in metrics:
+            _advance_evidence(db, strategy, result)
         saved.append({"strategy_id": strategy.id, "strategy": strategy.name,
                       "scope": "pool_top50"})
         logger.info("评估 %s: %s", strategy.name,
-                    {k: v for k, v in metrics.items() if k != "per_code"})
+                    {k: v for k, v in metrics.items()
+                     if k not in {"per_code", "validation"}})
 
     for strategy in enabled_strategies(db, kind="portfolio"):
         spec_hash = strategy_spec_hash(strategy_spec_for(strategy))
+        result = None
         try:
-            res = run_backtest(
+            result = run_backtest(
                 db, strategy, pool, start, end, save=False,
                 dynamic_universe=True,
             )
-            metrics = res["metrics"]
+            metrics = result["metrics"]
         except Exception as e:  # noqa: BLE001
             logger.exception("评估失败 %s", strategy.name)
             metrics = {"error": str(e)}
@@ -133,9 +161,13 @@ def run_evaluation(db: Session, day: date | None = None,
                             params=strategy.params or {}, scope="pool",
                             start=start, end=end, metrics=metrics,
                             batch_id=batch_id, spec_hash=spec_hash))
+        if "error" not in metrics:
+            _advance_evidence(db, strategy, result)
         saved.append({"strategy_id": strategy.id, "strategy": strategy.name,
                       "scope": "pool"})
-        logger.info("评估 %s: %s", strategy.name, metrics)
+        logger.info("评估 %s: %s", strategy.name,
+                    {k: v for k, v in metrics.items()
+                     if k not in {"per_code", "validation", "evidence"}})
 
     db.commit()
     return {"start": str(start), "end": str(end), "batch_id": batch_id,
@@ -165,10 +197,28 @@ def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
         .join(Strategy, Strategy.id == StrategyEval.strategy_id)
         .where(
             StrategyEval.batch_id == batch_id,
-            StrategyEval.spec_hash == Strategy.spec_hash,
             visible_to(user_id),
         )
     ).all()
+    # 证据状态推进会改变策略 spec_hash(状态是规格的一部分),而评估行记录的是
+    # 执行当时的哈希;按身份匹配——同一规则内容在五种状态下的哈希都算数
+    # (见 strategy/evidence.py)。
+    hash_cache: dict[int, set[str]] = {}
+
+    def identity_hashes(strategy: Strategy) -> set[str]:
+        if strategy.id not in hash_cache:
+            try:
+                hash_cache[strategy.id] = candidate_spec_hashes(
+                    strategy_spec_for(strategy),
+                )
+            except Exception:  # noqa: BLE001 - 规格不可解析时退化为精确匹配
+                hash_cache[strategy.id] = {strategy.spec_hash}
+        return hash_cache[strategy.id]
+
+    rows = [
+        (r, s) for r, s in rows
+        if r.spec_hash is not None and r.spec_hash in identity_hashes(s)
+    ]
 
     def sort_key(row) -> float:
         m = row[0].metrics or {}
