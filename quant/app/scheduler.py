@@ -97,8 +97,35 @@ def _ingest_batch(codes: list[str], watch_set: set[str],
 EMPTY_RATIO_ABORT = 0.5
 
 
+def _ingest_market_day(day: date, codes: list[str]) -> tuple[int, list[str], list[str]]:
+    """按日批量采集(开关 bulk_daily_bars 开启时),返回 (成功数, 失败, 无当日数据)。
+
+    一次 Session 即可:批量链路只有 2 次 baostock 调用 + 整行 upsert,
+    不存在按 code 循环的 Session 中毒面。因子按日同步(P3)在
+    ingest.ingest_market_day 内部完成(同一次批量因子请求,不重复调用)。
+    北交所不在批量结果中,不计入 empty(它们走新浪源,见 ingest.sync_bj_market)。
+    """
+    with SessionLocal() as db:
+        try:
+            res = ingest.ingest_market_day(
+                db, day, codes=set(codes),
+                backfill_start=date.fromisoformat(settings.backfill_start))
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("盘后批量日线失败 %s", day)
+            return 0, sorted(codes), []
+    written = set(res["written_codes"])
+    empty = [c for c in codes
+             if c not in written and not ingest.is_bj_code(c)]
+    return res["codes"], res["failed"], sorted(empty)
+
+
 def job_daily_bars(day: date | None = None) -> dict:
-    """盘后:池内日线增量(baostock 单登录会话)+ 自选股增量并对账"""
+    """盘后:池内日线增量(baostock 单登录会话)+ 自选股增量并对账
+
+    开关 bulk_daily_bars 开启时改走按日批量链路(ingest.ingest_market_day,
+    含因子按日同步);默认关闭,走原有按 code 路径,逻辑不变。
+    """
     day = day or _now().date()
     if not _is_trading_day(day):
         logger.info("非交易日,跳过盘后任务")
@@ -108,10 +135,14 @@ def job_daily_bars(day: date | None = None) -> dict:
         watch = _watch_codes()
     watch_set = set(watch)
     codes = sorted(set(pool) | watch_set)
-    logger.info("盘后日线开始: 池内 %d 只,自选 %d 只", len(pool), len(watch))
-    # 全程复用一次 baostock 登录(可重入),Session 则按批切分
-    with baostock_client.login_session():
-        succeeded, failed, empty = _ingest_batch(codes, watch_set, day)
+    logger.info("盘后日线开始: 池内 %d 只,自选 %d 只,批量=%s",
+                len(pool), len(watch), settings.bulk_daily_bars)
+    if settings.bulk_daily_bars:
+        succeeded, failed, empty = _ingest_market_day(day, codes)
+    else:
+        # 全程复用一次 baostock 登录(可重入),Session 则按批切分
+        with baostock_client.login_session():
+            succeeded, failed, empty = _ingest_batch(codes, watch_set, day)
     with SessionLocal() as db:
         try:
             n = ingest.cleanup_snapshots(db, settings.snapshot_retention_days)

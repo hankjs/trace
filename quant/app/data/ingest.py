@@ -178,6 +178,75 @@ def backfill_list_dates(db: Session) -> dict:
             "missing": still_missing}
 
 
+def upsert_valuations_from_daily_bulk(db: Session, day: date,
+                                      bars: pd.DataFrame) -> int:
+    """把批量日 K 里的 peTTM/pb/psTTM 落入 quant_valuation_snapshot。
+
+    source=baostock_k_daily,available_date=data_date=day(日频点时,无公告滞后)。
+    与东财全市场估值并存:同 (code,data_date,available_date) 覆盖更新。
+    """
+    if bars.empty:
+        return 0
+    need = [c for c in ("pe_ttm", "pb", "ps_ttm") if c in bars.columns]
+    if not need:
+        return 0
+    usable = bars.dropna(subset=need, how="all")
+    if usable.empty:
+        return 0
+    rows = []
+    for r in usable.itertuples():
+        pe = getattr(r, "pe_ttm", None)
+        pb = getattr(r, "pb", None)
+        ps = getattr(r, "ps_ttm", None)
+        if pe is not None and pd.isna(pe):
+            pe = None
+        if pb is not None and pd.isna(pb):
+            pb = None
+        if ps is not None and pd.isna(ps):
+            ps = None
+        if pe is None and pb is None and ps is None:
+            continue
+        rows.append({
+            "code": r.code,
+            "data_date": day,
+            "available_date": day,
+            "report_period": None,
+            "source": "baostock_k_daily",
+            "pe_ttm": None if pe is None else float(pe),
+            "pb": None if pb is None else float(pb),
+            "ps_ttm": None if ps is None else float(ps),
+            "dividend_yield": None,
+            "total_market_cap": None,
+        })
+    if not rows:
+        return 0
+    # 按批 upsert,避免单次包过大
+    updated_cols = ("pe_ttm", "pb", "ps_ttm", "source", "report_period",
+                    "dividend_yield", "total_market_cap")
+    dialect = db.get_bind().dialect.name
+    n = 0
+    for i in range(0, len(rows), 500):
+        chunk = rows[i:i + 500]
+        if dialect == "sqlite":
+            stmt = sqlite_insert(ValuationSnapshot).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[
+                    ValuationSnapshot.code, ValuationSnapshot.data_date,
+                    ValuationSnapshot.available_date,
+                ],
+                set_={c: getattr(stmt.excluded, c) for c in updated_cols},
+            )
+        else:
+            stmt = mysql_insert(ValuationSnapshot).values(chunk)
+            stmt = stmt.on_duplicate_key_update(
+                **{c: getattr(stmt.inserted, c) for c in updated_cols}
+            )
+        db.execute(stmt)
+        n += len(chunk)
+    db.commit()
+    return n
+
+
 def upsert_bars(db: Session, code: str, df: pd.DataFrame) -> int:
     """日线 upsert(code+date 唯一键)。
 
@@ -727,6 +796,208 @@ def ingest_daily(db: Session, code: str, day: date | None = None,
                 if pct > 1.0:  # 差异超 1% 告警(前复权口径差异属正常,仅提示)
                     logger.warning("日线对账差异 %s %s: %s", code, day, rec)
     return result
+
+
+def raw_to_qfq(price: float | None, day_factor: float,
+               latest_factor: float = 1.0) -> float | None:
+    """不复权价换算为前复权价: qfq = raw × 当日因子 ÷ 最新因子。
+
+    **公式待 P0 spike 验证**(scripts/spike_bulk_vs_single.py,
+    docs/baostock-bulk-ingest.md §3) —— 验证结论若不一致,只改这一个函数。
+    当前假设:
+    - 批量日 K 无 adjustflag 入参,返回价视为不复权原始价;
+    - 因子与 quant_adjust_factor 同口径(库内 close/raw_close = 当日生效
+      前复权因子,见 audit_scale_against_factors)。该口径下前复权锚点因子
+      恒为 1,即 latest_factor=1.0,公式退化为 qfq = raw × 当日因子,
+      与单票 adjustflag=2 入库的既有前复权行一致。
+    """
+    if price is None or pd.isna(price):
+        return None
+    if not day_factor or day_factor <= 0 or not latest_factor or latest_factor <= 0:
+        return None
+    return float(price) * float(day_factor) / float(latest_factor)
+
+
+def _chunks(items: list, size: int = 500):
+    """IN 查询分块,避免触发 SQLite/MySQL 的占位符上限。"""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def _detect_factor_changes(db: Session, df: pd.DataFrame) -> set[str]:
+    """找出因子较库内权威记录发生变化的 code(新除权日 / 上游修订)。
+
+    判定基准是库内该 code divid_operate_date 最大的一条:批量接口返回的是
+    当日生效的最新因子记录,比库内最新记录日期更新,或同日期但值偏差超
+    REANCHOR_TOLERANCE,即为变化(分红除权/重锚嫌疑)。
+
+    库内完全没有该 code 的因子时无从判定「变化」(可能只是首次同步),
+    不算 changed —— 否则首次全量同步会把每只票都送进单票全历史重拉。
+    """
+    latest: dict[str, tuple[date, float]] = {}
+    codes = sorted(df["code"].unique())
+    for chunk in _chunks(codes):
+        rows = db.execute(
+            select(AdjustFactor.code, AdjustFactor.divid_operate_date,
+                   AdjustFactor.fore_factor)
+            .where(AdjustFactor.code.in_(chunk))
+            .order_by(AdjustFactor.code, AdjustFactor.divid_operate_date)
+        ).all()
+        for code, divid_date, fore in rows:
+            latest[code] = (divid_date, float(fore))  # 升序遍历,末条即最新
+
+    changed: set[str] = set()
+    for r in df.itertuples():
+        base = latest.get(r.code)
+        if base is None:
+            continue
+        divid_date, fore = base
+        if r.divid_operate_date > divid_date:
+            changed.add(r.code)
+        elif (r.divid_operate_date == divid_date and fore > 0
+              and abs(float(r.fore_factor) - fore) / fore > REANCHOR_TOLERANCE):
+            changed.add(r.code)
+    return changed
+
+
+def sync_adjust_factors_for_day(db: Session, day: date | str) -> dict:
+    """按日批量同步全市场复权因子(query_daily_adjust_factor,1 次/日)。
+
+    替代 sync_adjust_factors 的按 code 全表扫(旧函数保留,admin 手动
+    触发路径不动)。空响应视为数据源抖动,不清空已有数据(同
+    sync_adjust_factors 的保护语义)。
+
+    返回 {"day", "upserted", "empty", "changed"}:changed 是因子较库内
+    记录发生变化的 code 列表,供 ingest_market_day 对这些票走
+    safe_backfill 单票全历史兜底。
+    """
+    if isinstance(day, str):
+        day = date.fromisoformat(day)
+    df = baostock_client.fetch_market_adjust_factors(day)
+    if df.empty:
+        # 空响应不清空:数据源抖动不该被当成「因子被撤销」
+        logger.warning("批量复权因子 %s 返回空,保留库内已有因子", day)
+        return {"day": day, "upserted": 0, "empty": True, "changed": []}
+    # 变化检测必须在 upsert 之前做,否则基准被自己覆盖
+    changed = _detect_factor_changes(db, df)
+    upserted = 0
+    for code, grp in df.groupby("code"):
+        upserted += upsert_adjust_factors(db, code, grp)
+    logger.info("批量复权因子 %s: %d 只,写入 %d 行,因子变化 %d 只",
+                day, df["code"].nunique(), upserted, len(changed))
+    return {"day": day, "upserted": upserted, "empty": False,
+            "changed": sorted(changed)}
+
+
+def _effective_fore_factors(db: Session, codes: list[str],
+                            day: date) -> dict[str, float]:
+    """各 code 在 day 当日生效的前复权因子(divid_operate_date <= day 的末条)。"""
+    effective: dict[str, float] = {}
+    for chunk in _chunks(sorted(codes)):
+        rows = db.execute(
+            select(AdjustFactor.code, AdjustFactor.divid_operate_date,
+                   AdjustFactor.fore_factor)
+            .where(AdjustFactor.code.in_(chunk),
+                   AdjustFactor.divid_operate_date <= day)
+            .order_by(AdjustFactor.code, AdjustFactor.divid_operate_date)
+        ).all()
+        for code, _divid_date, fore in rows:
+            effective[code] = float(fore)  # 升序遍历,末条即当日生效值
+    return effective
+
+
+def ingest_market_day(db: Session, day: date | str,
+                      codes: set[str] | None = None,
+                      backfill_start: date | str = "2015-01-01",
+                      sleep_per_reanchor: float = 0.3) -> dict:
+    """盘后按日批量入库:全市场日 K 1 次 + 因子 1 次,替代按 code 逐只拉取。
+
+    流程(docs/baostock-bulk-ingest.md §4.1):
+    1. `fetch_market_daily_bars` 拉当日全 A 日 K(不复权原始价,口径待
+       P0 spike 验证),`sync_adjust_factors_for_day` 拉当日全市场因子并
+       upsert 进 quant_adjust_factor(P3 一并完成,不重复请求);
+    2. 用库内权威因子按 `raw_to_qfq` 换算前复权 OHLC,**无条件整行
+       upsert** 当日行(§7 第 3 条,覆盖盘中可能残留的半根线);
+    3. 因子较库内记录发生变化的 code(分红除权/重锚嫌疑)走
+       `safe_backfill` 单票全历史重拉,保住重锚防护语义。
+
+    北交所不在批量结果中,自然跳过,仍走原有新浪路径。
+    codes 为 None 时写入批量结果的全部 code(历史回填用);盘后增量传
+    池内+自选,保持 quant_daily_bar 的收录范围不变。
+    """
+    if isinstance(day, str):
+        day = date.fromisoformat(day)
+    if isinstance(backfill_start, str):
+        backfill_start = date.fromisoformat(backfill_start)
+
+    with baostock_client.login_session():
+        bars = baostock_client.fetch_market_daily_bars(day)
+        factor_res = sync_adjust_factors_for_day(db, day)
+
+        result: dict = {
+            "day": day, "bars": 0, "codes": 0, "written_codes": [],
+            "factors_upserted": factor_res["upserted"],
+            "factor_empty": factor_res["empty"],
+            "factor_changed": [], "reanchored": [], "failed": [],
+        }
+        if bars.empty:
+            logger.warning("批量日 K %s 返回空(非交易日或数据源异常),未写入", day)
+            return result
+        if codes is not None:
+            bars = bars[bars["code"].isin(codes)]
+        if bars.empty:
+            return result
+
+        bar_codes = sorted(bars["code"].unique())
+        factors = _effective_fore_factors(db, bar_codes, day)
+        changed = set(factor_res["changed"])
+        result["factor_changed"] = sorted(changed)
+
+        for code, grp in bars.groupby("code"):
+            if code in changed:
+                # 分红除权/重锚嫌疑:单票全历史重拉,重锚防护语义不丢
+                try:
+                    n = safe_backfill(db, code, start=backfill_start,
+                                      end=day, force=True)
+                    result["reanchored"].append(code)
+                    result["bars"] += n
+                    logger.info("因子变化 %s,已全历史重拉 %d 行", code, n)
+                except Exception:  # noqa: BLE001 - 单只失败不影响其他
+                    db.rollback()
+                    result["failed"].append(code)
+                    logger.exception("因子变化 %s 的全历史重拉失败", code)
+                if sleep_per_reanchor:
+                    time.sleep(sleep_per_reanchor)
+                continue
+            # 无因子记录 = 从未分红送转,因子为 1,前复权价即原始价
+            factor = factors.get(code, 1.0)
+            df = pd.DataFrame({
+                "date": grp["date"],
+                "open": grp["open"].map(lambda v: raw_to_qfq(v, factor)),
+                "high": grp["high"].map(lambda v: raw_to_qfq(v, factor)),
+                "low": grp["low"].map(lambda v: raw_to_qfq(v, factor)),
+                "close": grp["close"].map(lambda v: raw_to_qfq(v, factor)),
+                "raw_close": grp["close"],
+                "volume": grp["volume"],
+                "amount": grp["amount"],
+                "is_st": grp["is_st"],
+            })
+            result["bars"] += upsert_bars(db, code, df)
+        # 接口返回的 peTTM/pb/ps 一并入库,避免以后再扫估值源
+        try:
+            result["valuations"] = upsert_valuations_from_daily_bulk(db, day, bars)
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            result["valuations"] = 0
+            logger.exception("批量估值字段落库失败 %s", day)
+        result["codes"] = len(bar_codes)
+        result["written_codes"] = bar_codes
+    logger.info(
+        "批量日 K %s: %d 只,写入 %d 行,估值 %d 行,因子变化重拉 %d 只,失败 %d 只",
+        day, result["codes"], result["bars"], result.get("valuations", 0),
+        len(result["reanchored"]), len(result["failed"]))
+    return result
+
 
 
 def ingest_snapshot(db: Session, codes: list[str] | None = None) -> int:

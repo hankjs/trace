@@ -18,9 +18,9 @@ SDK demo:`baostock/demo/demo_daily_k_4_AStock.py` 等。
 
 | 场景 | 应用的接口 | 本模块现状 |
 |---|---|---|
-| 某日全 A 日 K | `bs.query_daily_history_k_AStock(date)` **1 次/日** | 尚未封装;盘后/全市场应按日批量,勿按 code 循环 |
-| 某日全 ETF 日 K | `bs.query_daily_history_k_ETF(date)` | 同上 |
-| 某日全市场复权因子 | `bs.query_daily_adjust_factor(date)` | 尚未封装;`fetch_adjust_factors` 仍按 code |
+| 某日全 A 日 K | `bs.query_daily_history_k_AStock(date)` **1 次/日** | `fetch_market_daily_bars`(已实现,待 P0 spike 验证换算口径后启用) |
+| 某日全 ETF 日 K | `bs.query_daily_history_k_ETF(date)` | 尚未封装 |
+| 某日全市场复权因子 | `bs.query_daily_adjust_factor(date)` | `fetch_market_adjust_factors`(已实现);`fetch_adjust_factors` 按 code 保留兜底 |
 | 单票任意区间 K | `bs.query_history_k_data_plus(code,…)` | `fetch_daily_bars`(每只 2 次:前复权+不复权) |
 | 单票区间因子 | `bs.query_adjust_factor(code,…)` | `fetch_adjust_factors` |
 | 全表证券资料 / 日历 / 成分 | 见对应 fetch_* | 已批量 |
@@ -274,7 +274,85 @@ def fetch_adjust_factors(code: str, start: date | str | None = None,
             code=code, start_date=start_s, end_date=end_s),
         f"baostock 复权因子查询失败 {code}",
     )
+    return _normalize_factor_frame(df)
 
+
+def fetch_market_daily_bars(day: date | str) -> pd.DataFrame:
+    """拉取某日全 A 日 K(query_daily_history_k_AStock,1 次/日)。
+
+    接口没有 adjustflag 入参,返回价**视为不复权原始价**(口径待 P0 spike
+    验证,见 docs/baostock-bulk-ingest.md §3),前复权换算在 ingest 层用
+    复权因子完成。返回列里的 adjustflag 只是信息列,不代表入参生效。
+
+    北交所不在结果中(baostock 不覆盖),仍走新浪源,本函数无需处理。
+
+    返回 DataFrame: date, code, open, high, low, close, preclose, volume,
+    amount, turn, pct_chg, tradestatus(bool), is_st(bool|None),
+    pe_ttm, pb, ps_ttm(接口 peTTM/pbMRQ/psTTM,可落估值表)。
+    停牌行价格为 NaN,由 upsert_bars 按既有语义丢弃。
+    """
+    day_s = day.isoformat() if isinstance(day, (date, datetime)) else str(day)
+
+    df = _client._query_frame(
+        lambda: bs.query_daily_history_k_AStock(date=day_s),
+        f"baostock 批量日 K 查询失败 {day_s}",
+    )
+
+    cols = [
+        "date", "code", "open", "high", "low", "close", "preclose",
+        "volume", "amount", "turn", "pct_chg", "tradestatus", "is_st",
+        "pe_ttm", "pb", "ps_ttm",
+    ]
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    rename = {
+        "preclose": "preclose", "pctChg": "pct_chg", "turn": "turn",
+        "peTTM": "pe_ttm", "pbMRQ": "pb", "psTTM": "ps_ttm",
+    }
+    for src, dst in rename.items():
+        if src in df.columns and src != dst:
+            df = df.rename(columns={src: dst})
+        if dst not in df.columns:
+            df[dst] = None
+
+    for col in ("open", "high", "low", "close", "preclose", "volume", "amount",
+                "turn", "pct_chg", "pe_ttm", "pb", "ps_ttm"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    # tradestatus/isST 是 '0'/'1' 字符串;isST 空值保持 None 表示「未知」
+    if "tradestatus" in df.columns:
+        df["tradestatus"] = df["tradestatus"].astype(str).str.strip() == "1"
+    else:
+        df["tradestatus"] = True
+    if "isST" in df.columns:
+        st = pd.to_numeric(df["isST"], errors="coerce")
+        df["is_st"] = st.map(lambda v: None if pd.isna(v) else bool(v))
+    else:
+        df["is_st"] = None
+    return df[cols]
+
+
+def fetch_market_adjust_factors(day: date | str) -> pd.DataFrame:
+    """拉取某日全市场复权因子(query_daily_adjust_factor,1 次/日)。
+
+    返回各 code 当日生效的最新因子记录(dividOperateDate 为其生效的除权日),
+    与 `fetch_adjust_factors` 同一来源同一口径,只是从按 code 改为按日全市场。
+
+    返回 DataFrame: code, divid_operate_date(date), fore_factor, back_factor
+    """
+    day_s = day.isoformat() if isinstance(day, (date, datetime)) else str(day)
+
+    df = _client._query_frame(
+        lambda: bs.query_daily_adjust_factor(date=day_s),
+        f"baostock 批量复权因子查询失败 {day_s}",
+    )
+    return _normalize_factor_frame(df)
+
+
+def _normalize_factor_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """baostock 因子帧规范化:列名统一、类型转换、剔除不可用行。"""
     cols = ["code", "divid_operate_date", "fore_factor", "back_factor"]
     if df.empty:
         return pd.DataFrame(columns=cols)

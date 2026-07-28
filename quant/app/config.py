@@ -43,6 +43,9 @@ class Settings:
         self.schema_strict: bool = True
         # HTTP 入口是否异步回测(BackgroundTasks)。生产默认 True;pytest 在 conftest 关。
         self.backtest_async: bool = True
+        # 盘后日 K 是否走 baostock 按日批量链路(P2)。默认关闭:
+        # 换算口径待 P0 spike 验证(docs/baostock-bulk-ingest.md §3),验证前不开生产。
+        self.bulk_daily_bars: bool = False
 
         # quant 自己的覆盖配置(可选)
         local_cfg = QUANT_DIR / "config.toml"
@@ -68,6 +71,8 @@ class Settings:
                 self.schema_strict = bool(local["schema_strict"])
             if "backtest_async" in local:
                 self.backtest_async = bool(local["backtest_async"])
+            if "bulk_daily_bars" in local:
+                self.bulk_daily_bars = bool(local["bulk_daily_bars"])
 
         if not self.database_url:
             raise ValueError(
