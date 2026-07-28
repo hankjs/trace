@@ -24,6 +24,11 @@ import {
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import StrategySpecEditor from '../components/StrategySpecEditor.vue'
+import {
+  designCompleteReady,
+  evaluateDesignCompleteChecklist,
+  type DesignCheckItem,
+} from '../designCompleteChecklist'
 import { useStrategies } from '../strategies'
 import {
   buildStrategySpec,
@@ -66,12 +71,45 @@ const previewSpec = computed(() => validation.value?.normalized_spec ?? draftSpe
 const previewJson = computed(() => JSON.stringify(previewSpec.value, null, 2))
 const capability = computed(() => validation.value?.capability ?? selected.value?.capability ?? null)
 
+const designChecks = computed<DesignCheckItem[]>(() => {
+  const capOk = (capability.value?.status ?? 'supported') === 'supported'
+  const spec = draftSpec.value ?? selected.value?.spec
+  return evaluateDesignCompleteChecklist(spec, capOk)
+})
+const designReady = computed(() => designCompleteReady(designChecks.value))
+const designGateMessage = ref('')
+
 const capabilityText: Record<StrategyCapabilityStatus, string> = {
   supported: '当前数据与引擎支持',
   missing_data: '缺少所需数据',
   missing_engine: '引擎尚未支持',
   subjective_only: '仅适合作为主观研究记录',
   boundary_denied: '超出日频研究边界',
+}
+
+const CHECK_FIELD_ANCHORS: Record<string, string> = {
+  HYP_LEN: 'hypothesis',
+  HYP_PLACEHOLDER: 'hypothesis',
+  BASELINE_KNOWN: 'validation',
+  BASELINE_MIN: 'validation',
+  REJECT_NONEMPTY: 'validation',
+  REJECT_KNOWN: 'validation',
+  LOCKED_OOS: 'validation',
+  NATIVE_EXIT: 'exit',
+  CAPABILITY: 'data',
+}
+
+function scrollToCheckField(checkId: string) {
+  const key = CHECK_FIELD_ANCHORS[checkId]
+  const map: Record<string, string> = {
+    hypothesis: 'strategy-spec-hypothesis',
+    validation: 'strategy-spec-validation-heading',
+    exit: 'strategy-spec-exit-heading',
+    data: 'strategy-spec-data-heading',
+  }
+  const elId = key ? map[key] : undefined
+  if (!elId) return
+  document.getElementById(elId)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
 }
 
 function kindName(strategy: Strategy) {
@@ -94,12 +132,29 @@ function evidenceStatusName(status?: StrategyEvidenceStatus) {
 async function runEvidenceAction(action: StrategyEvidenceAction) {
   const strategy = selected.value
   if (!strategy || !strategy.editable) return
+  if (
+    (action === 'mark_design_complete' || action === 'reset_rejected')
+    && !designReady.value
+  ) {
+    designGateMessage.value = '验证设计清单未全部通过,请先补全假说/基线/否决/锁定样本外等项。'
+    return
+  }
+  designGateMessage.value = ''
   await runAction(async () => {
-    await api.updateStrategyEvidence(strategy.id, action)
-    await refreshStrategies(strategy.id)
+    try {
+      await api.updateStrategyEvidence(strategy.id, action)
+      await refreshStrategies(strategy.id)
+    } catch (caught) {
+      const err = caught as Error & { detail?: { error?: string, checks?: DesignCheckItem[], message?: string } }
+      if (err.detail?.error === 'design_complete_checklist_failed' && err.detail.checks) {
+        const failed = err.detail.checks.filter((c) => !c.ok)
+        designGateMessage.value = failed.map((c) => c.message).join('；') || err.message
+      }
+      throw caught
+    }
   }, {
     success: action === 'mark_design_complete'
-      ? '已标记为验证设计完成。之后完成并落库的回测才会推进证据状态；样本外通过仅表示声明的否决条件已满足，不代表策略可交易。'
+      ? '已标记为验证设计完成。通过清单仅表示可以开始严肃回测证据链,不代表策略有效或可交易。'
       : '已复位否决结论，状态回到验证设计完成。',
   })
 }
@@ -350,18 +405,41 @@ void init()
               <button
                 v-if="selected.editable && selected.evidence_actions?.includes('mark_design_complete')"
                 type="button"
-                :disabled="busy"
+                :disabled="busy || !designReady"
                 class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
+                :title="designReady ? '标记为验证设计完成' : '清单未全绿,不可标记'"
                 @click="runEvidenceAction('mark_design_complete')"
               >标记设计完成</button>
               <button
                 v-if="selected.editable && selected.evidence_actions?.includes('reset_rejected')"
                 type="button"
-                :disabled="busy"
+                :disabled="busy || !designReady"
                 class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
                 @click="runEvidenceAction('reset_rejected')"
               >复位否决</button>
             </p>
+            <div
+              v-if="!creating && selected?.editable && (selected.evidence_actions?.length || designChecks.length)"
+              class="mt-2 rounded border border-border-subtle bg-surface-muted px-2.5 py-2"
+            >
+              <div class="text-[11px] font-medium text-text-secondary">验证设计清单</div>
+              <p class="mt-0.5 text-[10px] leading-4 text-text-tertiary">
+                通过清单 ≠ 策略有效,仅表示可以开始严肃回测证据链。
+              </p>
+              <ul class="mt-1.5 space-y-0.5">
+                <li
+                  v-for="check in designChecks"
+                  :key="check.id"
+                  class="flex cursor-pointer items-start gap-1.5 text-[11px] leading-4"
+                  :class="check.ok ? 'text-down' : 'text-up'"
+                  @click="scrollToCheckField(check.id)"
+                >
+                  <span class="shrink-0 font-mono">{{ check.ok ? '✓' : '✗' }}</span>
+                  <span>{{ check.id }} · {{ check.message }}</span>
+                </li>
+              </ul>
+              <p v-if="designGateMessage" class="mt-1.5 text-[11px] text-up">{{ designGateMessage }}</p>
+            </div>
           </div>
           <div class="flex flex-wrap items-center gap-2">
             <button

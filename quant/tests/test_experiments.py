@@ -14,10 +14,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.api.experiments import (
     ExperimentCreateIn,
+    TrialBatchCreateIn,
     TrialCreateIn,
     api_archive_experiment,
     api_create_experiment,
     api_create_trial,
+    api_create_trials_batch,
     api_delete_trial_denied,
     api_get_experiment,
     api_list_experiments,
@@ -127,3 +129,47 @@ def test_experiment_trial_ledger_keeps_failures():
 
         archived = api_archive_experiment(created["id"], db=db, claims=CLAIMS)
         assert archived["status"] == "archived"
+
+
+def test_batch_trials_persist_mixed_success_and_failure():
+    """B5: 批量创建含失败项全部落库。"""
+    with _session() as db:
+        strategy = _seed(db)
+        created = api_create_experiment(
+            ExperimentCreateIn(
+                title="批处理",
+                hypothesis="批量 trial 账本",
+                permanent_candidate_id="CAN-BATCH-01",
+                spec=strategy.spec,
+                strategy_id=strategy.id,
+            ),
+            db=db, claims=CLAIMS,
+        )
+        patches = [
+            {},
+            {"$.native_exit.condition.right.window": 5},
+            {"$.not.exist": 1},
+            {"$.holding.cooldown_days": 2},
+            {"$.also.missing": 9},
+            {},
+            {"$.holding.cooldown_days": 3},
+            {"$.holding.cooldown_days": 4},
+            {"$.bad.path": 0},
+            {"$.holding.cooldown_days": 5},
+        ]
+        assert len(patches) == 10
+        result = api_create_trials_batch(
+            created["id"],
+            TrialBatchCreateIn(
+                codes=["sh.600519"], start=START, end=END,
+                param_patches=patches,
+            ),
+            db=db, claims=CLAIMS,
+        )
+        assert result["count"] == 10
+        assert len(result["items"]) == 10
+        outcomes = [item["trial"]["outcome"] for item in result["items"]]
+        assert any(o == "error" for o in outcomes)
+        detail = api_get_experiment(created["id"], db=db, claims=CLAIMS)
+        assert detail["trial_count"] == 10
+        assert len(detail["trials"]) == 10

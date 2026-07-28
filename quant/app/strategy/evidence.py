@@ -9,13 +9,16 @@ evidence_status 归一后再算哈希,同一规则内容的不同状态共享同
 
 迁移规则(只能前进,rejected 为终态):
 
-- unverified --(手动标记,规格校验通过且 hypothesis 非空)--> design_complete
+- unverified --(手动标记,须通过 design_complete 硬清单)--> design_complete
 - design_complete --(有同身份规格的完成回测)--> backtested
 - backtested --(locked_oos 回测且否决条件全过)--> oos_passed
 - 任意非终态 --(回测命中否决条件)--> rejected
-- rejected --(人工复位)--> design_complete
+- rejected --(人工复位,同样须通过硬清单)--> design_complete
 - 规格编辑导致身份变化且旧状态高于 design_complete(含 rejected)时,保存即
   回落到 design_complete:旧回测证据与旧否决结论都是针对旧规格的。
+
+硬清单只约束进入 design_complete 的路径;普通 validate/save 仍允许草稿
+(例如 locked_oos=false),避免把探索阶段挡在门外。
 """
 from __future__ import annotations
 
@@ -24,7 +27,13 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from .runtime import strategy_spec_for
-from .spec import StrategySpec, parse_strategy_spec, strategy_spec_hash
+from .spec import (
+    CapabilityStatus,
+    StrategySpec,
+    parse_strategy_spec,
+    resolve_capabilities,
+    strategy_spec_hash,
+)
 
 EVIDENCE_STATUSES = (
     "unverified", "design_complete", "backtested", "oos_passed", "rejected",
@@ -33,6 +42,196 @@ STATUS_RANK = {
     "unverified": 0, "design_complete": 1, "backtested": 2, "oos_passed": 3,
 }
 MANUAL_ACTIONS = ("mark_design_complete", "reset_rejected")
+
+# 与 app/backtest/validation.py 的内置基线 / 遗留否决字符串保持同步
+KNOWN_BASELINE_IDS = frozenset({"buy_and_hold", "equal_weight"})
+KNOWN_LEGACY_REJECTION = frozenset({
+    "no_net_oos_increment", "unstable_parameters", "capacity_failure",
+})
+
+# 整句假说黑名单(大小写不敏感、去空白后精确匹配)
+_HYPOTHESIS_PLACEHOLDERS = frozenset({
+    "todo", "tbd", "placeholder", "n/a", "na", "none",
+    "测试", "占位", "待补充", "假说", "hypothesis",
+})
+_HYP_MIN_LEN = 20
+_HYP_MAX_LEN = 1000
+
+
+class DesignCompleteChecklistError(ValueError):
+    """硬清单未通过:携带字段级 checks,API 映射为 4xx 结构化 body。"""
+
+    def __init__(self, checks: list[dict[str, Any]]):
+        self.checks = checks
+        failed = sum(1 for item in checks if not item.get("ok"))
+        super().__init__(
+            f"design_complete_checklist_failed: {failed} 项未通过",
+        )
+
+
+def _check(
+    check_id: str, ok: bool, *, code: str | None, message: str,
+) -> dict[str, Any]:
+    return {
+        "id": check_id,
+        "ok": ok,
+        "code": None if ok else code,
+        "message": message,
+    }
+
+
+def design_complete_checks(
+    spec: StrategySpec | dict[str, Any],
+    *,
+    available_fields: set[str] | frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """机器可判定的验证设计硬清单(全部 ok 才能进入 design_complete)。
+
+    不修改规格;普通 validate 不调用本函数。
+    """
+    parsed = spec if isinstance(spec, StrategySpec) else parse_strategy_spec(spec)
+    hyp = (parsed.metadata.hypothesis or "").strip()
+    hyp_lower = hyp.casefold()
+    checks: list[dict[str, Any]] = []
+
+    hyp_len_ok = _HYP_MIN_LEN <= len(hyp) <= _HYP_MAX_LEN
+    checks.append(_check(
+        "HYP_LEN", hyp_len_ok,
+        code="hypothesis_too_short",
+        message=(
+            f"假说去空白后长度 {len(hyp)},须在 {_HYP_MIN_LEN}–{_HYP_MAX_LEN} 字"
+            if not hyp_len_ok else f"假说长度 {len(hyp)} 字,符合要求"
+        ),
+    ))
+
+    hyp_placeholder = hyp_lower in _HYPOTHESIS_PLACEHOLDERS
+    checks.append(_check(
+        "HYP_PLACEHOLDER", not hyp_placeholder,
+        code="hypothesis_placeholder",
+        message=(
+            "假说不能是占位词(todo/测试/TBD/占位等)"
+            if hyp_placeholder else "假说不是已知占位词"
+        ),
+    ))
+
+    baselines = list(parsed.validation.baseline_ids)
+    unknown = [b for b in baselines if b not in KNOWN_BASELINE_IDS]
+    checks.append(_check(
+        "BASELINE_KNOWN", not unknown and len(baselines) >= 1,
+        code="baseline_unknown",
+        message=(
+            f"未知基线: {', '.join(unknown)}"
+            if unknown else
+            ("至少需要 1 个已知基线" if not baselines else "基线均在已知集合内")
+        ),
+    ))
+    checks.append(_check(
+        "BASELINE_MIN", len(baselines) >= 1,
+        code="baseline_missing",
+        message="至少需要 1 个基线" if not baselines else f"已声明 {len(baselines)} 个基线",
+    ))
+
+    criteria = [str(c).strip() for c in parsed.validation.rejection_criteria]
+    rules = list(parsed.validation.rejection_rules or [])
+    empty_criteria = any(not c for c in criteria)
+    non_empty = [c for c in criteria if c]
+    has_legacy = any(c in KNOWN_LEGACY_REJECTION for c in non_empty)
+    # 去空白后每项非空,且至少有一条已知遗留条件或结构化规则
+    reject_nonempty = (
+        len(criteria) >= 1
+        and not empty_criteria
+        and (has_legacy or len(rules) >= 1)
+    )
+    checks.append(_check(
+        "REJECT_NONEMPTY", reject_nonempty,
+        code="rejection_missing",
+        message=(
+            "否决条件去空白后存在空项,或缺少已知否决/结构化规则"
+            if not reject_nonempty else "否决条件非空且可用"
+        ),
+    ))
+
+    unknown_criteria = [c for c in non_empty if c not in KNOWN_LEGACY_REJECTION]
+    # 禁止随意字符串:每个字符串 criteria 必须属于已知遗留集合
+    # 若只写 structured rules,仍须至少有一条合法字符串(Spec 层 min_length=1),
+    # 该字符串也必须是已知的(或允许用合法 legacy 占位 + rules)
+    reject_known = not unknown_criteria and (has_legacy or len(rules) >= 1)
+    if unknown_criteria:
+        reject_known = False
+    checks.append(_check(
+        "REJECT_KNOWN", reject_known,
+        code="rejection_unknown",
+        message=(
+            f"未知否决条件: {', '.join(unknown_criteria)}"
+            if unknown_criteria else
+            (
+                "否决条件均在已知集合"
+                if reject_known else "缺少已知否决条件或结构化规则"
+            )
+        ),
+    ))
+
+    locked = bool(parsed.validation.locked_oos)
+    checks.append(_check(
+        "LOCKED_OOS", locked,
+        code="oos_not_locked",
+        message="已锁定样本外" if locked else "须将 validation.locked_oos 设为 true",
+    ))
+
+    if parsed.kind == "single":
+        native_ok = parsed.native_exit is not None
+        checks.append(_check(
+            "NATIVE_EXIT", native_ok,
+            code="native_exit_missing",
+            message=(
+                "单标的策略必须包含 native_exit"
+                if not native_ok else "已声明原生离场"
+            ),
+        ))
+    else:
+        # portfolio: positioning 完整性由 StrategySpec 层保证;此处再确认有 score
+        pos = parsed.positioning
+        pos_ok = (
+            getattr(pos, "type", None) is not None
+            or (isinstance(pos, dict) and pos.get("type"))
+            or hasattr(pos, "selection")
+        )
+        checks.append(_check(
+            "NATIVE_EXIT", pos_ok,
+            code="native_exit_missing",
+            message=(
+                "组合策略 positioning 不完整"
+                if not pos_ok else "组合 positioning 完整"
+            ),
+        ))
+
+    report = resolve_capabilities(
+        parsed.model_dump(mode="json"),
+        available_fields=available_fields,
+    )
+    cap_ok = report.status == CapabilityStatus.SUPPORTED
+    checks.append(_check(
+        "CAPABILITY", cap_ok,
+        code="capability_not_supported",
+        message=(
+            f"能力状态为 {report.status.value},须为 supported"
+            if not cap_ok else "能力解析为 supported"
+        ),
+    ))
+
+    return checks
+
+
+def assert_design_complete_ready(
+    spec: StrategySpec | dict[str, Any],
+    *,
+    available_fields: set[str] | frozenset[str] | None = None,
+) -> list[dict[str, Any]]:
+    """清单全绿返回 checks;否则抛 DesignCompleteChecklistError。"""
+    checks = design_complete_checks(spec, available_fields=available_fields)
+    if any(not item["ok"] for item in checks):
+        raise DesignCompleteChecklistError(checks)
+    return checks
 
 
 def with_status(spec: StrategySpec, status: str) -> StrategySpec:
@@ -94,12 +293,21 @@ def resolve_status_on_edit(old_raw: Any, new_spec: StrategySpec) -> str:
     return "design_complete" if advanced else old_status
 
 
-def apply_manual_action(db: Session, strategy: Any, action: str) -> dict[str, str]:
-    """手动迁移:标记设计完成 / 否决复位。非法迁移抛 ValueError。"""
+def apply_manual_action(
+    db: Session,
+    strategy: Any,
+    action: str,
+    *,
+    available_fields: set[str] | frozenset[str] | None = None,
+) -> dict[str, Any]:
+    """手动迁移:标记设计完成 / 否决复位。
+
+    进入 design_complete 时跑硬清单;失败抛 DesignCompleteChecklistError。
+    其它非法迁移抛 ValueError。
+    """
     spec = strategy_spec_for(strategy)
     current = spec.metadata.evidence_status
     if action == "mark_design_complete":
-        # 规格能解析即代表校验通过;hypothesis 非空由 MetadataSpec 硬约束保证
         if current != "unverified":
             raise ValueError("只有未验证状态可以手动标记为设计完成")
         target = "design_complete"
@@ -109,8 +317,12 @@ def apply_manual_action(db: Session, strategy: Any, action: str) -> dict[str, st
         target = "design_complete"
     else:
         raise ValueError(f"未知证据状态操作: {action}")
+
+    checks = assert_design_complete_ready(
+        spec, available_fields=available_fields,
+    )
     _write_status(db, strategy, spec, target)
-    return {"from": current, "to": target}
+    return {"from": current, "to": target, "checks": checks}
 
 
 def advance_after_backtest(
@@ -161,7 +373,9 @@ def advance_after_backtest(
 
 __all__ = [
     "EVIDENCE_STATUSES", "MANUAL_ACTIONS", "STATUS_RANK",
-    "advance_after_backtest", "apply_manual_action", "candidate_spec_hashes",
-    "manual_actions_for", "resolve_status_on_edit", "spec_identity_hash",
-    "with_status",
+    "DesignCompleteChecklistError",
+    "advance_after_backtest", "apply_manual_action",
+    "assert_design_complete_ready", "candidate_spec_hashes",
+    "design_complete_checks", "manual_actions_for",
+    "resolve_status_on_edit", "spec_identity_hash", "with_status",
 ]

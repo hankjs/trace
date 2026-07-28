@@ -45,6 +45,20 @@ class TrialCreateIn(BaseModel):
     dynamic_universe: bool = False
 
 
+MAX_BATCH_TRIALS = 32
+
+
+class TrialBatchCreateIn(BaseModel):
+    """一次提交多个 param_patch;单项失败记 error 不中断整批。"""
+    codes: list[str] = Field(..., min_length=1, max_length=800)
+    start: date
+    end: date
+    param_patches: list[dict] = Field(..., min_length=1, max_length=MAX_BATCH_TRIALS)
+    costs: dict = Field(default_factory=dict)
+    pool_id: int | None = None
+    dynamic_universe: bool = False
+
+
 @router.get("")
 def api_list_experiments(
     include_archived: bool = False,
@@ -155,6 +169,50 @@ def api_create_trial(
             "execution_fingerprint": result.get("execution_fingerprint"),
         }
     return payload
+
+
+@router.post("/{experiment_id}/trials/batch")
+def api_create_trials_batch(
+    experiment_id: int,
+    body: TrialBatchCreateIn,
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """批量创建 trial(≤32);顺序执行,单项失败落库 outcome=error,不中断。"""
+    if body.start >= body.end:
+        raise HTTPException(400, "start 必须早于 end")
+    if len(body.param_patches) > MAX_BATCH_TRIALS:
+        raise HTTPException(400, f"单批最多 {MAX_BATCH_TRIALS} 个 param_patch")
+    owner_id = user_id_from_claims(claims)
+    codes = list(dict.fromkeys(c.lower() for c in body.codes))
+    items: list[dict[str, Any]] = []
+    for patch in body.param_patches:
+        try:
+            trial, result = create_trial_and_run(
+                db,
+                experiment_id=experiment_id,
+                owner_id=owner_id,
+                codes=codes,
+                start=body.start,
+                end=body.end,
+                param_patch=patch if isinstance(patch, dict) else {},
+                costs=body.costs or None,
+                pool_id=body.pool_id,
+                dynamic_universe=body.dynamic_universe,
+            )
+            item: dict[str, Any] = {"trial": trial_out(trial), "error": None}
+            if result is not None:
+                item["backtest_run_id"] = result.get("run_id")
+            items.append(item)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            # 实验级错误(如已归档)中断整批;trial 级错误由 create_trial_and_run 内部落库
+            raise HTTPException(400, str(exc)) from exc
+    return {
+        "count": len(items),
+        "items": items,
+    }
 
 
 @router.post("/{experiment_id}/archive")

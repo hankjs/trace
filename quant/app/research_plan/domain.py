@@ -438,7 +438,8 @@ def _reason_tree(expr: Expression, df: pd.DataFrame) -> dict[str, Any]:
 
 def _tree_has_unavailable_value(tree: Mapping[str, Any]) -> bool:
     indicator_ops = {
-        "rolling_mean", "rolling_max", "rolling_min", "volume_ratio",
+        "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
+        "rolling_rank", "zscore", "volume_ratio",
         "ma", "rsi", "atr", "momentum", "return", "shift",
     }
     if tree.get("op") in indicator_ops and tree.get("value") is None:

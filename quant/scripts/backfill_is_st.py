@@ -49,7 +49,7 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("backfill_is_st")
 
-SLEEP_PER_CODE = 0.15
+SLEEP_PER_CODE = 0.3
 RETRY = 3
 
 

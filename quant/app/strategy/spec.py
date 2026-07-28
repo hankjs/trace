@@ -29,7 +29,8 @@ SUPPORTED_OPERATORS = frozenset({
     "field", "literal", "all", "any", "not",
     "gt", "gte", "lt", "lte", "cross_above", "cross_below",
     "add", "subtract", "multiply", "divide",
-    "rolling_mean", "rolling_max", "rolling_min", "shift",
+    "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
+    "rolling_rank", "zscore", "shift",
     "ma", "rsi", "atr", "momentum", "return", "volume_ratio",
     "rank", "top_n",
 })
@@ -54,7 +55,8 @@ _OP_FIELDS: dict[str, frozenset[str]] = {
         "add", "subtract", "multiply", "divide",
     )},
     **{op: frozenset({"op", "input", "window", "shift"}) for op in (
-        "rolling_mean", "rolling_max", "rolling_min", "volume_ratio",
+        "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
+        "rolling_rank", "zscore", "volume_ratio",
     )},
     "shift": frozenset({"op", "input", "periods"}),
     **{op: frozenset({"op", "input", "window"}) for op in (
@@ -160,7 +162,10 @@ class Expression(StrictModel):
                 raise ValueError("literal.value 必须是有限数字")
         if self.op in {"all", "any"} and not self.args:
             raise ValueError(f"{self.op}.args 不能为空")
-        if self.op in {"rolling_mean", "rolling_max", "rolling_min", "volume_ratio"}:
+        if self.op in {
+            "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
+            "rolling_rank", "zscore", "volume_ratio",
+        }:
             if self.window is None or not 2 <= self.window <= MAX_WINDOW:
                 raise ValueError(f"{self.op}.window 必须在 2 到 {MAX_WINDOW} 之间")
             if self.shift is None or not 0 <= self.shift <= MAX_WINDOW:

@@ -107,6 +107,18 @@ export const EXPRESSION_OPS: ExpressionOpDef[] = [
     slots: [INPUT_SLOT], params: ['window', 'shift'], defaults: { window: 20, shift: 1 },
   },
   {
+    op: 'rolling_std', label: '滚动标准差 (ddof=0)', result: 'number',
+    slots: [INPUT_SLOT], params: ['window', 'shift'], defaults: { window: 20, shift: 1 },
+  },
+  {
+    op: 'rolling_rank', label: '滚动百分位排名', result: 'number',
+    slots: [INPUT_SLOT], params: ['window', 'shift'], defaults: { window: 20, shift: 1 },
+  },
+  {
+    op: 'zscore', label: '滚动 Z-Score', result: 'number',
+    slots: [INPUT_SLOT], params: ['window', 'shift'], defaults: { window: 20, shift: 1 },
+  },
+  {
     op: 'volume_ratio', label: '量比', result: 'number',
     slots: [INPUT_SLOT], params: ['window', 'shift'], defaults: { window: 5, shift: 1 },
   },

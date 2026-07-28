@@ -44,16 +44,20 @@ async function request<T>(url: string, options: RequestInit = {}): Promise<T> {
   }
   if (!res.ok) {
     let msg = `请求失败: ${res.status}`
+    let detail: unknown
     try {
       const json = await res.json()
+      detail = json.detail
       if (typeof json.detail === 'string') msg = json.detail
       else if (json.detail && typeof json.detail.message === 'string') msg = json.detail.message
+      else if (json.detail && typeof json.detail.error === 'string') msg = json.detail.error
       else if (Array.isArray(json.detail) && json.detail[0]?.msg) msg = json.detail[0].msg
     } catch {
       /* 非 JSON 错误体 */
     }
-    const error = new Error(msg) as Error & { status?: number }
+    const error = new Error(msg) as Error & { status?: number, detail?: unknown }
     error.status = res.status
+    error.detail = detail
     throw error
   }
   return res.json() as Promise<T>
@@ -1475,10 +1479,16 @@ export const api = {
     return request<{ deleted: number; id: number }>(`/api/strategies/${id}`, { method: 'DELETE' })
   },
 
-  validateStrategySpec(spec: StrategySpec) {
-    return request<StrategyValidationResult>('/api/strategies/validate', {
+  validateStrategySpec(spec: StrategySpec, opts?: { check_design_gate?: boolean }) {
+    return request<StrategyValidationResult & {
+      design_complete_checks?: Array<{ id: string, ok: boolean, code: string | null, message: string }>
+      design_complete_ready?: boolean
+    }>('/api/strategies/validate', {
       method: 'POST',
-      body: JSON.stringify({ spec }),
+      body: JSON.stringify({
+        spec,
+        check_design_gate: opts?.check_design_gate ?? false,
+      }),
     })
   },
 
@@ -1619,6 +1629,25 @@ export const api = {
         execution_fingerprint?: string
       }
     }>(`/api/experiments/${id}/trials`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
+  /** 批量 trial(≤32);单项失败落库不中断 */
+  createExperimentTrialsBatch(id: number, body: {
+    codes: string[]
+    start: string
+    end: string
+    param_patches: Array<Record<string, number | string | boolean>>
+    costs?: Record<string, number>
+    pool_id?: number
+    dynamic_universe?: boolean
+  }) {
+    return request<{
+      count: number
+      items: Array<{ trial: ExperimentTrial, error: string | null, backtest_run_id?: number }>
+    }>(`/api/experiments/${id}/trials/batch`, {
       method: 'POST',
       body: JSON.stringify(body),
     })

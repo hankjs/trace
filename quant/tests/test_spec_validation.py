@@ -52,9 +52,11 @@ from app.backtest.validation import (
 from app.db import Base
 from app.models import BacktestRun, Strategy
 from app.strategy.evidence import (
+    DesignCompleteChecklistError,
     advance_after_backtest,
     apply_manual_action,
     candidate_spec_hashes,
+    design_complete_checks,
     resolve_status_on_edit,
     spec_identity_hash,
     with_status,
@@ -112,7 +114,8 @@ def _spec_dict(
             "canonical_id": "USER-VALIDATION-01",
             "sources": [{"book": "测试", "candidate_id": "VALIDATION-01"}],
             "evidence_status": "unverified",
-            "hypothesis": "站上 10 元持有,跌破 8 元退出。",
+            # ≥20 字以满足 design_complete 硬清单 HYP_LEN
+            "hypothesis": "站上 10 元持有、跌破 8 元退出，用于验证设计清单。",
         },
         "universe": {
             "pool_id": 2, "exclude_st": True,
@@ -481,7 +484,10 @@ def test_advance_full_path():
         assert advance_after_backtest(db, strategy, _run_result(raw)) is None
         assert strategy.spec["metadata"]["evidence_status"] == "unverified"
 
-        apply_manual_action(db, strategy, "mark_design_complete")
+        transition = apply_manual_action(db, strategy, "mark_design_complete")
+        assert transition["from"] == "unverified"
+        assert transition["to"] == "design_complete"
+        assert all(c["ok"] for c in transition["checks"])
         # design_complete --(OOS 回测全过)--> oos_passed(允许跨级前进)
         transition = advance_after_backtest(db, strategy, _run_result(raw))
         assert transition == {"from": "design_complete", "to": "oos_passed"}
@@ -539,7 +545,9 @@ def test_manual_actions_and_reset():
         strategy = _strategy_row(db, raw)
 
         transition = apply_manual_action(db, strategy, "mark_design_complete")
-        assert transition == {"from": "unverified", "to": "design_complete"}
+        assert transition["from"] == "unverified"
+        assert transition["to"] == "design_complete"
+        assert all(c["ok"] for c in transition["checks"])
 
         # 自动推进的状态不允许手改
         with pytest.raises(ValueError):
@@ -550,7 +558,109 @@ def test_manual_actions_and_reset():
         advance_after_backtest(db, strategy, _run_result(raw, verdict="rejected"))
         assert strategy.spec["metadata"]["evidence_status"] == "rejected"
         transition = apply_manual_action(db, strategy, "reset_rejected")
-        assert transition == {"from": "rejected", "to": "design_complete"}
+        assert transition["from"] == "rejected"
+        assert transition["to"] == "design_complete"
+        assert all(c["ok"] for c in transition["checks"])
+
+
+def test_design_complete_checklist_matrix():
+    """D1–D5 / D7–D8:硬清单失败矩阵与成功路径。"""
+    base = _spec_dict()
+
+    # D1: 19 字失败;合法长度 + 其余满足成功
+    short_hyp = dict(base)
+    short_hyp["metadata"] = {
+        **base["metadata"],
+        "hypothesis": "一二三四五六七八九十一二三四五六七八九",  # 19
+    }
+    assert len(short_hyp["metadata"]["hypothesis"].strip()) == 19
+    short_checks = design_complete_checks(short_hyp)
+    by_id = {c["id"]: c for c in short_checks}
+    assert by_id["HYP_LEN"]["ok"] is False
+    assert by_id["HYP_LEN"]["code"] == "hypothesis_too_short"
+
+    ok_checks = design_complete_checks(base)
+    assert all(c["ok"] for c in ok_checks), ok_checks
+
+    # D2: locked_oos=false
+    unlocked = _spec_dict(locked_oos=False)
+    by_id = {c["id"]: c for c in design_complete_checks(unlocked)}
+    assert by_id["LOCKED_OOS"]["ok"] is False
+    assert by_id["LOCKED_OOS"]["code"] == "oos_not_locked"
+
+    # D3: 未知 rejection
+    bad_rej = _spec_dict(rejection_criteria=["foo"])
+    by_id = {c["id"]: c for c in design_complete_checks(bad_rej)}
+    assert by_id["REJECT_KNOWN"]["ok"] is False
+    assert by_id["REJECT_KNOWN"]["code"] == "rejection_unknown"
+
+    # D4: 未知 baseline
+    bad_base = _spec_dict(baseline_ids=["magic_alpha"])
+    by_id = {c["id"]: c for c in design_complete_checks(bad_base)}
+    assert by_id["BASELINE_KNOWN"]["ok"] is False
+    assert by_id["BASELINE_KNOWN"]["code"] == "baseline_unknown"
+
+    # D5: capability missing_data(声明不支持字段)
+    missing = dict(base)
+    missing["data_requirements"] = [
+        {"field": "close", "availability": "daily_close", "required": True},
+        {"field": "not_a_real_field_xyz", "availability": "daily_close", "required": True},
+    ]
+    # 未知 field 在 SUPPORTED_FIELDS 之外会在 resolve_capabilities 记 missing_data;
+    # 但 parse 可能因 field 名合法(snake)而通过。若字段不在 SUPPORTED_FIELDS:
+    from app.strategy.spec import SUPPORTED_FIELDS
+    assert "not_a_real_field_xyz" not in SUPPORTED_FIELDS
+    # parse 时 DataRequirementSpec 不校验字段目录;capability 会失败
+    by_id = {c["id"]: c for c in design_complete_checks(missing)}
+    assert by_id["CAPABILITY"]["ok"] is False
+    assert by_id["CAPABILITY"]["code"] == "capability_not_supported"
+
+    # D7: 普通 validate 仍允许 locked_oos=false 草稿
+    from app.api.strategies import StrategyValidateIn, validate_strategy
+    draft = validate_strategy(
+        StrategyValidateIn(spec=_spec_dict(locked_oos=False)),
+        db=None,
+    )
+    assert draft["valid"] is True
+    assert draft.get("design_complete_ready") is None
+
+    # 带 check_design_gate 可拿到清单
+    gated = validate_strategy(
+        StrategyValidateIn(
+            spec=_spec_dict(locked_oos=False), check_design_gate=True,
+        ),
+        db=None,
+    )
+    assert gated["valid"] is True
+    assert gated["design_complete_ready"] is False
+    assert any(
+        c["id"] == "LOCKED_OOS" and not c["ok"]
+        for c in gated["design_complete_checks"]
+    )
+
+    # D8: apply_manual_action 硬失败
+    with _session() as db:
+        strategy = _strategy_row(db, _spec_dict(locked_oos=False))
+        with pytest.raises(DesignCompleteChecklistError) as exc_info:
+            apply_manual_action(db, strategy, "mark_design_complete")
+        assert any(
+            c["id"] == "LOCKED_OOS" and not c["ok"]
+            for c in exc_info.value.checks
+        )
+        assert strategy.spec["metadata"]["evidence_status"] == "unverified"
+
+    with _session() as db:
+        good = _strategy_row(db, _spec_dict())
+        transition = apply_manual_action(db, good, "mark_design_complete")
+        assert transition["to"] == "design_complete"
+
+
+def test_hypothesis_placeholder_blocked():
+    raw = _spec_dict()
+    raw["metadata"] = {**raw["metadata"], "hypothesis": "TODO"}
+    by_id = {c["id"]: c for c in design_complete_checks(raw)}
+    assert by_id["HYP_PLACEHOLDER"]["ok"] is False
+    assert by_id["HYP_PLACEHOLDER"]["code"] == "hypothesis_placeholder"
 
 
 def test_resolve_status_on_edit_fallback():
@@ -656,9 +766,9 @@ def test_create_forces_unverified_and_manual_mark():
             db=db, claims=CLAIMS_A,
         )
         assert updated["evidence_status"] == "design_complete"
-        assert updated["evidence_transition"] == {
-            "from": "unverified", "to": "design_complete",
-        }
+        assert updated["evidence_transition"]["from"] == "unverified"
+        assert updated["evidence_transition"]["to"] == "design_complete"
+        assert all(c["ok"] for c in updated["evidence_transition"]["checks"])
         assert updated["evidence_actions"] == []
 
         # 重复标记:400

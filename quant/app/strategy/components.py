@@ -11,12 +11,15 @@ import pandas as pd
 from .spec import Expression
 
 COMPONENT_VERSION = "strategy-components-v1"
+# rolling_std 固定 ddof=0(总体标准差,与波动率实务一致);zscore 复用同口径。
+ROLLING_STD_DDOF = 0
 COMPONENT_VERSIONS = {
     op: COMPONENT_VERSION for op in (
         "field", "literal", "all", "any", "not",
         "gt", "gte", "lt", "lte", "cross_above", "cross_below",
         "add", "subtract", "multiply", "divide",
-        "rolling_mean", "rolling_max", "rolling_min", "shift",
+        "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
+        "rolling_rank", "zscore", "shift",
         "ma", "rsi", "atr", "momentum", "return", "volume_ratio",
         "rank", "top_n",
     )
@@ -81,7 +84,10 @@ def evaluate_expression(expr: Expression, fields: Mapping[str, Vector]) -> Any:
         assert expr.input is not None and expr.periods is not None
         return _shift(evaluate_expression(expr.input, fields), expr.periods)
 
-    if op in {"rolling_mean", "rolling_max", "rolling_min", "volume_ratio"}:
+    if op in {
+        "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
+        "rolling_rank", "zscore", "volume_ratio",
+    }:
         assert expr.input is not None and expr.window is not None and expr.shift is not None
         value = evaluate_expression(expr.input, fields)
         history = _shift(value, expr.shift)
@@ -92,6 +98,17 @@ def evaluate_expression(expr: Expression, fields: Mapping[str, Vector]) -> Any:
             return rolling.max()
         if op == "rolling_min":
             return rolling.min()
+        if op == "rolling_std":
+            return rolling.std(ddof=ROLLING_STD_DDOF)
+        if op == "rolling_rank":
+            # 窗口末值在窗内的百分位排名 ∈ (0,1];不足 window 根为 NaN
+            return history.rolling(expr.window).apply(
+                _window_percentile_rank, raw=True,
+            )
+        if op == "zscore":
+            mean = rolling.mean()
+            std = rolling.std(ddof=ROLLING_STD_DDOF)
+            return (history - mean) / std.where(std != 0)
         denominator = rolling.mean()
         return value / denominator.where(denominator > 0)
 
@@ -195,6 +212,19 @@ def used_component_versions(expr: Expression) -> dict[str, str]:
     return dict(sorted(versions.items()))
 
 
+def _window_percentile_rank(arr: np.ndarray) -> float:
+    """滚动窗口末值的百分位: (count of values <= last) / n, 输出 (0,1]。"""
+    if arr is None or len(arr) == 0:
+        return math.nan
+    last = arr[-1]
+    if last != last:  # NaN
+        return math.nan
+    valid = arr[~np.isnan(arr)]
+    if len(valid) == 0:
+        return math.nan
+    return float(np.sum(valid <= last) / len(valid))
+
+
 def _shift(value: Any, periods: int) -> Any:
     if not isinstance(value, (pd.Series, pd.DataFrame)):
         raise ValueError("shift/cross 操作符不能作用于字面量")
@@ -241,6 +271,6 @@ def _json_value(value: Any) -> Any:
 
 
 __all__ = [
-    "COMPONENT_VERSION", "COMPONENT_VERSIONS", "build_reason_tree",
-    "evaluate_expression", "used_component_versions",
+    "COMPONENT_VERSION", "COMPONENT_VERSIONS", "ROLLING_STD_DDOF",
+    "build_reason_tree", "evaluate_expression", "used_component_versions",
 ]

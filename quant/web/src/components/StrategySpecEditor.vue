@@ -1,11 +1,18 @@
 <script setup lang="ts">
 /** 完整策略规格表单:覆盖 StrategySpec 全部受控字段,表达式部分复用 SpecExpressionEditor。 */
-import { computed } from 'vue'
+import { computed, reactive, ref } from 'vue'
 import { Plus, X } from 'lucide-vue-next'
-import type { Pool } from '../api'
+import type { Pool, StrategyAstNode } from '../api'
 import type { StrategyEvidenceStatus, StrategySpecFormState } from '../strategySpecForm'
 import { parseRejectionRules } from '../strategySpecForm'
 import { SUPPORTED_FIELDS, usedFields } from '../specExpression'
+import {
+  type SpecSnippet,
+  type SnippetTarget,
+  isPlaceholderExpression,
+  mergeSuggestedFields,
+  snippetsForTarget,
+} from '../specSnippets'
 import SpecExpressionEditor from './SpecExpressionEditor.vue'
 
 const props = withDefaults(defineProps<{
@@ -90,11 +97,103 @@ function addParameterScan() {
   model.value.parameterScans.push({ path: '$.', values: '' })
 }
 
+// ---- 片段插入 ----
+const snippetOpen = ref(false)
+const snippetTarget = ref<SnippetTarget>('entry')
+const selectedSnippetId = ref('')
+const snippetParams = reactive<Record<string, number>>({})
+
+const availableSnippets = computed(() =>
+  snippetsForTarget(snippetTarget.value, model.value.kind),
+)
+const selectedSnippet = computed(
+  () => availableSnippets.value.find((s) => s.id === selectedSnippetId.value) ?? null,
+)
+const snippetPreview = computed(() => {
+  if (!selectedSnippet.value) return ''
+  try {
+    return JSON.stringify(selectedSnippet.value.build({ ...snippetParams }), null, 2)
+  } catch {
+    return ''
+  }
+})
+
+function openSnippet(target: SnippetTarget) {
+  if (props.disabled) return
+  snippetTarget.value = target
+  snippetOpen.value = true
+  const list = snippetsForTarget(target, model.value.kind)
+  selectedSnippetId.value = list[0]?.id ?? ''
+  loadSnippetDefaults(list[0] ?? null)
+}
+
+function loadSnippetDefaults(snip: SpecSnippet | null) {
+  for (const key of Object.keys(snippetParams)) delete snippetParams[key]
+  if (!snip) return
+  for (const p of snip.params) snippetParams[p.key] = p.default
+}
+
+function onSnippetSelect(id: string) {
+  selectedSnippetId.value = id
+  loadSnippetDefaults(availableSnippets.value.find((s) => s.id === id) ?? null)
+}
+
+function currentExprForTarget(target: SnippetTarget): StrategyAstNode | null {
+  switch (target) {
+    case 'entry': return model.value.entryCondition
+    case 'exit': return model.value.exitCondition
+    case 'score': return model.value.scoreExpression
+    case 'risk_filter': return model.value.riskFilterExpression
+    case 'add': return model.value.addCondition
+    case 'reduce': return model.value.reduceCondition
+    default: return null
+  }
+}
+
+function applySnippet() {
+  const snip = selectedSnippet.value
+  if (!snip || props.disabled) return
+  const current = currentExprForTarget(snippetTarget.value)
+  if (current && !isPlaceholderExpression(current)) {
+    if (!window.confirm('当前表达式非默认占位，确认整槽替换为片段？')) return
+  }
+  const ast = snip.build({ ...snippetParams })
+  switch (snippetTarget.value) {
+    case 'entry':
+      model.value.entryCondition = ast
+      break
+    case 'exit':
+      model.value.exitCondition = ast
+      break
+    case 'score':
+      model.value.scoreExpression = ast
+      break
+    case 'risk_filter':
+      model.value.riskFilterEnabled = true
+      model.value.riskFilterExpression = ast
+      break
+    case 'add':
+      model.value.allowAdd = true
+      model.value.addCondition = ast
+      break
+    case 'reduce':
+      model.value.allowReduce = true
+      model.value.reduceCondition = ast
+      break
+  }
+  model.value.dataRequirements = mergeSuggestedFields(
+    model.value.dataRequirements,
+    snip.suggestedFields,
+  ) as typeof model.value.dataRequirements
+  snippetOpen.value = false
+}
+
 const inputClass = 'h-9 w-full rounded-md border border-border bg-surface-raised px-2.5 text-sm text-text-primary outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-55'
 const checkClass = 'h-4 w-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:opacity-55'
 const smallInputClass = 'h-8 w-full rounded-md border border-border bg-surface-raised px-2 text-xs text-text-primary outline-none focus:ring-1 focus:ring-accent disabled:cursor-not-allowed disabled:opacity-55'
 const removeButtonClass = 'inline-flex h-8 w-8 shrink-0 items-center justify-center self-end rounded-md border border-border text-text-tertiary hover:bg-hover disabled:opacity-40'
 const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border border-dashed border-border px-2.5 text-xs text-text-secondary hover:bg-hover disabled:opacity-40'
+const snippetBtnClass = 'inline-flex h-7 items-center rounded-md border border-border px-2 text-[11px] text-text-secondary hover:bg-hover disabled:opacity-40'
 </script>
 
 <template>
@@ -233,7 +332,10 @@ const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border bor
     <section class="border-t border-border-subtle p-4" aria-labelledby="spec-entry-heading">
       <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <h4 :id="id('entry-heading')" class="text-sm font-semibold text-text-primary">进场条件</h4>
-        <span class="text-xs text-text-tertiary">布尔表达式,T 日收盘确认</span>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-text-tertiary">布尔表达式,T 日收盘确认</span>
+          <button v-if="!disabled" type="button" :class="snippetBtnClass" @click="openSnippet('entry')">插入片段</button>
+        </div>
       </div>
       <label :for="id('entry-reason')" class="mb-2 block max-w-sm text-xs font-medium text-text-secondary">
         原因码(snake_case)
@@ -250,7 +352,10 @@ const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border bor
     <section v-if="!isPortfolio" class="border-t border-border-subtle p-4" aria-labelledby="spec-exit-heading">
       <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <h4 :id="id('exit-heading')" class="text-sm font-semibold text-text-primary">原生离场</h4>
-        <span class="text-xs text-text-tertiary">单标的策略必须包含原生离场,风险覆盖不替代它</span>
+        <div class="flex items-center gap-2">
+          <span class="text-xs text-text-tertiary">单标的策略必须包含原生离场,风险覆盖不替代它</span>
+          <button v-if="!disabled" type="button" :class="snippetBtnClass" @click="openSnippet('exit')">插入片段</button>
+        </div>
       </div>
       <label :for="id('exit-reason')" class="mb-2 block max-w-sm text-xs font-medium text-text-secondary">
         原因码(snake_case)
@@ -267,7 +372,10 @@ const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border bor
       <h4 :id="id('portfolio-heading')" class="mb-3 text-sm font-semibold text-text-primary">组合构建</h4>
       <div class="space-y-3">
         <div>
-          <div class="mb-1 text-xs font-medium text-text-secondary">评分表达式(数值,横截面排序依据)</div>
+          <div class="mb-1 flex flex-wrap items-center justify-between gap-2">
+            <span class="text-xs font-medium text-text-secondary">评分表达式(数值,横截面排序依据)</span>
+            <button v-if="!disabled" type="button" :class="snippetBtnClass" @click="openSnippet('score')">插入片段</button>
+          </div>
           <SpecExpressionEditor
             v-model="model.scoreExpression"
             expected-type="number"
@@ -304,10 +412,13 @@ const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border bor
           </label>
         </div>
         <div>
-          <label class="flex items-center gap-2 text-sm text-text-secondary">
-            <input v-model="model.riskFilterEnabled" type="checkbox" :disabled="disabled" :class="checkClass" />
-            启用风险过滤(布尔表达式,为真时剔除候选)
-          </label>
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <label class="flex items-center gap-2 text-sm text-text-secondary">
+              <input v-model="model.riskFilterEnabled" type="checkbox" :disabled="disabled" :class="checkClass" />
+              启用风险过滤(布尔表达式,为真时剔除候选)
+            </label>
+            <button v-if="!disabled" type="button" :class="snippetBtnClass" @click="openSnippet('risk_filter')">插入片段</button>
+          </div>
           <SpecExpressionEditor
             v-if="model.riskFilterEnabled"
             v-model="model.riskFilterExpression"
@@ -550,5 +661,61 @@ const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border bor
         </button>
       </div>
     </section>
+
+    <!-- 片段插入弹层:系统策略 disabled 时不展示入口 -->
+    <div
+      v-if="snippetOpen && !disabled"
+      class="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label="插入表达式片段"
+      @click.self="snippetOpen = false"
+    >
+      <div class="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-lg border border-border bg-surface p-4 shadow-lg">
+        <div class="mb-3 flex items-start justify-between gap-2">
+          <div>
+            <h4 class="text-sm font-semibold text-text-primary">插入片段 · {{ snippetTarget }}</h4>
+            <p class="mt-1 text-[11px] text-text-tertiary">未验证配置辅助,不代表策略有效或可交易。不自动改 overlays/validation。</p>
+          </div>
+          <button type="button" class="rounded border border-border p-1 text-text-tertiary hover:bg-hover" aria-label="关闭" @click="snippetOpen = false">
+            <X :size="14" />
+          </button>
+        </div>
+        <label class="block text-xs font-medium text-text-secondary">
+          片段
+          <select
+            class="mt-1 w-full rounded-md border border-border bg-surface-raised px-2.5 py-1.5 text-sm"
+            :value="selectedSnippetId"
+            @change="onSnippetSelect(($event.target as HTMLSelectElement).value)"
+          >
+            <option v-for="s in availableSnippets" :key="s.id" :value="s.id">{{ s.name }} ({{ s.id }})</option>
+          </select>
+        </label>
+        <p v-if="selectedSnippet" class="mt-2 text-xs text-text-secondary">{{ selectedSnippet.description }}</p>
+        <div v-if="selectedSnippet" class="mt-3 grid gap-2 sm:grid-cols-2">
+          <label v-for="p in selectedSnippet.params" :key="p.key" class="text-xs text-text-secondary">
+            {{ p.label }}
+            <input
+              v-model.number="snippetParams[p.key]"
+              type="number"
+              :min="p.min"
+              :max="p.max"
+              :step="p.type === 'int' ? 1 : 0.1"
+              class="mt-0.5 w-full rounded-md border border-border bg-surface-raised px-2 py-1 text-sm"
+            />
+          </label>
+        </div>
+        <pre class="mt-3 max-h-40 overflow-auto rounded-md bg-surface-muted p-2 text-[10px] leading-4 text-text-tertiary">{{ snippetPreview }}</pre>
+        <div class="mt-3 flex justify-end gap-2">
+          <button type="button" class="rounded-md border border-border px-3 py-1.5 text-xs text-text-secondary hover:bg-hover" @click="snippetOpen = false">取消</button>
+          <button
+            type="button"
+            class="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
+            :disabled="!selectedSnippet"
+            @click="applySnippet"
+          >确认插入</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>

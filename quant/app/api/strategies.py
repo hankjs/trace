@@ -23,8 +23,10 @@ from ..models import BacktestRun, Strategy
 from ..research_plan.domain import CAPABILITIES
 from ..strategy.runtime import strategy_spec_for
 from ..strategy.evidence import (
+    DesignCompleteChecklistError,
     apply_manual_action,
     candidate_spec_hashes,
+    design_complete_checks,
     manual_actions_for,
     resolve_status_on_edit,
     with_status,
@@ -74,6 +76,8 @@ class StrategyDuplicateIn(BaseModel):
 
 class StrategyValidateIn(BaseModel):
     spec: dict
+    # 可选:附带 design_complete 硬清单结果,不改变普通 valid 判定
+    check_design_gate: bool = False
 
 
 class StrategyEvidenceIn(BaseModel):
@@ -137,8 +141,14 @@ def _require_supported(capability: CapabilityReport) -> None:
     )
 
 
-def validation_out(raw: object, *, db: Session | None = None) -> dict:
-    capability = resolve_capabilities(raw, available_fields=_available_fields(db))
+def validation_out(
+    raw: object,
+    *,
+    db: Session | None = None,
+    check_design_gate: bool = False,
+) -> dict:
+    available = _available_fields(db)
+    capability = resolve_capabilities(raw, available_fields=available)
     parsed: StrategySpec | None = None
     error: str | None = None
     try:
@@ -146,7 +156,7 @@ def validation_out(raw: object, *, db: Session | None = None) -> dict:
     except Exception as exc:
         error = str(exc)
     normalized = parsed.model_dump(mode="json") if parsed is not None else None
-    return {
+    out: dict = {
         "valid": parsed is not None and capability.status == CapabilityStatus.SUPPORTED,
         "kind": parsed.kind if parsed is not None else None,
         "spec_schema_version": parsed.schema_version if parsed is not None else None,
@@ -157,6 +167,15 @@ def validation_out(raw: object, *, db: Session | None = None) -> dict:
         "errors": [issue.message for issue in capability.issues]
         + ([error] if error else []),
     }
+    if check_design_gate:
+        if parsed is not None:
+            checks = design_complete_checks(parsed, available_fields=available)
+            out["design_complete_checks"] = checks
+            out["design_complete_ready"] = all(item["ok"] for item in checks)
+        else:
+            out["design_complete_checks"] = []
+            out["design_complete_ready"] = False
+    return out
 
 
 def _legacy_effective_params(strategy: Strategy) -> tuple[dict, bool]:
@@ -171,13 +190,18 @@ def _legacy_effective_params(strategy: Strategy) -> tuple[dict, bool]:
 def strategy_out(strategy: Strategy, *, editable: bool = False,
                  usage: int | None = None,
                  evidence_usage: int | None = None,
-                 db: Session | None = None) -> dict:
+                 db: Session | None = None,
+                 available_fields: frozenset[str] | None = None) -> dict:
+    fields = (
+        available_fields if available_fields is not None
+        else _available_fields(db)
+    )
     try:
         spec = strategy_spec_for(strategy)
         normalized = spec.model_dump(mode="json")
         calculated_hash = strategy_spec_hash(spec)
         capability = resolve_capabilities(
-            normalized, available_fields=_available_fields(db),
+            normalized, available_fields=fields,
         ).model_dump(mode="json")
     except Exception as exc:
         normalized = strategy.spec if isinstance(getattr(strategy, "spec", None), dict) else None
@@ -308,7 +332,9 @@ def list_templates():
 
 @router.post("/validate")
 def validate_strategy(body: StrategyValidateIn, db: Session = Depends(get_db)):
-    return validation_out(body.spec, db=db)
+    return validation_out(
+        body.spec, db=db, check_design_gate=body.check_design_gate,
+    )
 
 
 @router.get("")
@@ -318,12 +344,15 @@ def list_strategies(db: Session = Depends(get_db),
     items = list_visible(db, user_id)
     usage = _usage_counts(db, [item.id for item in items])
     evidence = _evidence_counts(db, items)
+    # 字段可用性与策略无关,整表探测一次即可,避免 N×10 次 LIMIT 1
+    available_fields = _available_fields(db)
     return {
         "count": len(items),
         "items": [
             strategy_out(
                 item, editable=can_edit(item, user_id), usage=usage.get(item.id, 0),
-                evidence_usage=evidence.get(item.id, 0), db=db,
+                evidence_usage=evidence.get(item.id, 0),
+                available_fields=available_fields,
             )
             for item in items
         ],
@@ -397,9 +426,18 @@ def update_evidence_status(strategy_id: int, body: StrategyEvidenceIn,
     user_id = user_id_from_claims(claims)
     strategy = _writable_strategy(db, strategy_id, user_id)
     try:
-        transition = apply_manual_action(db, strategy, body.action)
+        transition = apply_manual_action(
+            db, strategy, body.action,
+            available_fields=_available_fields(db),
+        )
+    except DesignCompleteChecklistError as exc:
+        raise HTTPException(400, detail={
+            "error": "design_complete_checklist_failed",
+            "checks": exc.checks,
+            "message": str(exc),
+        }) from exc
     except ValueError as exc:
-        raise HTTPException(400, str(exc))
+        raise HTTPException(400, str(exc)) from exc
     db.commit()
     db.refresh(strategy)
     usage = _usage_counts(db, [strategy.id])
