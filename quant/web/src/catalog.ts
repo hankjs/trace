@@ -217,6 +217,20 @@ export const fallbackCatalog: CatalogPayload = {
       category: 'watch',
       caveat: '观察提示不代表必须采取任何操作。',
     },
+    {
+      key: 'add',
+      name: '上调模拟仓位',
+      description: '持有期间加仓规则触发，模拟目标仓位上调一个档位。',
+      category: 'entry',
+      caveat: '这是研究提示，不是订单或交易指令。',
+    },
+    {
+      key: 'reduce',
+      name: '下调模拟仓位',
+      description: '持有期间减仓规则触发，模拟目标仓位下调一个档位。',
+      category: 'exit',
+      caveat: '真实卖出决定由用户在外部交易软件中自行确认。',
+    },
   ],
   backtest_metrics: [
     { key: 'total_return', name: '区间总收益', description: '回测期末相对期初的模拟净值变化。', category: 'return', unit: '%', caveat: '历史收益不代表未来收益。' },
@@ -329,6 +343,14 @@ export function reasonText(reason: Record<string, unknown>, fallback = ''): stri
   const current = reason.cur_position
   if (previous === 0 && current === 1) return '策略状态从“未模拟持有”变为“模拟持有”，因此产生入场提示。'
   if (previous === 1 && current === 0) return '策略状态从“模拟持有”变为“未持有”，因此产生退出提示。'
+  if (typeof previous === 'number' && typeof current === 'number' && previous > 0) {
+    if (current > previous) {
+      return `持有期间加仓规则触发，模拟目标仓位从 ${+previous.toFixed(4)} 上调至 ${+current.toFixed(4)}。`
+    }
+    if (current > 0 && current < previous) {
+      return `持有期间减仓规则触发，模拟目标仓位从 ${+previous.toFixed(4)} 下调至 ${+current.toFixed(4)}。`
+    }
+  }
 
   return Object.entries(reason)
     .map(([key, value]) => {

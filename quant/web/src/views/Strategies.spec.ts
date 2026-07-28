@@ -1,7 +1,7 @@
 import { flushPromises, mount } from '@vue/test-utils'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Strategy, StrategyAstNode, StrategyLimits, StrategySpec, StrategyValidationResult } from '../api'
+import type { Strategy, StrategyLimits, StrategySpec, StrategyValidationResult } from '../api'
 import { createBreakoutStrategySpec } from '../strategySpecForm'
 
 const limits: StrategyLimits = { max_total: 50, max_enabled: 10 }
@@ -42,6 +42,35 @@ function editableStrategy(): Strategy {
   }
 }
 
+/** 组合形态的公共策略:验证非突破形态也走结构化表单(只读) */
+function presetPortfolioStrategy(): Strategy {
+  const base = createBreakoutStrategySpec()
+  const spec: StrategySpec = {
+    ...base,
+    kind: 'portfolio',
+    entry: { condition: { op: 'literal', value: true }, reason_code: 'eligible_for_ranking' },
+    positioning: {
+      type: 'portfolio',
+      score: { op: 'momentum', input: { op: 'field', name: 'close' }, window: 20 },
+      selection: { type: 'top_n', n: 10 },
+      weighting: { type: 'equal' },
+      rebalance: { frequency: 'monthly', interval_days: null },
+      risk_filter: null,
+    },
+    native_exit: null,
+  }
+  return {
+    ...editableStrategy(),
+    id: 3,
+    name: '动量轮动',
+    kind: 'portfolio',
+    kind_name: '组合策略',
+    is_system: true,
+    editable: false,
+    spec,
+  }
+}
+
 async function mountPage(strategies: Strategy[]) {
   const { api } = await import('../api')
   vi.spyOn(api, 'strategies').mockResolvedValue({ items: strategies, limits })
@@ -71,7 +100,7 @@ beforeEach(() => {
 })
 
 describe('StrategySpec editor', () => {
-  it('creates the acceptance breakout rule through structured fields', async () => {
+  it('creates the default breakout rule through the structured editor', async () => {
     const { wrapper, api } = await mountPage([])
     const validate = vi.spyOn(api, 'validateStrategySpec').mockImplementation(async (spec) => validation(spec))
     const create = vi.spyOn(api, 'createStrategy').mockImplementation(async (body) => ({
@@ -83,10 +112,9 @@ describe('StrategySpec editor', () => {
     await wrapper.get('button').trigger('click')
     await flushPromises()
 
-    expect(wrapper.get<HTMLInputElement>('#create-spec-breakout-window').element.value).toBe('20')
-    expect(wrapper.get<HTMLInputElement>('#create-spec-volume-window').element.value).toBe('20')
-    expect(wrapper.get<HTMLInputElement>('#create-spec-volume-ratio').element.value).toBe('1.5')
-    expect(wrapper.get<HTMLInputElement>('#create-spec-exit-window').element.value).toBe('10')
+    // 结构化表单:基础字段与递归表达式编辑器均渲染
+    expect(wrapper.get<HTMLInputElement>('#create-spec-listing-days').element.value).toBe('120')
+    expect(wrapper.findAll('select[aria-label="算子"]').length).toBeGreaterThan(0)
 
     const submit = wrapper.findAll('button').find((button) => button.text() === '校验并创建')
     await submit!.trigger('click')
@@ -95,15 +123,18 @@ describe('StrategySpec editor', () => {
     expect(validate).toHaveBeenCalledOnce()
     const spec = create.mock.calls[0][0].spec
     expect(spec.universe).toMatchObject({ pool_id: 1, exclude_st: true })
-    const entry = spec.entry.condition as StrategyAstNode
-    const nativeExit = spec.native_exit.condition as StrategyAstNode
+    const entry = spec.entry.condition
+    expect(entry.op).toBe('all')
     expect(entry.args?.[0].right).toMatchObject({ op: 'rolling_max', window: 20, shift: 1 })
     expect(entry.args?.[1]).toMatchObject({
       op: 'gt',
       left: { op: 'divide', right: { op: 'rolling_mean', window: 20, shift: 1 } },
       right: { op: 'literal', value: 1.5 },
     })
-    expect(nativeExit.args?.[0].right).toMatchObject({ op: 'rolling_min', window: 10, shift: 1 })
+    expect(spec.native_exit?.condition).toMatchObject({
+      op: 'lt',
+      right: { op: 'rolling_min', window: 10, shift: 1 },
+    })
   })
 
   it('saves the normalized current spec in place', async () => {
@@ -112,7 +143,8 @@ describe('StrategySpec editor', () => {
     const validate = vi.spyOn(api, 'validateStrategySpec').mockImplementation(async (spec) => validation(spec))
     const update = vi.spyOn(api, 'updateStrategy').mockResolvedValue(strategy)
 
-    await wrapper.get<HTMLInputElement>('#edit-spec-exit-window').setValue(8)
+    await wrapper.get<HTMLInputElement>('#edit-spec-listing-days').setValue(90)
+    await wrapper.get<HTMLInputElement>('#edit-spec-cooldown-days').setValue(3)
     const save = wrapper.findAll('button').find((button) => button.text() === '校验并保存')
     await save!.trigger('click')
     await flushPromises()
@@ -121,16 +153,32 @@ describe('StrategySpec editor', () => {
     expect(update).toHaveBeenCalledWith(strategy.id, {
       name: strategy.name,
       spec: expect.objectContaining({
+        universe: expect.objectContaining({ min_listing_days: 90 }),
+        holding: expect.objectContaining({ cooldown_days: 3 }),
         native_exit: expect.objectContaining({
           condition: expect.objectContaining({
-            args: [expect.objectContaining({
-              right: expect.objectContaining({ op: 'rolling_min', window: 8 }),
-            })],
+            op: 'lt',
+            right: expect.objectContaining({ op: 'rolling_min', window: 10 }),
           }),
         }),
       }),
     })
     expect(wrapper.text()).toContain('当前数据与引擎支持')
     expect(wrapper.text()).toContain('规范化 JSON 只读预览')
+  })
+
+  it('renders a preset portfolio strategy in the structured readonly form', async () => {
+    const strategy = presetPortfolioStrategy()
+    const { wrapper } = await mountPage([strategy])
+
+    // 组合段落渲染、原生离场隐藏、公共策略输入只读但仍为结构化表单
+    expect(wrapper.text()).toContain('组合构建')
+    expect(wrapper.text()).toContain('评分表达式')
+    expect(wrapper.text()).not.toContain('原生离场')
+    expect(wrapper.find<HTMLSelectElement>('#edit-spec-rebalance').exists()).toBe(true)
+    expect(wrapper.get<HTMLSelectElement>('#edit-spec-rebalance').element.value).toBe('monthly')
+    expect(wrapper.get<HTMLSelectElement>('#edit-spec-kind').element.disabled).toBe(true)
+    expect(wrapper.text()).toContain('公共策略只读')
+    expect(wrapper.text()).not.toContain('尚未覆盖的受控组件')
   })
 })

@@ -17,7 +17,8 @@ import {
   type Pool,
   type Strategy,
   type StrategyCapabilityStatus,
-  type StrategySpec,
+  type StrategyEvidenceAction,
+  type StrategyEvidenceStatus,
   type StrategyValidationResult,
 } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
@@ -27,7 +28,6 @@ import { useStrategies } from '../strategies'
 import {
   buildStrategySpec,
   defaultStrategySpecForm,
-  isVolumeBreakoutSpec,
   strategySpecToForm,
   type StrategySpecFormState,
 } from '../strategySpecForm'
@@ -50,7 +50,6 @@ const selectedId = ref<number | null>(null)
 const creating = ref(false)
 const name = ref('')
 const form = ref<StrategySpecFormState>(defaultStrategySpecForm())
-const baseSpec = ref<StrategySpec | undefined>()
 const validation = ref<StrategyValidationResult | null>(null)
 const validating = ref(false)
 const validationError = ref('')
@@ -62,11 +61,8 @@ const selected = computed<Strategy | null>(
 const readonlyStrategy = computed(() => !!selected.value && !selected.value.editable)
 const usedByBacktests = computed(() => selected.value?.backtest_count ?? 0)
 const quotaFull = computed(() => limits.value.max_total > 0 && customStrategies.value.length >= limits.value.max_total)
-const draftSpec = computed(() => buildStrategySpec(form.value, baseSpec.value))
-const supportsStructuredEditor = computed(() => creating.value || isVolumeBreakoutSpec(selected.value?.spec))
-const previewSpec = computed(() => validation.value?.normalized_spec
-  ?? (supportsStructuredEditor.value ? draftSpec.value : selected.value?.spec)
-  ?? draftSpec.value)
+const draftSpec = computed(() => buildStrategySpec(form.value))
+const previewSpec = computed(() => validation.value?.normalized_spec ?? draftSpec.value)
 const previewJson = computed(() => JSON.stringify(previewSpec.value, null, 2))
 const capability = computed(() => validation.value?.capability ?? selected.value?.capability ?? null)
 
@@ -84,6 +80,32 @@ function kindName(strategy: Strategy) {
 
 function researchStatusName(strategy: Strategy) {
   return strategy.research_status === 'verified' ? '已验证' : strategy.research_status === 'rejected' ? '已否决' : '未验证'
+}
+
+const EVIDENCE_STATUS_NAMES: Record<StrategyEvidenceStatus, string> = {
+  unverified: '未验证',
+  design_complete: '设计完成',
+  backtested: '已回测',
+  oos_passed: '样本外通过',
+  rejected: '已否决',
+}
+
+function evidenceStatusName(status?: StrategyEvidenceStatus) {
+  return status ? EVIDENCE_STATUS_NAMES[status] ?? status : '未验证'
+}
+
+/** 证据状态的手动操作(标记设计完成 / 否决复位);其余状态由回测自动推进 */
+async function runEvidenceAction(action: StrategyEvidenceAction) {
+  const strategy = selected.value
+  if (!strategy || !strategy.editable) return
+  await runAction(async () => {
+    await api.updateStrategyEvidence(strategy.id, action)
+    await refreshStrategies(strategy.id)
+  }, {
+    success: action === 'mark_design_complete'
+      ? '已标记为设计完成，后续回测会自动推进证据状态。'
+      : '已复位否决结论，状态回到设计完成。',
+  })
 }
 
 async function refreshStrategies(selectId?: number) {
@@ -112,7 +134,6 @@ async function validateSaved(strategyId: number) {
 watch([selected, creating], ([strategy, isCreating]) => {
   if (!strategy || isCreating) return
   name.value = strategy.name
-  baseSpec.value = strategy.spec
   form.value = strategySpecToForm(strategy.spec)
   validation.value = null
   void validateSaved(strategy.id)
@@ -128,7 +149,6 @@ function startCreate() {
   creating.value = true
   selectedId.value = null
   name.value = '20 日放量突破'
-  baseSpec.value = undefined
   form.value = defaultStrategySpecForm()
   form.value.poolId = pools.value[0]?.id ?? null
   validation.value = null
@@ -153,19 +173,6 @@ async function validateDraft(): Promise<Extract<StrategyValidationResult, { vali
 }
 
 async function validateCurrent(): Promise<StrategyValidationResult> {
-  const strategy = selected.value
-  if (strategy && !supportsStructuredEditor.value) {
-    validating.value = true
-    validationError.value = ''
-    try {
-      const result = await api.validateStrategy(strategy.id)
-      validation.value = result
-      if (!result.valid) throw new Error(result.errors.join('；') || '策略规格未通过校验')
-      return result
-    } finally {
-      validating.value = false
-    }
-  }
   return validateDraft()
 }
 
@@ -196,11 +203,6 @@ async function saveStrategy() {
     return
   }
   await runAction(async () => {
-    if (!supportsStructuredEditor.value) {
-      await api.updateStrategy(strategy.id, { name: normalizedName })
-      await refreshStrategies(strategy.id)
-      return
-    }
     const result = await validateDraft()
     await api.updateStrategy(strategy.id, {
       name: normalizedName,
@@ -340,6 +342,30 @@ void init()
                 </template>
               </template>
             </p>
+            <p v-if="!creating && selected" class="mt-1 flex flex-wrap items-center gap-2 text-xs">
+              <span
+                class="rounded px-1.5 py-0.5 font-medium"
+                :class="selected.evidence_status === 'oos_passed'
+                  ? 'bg-down/10 text-down'
+                  : selected.evidence_status === 'rejected'
+                    ? 'bg-up/10 text-up'
+                    : 'bg-surface-muted text-text-secondary'"
+              >证据状态:{{ evidenceStatusName(selected.evidence_status) }}</span>
+              <button
+                v-if="selected.editable && selected.evidence_actions?.includes('mark_design_complete')"
+                type="button"
+                :disabled="busy"
+                class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
+                @click="runEvidenceAction('mark_design_complete')"
+              >标记设计完成</button>
+              <button
+                v-if="selected.editable && selected.evidence_actions?.includes('reset_rejected')"
+                type="button"
+                :disabled="busy"
+                class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
+                @click="runEvidenceAction('reset_rejected')"
+              >复位否决</button>
+            </p>
           </div>
           <div class="flex flex-wrap items-center gap-2">
             <button
@@ -391,12 +417,7 @@ void init()
           />
         </label>
 
-        <InlineFeedback v-if="!supportsStructuredEditor" tone="warning">
-          该策略使用当前最小编辑器尚未覆盖的受控组件。页面保持原规格只读，可校验、回测或另存，不会将其改写为突破规则。
-        </InlineFeedback>
-
         <StrategySpecEditor
-          v-if="supportsStructuredEditor"
           v-model="form"
           :pools="pools"
           :disabled="readonlyStrategy"
@@ -478,7 +499,7 @@ void init()
             class="h-9 rounded-md bg-accent px-4 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
             @click="creating ? createStrategy() : saveStrategy()"
           >
-            {{ creating ? '校验并创建' : supportsStructuredEditor ? '校验并保存' : '保存名称' }}
+            {{ creating ? '校验并创建' : '校验并保存' }}
           </button>
         </div>
       </section>

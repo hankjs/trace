@@ -10,6 +10,8 @@ import {
   type BacktestExitReasonDistribution,
   type BacktestResult,
   type BacktestTradeDetail,
+  type BacktestValidation,
+  type StrategyEvidenceStatus,
   type StrategyParamValue,
   type StrategySpec,
   type SweepResult,
@@ -76,6 +78,14 @@ interface GridRow {
 
 const gridRows = ref<GridRow[]>([{ path: '', valuesText: '' }])
 const sweepResult = ref<SweepResult | null>(null)
+
+/** 当前策略在规格里声明的参数扫描(validation.parameter_scans) */
+const declaredScans = computed(() => {
+  const validation = record(strategy.value?.spec?.validation)
+  return Array.isArray(validation.parameter_scans)
+    ? validation.parameter_scans.map(record).filter((scan) => typeof scan.path === 'string')
+    : []
+})
 
 const scanPathLabels: Record<string, string> = {
   '$.positioning.target': '目标仓位',
@@ -300,15 +310,49 @@ async function runSweep() {
     error.value = '请至少配置一个规格路径及其候选值'
     return
   }
+  await submitSweep({ param_grid })
+}
+
+/** 按规格 validation.parameter_scans 的声明执行扫描(服务端组装候选网格) */
+async function runDeclaredSweep() {
+  error.value = ''
+  const codes = parsedCodes()
+  if (strategyId.value === null) {
+    error.value = '请选择策略'
+    return
+  }
+  if (!strategyRunnable.value) {
+    error.value = '当前策略存在数据或引擎能力缺口，不能运行参数扫描'
+    return
+  }
+  if (!codes.length) {
+    error.value = '请至少选择一个股票代码'
+    return
+  }
+  if (!form.start || !form.end) {
+    error.value = '请选择起止日期'
+    return
+  }
+  if (!declaredScans.value.length) {
+    error.value = '当前策略规格未声明参数扫描'
+    return
+  }
+  await submitSweep({ declared: true })
+}
+
+async function submitSweep(body: {
+  param_grid?: Record<string, Array<number | boolean>>
+  declared?: boolean
+}) {
   running.value = true
   try {
     sweepResult.value = await api.sweepBacktest({
-      strategy_id: strategyId.value,
-      codes,
+      strategy_id: strategyId.value as number,
+      codes: parsedCodes(),
       start: form.start,
       end: form.end,
-      param_grid,
       costs: runCosts(),
+      ...body,
     })
   } catch (e) {
     sweepResult.value = null
@@ -379,10 +423,69 @@ const resultFingerprints = computed(() => [
 ].filter((item) => item.value))
 const resultSpecJson = computed(() => resultSpecSnapshot.value ? JSON.stringify(resultSpecSnapshot.value, null, 2) : '')
 const resultCurrentStrategy = computed(() => strategyById(result.value?.strategy_id ?? null))
+
+/** 规格身份:剔除 evidence_status(状态推进会改变 spec_hash,但规则内容未变) */
+function specIdentity(spec: StrategySpec | undefined | null): string {
+  if (!spec) return ''
+  const copy = JSON.parse(JSON.stringify(spec)) as Record<string, unknown>
+  const metadata = record(copy.metadata)
+  delete metadata.evidence_status
+  copy.metadata = metadata
+  return JSON.stringify(copy)
+}
+
 const exactHashMatch = computed<boolean | null>(() => {
-  const currentHash = resultCurrentStrategy.value?.spec_hash
-  if (!currentHash || !resultSpecHash.value) return null
-  return currentHash === resultSpecHash.value
+  const current = resultCurrentStrategy.value?.spec
+  if (!current || !resultSpecSnapshot.value) return null
+  return specIdentity(current) === specIdentity(resultSpecSnapshot.value)
+})
+
+// ---- 规格验证报告(基线对比 / OOS 分段 / 否决判定) ----
+
+const resultValidation = computed<BacktestValidation | null>(
+  () => result.value?.validation ?? result.value?.metrics.validation ?? null,
+)
+const validationOos = computed(() => {
+  const oos = resultValidation.value?.oos
+  return oos && oos.enabled ? oos : null
+})
+const validationRejection = computed(() => resultValidation.value?.rejection ?? null)
+
+const EVIDENCE_STATUS_NAMES: Record<StrategyEvidenceStatus, string> = {
+  unverified: '未验证',
+  design_complete: '设计完成',
+  backtested: '已回测',
+  oos_passed: '样本外通过',
+  rejected: '已否决',
+}
+
+const evidenceTransitionText = computed(() => {
+  const transition = result.value?.evidence_transition
+  if (!transition) return ''
+  return `证据状态已推进:${EVIDENCE_STATUS_NAMES[transition.from] ?? transition.from} → ${EVIDENCE_STATUS_NAMES[transition.to] ?? transition.to}`
+})
+
+/** OOS 分段指标展示行:样本内 / 样本外并排 */
+const oosMetricRows = computed(() => {
+  const oos = validationOos.value
+  if (!oos?.available) return []
+  const keys = [
+    { key: 'total_return', label: metricName('total_return'), pct: true },
+    { key: 'annual_return', label: metricName('annual_return'), pct: true },
+    { key: 'max_drawdown', label: metricName('max_drawdown'), pct: true },
+    { key: 'sharpe', label: metricName('sharpe'), pct: false },
+  ]
+  return keys.map((item) => {
+    const format = (value: unknown) => {
+      if (typeof value !== 'number') return '--'
+      return item.pct ? fmtPct(value) : fmtPrice(value)
+    }
+    return {
+      label: item.label,
+      inSample: format(oos.in_sample?.[item.key]),
+      oos: format(oos.oos?.[item.key]),
+    }
+  })
 })
 const resultTradeDetails = computed(() => result.value?.trade_details ?? resultEvidence.value?.trade_details ?? [])
 
@@ -666,6 +769,17 @@ onMounted(async () => {
         <p class="mt-2 text-xs leading-5 text-text-tertiary">
           路径必须以 <code>$.</code> 开头并指向当前规格中的数字或布尔字段。候选值用逗号分隔，最多 200 组组合。
         </p>
+        <div v-if="declaredScans.length" class="mt-3 flex flex-wrap items-center gap-3 rounded-md bg-surface-muted px-3 py-2">
+          <span class="text-xs text-text-secondary">
+            规格声明了 {{ declaredScans.length }} 项参数扫描：{{ declaredScans.map((scan) => String(scan.path)).join('、') }}
+          </span>
+          <button
+            type="button"
+            :disabled="running || !strategyRunnable"
+            class="rounded-md border border-border px-2.5 py-1 text-xs text-text-secondary hover:bg-hover disabled:opacity-50"
+            @click="runDeclaredSweep"
+          >按规格声明扫描</button>
+        </div>
       </div>
 
       <fieldset class="border-t border-border-subtle pt-3">
@@ -739,6 +853,34 @@ onMounted(async () => {
         <h3 class="px-2 pt-2 text-base font-semibold">规格路径热力图（总收益）</h3>
         <EChart :option="heatmapOption" height="380px" />
       </section>
+
+      <section
+        v-if="sweepResult.declared && sweepResult.stability"
+        class="rounded-lg border border-border bg-surface-raised p-4"
+        aria-labelledby="sweep-stability-heading"
+      >
+        <h3 id="sweep-stability-heading" class="text-sm font-semibold">参数稳定性(按规格声明)</h3>
+        <template v-if="sweepResult.stability.status === 'evaluated'">
+          <p class="mt-2 text-sm text-text-secondary">
+            当前参数年化中位数 {{ fmtPct(sweepResult.stability.current ?? 0) }}，
+            扫描中位数 {{ fmtPct(sweepResult.stability.median ?? 0) }}，
+            优于当前参数的组合占比 {{ fmtPct(sweepResult.stability.better_share ?? 0) }}。
+          </p>
+          <p
+            class="mt-2 rounded-md px-3 py-2 text-sm"
+            :class="sweepResult.stability.unstable
+              ? 'bg-up/10 text-up'
+              : 'bg-down/10 text-down'"
+          >
+            {{ sweepResult.stability.unstable
+              ? '超过一半的扫描组合优于当前参数,参数不稳定(unstable_parameters 将命中否决)。'
+              : '当前参数处于扫描组合的前半,未触发参数不稳定否决。' }}
+          </p>
+        </template>
+        <p v-else class="mt-2 text-sm text-text-tertiary">
+          稳定性不可评估:{{ sweepResult.stability.reason ?? '扫描结果不可用' }}
+        </p>
+      </section>
     </template>
 
     <!-- 单次回测结果 -->
@@ -751,6 +893,9 @@ onMounted(async () => {
           <span>{{ result.start }} ~ {{ result.end }}</span>
         </template>
         <span v-if="resultPool">股票池: {{ resultPool.name }}</span>
+        <span v-if="evidenceTransitionText" class="rounded bg-info-soft px-2 py-0.5 text-xs text-text-secondary">
+          {{ evidenceTransitionText }}
+        </span>
       </div>
 
       <div
@@ -838,6 +983,112 @@ onMounted(async () => {
         <div v-for="m in metrics" :key="m.label" class="rounded-lg border border-border bg-surface-raised p-3">
           <div class="text-xs text-text-tertiary">{{ m.label }}</div>
           <div class="mt-1 text-lg font-semibold" :class="m.cls">{{ m.value }}</div>
+        </div>
+      </section>
+
+      <section
+        v-if="resultValidation"
+        class="rounded-lg border border-border bg-surface-raised p-4"
+        aria-labelledby="spec-validation-report-heading"
+      >
+        <h3 id="spec-validation-report-heading" class="text-sm font-semibold">规格验证</h3>
+
+        <div
+          v-if="validationRejection"
+          class="mt-3 rounded-md px-3 py-2 text-sm leading-5"
+          :class="validationRejection.verdict === 'rejected'
+            ? 'bg-up/10 text-up'
+            : validationRejection.verdict === 'passed'
+              ? 'bg-down/10 text-down'
+              : 'bg-surface-muted text-text-secondary'"
+        >
+          <template v-if="validationRejection.verdict === 'rejected'">
+            命中否决条件,策略已被标记为已否决:
+            <ul class="mt-1 list-inside list-disc">
+              <li v-for="hit in validationRejection.hits" :key="hit.criterion + hit.detail">
+                {{ hit.detail }}
+              </li>
+            </ul>
+          </template>
+          <template v-else-if="validationRejection.verdict === 'passed'">
+            全部否决条件均通过。
+          </template>
+          <template v-else>
+            否决条件未命中,但有条件缺少数据未能评估:
+          </template>
+          <ul
+            v-if="validationRejection.unevaluated.length"
+            class="mt-1 list-inside list-disc text-xs"
+          >
+            <li v-for="item in validationRejection.unevaluated" :key="item.criterion">
+              {{ item.criterion }}:{{ item.reason }}
+            </li>
+          </ul>
+        </div>
+
+        <div v-if="validationOos" class="mt-4">
+          <h4 class="text-xs font-medium text-text-secondary">
+            锁定样本外(最后 {{ Math.round((validationOos.fraction ?? 0.2) * 100) }}% 交易日)
+          </h4>
+          <table v-if="validationOos.available" class="mt-2 w-full max-w-xl text-sm">
+            <thead class="border-b border-border text-left text-xs text-text-tertiary">
+              <tr>
+                <th class="py-1.5 pr-4 font-medium">指标</th>
+                <th class="py-1.5 pr-4 text-right font-medium">样本内({{ validationOos.in_sample_bars }} 日)</th>
+                <th class="py-1.5 text-right font-medium">样本外({{ validationOos.oos_bars }} 日,自 {{ validationOos.oos_start }})</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in oosMetricRows" :key="row.label" class="border-b border-border-subtle last:border-0">
+                <td class="py-1.5 pr-4 text-text-secondary">{{ row.label }}</td>
+                <td class="py-1.5 pr-4 text-right tabular-nums">{{ row.inSample }}</td>
+                <td class="py-1.5 text-right tabular-nums">{{ row.oos }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <p v-else class="mt-2 text-sm text-text-tertiary">
+            {{ validationOos.message ?? '样本外段不可用' }}
+          </p>
+        </div>
+
+        <div v-if="resultValidation.baselines.length" class="mt-4">
+          <h4 class="text-xs font-medium text-text-secondary">对照基线(策略 − 基线)</h4>
+          <div class="mt-2 overflow-x-auto">
+            <table class="w-full min-w-[36rem] text-sm">
+              <thead class="border-b border-border text-left text-xs text-text-tertiary">
+                <tr>
+                  <th class="py-1.5 pr-4 font-medium">基线</th>
+                  <th class="py-1.5 pr-4 text-right font-medium">{{ metricName('total_return') }}</th>
+                  <th class="py-1.5 pr-4 text-right font-medium">{{ metricName('annual_return') }}</th>
+                  <th class="py-1.5 pr-4 text-right font-medium">{{ metricName('max_drawdown') }}</th>
+                  <th class="py-1.5 pr-4 text-right font-medium">{{ metricName('sharpe') }}</th>
+                  <th class="py-1.5 text-right font-medium">年化差值</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  v-for="baseline in resultValidation.baselines"
+                  :key="baseline.baseline_id"
+                  class="border-b border-border-subtle last:border-0"
+                >
+                  <td class="py-1.5 pr-4 text-text-secondary">{{ baseline.name }}</td>
+                  <template v-if="baseline.status === 'ok' && baseline.metrics">
+                    <td class="py-1.5 pr-4 text-right tabular-nums">{{ baseline.metrics.total_return == null ? '--' : fmtPct(baseline.metrics.total_return) }}</td>
+                    <td class="py-1.5 pr-4 text-right tabular-nums">{{ baseline.metrics.annual_return == null ? '--' : fmtPct(baseline.metrics.annual_return) }}</td>
+                    <td class="py-1.5 pr-4 text-right tabular-nums">{{ baseline.metrics.max_drawdown == null ? '--' : fmtPct(baseline.metrics.max_drawdown) }}</td>
+                    <td class="py-1.5 pr-4 text-right tabular-nums">{{ baseline.metrics.sharpe == null ? '--' : fmtPrice(baseline.metrics.sharpe) }}</td>
+                    <td
+                      class="py-1.5 text-right tabular-nums"
+                      :class="(baseline.delta?.annual_return ?? 0) >= 0 ? 'text-up' : 'text-down'"
+                    >{{ baseline.delta?.annual_return == null ? '--' : fmtPct(baseline.delta.annual_return) }}</td>
+                  </template>
+                  <td v-else colspan="5" class="py-1.5 text-text-tertiary">
+                    {{ baseline.message ?? '基线不可用' }}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </section>
 

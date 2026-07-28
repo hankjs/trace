@@ -62,8 +62,8 @@ function nameOf(signal: SignalItem): string {
 }
 
 function sideClass(side: SignalItem['side']): string {
-  if (side === 'buy') return 'bg-up/10 text-up'
-  if (side === 'sell') return 'bg-down/10 text-down'
+  if (side === 'buy' || side === 'add') return 'bg-up/10 text-up'
+  if (side === 'sell' || side === 'reduce') return 'bg-down/10 text-down'
   return 'bg-active text-text-secondary'
 }
 
@@ -148,6 +148,8 @@ onMounted(async () => {
           <option value="buy">满足入场规则</option>
           <option value="sell">满足退出规则</option>
           <option value="watch">继续观察</option>
+          <option value="add">上调模拟仓位</option>
+          <option value="reduce">下调模拟仓位</option>
         </select>
       </label>
       <button type="submit" :disabled="loading" class="inline-flex h-9 items-center gap-1.5 rounded-md bg-accent px-4 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-50">

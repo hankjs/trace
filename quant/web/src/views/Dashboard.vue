@@ -63,8 +63,8 @@ function displayName(signal: SignalItem): string {
 }
 
 function sideClass(side: SignalItem['side']): string {
-  if (side === 'buy') return 'bg-up/10 text-up'
-  if (side === 'sell') return 'bg-down/10 text-down'
+  if (side === 'buy' || side === 'add') return 'bg-up/10 text-up'
+  if (side === 'sell' || side === 'reduce') return 'bg-down/10 text-down'
   return 'bg-surface-muted text-text-secondary'
 }
 

@@ -119,6 +119,16 @@ export function hasSurvivorshipBias(pool: Pool | PoolRef | null | undefined): bo
 
 export type StrategyResearchStatus = 'unverified' | 'verified' | 'rejected'
 
+/** 规格 metadata.evidence_status:服务端状态机管理,前端只展示与触发允许的手动操作 */
+export type StrategyEvidenceStatus =
+  | 'unverified'
+  | 'design_complete'
+  | 'backtested'
+  | 'oos_passed'
+  | 'rejected'
+
+export type StrategyEvidenceAction = 'mark_design_complete' | 'reset_rejected'
+
 export type StrategyCapabilityStatus =
   | 'supported'
   | 'missing_data'
@@ -140,16 +150,52 @@ export interface StrategyCapability {
   issues: StrategyCapabilityIssue[]
 }
 
+/**
+ * 受控表达式节点。字段与后端 app/strategy/spec.py 的 Expression 一一对应;
+ * 每种 op 只允许自己的字段子集(多一个少一个后端都拒绝),这里把全部可能
+ * 字段列为可选,具体形状由 specExpression.ts 的算子注册表约束。
+ */
 export interface StrategyAstNode {
-  op?: string
+  op: string
+  /** field: snake_case 字段名 */
+  name?: string
+  /** literal: 有限数字或布尔值 */
+  value?: number | boolean
+  /** all/any: 非空布尔子节点列表 */
   args?: StrategyAstNode[]
+  /** not: 布尔子节点 */
   arg?: StrategyAstNode
-  all?: StrategyAstNode[]
-  any?: StrategyAstNode[]
-  input?: StrategyAstNode
+  /** 比较/算术: 数值子节点 */
   left?: StrategyAstNode
   right?: StrategyAstNode
-  [key: string]: unknown
+  /** 滚动/位移/指标/横截面: 数值子节点 */
+  input?: StrategyAstNode
+  /** atr: 三个数值子节点 */
+  high?: StrategyAstNode
+  low?: StrategyAstNode
+  close?: StrategyAstNode
+  window?: number
+  shift?: number
+  periods?: number
+  /** rank: true 升序 */
+  ascending?: boolean
+  /** top_n */
+  n?: number
+}
+
+/** entry / native_exit 的规则形状:{condition, reason_code} */
+export interface StrategyRuleSpec {
+  condition: StrategyAstNode
+  /** snake_case 原因码 */
+  reason_code: string
+}
+
+export type StrategyDataAvailability = 'daily_close' | 'daily_open' | 'point_in_time'
+
+export interface StrategyDataRequirement {
+  field: string
+  availability: StrategyDataAvailability
+  required: boolean
 }
 
 /**
@@ -161,11 +207,12 @@ export interface StrategySpec {
   kind?: StrategyKind
   metadata: Record<string, unknown>
   universe: Record<string, unknown>
-  data_requirements: unknown[]
-  entry: StrategyAstNode
+  data_requirements: StrategyDataRequirement[]
+  entry: StrategyRuleSpec
   positioning: Record<string, unknown>
   holding: Record<string, unknown>
-  native_exit: StrategyAstNode
+  /** single 必须非 null;portfolio 为 null */
+  native_exit: StrategyRuleSpec | null
   overlays: Record<string, unknown>
   portfolio_constraints: Record<string, unknown>
   execution: Record<string, unknown>
@@ -232,6 +279,10 @@ export interface Strategy {
   spec_schema_version?: number
   spec?: StrategySpec
   spec_hash?: string
+  /** 服务端状态机维护的证据状态;自动推进的状态不允许手改 */
+  evidence_status?: StrategyEvidenceStatus
+  /** 当前状态允许的手动操作(仅 editable 策略非空) */
+  evidence_actions?: StrategyEvidenceAction[]
   research_status?: StrategyResearchStatus
   capability?: StrategyCapability
   /** 模板可生成哪些研究线/条件，由后端按模板声明。 */
@@ -263,7 +314,7 @@ export type ResearchPlanStatus =
   | 'expired'
 
 export type ResearchPlanType = 'single' | 'portfolio_rebalance'
-export type ResearchPlanSignalType = 'buy' | 'sell' | 'watch' | 'hold' | 'rebalance' | 'qualification_change'
+export type ResearchPlanSignalType = 'buy' | 'sell' | 'watch' | 'add' | 'reduce' | 'hold' | 'rebalance' | 'qualification_change'
 export type EntryObservationMode = 'none' | 'line' | 'range' | 'portfolio_rebalance'
 export type ResearchRuleSource = 'entry' | 'native_risk' | 'risk_overlay' | 'take_profit' | 'native_exit' | 'rebalance'
 
@@ -709,7 +760,7 @@ export interface SignalItem {
   /** 算法模板 key,如 ma_cross */
   template?: string
   is_system?: boolean
-  side: 'buy' | 'sell' | 'watch'
+  side: 'buy' | 'sell' | 'watch' | 'add' | 'reduce'
   side_name?: string
   /** 新契约明确命名；price 仅保留给过渡期响应。 */
   signal_close_price?: number
@@ -763,6 +814,58 @@ export interface BacktestMetrics {
   round_trips: number
   per_code?: Record<string, unknown>
   evidence?: BacktestRunEvidence
+  validation?: BacktestValidation | null
+}
+
+/** 回测完成后的规格 validation 段执行报告(基线对比 / OOS 分段 / 否决判定) */
+export interface BacktestValidation {
+  baselines: BacktestValidationBaseline[]
+  oos: BacktestValidationOos | null
+  rejection: BacktestRejection
+}
+
+export interface BacktestValidationBaseline {
+  baseline_id: string
+  name: string
+  status: 'ok' | 'unavailable'
+  message?: string | null
+  metrics?: {
+    total_return?: number | null
+    annual_return?: number | null
+    max_drawdown?: number | null
+    sharpe?: number | null
+  } | null
+  /** 策略 - 基线(越高越好) */
+  delta?: Record<string, number | null> | null
+}
+
+export interface BacktestValidationOos {
+  enabled: boolean
+  available?: boolean
+  fraction?: number
+  oos_start?: string | null
+  in_sample_bars?: number
+  oos_bars?: number
+  in_sample?: Record<string, number | null> | null
+  oos?: Record<string, number | null> | null
+  message?: string | null
+}
+
+export interface BacktestRejectionHit {
+  criterion: string
+  detail: string
+  metric?: string
+  segment?: string
+  op?: string
+  threshold?: number | null
+  actual?: number | null
+}
+
+export interface BacktestRejection {
+  /** passed 全过 / incomplete 有未评估条件 / rejected 命中否决 */
+  verdict: 'passed' | 'incomplete' | 'rejected'
+  hits: BacktestRejectionHit[]
+  unevaluated: { criterion: string, reason: string }[]
 }
 
 export interface BacktestResult {
@@ -797,6 +900,10 @@ export interface BacktestResult {
   metrics: BacktestMetrics
   equity: { date: string; equity: number }[]
   evidence?: BacktestRunEvidence
+  /** 规格 validation 段执行报告(基线对比 / OOS 分段 / 否决判定) */
+  validation?: BacktestValidation | null
+  /** 本次回测触发的证据状态迁移;未推进为 null */
+  evidence_transition?: { from: StrategyEvidenceStatus, to: StrategyEvidenceStatus } | null
   trade_details?: BacktestTradeDetail[]
   exit_reason_distribution?: BacktestExitReasonDistribution | BacktestExitReasonCount[] | Record<string, number>
   trades?: BacktestTrade[]
@@ -1092,6 +1199,19 @@ export interface SweepResult {
   start: string
   end: string
   results: SweepResultItem[]
+  /** true = 按规格 validation.parameter_scans 声明执行的扫描 */
+  declared?: boolean
+  declared_scans?: { path: string, values: Array<number | boolean> }[]
+  /** 按声明扫描的参数稳定性评估(unstable_parameters 的判定依据) */
+  stability?: {
+    status: 'evaluated' | 'unevaluated'
+    reason?: string
+    current?: number
+    median?: number
+    better_share?: number
+    unstable?: boolean
+    current_params?: Record<string, StrategyParamValue>
+  } | null
 }
 
 export const api = {
@@ -1365,13 +1485,23 @@ export const api = {
     codes: string[]
     start: string
     end: string
-    param_grid: Record<string, Array<number | boolean>>
+    param_grid?: Record<string, Array<number | boolean>>
     costs?: BacktestCostSnapshot
+    /** true 时忽略 param_grid,按规格 validation.parameter_scans 声明扫描 */
+    declared?: boolean
   }) {
     return request<SweepResult>('/api/backtest/sweep', {
       method: 'POST',
       body: JSON.stringify(body),
     })
+  },
+
+  /** 证据状态手动操作:标记设计完成 / 否决复位;其余状态由回测自动推进 */
+  updateStrategyEvidence(id: number, action: StrategyEvidenceAction) {
+    return request<Strategy & { evidence_transition?: { from: StrategyEvidenceStatus, to: StrategyEvidenceStatus } }>(
+      `/api/strategies/${id}/evidence`,
+      { method: 'POST', body: JSON.stringify({ action }) },
+    )
   },
 
   backfill(code: string, start?: string, end?: string) {
