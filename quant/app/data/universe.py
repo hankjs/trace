@@ -324,19 +324,19 @@ def all_market_pool(db: Session, day: date,
             select(Stock.code).order_by(Stock.code)).all()]
 
     cutoff = day - timedelta(days=min_list_days)
-    # 统计口径只算「有日线的股票」:数据源不覆盖的品种(如北交所 sh.92xxxx,
-    # baostock 既无上市日也无日线)永远补不上 list_date,把它们计入分母会让
-    # 护栏永久触发、默认口径永久不可用。它们本来也不该进全A池 —— 无日线
-    # 就无法回测。真正要防的是「有日线却缺上市日」,那才是元数据滞后。
-    has_bars = select(DailyBar.code).distinct().subquery()
+    # 统计口径只算「研究日当日有日线的股票」:走 date 索引,避免对
+    # quant_daily_bar 全表 DISTINCT(千万级会把解析拖到秒级以上)。
+    # 数据源不覆盖的品种永远补不上 list_date,也不该进全A池;真正要防的
+    # 是「当日有 bar 却缺上市日」的元数据滞后。
+    has_bars_on_day = select(DailyBar.code).where(DailyBar.date == day)
     total = db.execute(
         select(func.count()).select_from(Stock)
-        .where(Stock.code.in_(select(has_bars.c.code)))
+        .where(Stock.code.in_(has_bars_on_day))
     ).scalar() or 0
     missing = db.execute(
         select(func.count()).select_from(Stock)
         .where(Stock.list_date.is_(None),
-               Stock.code.in_(select(has_bars.c.code)))
+               Stock.code.in_(has_bars_on_day))
     ).scalar() or 0
     if missing and total:
         ratio = missing / total
@@ -452,17 +452,18 @@ def resolve_pool_during(db: Session, start: date, end: date, *,
     if kind == "all":
         # 先复用完整性护栏，再取区间内任一时点达到上市年限且尚未退市的并集；
         # ST 是逐日状态，在 pool_eligibility_matrix 中按 bar 过滤。
+        # 完整性护栏用 end 日有 bar 的样本(见 all_market_pool,走 date 索引)。
+        # 区间并集本身只依赖 quant_stock 上市/退市元数据 —— 不再对日线做
+        # DISTINCT(长回测区间会扫百万~千万行)。无日线的票在 eligibility 里自然出局。
         all_market_pool(
             db, end, min_list_days=min_list_days,
             max_missing_ratio=max_missing_ratio,
         )
         cutoff = end - timedelta(days=min_list_days)
-        has_bars = select(DailyBar.code).distinct()
         return [row[0] for row in db.execute(select(Stock.code).where(
             Stock.list_date.is_not(None),
             Stock.list_date <= cutoff,
             or_(Stock.delist_date.is_(None), Stock.delist_date > start),
-            Stock.code.in_(has_bars),
         ).order_by(Stock.code)).all()]
     return resolve_pool(db, end, kind=kind, index_name=index_name,
                         pool_id=pool_id, min_list_days=min_list_days,

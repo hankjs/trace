@@ -56,11 +56,14 @@ def list_signals(date_: date | None = Query(None, alias="date"),
     read_context = {"superseded_plan_ids": superseded_plan_ids}
     items = []
     for signal, stock, strategy, plan in rows:
+        # 列表不做日线重算/回测证据扫描;详情 GET /research-plans/{id} 再实时评估
         summary = (
             plan_summary(
                 plan, db=db, viewer_user_id=user_id,
                 evidence_cache=evidence_cache,
                 read_context=read_context,
+                reevaluate=False,
+                resolve_evidence=False,
             )
             if plan is not None else None
         )

@@ -2,13 +2,19 @@
 
 回测/选股是否可信,取决于 ST 历史、估值/财务点时数据和复权因子是否完整。
 本模块只做只读汇总,不触发采集;供看板、admin 与回测 metrics.data_quality 使用。
+
+性能约束:quant_daily_bar 可达千万级。全表 COUNT / COUNT(DISTINCT) 会卡死看板,
+因此默认 ST/活跃股票口径落在「最近 lookback 日历日」窗口内,走 date 索引;
+进程内短 TTL 缓存避免重复重扫。
 """
 from __future__ import annotations
 
+import threading
+import time
 from datetime import date, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -41,11 +47,59 @@ ST_COMPLETE_WARN = 0.85
 ST_COMPLETE_CRITICAL = 0.50
 VALUATION_WARN = 0.10
 
+# 全库扫描代价过高:默认只统计最近 N 个日历日(约 40 个交易日)的 ST / 活跃股票
+DEFAULT_LOOKBACK_DAYS = 60
+# 看板/admin 共享的报告缓存(秒);数据质量非秒级变化
+REPORT_CACHE_TTL_SECONDS = 300.0
+
+_cache_lock = threading.Lock()
+_report_cache: dict[str, tuple[float, Any]] = {}
+
 
 def _ratio(num: int, den: int) -> float:
     if den <= 0:
         return 0.0
     return round(num / den, 4)
+
+
+def _cache_get(key: str) -> Any | None:
+    with _cache_lock:
+        hit = _report_cache.get(key)
+        if hit is None:
+            return None
+        ts, value = hit
+        if time.monotonic() - ts >= REPORT_CACHE_TTL_SECONDS:
+            _report_cache.pop(key, None)
+            return None
+        return value
+
+
+def _cache_set(key: str, value: Any) -> Any:
+    with _cache_lock:
+        _report_cache[key] = (time.monotonic(), value)
+    return value
+
+
+def clear_quality_cache() -> None:
+    """测试或主动刷新时清空进程内缓存。"""
+    with _cache_lock:
+        _report_cache.clear()
+
+
+def _latest_bar_date(db: Session) -> date | None:
+    return db.execute(select(func.max(DailyBar.date))).scalar()
+
+
+def _default_window(
+    db: Session,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> tuple[date | None, date | None]:
+    """无显式区间时,用最新 bar 日期回推 lookback 天,避免全表扫。"""
+    latest = _latest_bar_date(db)
+    if latest is None:
+        return None, None
+    return latest - timedelta(days=lookback_days), latest
 
 
 def st_history_coverage(
@@ -54,34 +108,48 @@ def st_history_coverage(
     codes: list[str] | None = None,
     start: date | None = None,
     end: date | None = None,
+    lookback_days: int | None = DEFAULT_LOOKBACK_DAYS,
 ) -> dict[str, Any]:
-    """逐日 is_st 覆盖率(bar 级 + 股票级)。"""
+    """逐日 is_st 覆盖率(bar 级 + 股票级)。
+
+    未指定 start/end/codes 时默认只扫最近 lookback_days 日历日(走 date 索引)。
+    传入 start/end 或 codes 则按调用方范围统计;lookback_days=None 且无范围时
+    才全表扫描(运维慎用)。
+    """
+    scope = "custom"
+    window_start = start
+    window_end = end
+    if window_start is None and window_end is None and codes is None:
+        if lookback_days is not None:
+            window_start, window_end = _default_window(db, lookback_days=lookback_days)
+            scope = "recent_window"
+        else:
+            scope = "full"
+
     filters = []
     if codes is not None:
         filters.append(DailyBar.code.in_(codes))
-    if start is not None:
-        filters.append(DailyBar.date >= start)
-    if end is not None:
-        filters.append(DailyBar.date <= end)
+    if window_start is not None:
+        filters.append(DailyBar.date >= window_start)
+    if window_end is not None:
+        filters.append(DailyBar.date <= window_end)
 
-    total_q = select(func.count()).select_from(DailyBar)
-    known_q = select(func.count()).select_from(DailyBar).where(
-        DailyBar.is_st.is_not(None),
-    )
-    stock_q = select(func.count(func.distinct(DailyBar.code)))
-    known_stock_q = select(func.count(func.distinct(DailyBar.code))).where(
-        DailyBar.is_st.is_not(None),
-    )
+    # 单次扫描:COUNT(col) 自动跳过 NULL;股票级用 CASE 去重
+    known_code = case((DailyBar.is_st.is_not(None), DailyBar.code), else_=None)
+    q = select(
+        func.count().label("total_bars"),
+        func.count(DailyBar.is_st).label("known_bars"),
+        func.count(func.distinct(DailyBar.code)).label("total_stocks"),
+        func.count(func.distinct(known_code)).label("known_stocks"),
+    ).select_from(DailyBar)
     for f in filters:
-        total_q = total_q.where(f)
-        known_q = known_q.where(f)
-        stock_q = stock_q.where(f)
-        known_stock_q = known_stock_q.where(f)
+        q = q.where(f)
 
-    total_bars = int(db.execute(total_q).scalar() or 0)
-    known_bars = int(db.execute(known_q).scalar() or 0)
-    total_stocks = int(db.execute(stock_q).scalar() or 0)
-    known_stocks = int(db.execute(known_stock_q).scalar() or 0)
+    row = db.execute(q).one()
+    total_bars = int(row.total_bars or 0)
+    known_bars = int(row.known_bars or 0)
+    total_stocks = int(row.total_stocks or 0)
+    known_stocks = int(row.known_stocks or 0)
     return {
         "total_bars": total_bars,
         "known_bars": known_bars,
@@ -91,20 +159,38 @@ def st_history_coverage(
         "stocks_with_st_history": known_stocks,
         "stock_coverage_ratio": _ratio(known_stocks, total_stocks),
         "incomplete": total_bars > 0 and known_bars < total_bars,
+        "scope": scope,
+        "lookback_days": lookback_days if scope == "recent_window" else None,
+        "window_start": str(window_start) if window_start else None,
+        "window_end": str(window_end) if window_end else None,
     }
 
 
-def adjust_factor_summary(db: Session) -> dict[str, Any]:
-    """复权因子覆盖:权威 baostock / 自算 sina / 有日线无因子。"""
+def adjust_factor_summary(
+    db: Session,
+    *,
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+) -> dict[str, Any]:
+    """复权因子覆盖:权威 baostock / 自算 sina / 近期有日线无因子。
+
+    stocks_with_bars 取最近 lookback 内出现过的股票,避免对日线全表 DISTINCT。
+    """
     by_source = dict(
         db.execute(
             select(AdjustFactor.source, func.count(func.distinct(AdjustFactor.code)))
             .group_by(AdjustFactor.source)
         ).all()
     )
-    stocks_with_bars = int(db.execute(
-        select(func.count(func.distinct(DailyBar.code)))
-    ).scalar() or 0)
+    window_start, window_end = _default_window(db, lookback_days=lookback_days)
+    if window_start is None or window_end is None:
+        stocks_with_bars = 0
+    else:
+        stocks_with_bars = int(db.execute(
+            select(func.count(func.distinct(DailyBar.code))).where(
+                DailyBar.date >= window_start,
+                DailyBar.date <= window_end,
+            )
+        ).scalar() or 0)
     stocks_with_factors = int(db.execute(
         select(func.count(func.distinct(AdjustFactor.code)))
     ).scalar() or 0)
@@ -113,6 +199,9 @@ def adjust_factor_summary(db: Session) -> dict[str, Any]:
         "stocks_with_factors": stocks_with_factors,
         "by_source": {str(k): int(v) for k, v in by_source.items()},
         "missing_factor_stocks": max(0, stocks_with_bars - stocks_with_factors),
+        "lookback_days": lookback_days,
+        "window_start": str(window_start) if window_start else None,
+        "window_end": str(window_end) if window_end else None,
     }
 
 
@@ -122,6 +211,7 @@ def snapshot_coverage(
     as_of: date | None = None,
     codes: list[str] | None = None,
     lookback_days: int = 7,
+    include_fields: bool = True,
 ) -> dict[str, Any]:
     """估值/财务在研究日附近的可用覆盖(点时:available_date <= as_of)。"""
     as_of = as_of or today_cst()
@@ -152,37 +242,38 @@ def snapshot_coverage(
     fun_codes = int(db.execute(fun_codes_q).scalar() or 0)
 
     fields: dict[str, dict[str, Any]] = {}
-    for frame_name, col in _VALUATION_FRAME_FIELDS.items():
-        column = getattr(ValuationSnapshot, col)
-        q = select(func.count(func.distinct(ValuationSnapshot.code))).where(
-            ValuationSnapshot.available_date <= as_of,
-            ValuationSnapshot.data_date >= window_start,
-            ValuationSnapshot.data_date <= as_of,
-            column.is_not(None),
-        )
-        if codes is not None:
-            q = q.where(ValuationSnapshot.code.in_(codes))
-        available = int(db.execute(q).scalar() or 0)
-        fields[frame_name] = {
-            "available": available,
-            "total": universe,
-            "ratio": _ratio(available, universe),
-        }
-    for frame_name, col in _FUNDAMENTAL_FRAME_FIELDS.items():
-        column = getattr(FundamentalSnapshot, col)
-        q = select(func.count(func.distinct(FundamentalSnapshot.code))).where(
-            FundamentalSnapshot.available_date <= as_of,
-            FundamentalSnapshot.report_period <= as_of,
-            column.is_not(None),
-        )
-        if codes is not None:
-            q = q.where(FundamentalSnapshot.code.in_(codes))
-        available = int(db.execute(q).scalar() or 0)
-        fields[frame_name] = {
-            "available": available,
-            "total": universe,
-            "ratio": _ratio(available, universe),
-        }
+    if include_fields:
+        for frame_name, col in _VALUATION_FRAME_FIELDS.items():
+            column = getattr(ValuationSnapshot, col)
+            q = select(func.count(func.distinct(ValuationSnapshot.code))).where(
+                ValuationSnapshot.available_date <= as_of,
+                ValuationSnapshot.data_date >= window_start,
+                ValuationSnapshot.data_date <= as_of,
+                column.is_not(None),
+            )
+            if codes is not None:
+                q = q.where(ValuationSnapshot.code.in_(codes))
+            available = int(db.execute(q).scalar() or 0)
+            fields[frame_name] = {
+                "available": available,
+                "total": universe,
+                "ratio": _ratio(available, universe),
+            }
+        for frame_name, col in _FUNDAMENTAL_FRAME_FIELDS.items():
+            column = getattr(FundamentalSnapshot, col)
+            q = select(func.count(func.distinct(FundamentalSnapshot.code))).where(
+                FundamentalSnapshot.available_date <= as_of,
+                FundamentalSnapshot.report_period <= as_of,
+                column.is_not(None),
+            )
+            if codes is not None:
+                q = q.where(FundamentalSnapshot.code.in_(codes))
+            available = int(db.execute(q).scalar() or 0)
+            fields[frame_name] = {
+                "available": available,
+                "total": universe,
+                "ratio": _ratio(available, universe),
+            }
 
     return {
         "as_of": str(as_of),
@@ -291,14 +382,17 @@ def _alert_level(st_ratio: float, valuation_ratio: float) -> str:
     return "ok"
 
 
-def data_quality_report(db: Session, *, as_of: date | None = None) -> dict[str, Any]:
-    """全库数据信任报告(admin / 看板摘要共用)。"""
-    as_of = as_of or today_cst()
+def _build_data_quality_report(
+    db: Session,
+    *,
+    as_of: date,
+    include_fields: bool,
+) -> dict[str, Any]:
     st = st_history_coverage(db)
-    snaps = snapshot_coverage(db, as_of=as_of)
+    snaps = snapshot_coverage(db, as_of=as_of, include_fields=include_fields)
     factors = adjust_factor_summary(db)
     stock_count = int(db.execute(select(func.count()).select_from(Stock)).scalar() or 0)
-    latest_bar = db.execute(select(func.max(DailyBar.date))).scalar()
+    latest_bar = _latest_bar_date(db)
     level = _alert_level(
         st["stock_coverage_ratio"],
         snaps["valuation_ratio"],
@@ -322,14 +416,34 @@ def data_quality_report(db: Session, *, as_of: date | None = None) -> dict[str, 
     }
 
 
+def data_quality_report(db: Session, *, as_of: date | None = None) -> dict[str, Any]:
+    """全库数据信任报告(admin / 看板摘要共用)。"""
+    as_of = as_of or today_cst()
+    cache_key = f"report:{as_of.isoformat()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    report = _build_data_quality_report(db, as_of=as_of, include_fields=True)
+    return _cache_set(cache_key, report)
+
+
 def data_quality_public_summary(db: Session, *, as_of: date | None = None) -> dict[str, Any]:
-    """登录用户可读摘要:只暴露比率与告警,不含运维细节表。"""
-    report = data_quality_report(db, as_of=as_of)
-    return report["summary"]
+    """登录用户可读摘要:只暴露比率与告警,不含运维细节表。
+
+    不跑 admin 字段级覆盖明细;并与完整报告共享缓存键前缀策略,独立缓存。
+    """
+    as_of = as_of or today_cst()
+    cache_key = f"public:{as_of.isoformat()}"
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+    report = _build_data_quality_report(db, as_of=as_of, include_fields=False)
+    return _cache_set(cache_key, report["summary"])
 
 
 __all__ = [
     "adjust_factor_summary",
+    "clear_quality_cache",
     "data_quality_public_summary",
     "data_quality_report",
     "frames_data_quality",

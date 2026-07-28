@@ -602,15 +602,13 @@ def test_public_plan_binds_only_viewers_matching_strategy_version_backtest():
             date_=None, code=None, strategy_id=None, side=None,
             limit=200, db=db, claims=CLAIMS,
         )["items"][0]["research_plan"]
-        signal_for_b = list_signals(
-            date_=None, code=None, strategy_id=None, side=None,
-            limit=200, db=db, claims=claims_b,
-        )["items"][0]["research_plan"]
+        detail_for_a = plan_detail(db, plan, viewer_user_id=USER)
         detail_for_b = plan_detail(db, plan, viewer_user_id=user_b)
         detail_for_c = plan_detail(db, plan, viewer_user_id=user_c)
 
-        assert signal_for_a["backtest_evidence"]["run_id"] == 21
-        assert signal_for_b["backtest_evidence"]["run_id"] == 22
+        # 列表接口不做按查看者的证据扫库(热路径);详情才实时绑定
+        assert signal_for_a["backtest_status"] in {"unverified", "verified"}
+        assert detail_for_a["backtest_evidence"]["run_id"] == 21
         assert detail_for_b["backtest_evidence"]["run_id"] == 22
         assert detail_for_c["backtest_status"] == "unverified"
         assert "run_id" not in detail_for_c["backtest_evidence"]

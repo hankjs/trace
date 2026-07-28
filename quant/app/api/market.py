@@ -9,10 +9,11 @@ from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from ..data.akshare_client import symbol_to_code
+from ..data.latest_prices import latest_quotes
 from ..data.quality import data_quality_public_summary
 from ..auth import require_client, user_id_from_claims
 from ..db import get_db
-from ..models import DailyBar, Snapshot, Stock, WatchlistItem
+from ..models import DailyBar, Stock, WatchlistItem
 
 router = APIRouter(prefix="/api/market", tags=["market"])
 
@@ -130,39 +131,21 @@ def get_kline(code: str = Query(..., description="如 sh.600519"),
 @router.get("/snapshot")
 def get_snapshot(db: Session = Depends(get_db),
                  claims: dict = Depends(require_client)):
-    """自选股最新价:优先盘中快照,否则最近收盘"""
+    """自选股最新价:优先盘中快照,否则最近收盘(批量查询,避免 N+1)。"""
     watch = db.execute(
         select(Stock).join(WatchlistItem, WatchlistItem.code == Stock.code)
         .where(WatchlistItem.user_id == user_id_from_claims(claims))
         .order_by(Stock.code)
     ).scalars().all()
+    quotes = latest_quotes(db, [s.code for s in watch])
     items = []
     for s in watch:
-        snap = db.execute(
-            select(Snapshot).where(Snapshot.code == s.code)
-            .order_by(Snapshot.ts.desc()).limit(1)
-        ).scalar_one_or_none()
-        bar = db.execute(
-            select(DailyBar).where(DailyBar.code == s.code)
-            .order_by(DailyBar.date.desc()).limit(1)
-        ).scalar_one_or_none()
-        if snap is not None and (bar is None or snap.ts.date() >= bar.date):
-            items.append({
-                "code": s.code, "name": s.name, "industry": s.industry,
-                "source": "snapshot",
-                "ts": snap.ts.isoformat(sep=" "),
-                "price": snap.price, "pct_chg": snap.pct_chg,
-            })
-        elif bar is not None:
-            items.append({
-                "code": s.code, "name": s.name, "industry": s.industry,
-                "source": "close",
-                "ts": str(bar.date),
-                "price": bar.close, "pct_chg": None,
-            })
-        else:
-            items.append({
-                "code": s.code, "name": s.name, "industry": s.industry,
-                "source": None, "ts": None, "price": None, "pct_chg": None,
-            })
+        q = quotes.get(s.code) or {}
+        items.append({
+            "code": s.code, "name": s.name, "industry": s.industry,
+            "source": q.get("source"),
+            "ts": q.get("ts"),
+            "price": q.get("price"),
+            "pct_chg": q.get("pct_chg"),
+        })
     return {"count": len(items), "items": items}

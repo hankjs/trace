@@ -175,7 +175,7 @@ def all_db(monkeypatch):
 
 def test_all_kind_excludes_st_delisted_and_new_listings(all_db):
     """kind='all':ST、已退市、上市未满 60 天的票都要被剔除。"""
-    # 该 fixture 有 1/6 缺 list_date(16.7%),超过 5% 硬阈值,故放宽后再断言
+    # 该 fixture 当日有 bar 的 5 只中 1 只缺 list_date(20%),超过 5% 硬阈值
     codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.2)
 
     assert codes == ["sh.good", "sh.good2"]
@@ -202,10 +202,12 @@ def test_all_kind_refuses_to_resolve_when_list_date_coverage_is_poor(all_db):
     with pytest.raises(universe.IncompleteListingDataError) as exc:
         universe.resolve_pool(all_db, DAY, kind="all")  # 默认阈值 5%
 
-    # 报错必须点明缺多少、占比、以及怎么办
+    # 报错必须点明缺多少、占比、以及怎么办。
+    # 分母只计「研究日当日有 bar」的票(走 date 索引,避免全表 DISTINCT):
+    # DAY 当日 5 只有 bar(sh.st 无当日 bar 不计入),其中 1 只缺 list_date。
     msg = str(exc.value)
-    assert "1/6" in msg
-    assert "16.7%" in msg
+    assert "1/5" in msg
+    assert "20.0%" in msg
     assert "list_date" in msg
 
 
@@ -225,10 +227,10 @@ def test_all_kind_ignores_stocks_without_bars_in_coverage_check(all_db):
     ])
     all_db.commit()
 
-    # 仍是 1/6 而非 21/26 —— 这 20 只被排除在统计之外
+    # 仍是 1/5(当日有 bar)而非 21/25 —— 这 20 只被排除在统计之外
     with pytest.raises(universe.IncompleteListingDataError) as exc:
         universe.resolve_pool(all_db, DAY, kind="all")
-    assert "1/6" in str(exc.value)
+    assert "1/5" in str(exc.value)
 
     # 放宽阈值后它们也不会出现在池子里
     codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.2)
@@ -244,7 +246,7 @@ def test_all_kind_warns_but_proceeds_below_threshold(all_db, caplog):
     assert codes == ["sh.good", "sh.good2"]
     warnings = [r.getMessage() for r in caplog.records]
     assert any("list_date" in m for m in warnings)
-    assert any("1/6" in m for m in warnings)
+    assert any("1/5" in m for m in warnings)
 
 
 def test_delist_date_after_day_still_counts_as_listed(all_db):

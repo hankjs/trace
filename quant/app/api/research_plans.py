@@ -49,10 +49,13 @@ def list_research_plans(
     return {
         "count": len(plans),
         "items": [
+            # 列表轻量:不做原生条件重算与证据扫库;详情接口仍实时评估
             plan_summary(
                 plan, db=db, viewer_user_id=user_id,
                 evidence_cache=evidence_cache,
                 read_context=read_context,
+                reevaluate=False,
+                resolve_evidence=False,
             )
             for plan in plans
         ],

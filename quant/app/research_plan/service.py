@@ -605,8 +605,13 @@ def effective_status(
     *,
     db: Session | None = None,
     read_context: dict | None = None,
+    reevaluate: bool = True,
 ) -> tuple[str, dict]:
-    """有效期和市场偏离是读取状态，不改写不可变的生成快照。"""
+    """有效期和市场偏离是读取状态，不改写不可变的生成快照。
+
+    reevaluate=False 时跳过拉日线重算原生条件与盘口偏离(列表热路径);
+    仍会做 superseded / valid_until 等轻量判断。详情接口保持默认 True。
+    """
     as_of = as_of or today_cst()
     if db is not None:
         superseded_ids = (
@@ -624,14 +629,15 @@ def effective_status(
                 "code": "superseded_by_new_plan",
                 "text": "该计划已被更新的数据快照替代，请查看后继版本。",
             }
-        native_result = _native_condition_reevaluation(db, plan, as_of)
-        if native_result is not None and native_result[0] == "invalid":
-            return native_result
-        reason = _reevaluation_from_market(db, plan, as_of)
-        if reason is not None:
-            return "reevaluate", reason
-        if native_result is not None:
-            return native_result
+        if reevaluate:
+            native_result = _native_condition_reevaluation(db, plan, as_of)
+            if native_result is not None and native_result[0] == "invalid":
+                return native_result
+            reason = _reevaluation_from_market(db, plan, as_of)
+            if reason is not None:
+                return "reevaluate", reason
+            if native_result is not None:
+                return native_result
     if plan.status == "current" and plan.valid_until and as_of > plan.valid_until:
         return "expired", {
             "code": "validity_elapsed",
@@ -648,16 +654,24 @@ def plan_summary(
     viewer_user_id: str | None = None,
     evidence_cache: dict | None = None,
     read_context: dict | None = None,
+    reevaluate: bool = True,
+    resolve_evidence: bool = True,
 ) -> dict:
+    """序列化计划摘要。
+
+    列表接口应传 reevaluate=False、resolve_evidence=False,避免 O(N) 日线重算
+    与全量回测扫描;详情/需要实时状态时保持默认。
+    """
     status, status_reason = effective_status(
-        plan, as_of, db=db, read_context=read_context)
+        plan, as_of, db=db, read_context=read_context, reevaluate=reevaluate,
+    )
     evidence = (
         plan.backtest_evidence
         or _unverified_evidence(
             (plan.params_snapshot or {}).get("simulation_costs"),
         )[1]
     )
-    if db is not None:
+    if db is not None and resolve_evidence:
         _, evidence = _backtest_evidence(
             db, strategy_id=plan.strategy_id,
             strategy_spec_hash=plan.strategy_spec_hash,

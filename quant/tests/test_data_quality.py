@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.data.quality import (
+    clear_quality_cache,
+    data_quality_public_summary,
     data_quality_report,
     frames_data_quality,
     st_history_coverage,
@@ -23,6 +25,7 @@ from app.models import DailyBar, Stock
 
 @pytest.fixture()
 def db():
+    clear_quality_cache()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
@@ -49,6 +52,7 @@ def db():
         ])
         session.commit()
         yield session
+    clear_quality_cache()
 
 
 def test_st_history_coverage_counts_null_bars(db):
@@ -58,6 +62,18 @@ def test_st_history_coverage_counts_null_bars(db):
     assert report["null_bars"] == 1
     assert report["incomplete"] is True
     assert report["bar_coverage_ratio"] == pytest.approx(2 / 3, rel=1e-3)
+    assert report["scope"] == "recent_window"
+    assert report["window_start"] is not None
+    assert report["window_end"] == "2024-06-02"
+
+
+def test_st_history_coverage_custom_range(db):
+    report = st_history_coverage(
+        db, start=date(2024, 6, 2), end=date(2024, 6, 2),
+    )
+    assert report["scope"] == "custom"
+    assert report["total_bars"] == 1
+    assert report["known_bars"] == 0
 
 
 def test_data_quality_report_summary_shape(db):
@@ -70,6 +86,14 @@ def test_data_quality_report_summary_shape(db):
     assert "st_history" in report
     assert "snapshots" in report
     assert "adjust_factors" in report
+    assert report["snapshots"]["fields"]  # admin 路径含字段明细
+
+
+def test_data_quality_public_summary_skips_field_detail(db):
+    summary = data_quality_public_summary(db, as_of=date(2024, 6, 2))
+    assert summary["stock_count"] == 2
+    assert "alert_level" in summary
+    assert "fields" not in summary
 
 
 def test_frames_data_quality_flags_incomplete_st():

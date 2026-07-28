@@ -6,32 +6,18 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import DailyBar, Snapshot, Trade
+from ..data.latest_prices import latest_reference_prices
+from ..models import Trade
 
 logger = logging.getLogger(__name__)
 
 
 def _latest_prices(db: Session, codes: list[str]) -> dict[str, tuple[float, str]]:
-    """每只股票的最新参考价:(价格, 来源)"""
-    prices: dict[str, tuple[float, str]] = {}
-    for code in codes:
-        # 盘中最新快照
-        snap = db.execute(
-            select(Snapshot).where(Snapshot.code == code)
-            .order_by(Snapshot.ts.desc()).limit(1)
-        ).scalar_one_or_none()
-        bar = db.execute(
-            select(DailyBar).where(DailyBar.code == code)
-            .order_by(DailyBar.date.desc()).limit(1)
-        ).scalar_one_or_none()
-        if snap is not None and (bar is None or snap.ts.date() >= bar.date):
-            prices[code] = (snap.price, "snapshot")
-        elif bar is not None:
-            prices[code] = (bar.close, "close")
-    return prices
+    """每只股票的最新参考价:(价格, 来源)。批量查询。"""
+    return latest_reference_prices(db, codes)
 
 
 def _compute_book(db: Session, user_id: int) -> dict[str, dict]:
@@ -72,41 +58,43 @@ def _compute_book(db: Session, user_id: int) -> dict[str, dict]:
     return book
 
 
+def _position_item(
+    code: str, p: dict, prices: dict[str, tuple[float, str]],
+) -> dict:
+    avg_cost = p["cost"] / p["qty"]
+    last_price, price_src = prices.get(code, (None, None))
+    item = {
+        "code": code,
+        "qty": p["qty"],
+        "avg_cost": round(avg_cost, 4),
+        "last_price": last_price,
+        "price_source": price_src,
+        "market_value": round(p["qty"] * last_price, 2) if last_price else None,
+        "unrealized_pnl": (
+            round((last_price - avg_cost) * p["qty"], 2) if last_price else None
+        ),
+        "realized_pnl": round(p["realized"], 2),
+    }
+    if p.get("oversold_qty"):
+        item["data_warning"] = (
+            f"存在超卖成交 {p['oversold_qty']:g} 股,已按持仓截断"
+        )
+    return item
+
+
 def compute_positions(db: Session, user_id: int) -> list[dict]:
     """当前持仓列表(仅仍有持仓的股票)"""
     book = _compute_book(db, user_id)
     holding_codes = [c for c, p in book.items() if p["qty"] > 1e-9]
     prices = _latest_prices(db, holding_codes)
-
-    positions = []
-    for code in holding_codes:
-        p = book[code]
-        avg_cost = p["cost"] / p["qty"]
-        last_price, price_src = prices.get(code, (None, None))
-        item = {
-            "code": code,
-            "qty": p["qty"],
-            "avg_cost": round(avg_cost, 4),
-            "last_price": last_price,
-            "price_source": price_src,
-            "market_value": round(p["qty"] * last_price, 2) if last_price else None,
-            "unrealized_pnl": (
-                round((last_price - avg_cost) * p["qty"], 2) if last_price else None
-            ),
-            "realized_pnl": round(p["realized"], 2),
-        }
-        if p.get("oversold_qty"):
-            # 历史脏数据留痕:前端/审计能看到这只股票的成交与持仓口径不一致
-            item["data_warning"] = (
-                f"存在超卖成交 {p['oversold_qty']:g} 股,已按持仓截断"
-            )
-        positions.append(item)
-    return positions
+    return [_position_item(code, book[code], prices) for code in holding_codes]
 
 
 def portfolio_summary(db: Session, user_id: int) -> dict:
     book = _compute_book(db, user_id)
-    positions = compute_positions(db, user_id)
+    holding_codes = [c for c, p in book.items() if p["qty"] > 1e-9]
+    prices = _latest_prices(db, holding_codes)
+    positions = [_position_item(code, book[code], prices) for code in holding_codes]
     return {
         "positions": positions,
         "total_market_value": round(
