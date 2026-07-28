@@ -35,6 +35,8 @@ History follows Conventional Commits, for example `feat(quant): ...` and `fix(we
 
 Keep database URLs in the repository-level or local `config.toml`; both are ignored and must not be committed. Preserve the `quant_` table prefix and never add automatic trade execution: this project is an information and backtesting system only. Auth shares the server's `users` table (read-only, raw SQL in `app/auth.py`) and JWT secret: `jwt_secret` is read from the root `[server].jwt_secret` or overridden by `[quant].jwt_secret` — on the production host (no root config.toml) it must be set in `quant/config.toml`.
 
+**baostock hard limits** (by egress IP): ≤50k API calls/day; **no concurrent connections**; overage → blacklist. Prefer bulk APIs (`query_daily_history_k_AStock` / `query_daily_adjust_factor` = 1 call per day for the whole market); do **not** loop `query_history_k_data_plus` per code for full-market jobs. Never parallelize shards on the same IP. See `DATA-ARCHITECTURE.md` §5 and `app/data/baostock_client.py`.
+
 ## Product Boundary: Daily Research, Manual Trading
 
 This is a daily-frequency research and decision-support system. Strategies consume daily bars and produce informational picks or signals; backtest fills are simulations. Intraday snapshots are for display and valuation only. Never add broker connectivity, order submission, automatic execution, semi-automatic execution, or features that imply the system will trade on the user's behalf. All real buy, sell, position-sizing, and risk decisions are confirmed and executed manually by the user in an external trading application. Records in `quant_trade` are manual bookkeeping entries, not orders generated or executed by this system.

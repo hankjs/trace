@@ -8,6 +8,12 @@
 - 失败重试:单只最多 3 次,间隔递增;单只失败不影响整体;
 - baostock 限速友好:全程复用一次登录,每只间隔 sleep。
 
+## baostock 硬约束(务必遵守)
+
+- 每日 API ≤ 5 万次;每只股票 `fetch_daily_bars` 约 2 次请求(前复权+不复权)。
+- **禁止并发**:同一出口 IP 上不要同时跑多个本脚本实例/shard。
+- 超限按 IP 进黑名单(常见 10001011)。详见 DATA-ARCHITECTURE.md 第 5 节。
+
 运行: cd quant && uv run python scripts/backfill_pool.py [--limit N] [--years 3]
 全市场回填: uv run python scripts/backfill_pool.py --all --start 2019-01-01
 修复尺度错乱: uv run python scripts/backfill_pool.py --force-rescale sh.600519,sz.000001

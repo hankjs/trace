@@ -106,6 +106,13 @@ pnpm build     # 严格 TypeScript 检查并输出 web/dist
 权威因子加两层重锚检测应对，设计理由、精度陷阱与数据源覆盖边界见
 [`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md)。
 
+**baostock 连接限制（官方，按出口 IP）**：每日 API 请求不超过 **5 万次**；
+**禁止并发连接**；超限进入黑名单。能批量就不要按 code 单条循环——盘后/全市场
+日 K 应用 `query_daily_history_k_AStock(date)`（1 次/交易日），复权因子用
+`query_daily_adjust_factor(date)`；`query_history_k_data_plus` 只适合单票区间。
+回填须单进程串行并估算请求量。详见
+[`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) 第 5 节「baostock 连接与限速」。
+
 北交所（330 只 `bj.` 代码）baostock 完全不覆盖，日线走 akshare 新浪源、复权因子
 由 `close/raw_close` 自算并标 `source='sina'`，可信度低于权威值。自选股日线会使用
 AkShare 做对账，东财接口不可用时部分行情能力会降级到新浪。

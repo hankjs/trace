@@ -3,6 +3,34 @@
 注意:baostock 是同步阻塞接口,调用方需放到线程池(见 api/admin.py / scheduler.py)。
 复权口径:adjustflag="2" 前复权;另查 adjustflag="3" 拿不复权收盘价存入 raw_close。
 批量拉取时用 login_session() 包住,避免每次调用都登录/登出。
+
+## 连接与限速(官方硬约束,按出口 IP 计)
+
+- 每日 API 请求不能超过 **5 万次**;
+- **禁止并发连接**访问(多进程/多机同出口叠跑也会算并发);
+- 超过后进入**黑名单**控制,表现为登录/查询失败(常见 10001011)。
+- **优先批量接口,禁止无谓单条循环**(见下)。
+
+官方 API:<https://www.baostock.com/mainContent?file=pythonAPI.md>
+SDK demo:`baostock/demo/demo_daily_k_4_AStock.py` 等。
+
+## 批量 vs 单条(选型)
+
+| 场景 | 应用的接口 | 本模块现状 |
+|---|---|---|
+| 某日全 A 日 K | `bs.query_daily_history_k_AStock(date)` **1 次/日** | 尚未封装;盘后/全市场应按日批量,勿按 code 循环 |
+| 某日全 ETF 日 K | `bs.query_daily_history_k_ETF(date)` | 同上 |
+| 某日全市场复权因子 | `bs.query_daily_adjust_factor(date)` | 尚未封装;`fetch_adjust_factors` 仍按 code |
+| 单票任意区间 K | `bs.query_history_k_data_plus(code,…)` | `fetch_daily_bars`(每只 2 次:前复权+不复权) |
+| 单票区间因子 | `bs.query_adjust_factor(code,…)` | `fetch_adjust_factors` |
+| 全表证券资料 / 日历 / 成分 | 见对应 fetch_* | 已批量 |
+
+`query_history_k_data_plus` 的 code **只能单只**,不能拼多只。全市场增量请用
+`query_daily_history_k_AStock`,不要 N 次单票。批量日 K 无 adjustflag 入参,
+落地前须与前复权/`raw_close` 口径对齐(见 DATA-ARCHITECTURE.md §5)。
+
+本模块用 `_query_lock` 串行化查询,但仍无法阻止「多进程各自 login」。
+回填与脚本必须单进程串行,并在动手前估算请求量。
 """
 from __future__ import annotations
 

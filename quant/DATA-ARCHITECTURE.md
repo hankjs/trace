@@ -146,9 +146,9 @@ join 与乘法。当前选择的是渐进方案：读取路径不动，先建立
 - **日常调度自动补**：每晚的 `ingest_daily` 走 `fetch_daily_bars`（已带 `isST`），每次拉最近 10 天，所以新数据一定有值，并会回补最近 10 天的历史行。
 - **一次性回填**：`scripts/backfill_is_st.py` 只 `UPDATE` 这一列、不碰价格列、不走重锚检查，按股票粒度断点续跑。剩余约 4956 只，单进程 0.15s 间隔约 25 分钟。
 
-> **教训（写在这里以免重犯）**：最初我用 `backfill_pool.py --force-rescale all` 四分片并发全量重拉 1138 万行来补这一列 —— 其余 8 列的值完全不变，重拉纯属浪费，还要重走重锚判定去动已验证一致的价格序列。代价是真实的：触发 baostock 限速惩罚，出口 IP 被拉黑（错误码 `10001011`），采集中断。
+> **教训（写在这里以免重犯）**：最初我用 `backfill_pool.py --force-rescale all` 四分片并发全量重拉 1138 万行来补这一列 —— 其余 8 列的值完全不变，重拉纯属浪费，还要重走重锚判定去动已验证一致的价格序列。代价是真实的：触发 baostock 限速惩罚，出口 IP 被拉黑（错误码 `10001011`），采集中断。根因与硬性上限见下文「baostock 连接与限速」。
 >
-> 两条原则：**为补新增列不要重拉整行**；**并发采集前先确认数据源的限速容忍度**。baostock 用的是内置匿名账号（`anonymous`/`123456`，见 `login/loginout.py`），限速按 IP 计，且它是免费公益数据源 —— 换 IP 绕过限速既可能招致更长封禁，也不厚道。
+> 两条原则：**为补新增列不要重拉整行**；**严禁对 baostock 并发连接**。它是免费公益数据源，限速按 IP 计 —— 换 IP 绕过既可能招致更长封禁，也不厚道。
 
 **一处刻意的例外**：`selection/pipeline.py` 的 `run_selection` 仍按当前名称判定 ST。它跑的是**当日**选股，当日的当前状态就是正确状态，不存在前视问题。只有历史回溯（回测、历史筛选）才必须用逐日字段。
 
@@ -161,6 +161,67 @@ join 与乘法。当前选择的是渐进方案：读取路径不动，先建立
 | **baostock** | 沪深两市日线（前复权 + 不复权）、复权因子权威值、指数成分、交易日历、证券资料 | **北交所**（`bj.` 前缀报 `10004011`；换 `sh.`/`sz.` 前缀参数校验通过但**返回 0 行**） |
 | **akshare 东财** | 全市场快照、盘后对账 | 不稳定，会整段限流（实测连主板都 `ConnectionError`） |
 | **akshare 新浪** | 北交所日线（`adjust=''` 与 `'qfq'` 都有） | 部分老北交所代码（`bj.430xxx`/`bj.830xxx`）返回 `JSONDecodeError` |
+
+### baostock 连接与限速（硬性约束）
+
+官方文档：<https://www.baostock.com/mainContent?file=pythonAPI.md>
+（本地包 `baostock>=0.9` 的 demo / `security/history.py` 与文档一致；本环境实测 `00.9.30`。）
+
+baostock 官方对连接访问有明确配额；**超限会按出口 IP 进入黑名单**，表现为
+登录/查询失败（常见错误码 `10001011` 服务不可用）。项目内已多次因超额或并发
+被封 IP，回填与运维脚本必须把下列规则当硬约束，而不是「尽量友好」：
+
+| 规则 | 说明 |
+|---|---|
+| **每日 API 请求 ≤ 5 万次** | 按调用次数计（不是按股票只数、不是按返回行数）。 |
+| **禁止并发连接** | 同一时刻只能有一个进程/会话在访问。多进程分片（`--shards N`）、多机并行、定时任务与手动回填叠跑，都会触发黑名单。 |
+| **超限 → 黑名单** | 当日额度用尽或并发被抓到后，该出口 IP 进入控制名单，后续请求持续失败，需等解禁或换干净出口（见 `scripts/run_via_socks.py`，仅作运维兜底，不是常态采集手段）。 |
+| **优先批量接口，禁止无谓单条** | 凡有「按日全市场 / 空 code 全表」接口的，**一次拉全量**；不要为省本地解析而改成按 code 循环。见下表。 |
+
+#### 批量 vs 单条（接口选型）
+
+| 能力 | 批量接口（优先） | 单条接口（仅在无批量时用） | 请求量直觉 |
+|---|---|---|---|
+| **某日全 A 股日 K** | `query_daily_history_k_AStock(date)` | `query_history_k_data_plus(code, …)` 按只循环 | 批量 **1 次/交易日** ≈ 全市场；单条 ≈ `N 只 × 复权次数` |
+| **某日全 ETF 日 K** | `query_daily_history_k_ETF(date)` | 同上按 code | 同上 |
+| **某日全市场复权因子** | `query_daily_adjust_factor(date)` | `query_adjust_factor(code, start, end)` | 批量 **1 次/日**；单条 ≈ N 只 |
+| **证券资料** | `query_stock_basic()`（code 可空 = 全表） | `query_stock_basic(code=…)` | 已按全表用 |
+| **交易日历** | `query_trade_dates(start, end)` | — | 已按区间用 |
+| **指数成分** | `query_hs300_stocks` / `query_zz500_stocks`（可带 `date`） | — | 已按指数用 |
+| **任意区间单票历史 K** | —（**无**多 code 批量） | `query_history_k_data_plus` | 仅适合：补单票、重锚全历史、非整日全市场场景 |
+
+要点：
+
+1. **`query_history_k_data_plus` 的 `code` 只能是单只**（SDK 校验长度 = 9，如 `sh.600000`），**不能**逗号拼多只。要省请求数，应改用「按日全市场」接口，而不是幻想多 code 参数。
+2. **盘后增量 / 全市场按日回填** 应走 `query_daily_history_k_AStock`：一天全 A 只要 **1 次** API；用单条循环拉 5000 只则是 **5000+ 次**，极易顶破日配额并触发黑名单。
+3. **多年全历史** 也可按交易日循环批量接口：约 `交易日数` 次请求，而不是 `股票数 × 2（前复权+不复权）`。例如 7 年 ≈ 1700 次 vs 单条全市场 ≈ 数万次。
+4. **批量日 K 的字段与复权口径**（demo / 返回列）：
+   `date,code,open,high,low,close,preclose,volume,amount,adjustflag,turn,tradestatus,pctChg,peTTM,pbMRQ,psTTM,pcfNcfTTM,isST`。
+   接口**没有** `adjustflag` 入参（与 `query_history_k_data_plus` 不同），返回里的 `adjustflag` 是列；落地前须与单票前复权/`raw_close` 口径对齐验证（本系统 `open/high/low/close` 要前复权，`raw_close` 要不复权）—— 通常需配合 `query_daily_adjust_factor` 或库内权威因子换算，**不能**默认与 `adjustflag=2` 的单票结果逐字段相等。
+5. 批量结果一页上限约 **20000** 行（SDK 写死 `per_page_count`，不分页）；全 A 日 K 与当日因子量级在此内。
+
+#### 本仓库现状与工程落点
+
+**已做对的**
+
+- **进程内串行**：`app/data/baostock_client.py` 用 `_query_lock` 串行化查询；
+  `login_session()` 可重入引用计数，批量任务只 login 一次。
+- **调度单会话**：`scheduler.job_daily_bars` 整段包在一次 `login_session()` 内，
+  不另起并发 worker。
+- **元数据已批量**：`fetch_stock_basic` / `fetch_trade_dates` / 成分股查询。
+
+**仍偏单条、应优先改掉的（请求浪费大）**
+
+- 日线：`fetch_daily_bars(code, …)` → 底层 `query_history_k_data_plus`，且每只 **2 次**（前复权 + 不复权）。盘后 `job_daily_bars`、回填脚本、`backfill_is_st` 都走这条路径。
+- 复权因子：`fetch_adjust_factors(code, …)` → `query_adjust_factor` 按 code；应用 `query_daily_adjust_factor` 做按日全市场同步（或历史按日循环）。
+
+**脚本纪律**
+
+- `backfill_pool.py` / `backfill_is_st.py` 在未切批量接口前：默认单进程 + 每只 sleep；
+  `--shards` 仅用于**不同机器/不同时刻**切分任务列表，**禁止**同一出口 IP 同时跑多个 shard。
+- 新采集代码默认选型：**先查上表有没有批量接口**；没有再单条，并写清为何不能批量。
+- 动手前估算请求量：批量按「交易日数」；单条按「股票数 × 每只次数（含重试）」；
+  确认不顶破当日 5 万。宁可分多天，也不要为「跑快一点」开并发。
 
 ### 北交所（330 只）的处理
 
