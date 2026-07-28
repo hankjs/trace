@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0014_dynamic_strategy_spec"}
+    assert heads == {"0016_experiment_registry"}
     assert current_heads(migrated_db) == heads
 
 
@@ -70,6 +70,8 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_backtest_equity",
         "quant_backtest_run",
         "quant_daily_bar",
+        "quant_experiment",
+        "quant_experiment_trial",
         "quant_factor_daily",
         "quant_fundamental_snapshot",
         "quant_index_member",
@@ -468,8 +470,8 @@ def test_init_sql_uses_same_strategy_specs_and_head():
     from app.strategy.spec import canonical_spec_json, strategy_spec_hash
 
     source = (QUANT_DIR / "sql" / "init.sql").read_text()
-    assert "Schema revision: 0014_dynamic_strategy_spec" in source
-    assert "VALUES ('0014_dynamic_strategy_spec');" in source
+    assert "Schema revision: 0016_experiment_registry" in source
+    assert "VALUES ('0016_experiment_registry');" in source
     for template, spec in SYSTEM_STRATEGY_SPECS.items():
         canonical = canonical_spec_json(spec).replace("'", "''")
         assert f"'{template}'" in source

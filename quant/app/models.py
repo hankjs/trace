@@ -245,6 +245,15 @@ class BacktestRun(Base):
     execution_fingerprint: Mapped[str | None] = mapped_column(
         String(64), nullable=True, index=True,
     )
+    # 作业状态:pending → running → done|failed。同步路径直接写 done。
+    status: Mapped[str] = mapped_column(
+        String(16), default="done", nullable=False, index=True,
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # 创建时冻结的请求上下文(codes/pool/costs/dynamic_universe 等),供 worker 重放
+    request_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
@@ -395,6 +404,86 @@ class BacktestEquity(Base):
 # 不该因为 admin 被删或换人而失去归属,也不该让「属于某人」与「系统级」两种
 # 语义混淆。该值不对应 users 表的行,故 owner_id 不加 users 外键。
 SYSTEM_OWNER_ID = "00000000-0000-0000-0000-000000000000"
+
+
+class Experiment(Base):
+    """研究实验族:冻结的规格与假设,与日常 research_plan 分表。
+
+    失败 trial 也保留;禁止物理删除(仅 status=archived)。strategy_id 软链,
+    删策略不删账本。
+    """
+
+    __tablename__ = "quant_experiment"
+    __table_args__ = (
+        UniqueConstraint(
+            "owner_id", "permanent_candidate_id",
+            name="uq_experiment_owner_candidate",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    permanent_candidate_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    family_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    hypothesis: Mapped[str] = mapped_column(Text, nullable=False)
+    strategy_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("quant_strategy.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+    frozen_spec_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    frozen_spec_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    identity_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True,
+    )
+    validation_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    universe_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    cost_snapshot: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # design | running | completed | rejected | archived
+    status: Mapped[str] = mapped_column(
+        String(16), default="design", nullable=False, index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now,
+    )
+
+
+class ExperimentTrial(Base):
+    """实验族中的一次具体回测(含 error/no_trades)。不可物理删除。"""
+
+    __tablename__ = "quant_experiment_trial"
+    __table_args__ = (
+        UniqueConstraint(
+            "experiment_id", "trial_index", name="uq_experiment_trial_index",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    experiment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_experiment.id", ondelete="RESTRICT"),
+        nullable=False, index=True,
+    )
+    trial_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    param_patch: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    backtest_run_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("quant_backtest_run.id", ondelete="RESTRICT"),
+        nullable=True, index=True,
+    )
+    # ok | no_trades | error | rejected
+    outcome: Mapped[str] = mapped_column(
+        String(16), default="error", nullable=False, index=True,
+    )
+    metrics_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    data_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    universe_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cost_fingerprint: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    execution_fingerprint: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
+    oos_revealed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
 class Strategy(Base):

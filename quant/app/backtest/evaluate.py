@@ -23,7 +23,7 @@ from ..models import FactorDaily, Strategy, StrategyEval
 from ..selection.pipeline import score_cross_section
 from ..strategy.store import enabled_strategies, visible_to
 from ..strategy.runtime import strategy_spec_for
-from ..strategy.evidence import advance_after_backtest, candidate_spec_hashes
+from ..strategy.evidence import candidate_spec_hashes
 from ..strategy.spec import strategy_spec_hash
 from .engine import _median_or_none, _mean_or_none, run_backtest
 
@@ -91,17 +91,14 @@ def _eval_single(db: Session, strategy: Strategy, codes: list[str],
 
 def _advance_evidence(db: Session, strategy: Strategy,
                       result: dict | None) -> None:
-    """周度评估与手动回测走同一套证据状态推进;失败不拖垮本轮评估。"""
-    if result is None:
-        return
-    try:
-        transition = advance_after_backtest(db, strategy, result)
-    except Exception:  # noqa: BLE001
-        logger.exception("证据状态推进失败 %s", strategy.name)
-        return
-    if transition:
-        logger.info("证据状态推进 %s: %s -> %s",
-                    strategy.name, transition["from"], transition["to"])
+    """周度评估**不**推进证据状态。
+
+    评估通常 save=False,无持久化 BacktestRun,若推进会造成「幽灵升级」——
+    界面显示 oos_passed 却查不到可审计的回测 run。证据只由落库回测推进
+    (advance_after_backtest 要求 run_id)。保留本函数为空操作便于调用点统一。
+    """
+    _ = (db, strategy, result)
+    return
 
 
 def run_evaluation(db: Session, day: date | None = None,

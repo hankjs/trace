@@ -39,6 +39,10 @@ class Settings:
         # 也只有抢到 MySQL GET_LOCK 的那个实例真正运行定时任务(见 scheduler.py)。
         # 置 False 可让某些实例彻底不参与调度(如纯 API worker)。
         self.scheduler_enabled: bool = True
+        # schema 版本不一致时是否拒绝启动(开发默认 True;临时排障可在 quant 配置关)
+        self.schema_strict: bool = True
+        # HTTP 入口是否异步回测(BackgroundTasks)。生产默认 True;pytest 在 conftest 关。
+        self.backtest_async: bool = True
 
         # quant 自己的覆盖配置(可选)
         local_cfg = QUANT_DIR / "config.toml"
@@ -60,6 +64,10 @@ class Settings:
                 self.jwt_secret = str(local["jwt_secret"])
             if "scheduler_enabled" in local:
                 self.scheduler_enabled = bool(local["scheduler_enabled"])
+            if "schema_strict" in local:
+                self.schema_strict = bool(local["schema_strict"])
+            if "backtest_async" in local:
+                self.backtest_async = bool(local["backtest_async"])
 
         if not self.database_url:
             raise ValueError(

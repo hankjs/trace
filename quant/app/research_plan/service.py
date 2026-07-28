@@ -38,8 +38,11 @@ def next_trading_day(db: Session, day: date) -> date | None:
 
 def _unverified_evidence(costs: dict | None = None) -> tuple[None, dict]:
     evidence = {
-        "status": "unverified", "status_name": "尚未验证",
-        "reason": "未找到当前用户下策略版本、参数、覆盖层、费用和研究范围完全一致的回测。",
+        "status": "unverified", "status_name": "尚无匹配回测",
+        "reason": (
+            "未找到当前用户下策略版本、参数、覆盖层、费用和研究范围完全一致的回测。"
+            "这只表示缺少可对照的模拟记录,不代表策略无效或有效。"
+        ),
     }
     if costs is not None:
         evidence["costs"] = dict(costs)
@@ -100,7 +103,7 @@ def _backtest_evidence(
         metrics = run.metrics or {}
         persisted_evidence = metrics.get("evidence") or {}
         result = run.id, {
-            "status": "verified", "status_name": "已有同配置历史验证",
+            "status": "verified", "status_name": "已有同配置历史回测",
             "run_id": run.id, "start": str(run.start), "end": str(run.end),
             "costs": run.costs or {},
             "strategy_spec_hash": run.strategy_spec_hash,

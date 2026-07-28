@@ -13,7 +13,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -129,8 +129,18 @@ def test_preset_index_pool_members_resolve_current_constituents():
 
 
 def test_preset_all_market_pool_members_resolve_from_stock_table():
+    from app.data.clock import today_cst
+
     with _session() as db:
         _seed(db)
+        day = today_cst()
+        for code in ("sh.600519", "sz.000001", "sz.300750"):
+            db.add(DailyBar(
+                code=code, date=day,
+                open=10, high=10, low=10, close=10, raw_close=10,
+                volume=1, amount=1, is_st=False,
+            ))
+        db.commit()
         result = list_pool_members(pool_id=2, db=db, claims=CLAIMS_A)
 
     assert [item["code"] for item in result["items"]] == [
@@ -474,7 +484,7 @@ def test_backtest_rejects_pool_owned_by_another_user():
                 BacktestIn(strategy_id=ROTATION_ID, codes=[],
                            start=date(2024, 1, 1), end=date(2024, 6, 30),
                            pool_id=created["id"]),
-                db=db, claims=CLAIMS_A,
+                background_tasks=BackgroundTasks(), db=db, claims=CLAIMS_A,
             )
         assert exc.value.status_code == 404
 
@@ -493,6 +503,7 @@ def test_portfolio_backtest_resolves_static_pool_and_persists_pool_id():
         result = create_backtest(
             BacktestIn(strategy_id=ROTATION_ID, codes=[],
                        start=start, end=end, pool_id=pool["id"]),
+            background_tasks=BackgroundTasks(),
             db=db, claims=CLAIMS_A,
         )
         run = db.get(BacktestRun, result["run_id"])
@@ -537,6 +548,7 @@ def test_portfolio_backtest_defaults_to_frozen_spec_pool():
                 start=start,
                 end=end,
             ),
+            background_tasks=BackgroundTasks(),
             db=db,
             claims=CLAIMS_A,
         )
@@ -554,6 +566,7 @@ def test_explicit_codes_backtest_does_not_echo_pool():
         result = create_backtest(
             BacktestIn(strategy_id=MA_CROSS_ID, codes=["sh.600519"],
                        start=start, end=end),
+            background_tasks=BackgroundTasks(),
             db=db, claims=CLAIMS_A,
         )
         run = db.get(BacktestRun, result["run_id"])

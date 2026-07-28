@@ -38,6 +38,7 @@ import vectorbt as vbt
 from sqlalchemy.orm import Session
 
 from ..data.ingest import load_bars_df, required_snapshot_fields
+from ..data.quality import frames_data_quality
 from ..data.universe import (INDEX_NAMES, membership_intervals,
                              pool_eligibility_matrix)
 from ..catalog import STRATEGY_TEMPLATES
@@ -415,6 +416,18 @@ def _sell_tradable_mask(dfs: dict[str, pd.DataFrame], idx: pd.DatetimeIndex
     return mask
 
 
+def _empty_execution_attribution() -> dict[str, int]:
+    return {
+        "buy_blocked_limit_up_or_halt": 0,
+        "buy_signal_days": 0,
+        "buy_filled": 0,
+        "sell_delayed": 0,
+        "sell_signal_days": 0,
+        "sell_filled": 0,
+        "missing_bar_block": 0,
+    }
+
+
 def _single_execution_schedule(
     dfs: dict[str, pd.DataFrame],
     idx: pd.DatetimeIndex,
@@ -422,17 +435,27 @@ def _single_execution_schedule(
     exits: pd.DataFrame,
     reason_map: dict[tuple[pd.Timestamp, str], list[dict]],
     synthetic_entries: pd.DataFrame,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[tuple[pd.Timestamp, str], dict]]:
-    """按真实可成交性生成单标的订单；卖出不可成交时逐日重试。"""
+) -> tuple[
+    pd.DataFrame, pd.DataFrame, dict[tuple[pd.Timestamp, str], dict], dict[str, int],
+]:
+    """按真实可成交性生成单标的订单；卖出不可成交时逐日重试。
+
+    同时累计 execution_attribution,供结果页展示「理论信号 vs 实际成交」。
+    """
     open_prices = _to_price_matrix(dfs, "open", idx)
+    volume = _to_price_matrix(dfs, "volume", idx)
     buy_tradable = opening_buy_tradable_mask(dfs, idx).reindex(
         columns=entries.columns, fill_value=False)
     sell_tradable = _sell_tradable_mask(dfs, idx).reindex(
         columns=entries.columns, fill_value=False,
     )
+    limit_up = _limit_up_mask(dfs, idx).reindex(
+        columns=entries.columns, fill_value=False,
+    )
     actual_entries = pd.DataFrame(False, index=idx, columns=entries.columns)
     actual_exits = pd.DataFrame(False, index=idx, columns=entries.columns)
     events: dict[tuple[pd.Timestamp, str], dict] = {}
+    attribution = _empty_execution_attribution()
 
     for code in entries.columns:
         holding = False
@@ -441,6 +464,7 @@ def _single_execution_schedule(
         for day in idx:
             if holding:
                 if pending is None and bool(exits.at[day, code]):
+                    attribution["sell_signal_days"] += 1
                     signal_day = _prior_trading_day(dfs[code], day)
                     pending = {
                         "signal_date": signal_day,
@@ -448,11 +472,17 @@ def _single_execution_schedule(
                             (signal_day, code), [exit_reason("native")],
                         ),
                     }
+                    if not bool(sell_tradable.at[day, code]):
+                        attribution["sell_delayed"] += 1
                 if pending is not None and bool(sell_tradable.at[day, code]):
                     actual_exits.at[day, code] = True
                     events[(day, code)] = pending
                     pending = None
                     holding = False
+                    attribution["sell_filled"] += 1
+                elif pending is not None and not bool(sell_tradable.at[day, code]):
+                    # 后续重试日:仍算延迟(只在首次 signal 日计 sell_delayed)
+                    pass
                 continue
             if bool(synthetic_entries.at[day, code]):
                 synthetic_pending = True
@@ -462,11 +492,30 @@ def _single_execution_schedule(
                     actual_entries.at[day, code] = True
                     holding = True
                     synthetic_pending = False
+                    attribution["buy_filled"] += 1
+                else:
+                    attribution["missing_bar_block"] += 1
                 continue
-            if bool(entries.at[day, code]) and bool(buy_tradable.at[day, code]):
-                actual_entries.at[day, code] = True
-                holding = True
-    return actual_entries, actual_exits, events
+            if bool(entries.at[day, code]):
+                attribution["buy_signal_days"] += 1
+                if bool(buy_tradable.at[day, code]):
+                    actual_entries.at[day, code] = True
+                    holding = True
+                    attribution["buy_filled"] += 1
+                else:
+                    open_price = open_prices.at[day, code]
+                    vol = volume.at[day, code] if code in volume.columns else np.nan
+                    if bool(limit_up.at[day, code]):
+                        attribution["buy_blocked_limit_up_or_halt"] += 1
+                    elif (
+                        not pd.notna(open_price)
+                        or float(open_price) <= 0
+                        or not (pd.notna(vol) and float(vol) > 0)
+                    ):
+                        attribution["missing_bar_block"] += 1
+                    else:
+                        attribution["buy_blocked_limit_up_or_halt"] += 1
+    return actual_entries, actual_exits, events, attribution
 
 
 def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
@@ -526,7 +575,7 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
         for code, by_day in (exit_reasons_by_code or {}).items()
         for day, reasons in by_day.items()
     }
-    entries, exits, exit_events = _single_execution_schedule(
+    entries, exits, exit_events, attribution = _single_execution_schedule(
         dfs, idx, entries, exits, reason_map, synthetic_entries,
     )
 
@@ -549,7 +598,10 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
             "metrics": _metrics_from_equity(eq, pf[code], trade_details=code_details),
             "trade_details": code_details,
             "exit_reason_distribution": _exit_reason_distribution(code_details),
+            "execution_attribution": dict(attribution),
         }
+    # 批量路径共享同一 attribution 汇总(全列累计)
+    out["_execution_attribution"] = attribution
     return out
 
 
@@ -648,7 +700,8 @@ def run_backtest(db: Session, strategy, codes: list[str],
                  dynamic_universe: bool = False,
                  user_id: str | None = None,
                  pool_id: int | None = None,
-                 execution_spec: StrategySpec | dict | None = None) -> dict:
+                 execution_spec: StrategySpec | dict | None = None,
+                 run_id: int | None = None) -> dict:
     """编译当前 StrategySpec，并复用既有 T+1 撮合完成回测。
 
     规格在函数入口立即解析成不可变快照；数据加载期间即使策略行被原地更新，
@@ -687,7 +740,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
         return _run_portfolio(
             db, strategy, codes, start, end, snapshot, legacy_params, costs, save,
             dynamic_universe=dynamic_universe, user_id=user_id,
-            pool_id=pool_id,
+            pool_id=pool_id, run_id=run_id,
         )
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
@@ -734,6 +787,9 @@ def run_backtest(db: Session, strategy, codes: list[str],
     results = _batch_single(
         dfs, positions, costs, start, exit_reasons_by_code=exit_reasons,
     )
+    execution_attribution = results.pop(
+        "_execution_attribution", _empty_execution_attribution(),
+    )
     per_code = {c: r["metrics"] for c, r in results.items()}
     curves = [r["equity"] for r in results.values()]
 
@@ -744,6 +800,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
     aligned = pd.concat(curves, axis=1).ffill()
     combo = aligned.mean(axis=1)
     metrics = _combo_metrics(combo, per_code)
+    metrics["execution_attribution"] = execution_attribution
     trade_details = sorted(
         (item for result in results.values() for item in result["trade_details"]),
         key=lambda item: (item["execution_date"], item["code"], item["side"]),
@@ -761,6 +818,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
         pool_id=pool_id,
         dynamic_universe=dynamic_universe,
     )
+    data_quality = frames_data_quality(dfs, required_fields=extra_fields)
     evidence = {
         "strategy_version": snapshot.spec_hash,
         "strategy_spec_snapshot": deepcopy(snapshot.spec_snapshot),
@@ -772,12 +830,14 @@ def run_backtest(db: Session, strategy, codes: list[str],
         "fee_assumptions": fee_assumptions,
         "trade_details": trade_details,
         "exit_reason_distribution": reason_distribution,
+        "data_quality": data_quality,
         "start": str(start),
         "end": str(end),
     }
     # BacktestRun 现有 schema 将 metrics 持久化；把证据嵌入其中，历史查询不会
     # 因策略参数或默认费率变化而丢失复现依据。
     metrics["evidence"] = evidence
+    metrics["data_quality"] = data_quality
     # 规格 validation 段的执行结果(基线对比 / OOS 分段 / 否决判定)同样嵌入
     # metrics JSON 列持久化,不新建表。
     validation_report = evaluate_validation(
@@ -807,6 +867,8 @@ def run_backtest(db: Session, strategy, codes: list[str],
         "fee_assumptions": fee_assumptions,
         "metrics": metrics,
         "evidence": evidence,
+        "data_quality": data_quality,
+        "execution_attribution": execution_attribution,
         "validation": validation_report,
         "trade_details": trade_details,
         "exit_reason_distribution": reason_distribution,
@@ -817,7 +879,9 @@ def run_backtest(db: Session, strategy, codes: list[str],
     }
     if save:
         _save_run(db, result, start, end, combo, user_id=user_id,
-                  pool_id=pool_id)
+                  pool_id=pool_id, run_id=run_id)
+    elif run_id is not None:
+        result["run_id"] = run_id
     return result
 
 
@@ -1142,7 +1206,8 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
 def _run_portfolio(db: Session, strategy, codes: list[str],
                    start: date, end: date, snapshot, legacy_params: dict,
                    costs: dict, save: bool, *, dynamic_universe: bool,
-                   user_id: str | None, pool_id: int | None = None) -> dict:
+                   user_id: str | None, pool_id: int | None = None,
+                   run_id: int | None = None) -> dict:
     """组合规格编译为目标权重，再交给既有 T+1 组合撮合。"""
     warmup_start = start - timedelta(days=PORTFOLIO_WARMUP_DAYS)
     extra_fields = required_snapshot_fields(snapshot.spec)
@@ -1226,6 +1291,7 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         dynamic_universe=dynamic_universe,
         eligibility=eligibility,
     )
+    data_quality = frames_data_quality(pool_dfs, required_fields=extra_fields)
     evidence = {
         "strategy_version": snapshot.spec_hash,
         "strategy_spec_snapshot": deepcopy(snapshot.spec_snapshot),
@@ -1237,10 +1303,12 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         "fee_assumptions": fee_assumptions,
         "trade_details": sim["trade_details"],
         "exit_reason_distribution": sim["exit_reason_distribution"],
+        "data_quality": data_quality,
         "start": str(start),
         "end": str(end),
     }
     sim["metrics"]["evidence"] = evidence
+    sim["metrics"]["data_quality"] = data_quality
     # 与单标的路径同口径:规格 validation 段执行结果嵌入 metrics JSON 列
     validation_report = evaluate_validation(
         snapshot.spec, frames=pool_dfs, start=start, end=end,
@@ -1268,6 +1336,7 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         "fee_assumptions": fee_assumptions,
         "metrics": sim["metrics"],
         "evidence": evidence,
+        "data_quality": data_quality,
         "validation": validation_report,
         "trade_details": sim["trade_details"],
         "exit_reason_distribution": sim["exit_reason_distribution"],
@@ -1277,7 +1346,10 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
         ],
     }
     if save:
-        _save_run(db, result, start, end, eq, user_id=user_id, pool_id=pool_id)
+        _save_run(db, result, start, end, eq, user_id=user_id, pool_id=pool_id,
+                  run_id=run_id)
+    elif run_id is not None:
+        result["run_id"] = run_id
     return result
 
 
@@ -1314,14 +1386,19 @@ def _weighted_win_rate(per_code: dict[str, dict]) -> float | None:
 
 def _save_run(db: Session, result: dict, start: date, end: date,
               combo: pd.Series, user_id: str | None = None,
-              pool_id: int | None = None) -> None:
+              pool_id: int | None = None,
+              run_id: int | None = None) -> None:
     """落库一次回测。costs 快照与实际样本一并存,否则费率/默认参数一改,
     历史结果就无法审计复现。pool_id 存所用股票池,供按编号回查时回显。
 
     params 存的是**实际生效的全量参数**,不是策略行的 params —— 策略行可以被
     用户改,历史回测不能随之变化。
+
+    run_id 非空时更新既有 pending 行(异步作业),否则新建 done 行(同步路径)。
     """
-    run = BacktestRun(
+    from datetime import datetime
+
+    fields = dict(
         strategy_id=result["strategy_id"], params=result["params"],
         codes=result["codes"], start=start, end=end,
         metrics=result["metrics"], user_id=user_id,
@@ -1334,9 +1411,26 @@ def _save_run(db: Session, result: dict, start: date, end: date,
         universe_fingerprint=result["universe_fingerprint"],
         cost_fingerprint=result["cost_fingerprint"],
         execution_fingerprint=result["execution_fingerprint"],
+        status="done",
+        error=None,
+        finished_at=datetime.now(),
     )
-    db.add(run)
-    db.flush()
+    if run_id is not None:
+        run = db.get(BacktestRun, run_id)
+        if run is None:
+            raise ValueError(f"回测作业 {run_id} 不存在")
+        for key, value in fields.items():
+            setattr(run, key, value)
+        db.flush()
+        db.execute(
+            BacktestEquity.__table__.delete().where(
+                BacktestEquity.run_id == run_id,
+            )
+        )
+    else:
+        run = BacktestRun(**fields)
+        db.add(run)
+        db.flush()
     db.execute(
         BacktestEquity.__table__.insert(),
         [{"run_id": run.id, "date": d.date(), "equity": float(v)}
@@ -1344,6 +1438,7 @@ def _save_run(db: Session, result: dict, start: date, end: date,
     )
     db.commit()
     result["run_id"] = run.id
+    result["status"] = "done"
 
 
 def run_sweep(db: Session, strategy, codes: list[str],
@@ -1436,6 +1531,7 @@ def run_sweep(db: Session, strategy, codes: list[str],
             full_dfs, positions, costs, start,
             exit_reasons_by_code=exit_reasons,
         )
+        results.pop("_execution_attribution", None)
         per = [r["metrics"] for r in results.values()]
         rows.append({
             "params": display,

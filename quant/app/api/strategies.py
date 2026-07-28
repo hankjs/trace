@@ -9,7 +9,7 @@ from copy import deepcopy
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -54,18 +54,10 @@ ResearchStatus = Literal["unverified", "verified", "rejected"]
 
 class StrategyCreateIn(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
-    spec: dict | None = None
+    # 完整 StrategySpec 是唯一创建路径;系统预设请用「另存为/复制」。
+    spec: dict
     enabled: bool = True
     research_status: ResearchStatus = "unverified"
-    # 迁移期兼容旧客户端；服务端立即转换成完整规格，执行路径不会读取这两项。
-    template: str | None = Field(None, min_length=1, max_length=32)
-    params: dict = Field(default_factory=dict)
-
-    @model_validator(mode="after")
-    def require_definition(self) -> StrategyCreateIn:
-        if self.spec is None and self.template is None:
-            raise ValueError("spec 不能为空")
-        return self
 
 
 class StrategyPatchIn(BaseModel):
@@ -73,14 +65,11 @@ class StrategyPatchIn(BaseModel):
     spec: dict | None = None
     enabled: bool | None = None
     research_status: ResearchStatus | None = None
-    # 旧客户端只改 params 时转换为新的完整规格。
-    params: dict | None = None
 
 
 class StrategyDuplicateIn(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=64)
     spec: dict | None = None
-    params: dict | None = None
 
 
 class StrategyValidateIn(BaseModel):
@@ -347,9 +336,7 @@ def list_strategies(db: Session = Depends(get_db),
 def create_strategy(body: StrategyCreateIn, db: Session = Depends(get_db),
                     claims: dict = Depends(require_client)):
     user_id = user_id_from_claims(claims)
-    spec, capability = _parse_definition(
-        spec=body.spec, template=body.template, params=body.params, db=db,
-    )
+    spec, capability = _parse_definition(spec=body.spec, db=db)
     # evidence_status 由服务端状态机管理(见 strategy/evidence.py):
     # 新建一律 unverified,客户端传入的状态值无效
     spec = with_status(spec, "unverified")
@@ -361,9 +348,9 @@ def create_strategy(body: StrategyCreateIn, db: Session = Depends(get_db),
         owner_id=user_id,
         is_system=False,
         name=body.name.strip(),
-        template=body.template or "strategy_spec",
+        template="strategy_spec",
         kind=spec.kind,
-        params=dict(body.params or {}) if body.template else {},
+        params={},
         spec_schema_version=spec.schema_version,
         spec=normalized,
         spec_hash=strategy_spec_hash(spec),
@@ -433,10 +420,6 @@ def duplicate_strategy(strategy_id: int, body: StrategyDuplicateIn,
     source = get_strategy_or_404(db, strategy_id, user_id)
     if body.spec is not None:
         spec, capability = _parse_definition(spec=body.spec, db=db)
-    elif body.params is not None:
-        spec, capability = _parse_definition(
-            spec=None, template=source.template, params=body.params, db=db,
-        )
     else:
         spec = strategy_spec_for(source)
         capability = resolve_capabilities(
@@ -451,9 +434,9 @@ def duplicate_strategy(strategy_id: int, body: StrategyDuplicateIn,
         owner_id=user_id,
         is_system=False,
         name=name,
-        template=source.template,
+        template=source.template or "strategy_spec",
         kind=spec.kind,
-        params=dict(body.params or source.params or {}) if source.template in REGISTRY else {},
+        params={},
         spec_schema_version=spec.schema_version,
         spec=spec.model_dump(mode="json"),
         spec_hash=strategy_spec_hash(spec),
@@ -478,12 +461,8 @@ def update_strategy(strategy_id: int, body: StrategyPatchIn,
     strategy = _writable_strategy(db, strategy_id, user_id)
     if body.name is not None:
         strategy.name = body.name.strip()
-    if body.spec is not None or body.params is not None:
-        spec, capability = _parse_definition(
-            spec=body.spec,
-            template=strategy.template if body.spec is None else None,
-            params=body.params, db=db,
-        )
+    if body.spec is not None:
+        spec, capability = _parse_definition(spec=body.spec, db=db)
         if bool(body.enabled if body.enabled is not None else strategy.enabled):
             _require_supported(capability)
         # evidence_status 由状态机管理:客户端传入值无效;规格内容身份变化时,
@@ -494,8 +473,6 @@ def update_strategy(strategy_id: int, body: StrategyPatchIn,
         strategy.spec_schema_version = spec.schema_version
         strategy.spec = spec.model_dump(mode="json")
         strategy.spec_hash = strategy_spec_hash(spec)
-        if body.params is not None and strategy.template in REGISTRY:
-            strategy.params = dict(body.params)
     if body.enabled is not None and body.enabled != strategy.enabled:
         if body.enabled:
             _require_supported(resolve_capabilities(

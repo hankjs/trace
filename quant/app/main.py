@@ -18,8 +18,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import (admin, auth, backtest, catalog, market, pools, portfolio,
-                  research_plans, selection, signals, strategies, watchlist)
+from .api import (admin, auth, backtest, catalog, experiments, market, pools,
+                  portfolio, research_plans, selection, signals, strategies,
+                  watchlist)
 from .auth import require_admin, require_client
 from .config import settings
 from .db import engine
@@ -73,6 +74,7 @@ app.include_router(research_plans.router, dependencies=_auth)
 app.include_router(portfolio.router, dependencies=_auth)
 app.include_router(backtest.router, dependencies=_auth)
 app.include_router(backtest.plural_router, dependencies=_auth)
+app.include_router(experiments.router, dependencies=_auth)
 app.include_router(selection.router, dependencies=_auth)
 app.include_router(admin.router, dependencies=[Depends(require_admin)])
 

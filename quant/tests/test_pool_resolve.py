@@ -153,9 +153,22 @@ def all_db(monkeypatch):
     monkeypatch.setattr(universe, "DailyBar", BarForCoverage)
     with Session(engine) as db:
         db.add_all(rows)
-        # 上面 6 只都有日线,故都计入护栏的统计口径
+        # 上面 6 只都有日线,故都计入护栏的统计口径;DAY 当日显式标 is_st=False
+        # (严格口径要求 confirmed non-ST,不再回退 quant_stock.is_st)
         db.add_all([BarForCoverage(code=r.code, date=date(2024, 1, 2))
                     for r in rows])
+        db.add_all([
+            BarForCoverage(code="sh.good", date=DAY, is_st=False),
+            BarForCoverage(code="sh.good2", date=DAY, is_st=False),
+            BarForCoverage(code="sh.newbie", date=DAY, is_st=False),
+            BarForCoverage(code="sh.delisted", date=DAY, is_st=False),
+            # sh.st 当日不建 bar:无 is_st 确认 → 严格排除
+            BarForCoverage(code="sh.unknown", date=DAY, is_st=False),
+            # 退市日之前的查询日需要 confirmed non-ST
+            BarForCoverage(code="sh.delisted", date=date(2023, 6, 30), is_st=False),
+            BarForCoverage(code="sh.good", date=date(2023, 6, 30), is_st=False),
+            BarForCoverage(code="sh.good2", date=date(2023, 6, 30), is_st=False),
+        ])
         db.commit()
         yield db
 
@@ -166,7 +179,7 @@ def test_all_kind_excludes_st_delisted_and_new_listings(all_db):
     codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.2)
 
     assert codes == ["sh.good", "sh.good2"]
-    assert "sh.st" not in codes          # ST
+    assert "sh.st" not in codes          # ST / 无当日 is_st=False
     assert "sh.delisted" not in codes    # 已退市
     assert "sh.newbie" not in codes      # 新股
     assert "sh.unknown" not in codes     # list_date 缺失
@@ -292,7 +305,9 @@ def test_all_kind_uses_daily_st_not_current_snapshot(all_db):
 
 def test_all_kind_excludes_stock_that_is_st_on_that_day(all_db):
     """反向:当日确实是 ST 就必须剔除,即便 quant_stock.is_st 还没更新。"""
-    all_db.add(BarForCoverage(code="sh.good", date=DAY, is_st=True))
+    bar = all_db.get(BarForCoverage, ("sh.good", DAY))
+    assert bar is not None
+    bar.is_st = True
     all_db.commit()
 
     codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.3)
@@ -300,13 +315,25 @@ def test_all_kind_excludes_stock_that_is_st_on_that_day(all_db):
     assert "sh.good" not in codes
 
 
-def test_all_kind_falls_back_to_snapshot_when_daily_st_missing(all_db):
-    """当日无 is_st 数据(NULL/无 bar)时退回当前状态兜底,不当作非 ST。
+def test_all_kind_excludes_when_daily_st_missing(all_db):
+    """当日无 is_st 确认(NULL/无 bar)时严格排除,不回退 quant_stock.is_st。
 
-    回填完成前的过渡行为:NULL 表示「未采集」,把它当 False 会让未采集的
-    ST 股混进样本。
+    开发阶段宁可池子变小,也不用当前 ST 快照伪造历史资格(前视偏差)。
     """
-    # sh.st 在 DAY 当日无 bar(fixture 的 bar 是 2024-01-02)
+    # sh.st 在 DAY 当日无 is_st=False 确认(fixture 未给它 DAY 行)
     codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.3)
 
-    assert "sh.st" not in codes, "缺当日 is_st 时应退回当前状态兜底"
+    assert "sh.st" not in codes, "缺当日 is_st 确认时应排除,不得回退当前快照"
+
+
+def test_all_kind_does_not_use_stock_st_as_non_st_proxy(all_db):
+    """quant_stock.is_st=False 且无当日 bar 时仍不得入池。"""
+    all_db.add(StockWithListing(
+        code="sh.nohist", list_date=date(2018, 1, 1),
+        delist_date=None, is_st=False,
+    ))
+    all_db.add(BarForCoverage(code="sh.nohist", date=date(2024, 1, 2)))
+    all_db.commit()
+
+    codes = universe.resolve_pool(all_db, DAY, kind="all", max_missing_ratio=0.3)
+    assert "sh.nohist" not in codes

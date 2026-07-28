@@ -33,26 +33,46 @@ def current_heads(engine: Engine) -> set[str]:
         return set(MigrationContext.configure(connection).get_current_heads())
 
 
-def check_schema_version(engine: Engine) -> bool:
-    """库版本是否为最新。不一致只告警不抛错,便于运维先看日志再决定。"""
+class SchemaVersionError(RuntimeError):
+    """Alembic 版本与代码不一致且 schema_strict=True 时抛出,阻止启动。"""
+
+
+def check_schema_version(engine: Engine, *, strict: bool | None = None) -> bool:
+    """库版本是否为最新。
+
+    strict 默认读 settings.schema_strict:True 时版本不一致抛 SchemaVersionError,
+    避免带着错误 schema 跑出不可复现的研究结论;False 时只打日志(临时排障)。
+    """
+    if strict is None:
+        from .config import settings
+        strict = settings.schema_strict
+
     expected = expected_heads()
     try:
         current = current_heads(engine)
-    except Exception:  # noqa: BLE001 - 连不上库的报错留给后续请求暴露
+    except Exception as exc:  # noqa: BLE001 - 连不上库的报错留给后续请求暴露
         logger.exception("无法读取数据库 alembic 版本")
+        if strict:
+            raise SchemaVersionError("无法读取数据库 alembic 版本") from exc
         return False
 
     if not current:
-        logger.error(
+        msg = (
             "数据库无 alembic 版本记录。空库请执行 `alembic upgrade head`;"
             "改造前就存在的库请先 `alembic stamp 0001_baseline` 再 upgrade head。"
         )
+        logger.error(msg)
+        if strict:
+            raise SchemaVersionError(msg)
         return False
     if current != expected:
-        logger.error(
-            "数据库 schema 版本 %s 与代码期望 %s 不一致,请执行 `alembic upgrade head`",
-            sorted(current), sorted(expected),
+        msg = (
+            f"数据库 schema 版本 {sorted(current)} 与代码期望 "
+            f"{sorted(expected)} 不一致,请执行 `alembic upgrade head`"
         )
+        logger.error(msg)
+        if strict:
+            raise SchemaVersionError(msg)
         return False
 
     logger.info("数据库 schema 版本已是最新: %s", sorted(current))

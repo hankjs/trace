@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0014_dynamic_strategy_spec
+-- Schema revision: 0016_experiment_registry
 
 SET NAMES utf8mb4;
 
@@ -235,14 +235,76 @@ CREATE TABLE `quant_backtest_run` (
   `universe_fingerprint` VARCHAR(64) DEFAULT NULL,
   `cost_fingerprint` VARCHAR(64) DEFAULT NULL,
   `execution_fingerprint` VARCHAR(64) DEFAULT NULL,
+  `status` VARCHAR(16) NOT NULL DEFAULT 'done',
+  `error` TEXT DEFAULT NULL,
+  `request_snapshot` JSON DEFAULT NULL,
+  `started_at` DATETIME DEFAULT NULL,
+  `finished_at` DATETIME DEFAULT NULL,
   `created_at` DATETIME NOT NULL,
   PRIMARY KEY (`id`),
   KEY `ix_quant_backtest_run_execution_fingerprint` (`execution_fingerprint`),
   KEY `ix_quant_backtest_run_strategy_spec_hash` (`strategy_spec_hash`),
   KEY `ix_quant_backtest_run_strategy_id` (`strategy_id`),
   KEY `ix_quant_backtest_run_user_id` (`user_id`),
+  KEY `ix_quant_backtest_run_status` (`status`),
   CONSTRAINT `fk_quant_backtest_run_strategy_id`
     FOREIGN KEY (`strategy_id`) REFERENCES `quant_strategy` (`id`)
+    ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_experiment` (
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `owner_id` VARCHAR(36) NOT NULL,
+  `permanent_candidate_id` VARCHAR(64) NOT NULL,
+  `family_id` VARCHAR(64) DEFAULT NULL,
+  `title` VARCHAR(128) NOT NULL,
+  `hypothesis` TEXT NOT NULL,
+  `strategy_id` INT DEFAULT NULL,
+  `frozen_spec_snapshot` JSON NOT NULL,
+  `frozen_spec_hash` VARCHAR(64) NOT NULL,
+  `identity_hash` VARCHAR(64) NOT NULL,
+  `validation_snapshot` JSON DEFAULT NULL,
+  `universe_snapshot` JSON DEFAULT NULL,
+  `cost_snapshot` JSON DEFAULT NULL,
+  `status` VARCHAR(16) NOT NULL DEFAULT 'design',
+  `created_at` DATETIME NOT NULL,
+  `updated_at` DATETIME NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_experiment_owner_candidate` (`owner_id`, `permanent_candidate_id`),
+  KEY `ix_quant_experiment_owner_id` (`owner_id`),
+  KEY `ix_quant_experiment_identity_hash` (`identity_hash`),
+  KEY `ix_quant_experiment_status` (`status`),
+  KEY `ix_quant_experiment_strategy_id` (`strategy_id`),
+  CONSTRAINT `fk_experiment_strategy_id`
+    FOREIGN KEY (`strategy_id`) REFERENCES `quant_strategy` (`id`)
+    ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_experiment_trial` (
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `experiment_id` INT NOT NULL,
+  `trial_index` INT NOT NULL,
+  `param_patch` JSON DEFAULT NULL,
+  `backtest_run_id` INT DEFAULT NULL,
+  `outcome` VARCHAR(16) NOT NULL DEFAULT 'error',
+  `metrics_summary` JSON DEFAULT NULL,
+  `error` TEXT DEFAULT NULL,
+  `data_fingerprint` VARCHAR(64) DEFAULT NULL,
+  `universe_fingerprint` VARCHAR(64) DEFAULT NULL,
+  `cost_fingerprint` VARCHAR(64) DEFAULT NULL,
+  `execution_fingerprint` VARCHAR(64) DEFAULT NULL,
+  `oos_revealed_at` DATETIME DEFAULT NULL,
+  `created_at` DATETIME NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_experiment_trial_index` (`experiment_id`, `trial_index`),
+  KEY `ix_quant_experiment_trial_experiment_id` (`experiment_id`),
+  KEY `ix_quant_experiment_trial_backtest_run_id` (`backtest_run_id`),
+  KEY `ix_quant_experiment_trial_outcome` (`outcome`),
+  CONSTRAINT `fk_experiment_trial_experiment`
+    FOREIGN KEY (`experiment_id`) REFERENCES `quant_experiment` (`id`)
+    ON DELETE RESTRICT,
+  CONSTRAINT `fk_experiment_trial_backtest`
+    FOREIGN KEY (`backtest_run_id`) REFERENCES `quant_backtest_run` (`id`)
     ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
@@ -453,6 +515,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0014_dynamic_strategy_spec');
+VALUES ('0016_experiment_registry');
 
 COMMIT;

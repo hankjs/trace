@@ -16,6 +16,7 @@ from ..config import settings
 from ..backtest.evaluate import run_evaluation
 from ..data import fundamentals, ingest, universe
 from ..data import calendar as trade_calendar
+from ..data.quality import data_quality_report
 from ..db import SessionLocal
 from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
@@ -206,3 +207,9 @@ async def run_eval_now(date_: date | None = Query(None, alias="date"),
                 db, day=date_, period_days=period_days))
     except Exception as e:  # noqa: BLE001
         raise HTTPException(500, f"批量评估失败: {e}")
+
+
+@router.get("/data-quality")
+async def data_quality_now():
+    """全库数据信任报告(ST/估值/财务/复权因子覆盖,只读)。"""
+    return await run_db_job(lambda db: data_quality_report(db))

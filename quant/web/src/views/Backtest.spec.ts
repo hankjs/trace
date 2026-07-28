@@ -120,7 +120,7 @@ describe('saved StrategySpec backtest workflow', () => {
     })
     expect(run.mock.calls[0][0]).not.toHaveProperty('params')
     expect(wrapper.text()).toContain('不可变执行证据')
-    expect(wrapper.text()).toContain('与当前策略完全一致')
+    expect(wrapper.text()).toContain('与当前策略一致')
     expect(wrapper.text()).toContain('strategy-compiler-v1')
     expect(wrapper.text()).toContain('execution-fingerprint-123')
     expect(wrapper.text()).toContain('完整 StrategySpec 快照')

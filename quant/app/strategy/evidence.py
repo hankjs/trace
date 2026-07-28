@@ -116,12 +116,17 @@ def apply_manual_action(db: Session, strategy: Any, action: str) -> dict[str, st
 def advance_after_backtest(
     db: Session, strategy: Any, result: dict[str, Any],
 ) -> dict[str, str] | None:
-    """回测/评估完成后按身份哈希自动推进状态;未推进返回 None。
+    """落库回测完成后按身份哈希自动推进状态;未推进返回 None。
 
-    推进目标:命中否决 -> rejected(终态);locked_oos 已评估且否决全过
-    -> oos_passed;其余完成的回测 -> backtested。只前进不后退,rejected
-    不自动迁移(只能人工复位)。不是按当前规格身份跑的(临时参数、旧规格)
-    不推进。
+    闸门(开发阶段收紧,避免幽灵升级与未设计即宣称样本外通过):
+    - 必须有 ``run_id``(已持久化的 BacktestRun);save=False 的评估不推进
+    - 起点必须是 ``design_complete`` 及之后;``unverified`` 只记 run、不推进
+    - 命中否决 -> rejected(终态);locked_oos 已评估且否决全过 -> oos_passed;
+      其余完成的回测 -> backtested
+    - 只前进不后退;rejected 不自动迁移(只能人工复位)
+    - 不是按当前规格身份跑的(临时参数、旧规格)不推进
+
+    ``oos_passed`` 仅表示「通过规格声明的否决条件」,不是科学证实可交易。
     """
     try:
         spec = strategy_spec_for(strategy)
@@ -129,6 +134,12 @@ def advance_after_backtest(
         return None
     current = spec.metadata.evidence_status
     if current == "rejected":
+        return None
+    # 未完成验证设计的规格:允许跑回测,但不自动升级证据状态
+    if current == "unverified":
+        return None
+    # 必须有落库 run,禁止周度评估等 save=False 路径推进状态
+    if not result.get("run_id"):
         return None
     run_hash = result.get("strategy_spec_hash")
     if not run_hash or run_hash not in candidate_spec_hashes(spec):

@@ -21,9 +21,9 @@ const model = defineModel<StrategySpecFormState>({ required: true })
 
 const EVIDENCE_STATUS_NAMES: Record<StrategyEvidenceStatus, string> = {
   unverified: '未验证',
-  design_complete: '设计完成',
-  backtested: '已回测',
-  oos_passed: '样本外通过',
+  design_complete: '验证设计完成',
+  backtested: '已回测（样本内）',
+  oos_passed: '样本外否决条件通过',
   rejected: '已否决',
 }
 
@@ -120,7 +120,7 @@ const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border bor
           {{ evidenceStatusName(model.evidenceStatus) }}
         </div>
         <p class="mt-1 text-[11px] font-normal leading-4 text-text-tertiary">
-          由回测与否决判定自动推进，仅「标记设计完成 / 否决复位」可在策略管理页手动操作。
+          须先标记「验证设计完成」；之后仅落库回测会自动推进。样本外通过 = 声明的否决条件已满足，不代表策略有效或可交易。
         </p>
       </div>
       <label :for="id('pool')" class="text-xs font-medium text-text-secondary">

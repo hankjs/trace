@@ -411,6 +411,18 @@ const resultBiased = computed(() => hasSurvivorshipBias(resultPool.value))
 
 const resultCosts = computed(() => result.value?.costs ?? {})
 const resultEvidence = computed(() => result.value?.evidence ?? result.value?.metrics.evidence)
+const resultDataQuality = computed(() => {
+  const top = result.value?.data_quality
+  if (top) return top
+  const metrics = result.value?.metrics as { data_quality?: typeof top } | undefined
+  return metrics?.data_quality ?? null
+})
+const resultAttribution = computed(() => {
+  const top = result.value?.execution_attribution
+  if (top) return top
+  const metrics = result.value?.metrics as { execution_attribution?: typeof top } | undefined
+  return metrics?.execution_attribution ?? null
+})
 const resultSpecSnapshot = computed(() => result.value?.strategy_spec_snapshot ?? resultEvidence.value?.strategy_spec_snapshot)
 const resultSpecHash = computed(() => result.value?.strategy_spec_hash ?? resultEvidence.value?.strategy_spec_hash ?? '')
 const resultCompilerVersion = computed(() => result.value?.compiler_version ?? resultEvidence.value?.compiler_version ?? '')
@@ -453,9 +465,9 @@ const validationRejection = computed(() => resultValidation.value?.rejection ?? 
 
 const EVIDENCE_STATUS_NAMES: Record<StrategyEvidenceStatus, string> = {
   unverified: '未验证',
-  design_complete: '设计完成',
-  backtested: '已回测',
-  oos_passed: '样本外通过',
+  design_complete: '验证设计完成',
+  backtested: '已回测（样本内）',
+  oos_passed: '样本外否决条件通过',
   rejected: '已否决',
 }
 
@@ -910,9 +922,42 @@ onMounted(async () => {
         <CheckCircle2 v-if="exactHashMatch === true" :size="17" class="mt-0.5 shrink-0 text-down" />
         <TriangleAlert v-else-if="exactHashMatch === false" :size="17" class="mt-0.5 shrink-0 text-warning" />
         <Fingerprint v-else :size="17" class="mt-0.5 shrink-0 text-text-tertiary" />
-        <span v-if="exactHashMatch === true">本次规格哈希与当前策略完全一致，可作为当前策略的回测证据。</span>
+        <span v-if="exactHashMatch === true">本次规格哈希与当前策略一致，可作为当前策略的模拟回测证据（须先完成验证设计，且不代表可交易）。</span>
         <span v-else-if="exactHashMatch === false">这是旧规格的历史快照，不作为当前策略证据。当前策略修改不会改变本次结果。</span>
         <span v-else>本次回测保留了完整规格快照，但当前策略已不可用，无法建立精确哈希关联。</span>
+      </div>
+
+      <p
+        v-if="resultDataQuality?.warnings?.length"
+        class="flex items-start gap-2 rounded-md border border-warning/30 bg-warning-soft px-4 py-3 text-sm leading-6 text-text-secondary"
+      >
+        <AlertTriangle :size="16" class="mt-0.5 shrink-0 text-warning" />
+        <span>
+          <strong class="font-medium text-text-primary">数据信任警告</strong>
+          <template v-if="resultDataQuality.st_history_incomplete">
+            ：ST 历史不完整（空值 bar 占比 {{ fmtPct(resultDataQuality.st_null_bar_ratio ?? 0) }}）。
+          </template>
+          <ul class="mt-1 list-disc pl-4">
+            <li v-for="(w, i) in resultDataQuality.warnings" :key="i">{{ w }}</li>
+          </ul>
+        </span>
+      </p>
+
+      <div
+        v-if="resultAttribution"
+        class="rounded-md border border-border bg-surface-raised px-4 py-3 text-sm leading-6 text-text-secondary"
+      >
+        <strong class="font-medium text-text-primary">成交归因</strong>
+        <span class="ml-2 text-xs text-text-tertiary">理论信号 vs 模拟可成交</span>
+        <dl class="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-3">
+          <div>买入信号日 {{ resultAttribution.buy_signal_days ?? 0 }}</div>
+          <div>买入成交 {{ resultAttribution.buy_filled ?? 0 }}</div>
+          <div>涨停/停牌未买 {{ resultAttribution.buy_blocked_limit_up_or_halt ?? 0 }}</div>
+          <div>卖出信号日 {{ resultAttribution.sell_signal_days ?? 0 }}</div>
+          <div>卖出成交 {{ resultAttribution.sell_filled ?? 0 }}</div>
+          <div>跌停延迟卖出 {{ resultAttribution.sell_delayed ?? 0 }}</div>
+          <div>缺 bar 阻断 {{ resultAttribution.missing_bar_block ?? 0 }}</div>
+        </dl>
       </div>
 
       <!-- 静态池无成员历史,历史区间结果含幸存者偏差;预置池逐日解析成分,不标注 -->

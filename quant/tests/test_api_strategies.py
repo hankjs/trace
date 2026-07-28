@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -41,6 +41,14 @@ USER_A = "11111111-1111-1111-1111-111111111111"
 USER_B = "22222222-2222-2222-2222-222222222222"
 CLAIMS_A = {"sub": USER_A, "username": "a", "can_client": True}
 CLAIMS_B = {"sub": USER_B, "username": "b", "can_client": True}
+
+
+def _create_in(name: str, template: str = "ma_cross", *,
+               params: dict | None = None, enabled: bool = True,
+               **kwargs) -> StrategyCreateIn:
+    """测试辅助:从预置模板构造完整 StrategyCreateIn(创建路径已要求 spec)。"""
+    spec = get_preset_spec(template, params).model_dump(mode="json")
+    return StrategyCreateIn(name=name, spec=spec, enabled=enabled, **kwargs)
 
 # 对齐 Alembic 0014 的完整 StrategySpec seed
 PRESETS = [
@@ -142,70 +150,46 @@ def test_preset_strategies_are_visible_and_readonly_to_everyone():
         assert db.get(Strategy, 1).name == "双均线趋势策略"
 
 
-def test_effective_params_merge_template_defaults():
-    """params 只存用户覆盖的键,effective_params 是实际生效的全量参数。"""
+def test_create_requires_full_strategy_spec():
+    """创建路径只接受完整 StrategySpec;params 列不再作为事实来源。"""
     with _session() as db:
         _seed(db)
         created = create_strategy(
-            StrategyCreateIn(name="我的双均线", template="ma_cross",
-                             params={"fast": 10}),
+            _create_in("我的双均线", "ma_cross", params={"fast": 10}),
             db=db, claims=CLAIMS_A,
         )
-    assert created["params"] == {"fast": 10}
-    assert created["effective_params"]["fast"] == 10
-    assert created["effective_params"]["slow"] == 20
-    assert created["effective_params"]["risk_overlay"]["enabled"] is False
-    assert created["effective_params"]["take_profit"]["enabled"] is False
-    assert created["params_valid"] is True
+    assert created["params"] == {} or created["params"] is None or created["params"] == {}
+    assert created["spec"]["kind"] == "single"
     assert created["editable"] is True
-    assert created["template_name"] == "双均线趋势策略"
+    # 预置映射到 template 标签时可能仍回显系统名
+    assert created["kind"] == "single"
 
 
-def test_kind_comes_from_template_not_client():
-    """kind 由模板决定:否则组合策略能被标成单标的而进按个股跑的信号引擎。"""
+def test_kind_comes_from_spec_not_client():
+    """kind 由规格决定:否则组合策略能被标成单标的而进按个股跑的信号引擎。"""
     with _session() as db:
         _seed(db)
         created = create_strategy(
-            StrategyCreateIn(name="我的轮动", template="momentum_rotation"),
+            _create_in("我的轮动", "momentum_rotation"),
             db=db, claims=CLAIMS_A,
         )
     assert created["kind"] == "portfolio"
 
 
-def test_invalid_params_and_template_are_rejected():
+def test_invalid_spec_is_rejected():
     with _session() as db:
         _seed(db)
-        # 跨参数约束(fast < slow)
         with pytest.raises(HTTPException) as exc:
             create_strategy(
-                StrategyCreateIn(name="坏参数", template="ma_cross",
-                                 params={"fast": 30, "slow": 10}),
+                StrategyCreateIn(
+                    name="坏规格",
+                    spec={"kind": "single", "schema_version": 1},
+                ),
                 db=db, claims=CLAIMS_A,
             )
         assert exc.value.status_code == 400
-        # 超出上下界
-        with pytest.raises(HTTPException) as exc:
-            create_strategy(
-                StrategyCreateIn(name="越界", template="ma_cross",
-                                 params={"fast": 99999}),
-                db=db, claims=CLAIMS_A,
-            )
-        assert exc.value.status_code == 400
-        # 不认识的参数键
-        with pytest.raises(HTTPException) as exc:
-            create_strategy(
-                StrategyCreateIn(name="乱参数", template="ma_cross",
-                                 params={"future_window": 3}),
-                db=db, claims=CLAIMS_A,
-            )
-        assert exc.value.status_code == 400
-        # 不存在的模板
-        with pytest.raises(HTTPException) as exc:
-            create_strategy(
-                StrategyCreateIn(name="坏模板", template="not_a_template"),
-                db=db, claims=CLAIMS_A,
-            )
-        assert exc.value.status_code == 400
+        with pytest.raises(ValueError):
+            _create_in("坏模板", "not_a_template")
 
         assert db.execute(select(Strategy).where(
             Strategy.is_system.is_(False))).scalars().all() == []
@@ -216,8 +200,7 @@ def test_custom_strategy_is_invisible_to_other_users():
     with _session() as db:
         _seed(db)
         mine = create_strategy(
-            StrategyCreateIn(name="A 的策略", template="ma_cross",
-                             params={"fast": 3}),
+            _create_in("A 的策略", "ma_cross", params={"fast": 3}),
             db=db, claims=CLAIMS_A,
         )
         sid = mine["id"]
@@ -245,7 +228,7 @@ def test_custom_strategy_is_invisible_to_other_users():
 def test_same_name_allowed_across_users_and_rejected_within_user():
     with _session() as db:
         _seed(db)
-        body = StrategyCreateIn(name="同名策略", template="ma_cross")
+        body = _create_in("同名策略", "ma_cross")
         create_strategy(body, db=db, claims=CLAIMS_A)
         # 换个用户可以同名
         create_strategy(body, db=db, claims=CLAIMS_B)
@@ -256,21 +239,18 @@ def test_same_name_allowed_across_users_and_rejected_within_user():
 
 
 def test_duplicate_makes_editable_copy_owned_by_caller():
-    """公共策略只读,「另存为我的策略」后才能调参。"""
+    """公共策略只读,「另存为我的策略」后才能改规格。"""
     with _session() as db:
         _seed(db)
         copy = duplicate_strategy(
-            1, StrategyDuplicateIn(name="我的双均线", params={"fast": 8}),
+            1, StrategyDuplicateIn(name="我的双均线"),
             db=db, claims=CLAIMS_A,
         )
     assert copy["owner_id"] == USER_A
     assert copy["is_system"] is False
     assert copy["editable"] is True
-    assert copy["template"] == "ma_cross"
-    assert copy["effective_params"]["fast"] == 8
-    assert copy["effective_params"]["slow"] == 20
-    assert copy["effective_params"]["risk_overlay"]["enabled"] is False
-    assert copy["effective_params"]["take_profit"]["enabled"] is False
+    assert copy["kind"] == "single"
+    assert copy["spec"]["kind"] == "single"
 
 
 def test_duplicate_without_name_suffixes_original():
@@ -281,23 +261,22 @@ def test_duplicate_without_name_suffixes_original():
     assert copy["name"] == "双均线趋势策略 副本"
 
 
-def test_update_changes_name_params_and_enabled():
+def test_update_changes_name_spec_and_enabled():
     with _session() as db:
         _seed(db)
         created = create_strategy(
-            StrategyCreateIn(name="待改", template="ma_cross"),
+            _create_in("待改", "ma_cross"),
             db=db, claims=CLAIMS_A,
         )
+        new_spec = get_preset_spec("breakout").model_dump(mode="json")
         updated = update_strategy(
             created["id"],
-            StrategyPatchIn(name="改好了", params={"fast": 7}, enabled=False),
+            StrategyPatchIn(name="改好了", spec=new_spec, enabled=False),
             db=db, claims=CLAIMS_A,
         )
     assert updated["name"] == "改好了"
-    assert updated["effective_params"]["fast"] == 7
-    assert updated["effective_params"]["slow"] == 20
-    assert updated["effective_params"]["risk_overlay"]["enabled"] is False
-    assert updated["effective_params"]["take_profit"]["enabled"] is False
+    assert updated["kind"] == "single"
+    assert updated["spec"]["metadata"]["canonical_id"] == new_spec["metadata"]["canonical_id"]
     assert updated["enabled"] is False
 
 
@@ -306,7 +285,7 @@ def test_strategy_used_by_backtest_cannot_be_deleted():
     with _session() as db:
         _seed(db)
         created = create_strategy(
-            StrategyCreateIn(name="跑过回测的", template="ma_cross"),
+            _create_in("跑过回测的", "ma_cross"),
             db=db, claims=CLAIMS_A,
         )
         db.add(BacktestRun(
@@ -335,7 +314,7 @@ def test_unused_strategy_can_be_deleted():
     with _session() as db:
         _seed(db)
         created = create_strategy(
-            StrategyCreateIn(name="没用过的", template="breakout"),
+            _create_in("没用过的", "breakout"),
             db=db, claims=CLAIMS_A,
         )
         assert delete_strategy(created["id"], db=db, claims=CLAIMS_A) == {
@@ -349,14 +328,12 @@ def test_enabled_quota_is_enforced():
         _seed(db)
         for i in range(MAX_ENABLED_PER_USER):
             create_strategy(
-                StrategyCreateIn(name=f"启用{i}", template="ma_cross",
-                                 enabled=True),
+                _create_in(f"启用{i}", "ma_cross", enabled=True),
                 db=db, claims=CLAIMS_A,
             )
         with pytest.raises(HTTPException) as exc:
             create_strategy(
-                StrategyCreateIn(name="再来一个", template="ma_cross",
-                                 enabled=True),
+                _create_in("再来一个", "ma_cross", enabled=True),
                 db=db, claims=CLAIMS_A,
             )
         assert exc.value.status_code == 400
@@ -364,7 +341,7 @@ def test_enabled_quota_is_enforced():
 
         # 停用的不占启用配额
         stopped = create_strategy(
-            StrategyCreateIn(name="停用的", template="ma_cross", enabled=False),
+            _create_in("停用的", "ma_cross", enabled=False),
             db=db, claims=CLAIMS_A,
         )
         assert stopped["enabled"] is False
@@ -387,8 +364,7 @@ def test_total_quota_is_enforced():
         db.commit()
         with pytest.raises(HTTPException) as exc:
             create_strategy(
-                StrategyCreateIn(name="超额", template="ma_cross",
-                                 enabled=False),
+                _create_in("超额", "ma_cross", enabled=False),
                 db=db, claims=CLAIMS_A,
             )
         assert exc.value.status_code == 400
@@ -408,7 +384,7 @@ def test_quota_counts_only_own_strategies():
         db.commit()
         # A 仍然可以建并启用
         created = create_strategy(
-            StrategyCreateIn(name="A 的第一个", template="ma_cross"),
+            _create_in("A 的第一个", "ma_cross"),
             db=db, claims=CLAIMS_A,
         )
         assert created["enabled"] is True
@@ -453,7 +429,7 @@ def test_dynamic_volume_breakout_edit_keeps_prior_backtest_immutable(monkeypatch
                 start=dates[0].date(),
                 end=dates[-1].date(),
             ),
-            db=db,
+            background_tasks=BackgroundTasks(), db=db,
             claims=CLAIMS_A,
         )
         first_run = db.get(BacktestRun, first["run_id"])
@@ -478,6 +454,7 @@ def test_dynamic_volume_breakout_edit_keeps_prior_backtest_immutable(monkeypatch
                 start=dates[0].date(),
                 end=dates[-1].date(),
             ),
+            background_tasks=BackgroundTasks(),
             db=db,
             claims=CLAIMS_A,
         )
@@ -524,6 +501,7 @@ def test_backtest_request_freezes_spec_before_execution_starts(monkeypatch):
                 start=date(2024, 1, 1),
                 end=date(2024, 6, 30),
             ),
+            background_tasks=BackgroundTasks(),
             db=db,
             claims=CLAIMS_A,
         )

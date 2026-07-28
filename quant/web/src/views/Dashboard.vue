@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { ArrowRight, Bell, FlaskConical, ListFilter, RefreshCw } from 'lucide-vue-next'
-import { api, type PickItem, type SignalItem, type SnapshotItem } from '../api'
+import { ArrowRight, Bell, FlaskConical, ListFilter, RefreshCw, ShieldCheck } from 'lucide-vue-next'
+import { api, type DataQualitySummary, type PickItem, type SignalItem, type SnapshotItem } from '../api'
 import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
@@ -13,6 +13,7 @@ const snapshot = ref<SnapshotItem[]>([])
 const signals = ref<SignalItem[]>([])
 const picks = ref<PickItem[]>([])
 const picksDate = ref('')
+const dataQuality = ref<DataQualitySummary | null>(null)
 const loading = ref(true)
 const error = ref('')
 
@@ -72,14 +73,35 @@ function sideLabel(signal: SignalItem): string {
   return signal.side_name || signalName(signal.side)
 }
 
+const dataQualityAlertClass = computed(() => {
+  const level = dataQuality.value?.alert_level
+  if (level === 'critical') return 'border-down/30 bg-down/5 text-text-secondary'
+  if (level === 'warning') return 'border-warning/30 bg-warning-soft text-text-secondary'
+  return 'border-border bg-surface-raised text-text-secondary'
+})
+
+const dataQualityLabel = computed(() => {
+  const level = dataQuality.value?.alert_level
+  if (level === 'critical') return '不可信（覆盖严重不足）'
+  if (level === 'warning') return '需关注'
+  if (level === 'ok') return '覆盖良好'
+  return '未知'
+})
+
+function ratioText(value?: number) {
+  if (value == null || Number.isNaN(value)) return '—'
+  return fmtPct(value)
+}
+
 async function load() {
   loading.value = true
   error.value = ''
   await loadCatalog()
-  const [snapshotResult, signalResult, picksResult] = await Promise.allSettled([
+  const [snapshotResult, signalResult, picksResult, qualityResult] = await Promise.allSettled([
     api.snapshot(),
     api.signals({ limit: 12 }),
     api.picks(),
+    api.dataQuality(),
   ])
 
   if (snapshotResult.status === 'fulfilled') snapshot.value = snapshotResult.value.items
@@ -88,6 +110,8 @@ async function load() {
     picks.value = picksResult.value.items
     picksDate.value = picksResult.value.date ?? ''
   }
+  if (qualityResult.status === 'fulfilled') dataQuality.value = qualityResult.value
+  else dataQuality.value = null
 
   const failed = [snapshotResult, signalResult, picksResult].filter((result) => result.status === 'rejected')
   if (failed.length === 3) error.value = (failed[0] as PromiseRejectedResult).reason?.message ?? '研究数据加载失败'
@@ -126,6 +150,30 @@ onMounted(load)
     <LoadingRows v-if="loading" :rows="8" />
 
     <template v-else>
+      <section
+        class="flex shrink-0 flex-col gap-2 rounded-md border px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
+        :class="dataQualityAlertClass"
+        aria-labelledby="data-trust-heading"
+      >
+        <div class="flex min-w-0 items-start gap-2">
+          <ShieldCheck :size="18" class="mt-0.5 shrink-0" />
+          <div class="min-w-0">
+            <h2 id="data-trust-heading" class="text-sm font-semibold text-text-primary">数据信任</h2>
+            <p class="mt-0.5 text-xs leading-5">
+              状态 {{ dataQualityLabel }}
+              <template v-if="dataQuality?.latest_bar_date"> · 最新日线 {{ dataQuality.latest_bar_date }}</template>
+              · ST 股票覆盖 {{ ratioText(dataQuality?.st_stock_coverage_ratio) }}
+              · ST bar 覆盖 {{ ratioText(dataQuality?.st_bar_coverage_ratio) }}
+              · 估值覆盖 {{ ratioText(dataQuality?.valuation_coverage_ratio) }}
+              · 财务覆盖 {{ ratioText(dataQuality?.fundamental_coverage_ratio) }}
+            </p>
+            <p class="mt-0.5 text-[11px] text-text-tertiary">
+              历史回测仅使用逐日 ST；缺 is_st 的标的不会回退当前标记。覆盖不足时结论不可当作干净证据。
+            </p>
+          </div>
+        </div>
+      </section>
+
       <dl class="grid shrink-0 grid-cols-2 overflow-hidden border border-border bg-surface-raised xl:grid-cols-4">
         <div class="flex min-h-14 flex-col items-start justify-center gap-0.5 border-b border-r border-border-subtle px-3 py-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3 xl:border-b-0">
           <dt class="text-xs text-text-tertiary">数据基准</dt>

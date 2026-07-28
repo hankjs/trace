@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import PageHeader from '../components/PageHeader.vue'
 import WorkspaceTabs from '../components/WorkspaceTabs.vue'
 import Backtest from './Backtest.vue'
+import Experiments from './Experiments.vue'
 import Leaderboard from './Leaderboard.vue'
 import Strategies from './Strategies.vue'
 
@@ -11,17 +12,20 @@ const route = useRoute()
 const router = useRouter()
 const tabs = [
   { key: 'backtest', label: '回测验证' },
+  { key: 'experiments', label: '试验账本' },
   { key: 'leaderboard', label: '策略比较' },
   { key: 'manage', label: '策略管理' },
 ]
 
 const active = computed(() => {
   const tab = route.query.tab
-  return tab === 'leaderboard' || tab === 'manage' ? tab : 'backtest'
+  if (tab === 'leaderboard' || tab === 'manage' || tab === 'experiments') return tab
+  return 'backtest'
 })
 const activeComponent = computed(() => {
   if (active.value === 'leaderboard') return Leaderboard
   if (active.value === 'manage') return Strategies
+  if (active.value === 'experiments') return Experiments
   return Backtest
 })
 

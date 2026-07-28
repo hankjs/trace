@@ -357,22 +357,20 @@ def all_market_pool(db: Session, day: date,
     # 的只有 14.4%,用当前标记会把其余 85.6% 一并剔除 —— 而被剔掉的恰是后来
     # 才出问题的公司,等于让策略提前知道谁将退化(见 alembic 0010)。
     #
-    # 判定取 day 当日的 bar:is_st IS TRUE 才剔除。NULL 表示未采集,此时
-    # 退回 quant_stock.is_st 兜底(回填完成前的过渡),并非当作非 ST。
-    st_on_day = select(DailyBar.code).where(
-        DailyBar.date == day, DailyBar.is_st.is_(True))
-    has_st_data = select(DailyBar.code).where(
-        DailyBar.date == day, DailyBar.is_st.is_not(None))
+    # 严格口径:仅当日 bar.is_st IS FALSE 才入池。
+    # - is_st IS TRUE  → 剔除
+    # - is_st IS NULL / 无 bar → 剔除(未采集,不回退当前快照,避免前视)
+    # 宁可池子变小,也不用「今天的 ST 名单」伪造历史资格。
+    confirmed_non_st = select(DailyBar.code).where(
+        DailyBar.date == day, DailyBar.is_st.is_(False),
+    )
 
     rows = db.execute(
         select(Stock.code).where(
             Stock.list_date.is_not(None),
             Stock.list_date <= cutoff,
             or_(Stock.delist_date.is_(None), Stock.delist_date > day),
-            Stock.code.not_in(st_on_day),
-            # 当日无 is_st 数据的票才用当前状态兜底
-            or_(Stock.code.in_(has_st_data),
-                Stock.is_st.is_(None), Stock.is_st.is_(False)),
+            Stock.code.in_(confirmed_non_st),
         ).order_by(Stock.code)
     ).all()
     return [r[0] for r in rows]

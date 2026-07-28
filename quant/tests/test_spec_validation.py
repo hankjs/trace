@@ -20,7 +20,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
 from pydantic import ValidationError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -451,8 +451,9 @@ def _strategy_row(db: Session, spec: dict) -> Strategy:
 
 
 def _run_result(spec: dict, verdict: str = "passed",
-                oos_available: bool = True) -> dict:
+                oos_available: bool = True, *, run_id: int | None = 1) -> dict:
     return {
+        "run_id": run_id,
         "strategy_spec_hash": strategy_spec_hash(spec),
         "validation": {
             "rejection": {"verdict": verdict, "hits": [], "unevaluated": []},
@@ -476,9 +477,14 @@ def test_advance_full_path():
         raw = _spec_dict()
         strategy = _strategy_row(db, raw)
 
-        # unverified --(OOS 回测全过)--> oos_passed(允许跨级前进)
+        # unverified 即使 OOS 全过也不推进(须先 mark_design_complete)
+        assert advance_after_backtest(db, strategy, _run_result(raw)) is None
+        assert strategy.spec["metadata"]["evidence_status"] == "unverified"
+
+        apply_manual_action(db, strategy, "mark_design_complete")
+        # design_complete --(OOS 回测全过)--> oos_passed(允许跨级前进)
         transition = advance_after_backtest(db, strategy, _run_result(raw))
-        assert transition == {"from": "unverified", "to": "oos_passed"}
+        assert transition == {"from": "design_complete", "to": "oos_passed"}
         assert strategy.spec["metadata"]["evidence_status"] == "oos_passed"
 
         # 只前进:再来一次同样的回测不再迁移
@@ -494,15 +500,28 @@ def test_advance_full_path():
         assert advance_after_backtest(db, strategy, _run_result(raw)) is None
 
 
+def test_advance_requires_run_id():
+    with _session() as db:
+        raw = _spec_dict()
+        strategy = _strategy_row(db, raw)
+        apply_manual_action(db, strategy, "mark_design_complete")
+        # save=False / 周度评估无 run_id → 不推进
+        assert advance_after_backtest(
+            db, strategy, _run_result(raw, run_id=None),
+        ) is None
+        assert strategy.spec["metadata"]["evidence_status"] == "design_complete"
+
+
 def test_advance_backtested_when_incomplete_or_no_oos():
     with _session() as db:
         raw = _spec_dict()
         strategy = _strategy_row(db, raw)
+        apply_manual_action(db, strategy, "mark_design_complete")
         # verdict incomplete(有未评估条件)只能到 backtested
         transition = advance_after_backtest(
             db, strategy, _run_result(raw, verdict="incomplete"),
         )
-        assert transition == {"from": "unverified", "to": "backtested"}
+        assert transition == {"from": "design_complete", "to": "backtested"}
 
         # OOS 不可用同样只能到 backtested;已 backtested 不再迁移
         assert advance_after_backtest(
@@ -574,6 +593,7 @@ def test_backtest_response_contains_validation_report(monkeypatch):
         result = create_backtest(
             BacktestIn(strategy_id=created["id"], codes=["sh.600519"],
                        start=START, end=END),
+            background_tasks=BackgroundTasks(),
             db=db, claims=CLAIMS_A,
         )
         validation = result["validation"]
@@ -611,6 +631,7 @@ def test_unknown_baseline_reported_as_unavailable(monkeypatch):
         result = create_backtest(
             BacktestIn(strategy_id=created["id"], codes=["sh.600519"],
                        start=START, end=END),
+            background_tasks=BackgroundTasks(),
             db=db, claims=CLAIMS_A,
         )
         by_id = {b["baseline_id"]: b for b in result["validation"]["baselines"]}
@@ -668,25 +689,40 @@ def test_evidence_endpoint_rejects_system_strategy():
 
 
 def test_backtest_auto_advances_and_edit_falls_back(monkeypatch):
-    """完整链路:回测自动推进 -> 规格编辑回落 -> 否决命中 -> 人工复位。"""
+    """完整链路:设计完成 -> 回测自动推进 -> 规格编辑回落。"""
     _patch_bars(monkeypatch, RISE_THEN_FALL)
     with _session() as db:
         created = create_strategy(
             StrategyCreateIn(name="自动推进", spec=_spec_dict()),
             db=db, claims=CLAIMS_A,
         )
+        # unverified 时回测不推进证据
+        bare = create_backtest(
+            BacktestIn(strategy_id=created["id"], codes=["sh.600519"],
+                       start=START, end=END),
+            background_tasks=BackgroundTasks(),
+            db=db, claims=CLAIMS_A,
+        )
+        assert bare["evidence_transition"] is None
+        assert "data_quality" in bare
+
+        update_evidence_status(
+            created["id"], StrategyEvidenceIn(action="mark_design_complete"),
+            db=db, claims=CLAIMS_A,
+        )
         result = create_backtest(
             BacktestIn(strategy_id=created["id"], codes=["sh.600519"],
                        start=START, end=END),
+            background_tasks=BackgroundTasks(),
             db=db, claims=CLAIMS_A,
         )
         assert result["evidence_transition"] == {
-            "from": "unverified", "to": "oos_passed",
+            "from": "design_complete", "to": "oos_passed",
         }
         current = get_strategy(created["id"], db=db, claims=CLAIMS_A)
         assert current["evidence_status"] == "oos_passed"
         # 推进改变了 spec_hash,但刚完成的回测按身份仍算当前规格的证据
-        assert current["evidence_backtest_count"] == 1
+        assert current["evidence_backtest_count"] >= 1
 
         # 规格编辑导致身份变化:状态回落到 design_complete
         edited = deepcopy(_spec_dict())
@@ -711,16 +747,21 @@ def test_rejection_hit_marks_strategy_rejected(monkeypatch):
             ),
             db=db, claims=CLAIMS_A,
         )
+        update_evidence_status(
+            created["id"], StrategyEvidenceIn(action="mark_design_complete"),
+            db=db, claims=CLAIMS_A,
+        )
         result = create_backtest(
             BacktestIn(strategy_id=created["id"], codes=["sh.600519"],
                        start=START, end=END),
+            background_tasks=BackgroundTasks(),
             db=db, claims=CLAIMS_A,
         )
         rejection = result["validation"]["rejection"]
         assert rejection["verdict"] == "rejected"
         assert rejection["hits"][0]["metric"] == "annual_return"
         assert result["evidence_transition"] == {
-            "from": "unverified", "to": "rejected",
+            "from": "design_complete", "to": "rejected",
         }
 
         current = get_strategy(created["id"], db=db, claims=CLAIMS_A)

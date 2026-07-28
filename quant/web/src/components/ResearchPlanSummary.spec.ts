@@ -32,7 +32,7 @@ const plan: ResearchPlan = {
 describe('ResearchPlanSummary', () => {
   it('keeps the required reading order and shows traceability', () => {
     const text = mount(ResearchPlanSummary, { props: { plan } }).text()
-    const headings = ['数据与信号', '进场观察', '风险与退出', '历史验证', '产品边界']
+    const headings = ['数据与信号', '进场观察', '风险与退出', '历史回测对照', '产品边界']
     const offsets = headings.map((heading) => text.indexOf(heading))
 
     expect(offsets.every((offset) => offset >= 0)).toBe(true)
@@ -41,7 +41,7 @@ describe('ResearchPlanSummary', () => {
     expect(text).toContain('开盘价越过进场观察区间')
     expect(text).toContain('前复权')
     expect(text).toContain('不是建议成交价')
-    expect(text).toContain('尚未验证')
+    expect(text).toContain('尚无匹配回测')
   })
 
   it('shows fee assumptions for exact backtest evidence', () => {
@@ -81,6 +81,6 @@ describe('ResearchPlanSummary', () => {
     })
 
     expect(wrapper.text()).toContain('持仓快照未生成新信号')
-    expect(wrapper.text()).toContain('待验证费用口径')
+    expect(wrapper.text()).toContain('待对照费用口径')
   })
 })

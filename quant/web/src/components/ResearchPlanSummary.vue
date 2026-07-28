@@ -156,9 +156,9 @@ function costText(): string {
       </section>
 
       <section aria-labelledby="plan-evidence-heading">
-        <h4 id="plan-evidence-heading" class="text-xs font-semibold text-text-primary">4. 历史验证</h4>
+        <h4 id="plan-evidence-heading" class="text-xs font-semibold text-text-primary">4. 历史回测对照</h4>
         <div v-if="plan?.evidence?.status === 'verified' && plan.evidence.exact_match" class="mt-2 text-xs leading-5">
-          <p>同策略版本、参数和覆盖层的回测 #{{ plan.evidence.backtest_id }}</p>
+          <p>已有同配置历史回测 #{{ plan.evidence.backtest_id }}（模拟记录，非科学证实）</p>
           <dl class="mt-1 grid grid-cols-2 gap-x-4 gap-y-1 text-text-secondary">
             <div>区间收益：{{ plan.evidence.metrics?.total_return == null ? '未提供' : fmtPct(plan.evidence.metrics.total_return) }}</div>
             <div>最大回撤：{{ plan.evidence.metrics?.max_drawdown == null ? '未提供' : fmtPct(plan.evidence.metrics.max_drawdown) }}</div>
@@ -169,8 +169,8 @@ function costText(): string {
           <p class="mt-1 text-text-tertiary">{{ plan.evidence.start }} 至 {{ plan.evidence.end }}，历史结果不代表未来表现。</p>
         </div>
         <div v-else class="mt-2 text-xs leading-5 text-text-tertiary">
-          <p>尚未验证：没有与当前策略版本、参数、覆盖层和费用完全一致的回测证据。</p>
-          <p v-if="costText()" class="mt-1 text-text-secondary">待验证费用口径：{{ costText() }}</p>
+          <p>尚无匹配回测：没有与当前策略版本、参数、覆盖层和费用完全一致的模拟记录。</p>
+          <p v-if="costText()" class="mt-1 text-text-secondary">待对照费用口径：{{ costText() }}</p>
         </div>
       </section>
     </div>

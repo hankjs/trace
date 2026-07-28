@@ -131,12 +131,12 @@ def test_structured_screen_excludes_not_yet_available_report() -> None:
             DailyBar(
                 code="sh.600001", date=date(2025, 1, 9),
                 open=10, high=10.5, low=9.8, close=10, raw_close=10,
-                volume=100, amount=1000,
+                volume=100, amount=1000, is_st=False,
             ),
             DailyBar(
                 code="sh.600001", date=day,
                 open=10, high=11, low=9.9, close=11, raw_close=11,
-                volume=120, amount=1200,
+                volume=120, amount=1200, is_st=False,
             ),
         ])
         db.add(ValuationSnapshot(
@@ -189,6 +189,18 @@ def test_structured_screen_uses_revision_only_after_available_date() -> None:
         db.add_all([
             FactorDaily(id=1, code="sh.600001", date=before_revision),
             FactorDaily(id=2, code="sh.600001", date=after_revision),
+        ])
+        db.add_all([
+            DailyBar(
+                code="sh.600001", date=before_revision,
+                open=10, high=11, low=9, close=10, raw_close=10,
+                volume=100, amount=1000, is_st=False,
+            ),
+            DailyBar(
+                code="sh.600001", date=after_revision,
+                open=10, high=11, low=9, close=10, raw_close=10,
+                volume=100, amount=1000, is_st=False,
+            ),
         ])
         db.add_all([
             FundamentalSnapshot(
@@ -308,7 +320,7 @@ def test_structured_screen_skips_listing_history_when_unused(monkeypatch) -> Non
         db.add(DailyBar(
             code="sh.600001", date=day,
             open=10, high=11, low=9.9, close=10.5, raw_close=10.5,
-            volume=120, amount=1200,
+            volume=120, amount=1200, is_st=False,
         ))
         db.commit()
 
@@ -338,12 +350,12 @@ def test_structured_screen_counts_listing_days_when_requested() -> None:
             DailyBar(
                 code="sh.600001", date=date(2025, 1, 9),
                 open=10, high=10.5, low=9.8, close=10, raw_close=10,
-                volume=100, amount=1000,
+                volume=100, amount=1000, is_st=False,
             ),
             DailyBar(
                 code="sh.600001", date=day,
                 open=10, high=11, low=9.9, close=11, raw_close=11,
-                volume=120, amount=1200,
+                volume=120, amount=1200, is_st=False,
             ),
         ])
         db.commit()

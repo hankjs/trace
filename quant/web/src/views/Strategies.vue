@@ -78,15 +78,11 @@ function kindName(strategy: Strategy) {
   return strategy.kind === 'portfolio' ? '组合策略' : '单标的策略'
 }
 
-function researchStatusName(strategy: Strategy) {
-  return strategy.research_status === 'verified' ? '已验证' : strategy.research_status === 'rejected' ? '已否决' : '未验证'
-}
-
 const EVIDENCE_STATUS_NAMES: Record<StrategyEvidenceStatus, string> = {
   unverified: '未验证',
-  design_complete: '设计完成',
-  backtested: '已回测',
-  oos_passed: '样本外通过',
+  design_complete: '验证设计完成',
+  backtested: '已回测（样本内）',
+  oos_passed: '样本外否决条件通过',
   rejected: '已否决',
 }
 
@@ -103,8 +99,8 @@ async function runEvidenceAction(action: StrategyEvidenceAction) {
     await refreshStrategies(strategy.id)
   }, {
     success: action === 'mark_design_complete'
-      ? '已标记为设计完成，后续回测会自动推进证据状态。'
-      : '已复位否决结论，状态回到设计完成。',
+      ? '已标记为验证设计完成。之后完成并落库的回测才会推进证据状态；样本外通过仅表示声明的否决条件已满足，不代表策略可交易。'
+      : '已复位否决结论，状态回到验证设计完成。',
   })
 }
 
@@ -303,7 +299,7 @@ void init()
                     <Lock v-if="!strategy.editable" :size="13" class="shrink-0 text-text-tertiary" aria-label="公共只读" />
                   </span>
                   <span class="mt-0.5 block text-xs text-text-tertiary">
-                    {{ kindName(strategy) }} · {{ researchStatusName(strategy) }}
+                    {{ kindName(strategy) }} · {{ evidenceStatusName(strategy.evidence_status) }}
                     <template v-if="!strategy.enabled"> · 已停用</template>
                   </span>
                 </button>

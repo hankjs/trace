@@ -868,8 +868,92 @@ export interface BacktestRejection {
   unevaluated: { criterion: string, reason: string }[]
 }
 
+/** 全局或单次回测的数据信任信号 */
+export interface DataQualitySummary {
+  as_of?: string
+  alert_level?: 'ok' | 'warning' | 'critical'
+  stock_count?: number
+  latest_bar_date?: string | null
+  st_stock_coverage_ratio?: number
+  st_bar_coverage_ratio?: number
+  valuation_coverage_ratio?: number
+  fundamental_coverage_ratio?: number
+  adjust_factor_missing_stocks?: number
+}
+
+export interface BacktestDataQuality {
+  st_history_incomplete?: boolean
+  st_null_bar_ratio?: number
+  st_incomplete_codes?: string[]
+  st_incomplete_code_count?: number
+  field_coverage?: Record<string, { available: number; total: number; ratio: number }>
+  warnings?: string[]
+}
+
+export type BacktestJobStatus = 'pending' | 'running' | 'done' | 'failed'
+
+export interface ExecutionAttribution {
+  buy_blocked_limit_up_or_halt?: number
+  buy_signal_days?: number
+  buy_filled?: number
+  sell_delayed?: number
+  sell_signal_days?: number
+  sell_filled?: number
+  missing_bar_block?: number
+}
+
+export interface MultiplicityReport {
+  n_trials: number
+  n_evaluable: number
+  alpha: number
+  bonferroni_alpha?: number | null
+  best_metric?: number | null
+  best_params?: Record<string, unknown>
+  disclaimer: string
+}
+
+export interface ExperimentSummary {
+  id: number
+  permanent_candidate_id: string
+  family_id?: string | null
+  title: string
+  hypothesis: string
+  strategy_id?: number | null
+  frozen_spec_hash: string
+  identity_hash: string
+  status: string
+  trial_count?: number | null
+  created_at?: string | null
+}
+
+export interface ExperimentTrial {
+  id: number
+  experiment_id: number
+  trial_index: number
+  param_patch?: Record<string, unknown>
+  backtest_run_id?: number | null
+  outcome: 'ok' | 'no_trades' | 'error' | 'rejected' | string
+  metrics_summary?: Partial<BacktestMetrics> | null
+  error?: string | null
+  data_fingerprint?: string | null
+  execution_fingerprint?: string | null
+  created_at?: string | null
+}
+
+export interface ExperimentDetail extends ExperimentSummary {
+  frozen_spec_snapshot?: StrategySpec
+  validation_snapshot?: Record<string, unknown> | null
+  universe_snapshot?: Record<string, unknown> | null
+  cost_snapshot?: Record<string, unknown> | null
+  trials: ExperimentTrial[]
+  multiplicity?: MultiplicityReport
+}
+
 export interface BacktestResult {
   run_id: number
+  /** pending/running 时 metrics/equity 可能为空;轮询直至 done|failed */
+  status?: BacktestJobStatus
+  error?: string | null
   strategy_id?: number
   /** 策略实例名;策略行已被删除时后端回显 null */
   strategy_name?: string | null
@@ -900,6 +984,10 @@ export interface BacktestResult {
   metrics: BacktestMetrics
   equity: { date: string; equity: number }[]
   evidence?: BacktestRunEvidence
+  /** ST/基本面覆盖等数据信任信号 */
+  data_quality?: BacktestDataQuality
+  /** 成交失败归因(涨停未买/跌停延迟卖出等) */
+  execution_attribution?: ExecutionAttribution
   /** 规格 validation 段执行报告(基线对比 / OOS 分段 / 否决判定) */
   validation?: BacktestValidation | null
   /** 本次回测触发的证据状态迁移;未推进为 null */
@@ -1235,6 +1323,11 @@ export const api = {
     return request<{ count: number; items: SnapshotItem[] }>('/api/market/snapshot')
   },
 
+  /** 数据信任摘要:ST/估值/财务覆盖率与告警级别 */
+  dataQuality() {
+    return request<DataQualitySummary>('/api/market/data-quality')
+  },
+
   stockSearch(query: string, limit = 10) {
     const params = new URLSearchParams({ q: query, limit: String(limit) })
     return request<{ count?: number; items: StockSearchItem[] }>(`/api/market/stocks?${params}`)
@@ -1439,7 +1532,7 @@ export const api = {
     return request<{ deleted: number }>(`/api/pools/${id}/members/${code}`, { method: 'DELETE' })
   },
 
-  runBacktest(body: {
+  async runBacktest(body: {
     strategy_id: number
     codes: string[]
     start: string
@@ -1447,14 +1540,120 @@ export const api = {
     pool_id?: number
     costs?: BacktestCostSnapshot
   }) {
-    return request<BacktestResult>('/api/backtests', {
+    const initial = await request<BacktestResult>('/api/backtests', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    // 同步路径直接 done;异步路径 202 pending 后轮询直到完成
+    if (!initial.status || initial.status === 'done' || initial.status === 'failed') {
+      if (initial.status === 'failed') {
+        throw new Error(initial.error || '回测失败')
+      }
+      return initial
+    }
+    const runId = initial.run_id
+    const deadline = Date.now() + 10 * 60 * 1000
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1200))
+      const current = await request<BacktestResult>(`/api/backtests/${runId}`)
+      if (current.status === 'done' || current.status === 'failed' || !current.status) {
+        if (current.status === 'failed') {
+          throw new Error(current.error || '回测失败')
+        }
+        return current
+      }
+    }
+    throw new Error(`回测 #${runId} 超时仍未完成，可稍后用编号查询`)
+  },
+
+  getBacktest(runId: number) {
+    return request<BacktestResult>(`/api/backtests/${runId}`)
+  },
+
+  listExperiments(includeArchived = false) {
+    const params = new URLSearchParams()
+    if (includeArchived) params.set('include_archived', 'true')
+    const qs = params.toString()
+    return request<{ count: number; items: ExperimentSummary[] }>(
+      `/api/experiments${qs ? `?${qs}` : ''}`,
+    )
+  },
+
+  createExperiment(body: {
+    title: string
+    hypothesis: string
+    permanent_candidate_id: string
+    spec: StrategySpec
+    strategy_id?: number
+    family_id?: string
+    universe_snapshot?: Record<string, unknown>
+    cost_snapshot?: Record<string, number>
+  }) {
+    return request<ExperimentSummary>('/api/experiments', {
       method: 'POST',
       body: JSON.stringify(body),
     })
   },
 
-  getBacktest(runId: number) {
-    return request<BacktestResult>(`/api/backtests/${runId}`)
+  getExperiment(id: number) {
+    return request<ExperimentDetail>(`/api/experiments/${id}`)
+  },
+
+  createExperimentTrial(id: number, body: {
+    codes: string[]
+    start: string
+    end: string
+    param_patch?: Record<string, number | string | boolean>
+    costs?: Record<string, number>
+    pool_id?: number
+    dynamic_universe?: boolean
+  }) {
+    return request<{
+      trial: ExperimentTrial
+      backtest?: {
+        run_id?: number
+        metrics?: BacktestMetrics
+        validation?: BacktestValidation | null
+        data_quality?: BacktestDataQuality
+        execution_attribution?: ExecutionAttribution
+        execution_fingerprint?: string
+      }
+    }>(`/api/experiments/${id}/trials`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
+  archiveExperiment(id: number) {
+    return request<ExperimentSummary>(`/api/experiments/${id}/archive`, {
+      method: 'POST',
+    })
+  },
+
+  costSensitivity(body: {
+    strategy_id: number
+    codes: string[]
+    start: string
+    end: string
+    pool_id?: number
+    costs?: BacktestCostSnapshot
+    slippage_multipliers?: number[]
+  }) {
+    return request<{
+      strategy_id: number
+      base_slippage: number
+      results: Array<{
+        slippage_multiplier: number
+        slippage: number
+        metrics?: Partial<BacktestMetrics>
+        error?: string
+        execution_attribution?: ExecutionAttribution
+      }>
+      disclaimer: string
+    }>('/api/backtest/sensitivity', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
   },
 
   picks(date?: string) {

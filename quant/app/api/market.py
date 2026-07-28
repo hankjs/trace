@@ -9,6 +9,7 @@ from sqlalchemy import case, select
 from sqlalchemy.orm import Session
 
 from ..data.akshare_client import symbol_to_code
+from ..data.quality import data_quality_public_summary
 from ..auth import require_client, user_id_from_claims
 from ..db import get_db
 from ..models import DailyBar, Snapshot, Stock, WatchlistItem
@@ -85,6 +86,16 @@ def search_stocks(
         "count": len(rows),
         "items": [_stock_out(stock, stock.code in watch_codes) for stock in rows],
     }
+
+
+@router.get("/data-quality")
+def get_data_quality(
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """数据信任摘要:ST/估值/财务覆盖率与告警级别(只读,不触发采集)。"""
+    _ = claims
+    return data_quality_public_summary(db)
 
 
 @router.get("/kline")

@@ -135,11 +135,11 @@ join 与乘法。当前选择的是渐进方案：读取路径不动，先建立
 
 偏差方向是**高估策略表现**：被剔掉的恰是后来才出问题的公司，而研究日当时它们看起来完全正常、会被策略正常选中。这与 `engine.py` 的提前建仓、财报缺 `available_date` 属于同一类错误，只是入口不同。ST 股集中在小市值高波动区间，恰是动量与均值回归策略最易选中处，所以 4.7% 的股票占比低估了实际影响。
 
-`NULL` 的含义是「未采集」而非「非 ST」。过滤时必须显式区分 —— 把 `NULL` 当 `False` 会让未采集的行被当成「确认非 ST」放进样本。`all_market_pool` 的实现是：当日 `is_st IS TRUE` 则剔除；当日无 `is_st` 数据时退回 `quant_stock.is_st` 兜底，而不是当作非 ST。
+`NULL` 的含义是「未采集」而非「非 ST」。过滤时必须显式区分 —— 把 `NULL` 当 `False` 会让未采集的行被当成「确认非 ST」放进样本。
 
-**当前覆盖率不足（唯一的已知数据缺口）**：`is_st` 是后加的列，既有 1138 万行需回填，目前只补了 **15.3%**（628 / 5584 只，按股票为单位完整补齐，无部分补齐）。
+**严格口径（开发阶段已启用）**：`all_market_pool` **只**纳入当日 `is_st IS FALSE` 的代码；`TRUE` / `NULL` / 无 bar 一律排除，**不再**回退 `quant_stock.is_st`。动态池 `pool_eligibility_matrix` 在窗口内缺 ST 时直接 `MissingPoolHistoryError`。
 
-未补的股票在 `all_market_pool` 里退回 `quant_stock.is_st` 兜底 —— 也就是说**对这些股票，历史回测暂时仍带 ST 前视偏差**。使用回测结果时需知情。
+覆盖率通过 `app/data/quality.py` 与 `GET /api/market/data-quality` 暴露；回测结果在 `metrics.data_quality` 中标注 `st_history_incomplete` 与字段覆盖。未回填 ST 的标的会被排除出历史全 A 池，宁可池子变小，也不引入前视偏差。
 
 补齐路径有两条，会自然收敛：
 

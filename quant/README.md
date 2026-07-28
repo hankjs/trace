@@ -11,7 +11,6 @@
 |---|---|
 | 本文 | 功能、启动、API、调度 |
 | [`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) | 数据分层、前复权价的重写风险、精度陷阱、数据源覆盖边界、池与策略抽象 |
-| [`REVIEW.md`](REVIEW.md) | 代码与数据库审查基线 |
 | [`DESIGN.md`](DESIGN.md) | UI 设计系统（与数据架构无关） |
 | `alembic/versions/*.py` | 每次 schema 变更的设计理由（写在 docstring 里） |
 
