@@ -81,6 +81,23 @@ class WatchlistItem(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class UserSettings(Base):
+    """用户账户偏好(与 users 表解耦,quant 侧独立存储)。
+
+    无行时按默认值读出(见 app/user_settings.py),不预插。
+    can_trade_bse: 当前账户是否已开通北交所交易权限 —— 仅表达「我能否实盘买卖」,
+    不改动行情入库范围;后续筛选/提示可按此字段过滤 bj. 标的。
+    """
+
+    __tablename__ = "quant_user_settings"
+
+    user_id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    can_trade_bse: Mapped[bool] = mapped_column(Boolean, default=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now,
+    )
+
+
 class DailyBar(Base):
     """日线。open/high/low/close 为前复权价,raw_close 为不复权收盘价。
 

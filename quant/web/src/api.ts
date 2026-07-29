@@ -1341,11 +1341,28 @@ export interface SweepResult {
   } | null
 }
 
+export interface UserSettings {
+  user_id: string
+  can_trade_bse: boolean
+  updated_at: string | null
+}
+
 export const api = {
   login(username: string, password: string) {
     return request<{ token: string; username: string }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
+    })
+  },
+
+  getSettings() {
+    return request<UserSettings>('/api/settings')
+  },
+
+  patchSettings(body: { can_trade_bse?: boolean }) {
+    return request<UserSettings>('/api/settings', {
+      method: 'PATCH',
+      body: JSON.stringify(body),
     })
   },
 

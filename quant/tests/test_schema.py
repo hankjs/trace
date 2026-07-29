@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0016_experiment_registry"}
+    assert heads == {"0019_user_settings"}
     assert current_heads(migrated_db) == heads
 
 
@@ -70,6 +70,8 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_backtest_equity",
         "quant_backtest_run",
         "quant_daily_bar",
+        "quant_data_quality_cache",
+        "quant_evidence_promotion",
         "quant_experiment",
         "quant_experiment_trial",
         "quant_factor_daily",
@@ -88,6 +90,7 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_strategy_eval",
         "quant_trade",
         "quant_trade_calendar",
+        "quant_user_settings",
         "quant_valuation_snapshot",
         "quant_watchlist",
     }

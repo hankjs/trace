@@ -16,6 +16,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Search,
+  Settings,
   ShieldCheck,
   Star,
   X,
@@ -88,6 +89,7 @@ const routeTitles: Record<string, string> = {
   portfolio: '持仓记录',
   catalog: '研究词典',
   stock: '个股研究',
+  settings: '账户设置',
 }
 
 const currentRouteTitle = computed(() => routeTitles[String(route.name)] ?? '研究工作台')
@@ -324,6 +326,15 @@ onBeforeUnmount(() => {
 
         <ThemeToggle />
         <span class="hidden max-w-24 truncate text-xs text-text-tertiary md:block">{{ username }}</span>
+        <router-link
+          :to="{ name: 'settings' }"
+          class="icon-button shrink-0"
+          title="账户设置"
+          active-class="!bg-active !text-text-primary"
+        >
+          <Settings :size="17" />
+          <span class="sr-only">账户设置</span>
+        </router-link>
         <button class="icon-button shrink-0" title="退出登录" @click="logout">
           <LogOut :size="17" />
           <span class="sr-only">退出登录</span>

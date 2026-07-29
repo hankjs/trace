@@ -19,8 +19,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .api import (admin, auth, backtest, catalog, experiments, market, pools,
-                  portfolio, research_plans, selection, signals, strategies,
-                  watchlist)
+                  portfolio, research_plans, selection, settings as settings_api,
+                  signals, strategies, watchlist)
 from .auth import require_admin, require_client
 from .config import settings
 from .db import engine
@@ -71,6 +71,7 @@ _auth = [Depends(require_client)]
 app.include_router(catalog.router, dependencies=_auth)
 app.include_router(market.router, dependencies=_auth)
 app.include_router(watchlist.router, dependencies=_auth)
+app.include_router(settings_api.router, dependencies=_auth)
 app.include_router(pools.router, dependencies=_auth)
 app.include_router(strategies.router, dependencies=_auth)
 app.include_router(signals.router, dependencies=_auth)

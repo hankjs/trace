@@ -17,6 +17,7 @@ const router = createRouter({
     { path: '/strategies', name: 'strategies', component: () => import('./views/StrategyWorkspace.vue') },
     { path: '/portfolio', name: 'portfolio', component: () => import('./views/Portfolio.vue') },
     { path: '/catalog', name: 'catalog', component: () => import('./views/Catalog.vue') },
+    { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue') },
     {
       path: '/picks',
       redirect: (to) => ({ name: 'selection', query: { ...to.query, tab: 'picks' } }),

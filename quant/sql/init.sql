@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0018_evidence_promotion
+-- Schema revision: 0019_user_settings
 
 SET NAMES utf8mb4;
 
@@ -223,6 +223,13 @@ CREATE TABLE `quant_watchlist` (
   `code` VARCHAR(16) NOT NULL,
   `created_at` DATETIME NOT NULL,
   PRIMARY KEY (`user_id`, `code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_user_settings` (
+  `user_id` VARCHAR(36) NOT NULL,
+  `can_trade_bse` TINYINT(1) NOT NULL DEFAULT 0,
+  `updated_at` DATETIME NOT NULL,
+  PRIMARY KEY (`user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `quant_backtest_run` (
@@ -558,6 +565,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0018_evidence_promotion');
+VALUES ('0019_user_settings');
 
 COMMIT;
