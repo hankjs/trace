@@ -3,6 +3,7 @@
 布局(与日 K 同属 baostock_raw,可一起 rsync):
   data/baostock_raw/index/{hs300,zz500}/YYYY-MM-DD.csv.gz
   列: code, name
+  空结果也写 header-only 文件(resume 不再重打该日)
   data/baostock_raw/index/download_state.json
   data/baostock_raw/index/manifest.json  (start/end/step/indices)
 
@@ -25,6 +26,8 @@ import sys
 import time
 from datetime import date
 from pathlib import Path
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -68,13 +71,18 @@ def _path(index_name: str, day: date) -> Path:
     return INDEX_ROOT / index_name / f"{day.isoformat()}.csv.gz"
 
 
-def _write_frame(path: Path, df) -> int:
+def _write_frame(path: Path, df: pd.DataFrame) -> int:
+    """原子写 gzip CSV。空 DataFrame 也落盘(header-only),作 empty 标记。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    # 空结果写 0 字节标记? 不写文件,由调用方决定 skip/失败
     tmp = path.with_suffix(path.suffix + ".tmp")
     df.to_csv(tmp, index=False, compression="gzip")
     tmp.replace(path)
     return path.stat().st_size
+
+
+def _write_empty_marker(path: Path) -> int:
+    """空响应 durable 标记:resume 视为已完成,ingest 会跳过空成员。"""
+    return _write_frame(path, pd.DataFrame(columns=["code", "name"]))
 
 
 def _save_state(*, last_key: str, requests: int, bytes_written: int) -> None:
@@ -170,8 +178,14 @@ def main() -> None:
                     continue
                 written = 0
                 if df is None or df.empty:
-                    logger.warning("空结果跳过写文件 %s %s", name, day)
+                    # 必须落盘:否则 resume 把 missing 当天反复请求,烧日配额
+                    written = _write_empty_marker(path)
+                    bytes_written += written
                     empty += 1
+                    logger.warning(
+                        "[%d/%d] 空结果写标记 %s %s bytes=%d",
+                        i, len(missing), name, day, written,
+                    )
                 else:
                     # 统一列
                     out = df[["code", "name"]].copy() if "name" in df.columns \

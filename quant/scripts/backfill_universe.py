@@ -6,9 +6,9 @@
   uv run python scripts/download_index_members.py --start 2015-01-01 --estimate
   uv run python scripts/download_index_members.py --start 2015-01-01 --sleep 0.35
 
-  # 2) 本机读文件写库(不访问 baostock)
+  # 2) 本机读文件写库;生产加 --live-sync 对齐当前成分
   uv run python scripts/ingest_index_members_from_files.py --estimate
-  uv run python scripts/ingest_index_members_from_files.py
+  uv run python scripts/ingest_index_members_from_files.py --live-sync
 
 本脚本保留「在线一次跑完」模式(边拉边写),仅适合小区间调试。
 默认 --start 现为 2015-01-01(库内若仍从 2019 起,用两阶段重灌即可)。
