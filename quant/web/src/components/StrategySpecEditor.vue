@@ -191,9 +191,9 @@ function applySnippet() {
 const inputClass = 'h-9 w-full rounded-md border border-border bg-surface-raised px-2.5 text-sm text-text-primary outline-none focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-55'
 const checkClass = 'h-4 w-4 rounded border-border text-accent focus:ring-2 focus:ring-accent focus:ring-offset-2 disabled:opacity-55'
 const smallInputClass = 'h-8 w-full rounded-md border border-border bg-surface-raised px-2 text-xs text-text-primary outline-none focus:ring-1 focus:ring-accent disabled:cursor-not-allowed disabled:opacity-55'
-const removeButtonClass = 'inline-flex h-8 w-8 shrink-0 items-center justify-center self-end rounded-md border border-border text-text-tertiary hover:bg-hover disabled:opacity-40'
-const addButtonClass = 'inline-flex h-7 items-center gap-1 rounded-md border border-dashed border-border px-2.5 text-xs text-text-secondary hover:bg-hover disabled:opacity-40'
-const snippetBtnClass = 'inline-flex h-7 items-center rounded-md border border-border px-2 text-[11px] text-text-secondary hover:bg-hover disabled:opacity-40'
+const removeButtonClass = 'inline-flex h-8 w-8 shrink-0 items-center justify-center self-end rounded-md border border-border text-text-tertiary transition-colors hover:bg-hover hover:text-text-primary disabled:opacity-40'
+const addButtonClass = 'inline-flex h-8 items-center gap-1.5 rounded-md border border-dashed border-border px-2.5 text-xs text-text-secondary transition-colors hover:bg-hover hover:text-text-primary disabled:opacity-40'
+const snippetBtnClass = 'btn btn-secondary btn-sm'
 </script>
 
 <template>
@@ -288,7 +288,7 @@ const snippetBtnClass = 'inline-flex h-7 items-center rounded-md border border-b
       </div>
       <div v-if="missingFields.length" class="mb-3 flex flex-wrap items-center gap-2 rounded-md bg-surface-muted px-3 py-2 text-xs text-warning">
         <span>缺少字段声明:{{ missingFields.join(', ') }}</span>
-        <button v-if="!disabled" type="button" class="rounded border border-border px-2 py-0.5 text-text-secondary hover:bg-hover" @click="declareMissingFields">
+        <button v-if="!disabled" type="button" class="btn btn-secondary btn-sm" @click="declareMissingFields">
           一键补充声明
         </button>
       </div>
@@ -677,7 +677,7 @@ const snippetBtnClass = 'inline-flex h-7 items-center rounded-md border border-b
             <h4 class="text-sm font-semibold text-text-primary">插入片段 · {{ snippetTarget }}</h4>
             <p class="mt-1 text-[11px] text-text-tertiary">未验证配置辅助,不代表策略有效或可交易。不自动改 overlays/validation。</p>
           </div>
-          <button type="button" class="rounded border border-border p-1 text-text-tertiary hover:bg-hover" aria-label="关闭" @click="snippetOpen = false">
+          <button type="button" class="icon-button !h-7 !w-7" aria-label="关闭" @click="snippetOpen = false">
             <X :size="14" />
           </button>
         </div>
@@ -707,10 +707,10 @@ const snippetBtnClass = 'inline-flex h-7 items-center rounded-md border border-b
         </div>
         <pre class="mt-3 max-h-40 overflow-auto rounded-md bg-surface-muted p-2 text-[10px] leading-4 text-text-tertiary">{{ snippetPreview }}</pre>
         <div class="mt-3 flex justify-end gap-2">
-          <button type="button" class="rounded-md border border-border px-3 py-1.5 text-xs text-text-secondary hover:bg-hover" @click="snippetOpen = false">取消</button>
+          <button type="button" class="btn btn-secondary btn-sm" @click="snippetOpen = false">取消</button>
           <button
             type="button"
-            class="rounded-md bg-accent px-3 py-1.5 text-xs font-medium text-white hover:opacity-90 disabled:opacity-40"
+            class="btn btn-primary btn-sm"
             :disabled="!selectedSnippet"
             @click="applySnippet"
           >确认插入</button>

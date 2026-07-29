@@ -92,7 +92,19 @@ const routeTitles: Record<string, string> = {
   settings: '账户设置',
 }
 
+const routeDescriptions: Record<string, string> = {
+  watchlist: '自选股票决定行情总览「自选行情」的展示范围，盘中快照也按自选名单采集。',
+  selection: '查看每日量化候选，或用技术面、估值和财务条件独立组合筛选。',
+  signals: '查看策略在日线数据上发生的状态变化，并阅读产生提示的原因。',
+  pools: '选股与回测的研究范围。预置池按成分变动历史逐日解析，自定义池只保存当前名单。',
+  strategies: '理解策略规则，用历史日线验证表现，再比较不同策略与参数。',
+  portfolio: '记录已在外部交易软件中完成的成交，并查看持仓估值。',
+  catalog: '中文名称用于阅读，英文 key 用于对照系统参数。',
+  settings: '记录与实盘能力相关的偏好，系统不会代为下单。',
+}
+
 const currentRouteTitle = computed(() => routeTitles[String(route.name)] ?? '研究工作台')
+const currentRouteDescription = computed(() => routeDescriptions[String(route.name)] ?? '')
 const currentRouteSection = computed(() => {
   const routeName = String(route.name)
   return navGroups.find((group) => group.items.some((item) => item.name === routeName))?.label ?? '行情研究'
@@ -293,13 +305,16 @@ onBeforeUnmount(() => {
           <span class="sr-only">打开导航</span>
         </button>
 
-        <div class="hidden min-w-0 items-center gap-1.5 text-xs sm:flex lg:w-52">
-          <span class="truncate text-text-tertiary">{{ currentRouteSection }}</span>
+        <div class="hidden min-w-0 items-center gap-1.5 text-xs sm:flex">
+          <span class="shrink-0 text-text-tertiary">{{ currentRouteSection }}</span>
           <span class="text-border">/</span>
-          <strong class="truncate font-medium text-text-primary">{{ currentRouteTitle }}</strong>
+          <strong class="shrink-0 font-medium text-text-primary">{{ currentRouteTitle }}</strong>
+          <span v-if="currentRouteDescription" class="hidden min-w-0 truncate text-text-tertiary xl:inline">
+            · {{ currentRouteDescription }}
+          </span>
         </div>
 
-        <form class="mx-auto flex min-w-0 max-w-md flex-1 items-center" role="search" @submit.prevent="openStock">
+        <form class="ml-auto flex w-full min-w-0 max-w-md items-center" role="search" @submit.prevent="openStock">
           <StockSearchInput
             ref="stockSearch"
             v-model="stockCode"
@@ -318,7 +333,7 @@ onBeforeUnmount(() => {
           </button>
         </form>
 
-        <div class="ml-auto hidden items-center gap-2.5 text-xs text-text-tertiary 2xl:flex">
+        <div class="hidden items-center gap-2.5 text-xs text-text-tertiary 2xl:flex">
           <span>{{ today }}</span>
           <span class="h-3 w-px bg-border" />
           <span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-down" />日频研究模式</span>

@@ -6,11 +6,11 @@
  * 自定义池(kind='static')只存代码不存日期,故无成员历史 —— 页面需明示该取舍。
  */
 import { computed, onMounted, ref, watch } from 'vue'
-import { AlertTriangle, ClipboardPaste, Lock, Plus, Trash2 } from 'lucide-vue-next'
+import { AlertTriangle, ClipboardPaste, Lock, Plus, Search, Trash2 } from 'lucide-vue-next'
 import { api, isPresetPool, normalizeStockCode, type Pool, type PoolMember } from '../api'
-import PageHeader from '../components/PageHeader.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import { fmtPct, fmtPrice } from '../format'
 import { usePools } from '../pools'
 import { useAsyncAction } from '../useAsyncAction'
 
@@ -33,6 +33,21 @@ const minListDays = ref(60)
 
 const selected = computed<Pool | null>(() => pools.value.find((pool) => pool.id === selectedId.value) ?? null)
 const readonlyPool = computed(() => isPresetPool(selected.value))
+
+/** 成员表格过滤:代码或名称子串 */
+const memberFilter = ref('')
+const filteredMembers = computed(() => {
+  const f = memberFilter.value.trim().toLowerCase()
+  if (!f) return members.value
+  return members.value.filter((member) =>
+    member.code.includes(f) || (member.name ?? '').toLowerCase().includes(f))
+})
+
+/** 涨跌幅配色:A股惯例涨红跌绿,无数据/平盘用中性色 */
+function pctClass(value?: number | null): string {
+  if (value == null || value === 0) return 'text-text-secondary'
+  return value > 0 ? 'text-up' : 'text-down'
+}
 
 /** 粘贴框里能识别出的合法代码,去重后预览 */
 const parsedCodes = computed(() => {
@@ -75,6 +90,7 @@ async function loadMembers(id: number | null) {
 watch(selectedId, (id) => {
   clear()
   pasteText.value = ''
+  memberFilter.value = ''
   void loadMembers(id)
 })
 
@@ -164,11 +180,6 @@ async function deletePool() {
 
 <template>
   <div class="space-y-5">
-    <PageHeader
-      title="股票池组"
-      description="选股与回测的研究范围。预置池按指数成分变动历史逐日解析，自定义池只保存当前名单。"
-    />
-
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
@@ -181,7 +192,7 @@ async function deletePool() {
           <li v-for="pool in pools" :key="pool.id">
             <button
               type="button"
-              class="w-full rounded-md border px-3 py-2 text-left text-sm"
+              class="w-full rounded-md border px-3 py-2 text-left text-sm transition-colors"
               :class="pool.id === selectedId
                 ? 'border-accent bg-active text-text-primary'
                 : 'border-border bg-surface-raised text-text-secondary hover:bg-hover'"
@@ -210,16 +221,16 @@ async function deletePool() {
           <input
             v-model="newPoolName"
             placeholder="名称，如 我的观察池"
-            class="w-full rounded-md border border-border px-2 py-1.5 text-sm"
+            class="h-9 w-full rounded-md border border-border px-2.5 text-sm"
           />
           <label class="block text-xs text-text-tertiary">
             新股上市满（交易日）
-            <input v-model.number="minListDays" type="number" min="0" max="750" class="mt-1 w-full rounded-md border border-border px-2 py-1.5 text-sm" />
+            <input v-model.number="minListDays" type="number" min="0" max="750" class="mt-1 h-9 w-full rounded-md border border-border px-2.5 text-sm" />
           </label>
           <button
             type="submit"
             :disabled="busy"
-            class="inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
+            class="btn btn-primary w-full"
           >
             <Plus :size="15" />
             新建
@@ -242,7 +253,7 @@ async function deletePool() {
             <button
               type="button"
               :disabled="busy"
-              class="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              class="btn btn-secondary"
               @click="saveAsCustom"
             >
               另存为自定义池
@@ -251,7 +262,7 @@ async function deletePool() {
               v-if="!readonlyPool"
               type="button"
               :disabled="busy"
-              class="inline-flex items-center gap-1.5 rounded-md border border-up/40 px-3 py-1.5 text-sm text-up hover:bg-up/5 disabled:opacity-50"
+              class="btn btn-danger"
               @click="deletePool"
             >
               <Trash2 :size="14" />
@@ -283,12 +294,12 @@ async function deletePool() {
           <div class="flex flex-wrap items-end gap-3 rounded-md border border-border bg-surface-raised p-4">
             <label class="text-sm">
               <span class="mb-1 block text-xs text-text-tertiary">新股上市满（交易日）</span>
-              <input v-model.number="selected.min_list_days" type="number" min="0" max="750" class="w-32 rounded-md border border-border px-2 py-1.5 text-sm" />
+              <input v-model.number="selected.min_list_days" type="number" min="0" max="750" class="h-9 w-32 rounded-md border border-border px-2.5 text-sm" />
             </label>
             <button
               type="button"
               :disabled="busy"
-              class="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              class="btn btn-secondary"
               @click="saveSettings"
             >
               保存设置
@@ -314,7 +325,7 @@ async function deletePool() {
               <button
                 type="button"
                 :disabled="busy || !parsedCodes.length"
-                class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
+                class="btn btn-primary"
                 @click="importCodes"
               >
                 导入 {{ parsedCodes.length }} 只
@@ -326,35 +337,65 @@ async function deletePool() {
 
         <!-- 成员列表 -->
         <div>
-          <h3 class="mb-2 text-sm font-semibold">
-            成员
-            <span class="ml-1 font-normal text-text-tertiary">（{{ members.length }}）</span>
-          </h3>
-          <LoadingRows v-if="membersLoading" :rows="3" />
-          <template v-else-if="members.length">
-            <div class="flex flex-wrap gap-2">
-              <span
-                v-for="member in members"
-                :key="member.code"
-                class="inline-flex items-center gap-1.5 rounded-md border border-border bg-surface-raised px-2.5 py-1 text-xs"
-              >
-                <router-link :to="`/stock/${member.code}`" class="hover:text-accent">
-                  {{ member.name || member.code }}
-                  <span class="ml-1 text-text-tertiary">{{ member.code }}</span>
-                </router-link>
-                <button
-                  v-if="!readonlyPool"
-                  type="button"
-                  :disabled="busy"
-                  class="text-text-tertiary hover:text-up disabled:opacity-40"
-                  :aria-label="`从股票池移除 ${member.name || member.code}`"
-                  @click="removeMember(member.code)"
-                >
-                  <Trash2 :size="12" />
-                </button>
-              </span>
+          <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <h3 class="text-sm font-semibold">
+              成员
+              <span class="ml-1 font-normal text-text-tertiary">（{{ members.length }}）</span>
+            </h3>
+            <div v-if="members.length" class="flex items-center gap-1.5 rounded-md border border-border bg-surface-raised px-2.5">
+              <Search :size="13" class="shrink-0 text-text-tertiary" />
+              <input
+                v-model="memberFilter"
+                type="text"
+                placeholder="过滤代码或名称"
+                class="h-8 w-44 bg-transparent text-xs outline-none"
+              />
             </div>
-          </template>
+          </div>
+          <LoadingRows v-if="membersLoading" :rows="3" />
+          <div v-else-if="filteredMembers.length" class="max-h-[26rem] overflow-y-auto rounded-md border border-border bg-surface-raised">
+            <table class="terminal-table">
+              <thead>
+                <tr>
+                  <th class="w-32">代码</th>
+                  <th>名称</th>
+                  <th class="w-24 text-right">最新价</th>
+                  <th class="w-20 text-right">涨跌幅</th>
+                  <th v-if="!readonlyPool" class="w-16 text-right">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="member in filteredMembers" :key="member.code">
+                  <td class="font-mono text-xs text-text-tertiary">{{ member.code }}</td>
+                  <td>
+                    <router-link :to="`/stock/${member.code}`" class="transition-colors hover:text-accent">
+                      {{ member.name || member.code }}
+                    </router-link>
+                  </td>
+                  <td class="text-right tabular-nums">
+                    {{ member.price == null ? '--' : fmtPrice(member.price) }}
+                  </td>
+                  <td class="text-right tabular-nums" :class="pctClass(member.pct_chg)">
+                    {{ member.pct_chg == null ? '--' : fmtPct(member.pct_chg) }}
+                  </td>
+                  <td v-if="!readonlyPool" class="text-right">
+                    <button
+                      type="button"
+                      :disabled="busy"
+                      class="text-text-tertiary transition-colors hover:text-up disabled:opacity-40"
+                      :aria-label="`从股票池移除 ${member.name || member.code}`"
+                      @click="removeMember(member.code)"
+                    >
+                      <Trash2 :size="13" />
+                    </button>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else-if="members.length" class="rounded-md border border-dashed border-border px-4 py-6 text-center text-sm text-text-tertiary">
+            没有匹配「{{ memberFilter }}」的成员。
+          </p>
           <p v-else class="rounded-md border border-dashed border-border px-4 py-8 text-center text-sm text-text-tertiary">
             <template v-if="readonlyPool">该池成员按交易日动态解析，不保存固定名单。</template>
             <template v-else>还没有成员，先在上方粘贴代码导入。</template>

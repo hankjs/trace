@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import PageHeader from '../components/PageHeader.vue'
 import WorkspaceTabs from '../components/WorkspaceTabs.vue'
 import Backtest from './Backtest.vue'
 import Experiments from './Experiments.vue'
@@ -35,14 +34,12 @@ function changeTab(tab: string) {
 </script>
 
 <template>
-  <div class="space-y-5">
-    <PageHeader
-      title="策略研究"
-      description="理解策略规则，用历史日线验证表现，再比较不同策略与参数。"
-    />
+  <div :class="active === 'manage' ? 'space-y-5 lg:flex lg:h-full lg:min-h-0 lg:flex-col lg:gap-5 lg:space-y-0' : 'space-y-5'">
     <WorkspaceTabs :tabs="tabs" :active="active" @change="changeTab" />
-    <KeepAlive>
-      <component :is="activeComponent" />
-    </KeepAlive>
+    <div :class="active === 'manage' ? 'lg:min-h-0 lg:flex-1' : ''">
+      <KeepAlive>
+        <component :is="activeComponent" />
+      </KeepAlive>
+    </div>
   </div>
 </template>

@@ -3,7 +3,6 @@ import { computed, onMounted, ref } from 'vue'
 import { BookOpen, Search } from 'lucide-vue-next'
 import type { CatalogEntry } from '../api'
 import { categoryLabels, useCatalog } from '../catalog'
-import PageHeader from '../components/PageHeader.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import WorkspaceTabs from '../components/WorkspaceTabs.vue'
 
@@ -45,18 +44,12 @@ onMounted(load)
 
 <template>
   <div class="space-y-5">
-    <PageHeader
-      title="研究词典"
-      description="中文名称用于阅读，英文 key 用于对照系统参数。"
-    >
-      <template #actions>
-        <span v-if="usingFallback" class="rounded-md bg-warning-soft px-2 py-1 text-xs text-warning">
-          使用内置词典
-        </span>
-      </template>
-    </PageHeader>
-
-    <WorkspaceTabs :tabs="tabs" :active="active" @change="changeTab" />
+    <div class="flex items-center justify-between gap-3">
+      <WorkspaceTabs :tabs="tabs" :active="active" @change="changeTab" />
+      <span v-if="usingFallback" class="rounded-md bg-warning-soft px-2 py-1 text-xs text-warning">
+        使用内置词典
+      </span>
+    </div>
 
     <label class="relative block max-w-md">
       <span class="sr-only">搜索名称、说明或英文 key</span>

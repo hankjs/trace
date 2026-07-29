@@ -13,6 +13,8 @@ import ManagedSelectField from './ManagedSelectField.vue'
 
 const props = withDefaults(defineProps<{
   label?: string
+  /** 隐藏内置标签(父级已提供标签行时) */
+  hideLabel?: boolean
   /** 是否展示「管理股票池」入口 */
   manageLink?: boolean
   /** 是否在选中静态池时展示幸存者偏差提示 */
@@ -20,6 +22,7 @@ const props = withDefaults(defineProps<{
   disabled?: boolean
 }>(), {
   label: '股票池',
+  hideLabel: false,
   manageLink: true,
   showBiasHint: true,
   disabled: false,
@@ -64,7 +67,7 @@ onMounted(() => {
 <template>
   <ManagedSelectField
     v-model="model"
-    :label="label"
+    :label="hideLabel ? '' : label"
     :options="selectOptions"
     :loading="loading"
     :error="error ? `股票池加载失败：${error}` : ''"

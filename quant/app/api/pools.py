@@ -22,6 +22,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth import require_client, user_id_from_claims
+from ..data.latest_prices import latest_quotes
 from ..data.universe import (DEFAULT_MIN_LIST_DAYS, INDEX_NAMES,
                              IncompleteListingDataError,
                              MissingIndexHistoryError, resolve_pool,
@@ -350,10 +351,20 @@ def delete_pool(pool_id: int, db: Session = Depends(get_db),
 @router.get("/{pool_id}/members")
 def list_pool_members(pool_id: int, db: Session = Depends(get_db),
                       claims: dict = Depends(require_client)):
-    """池成员。预置池返回**当日解析出的当前成分**(供「另存为」取快照)。"""
+    """池成员。预置池返回**当日解析出的当前成分**(供「另存为」取快照)。
+
+    每项附最新参考价(盘中快照优先于最近收盘),供成员表格展示。
+    """
     pool = get_pool_or_404(db, pool_id, user_id_from_claims(claims))
     codes = resolve_pool_codes(db, pool)
     items = StockRepository(db).items(codes)
+    quotes = latest_quotes(db, [item["code"] for item in items])
+    for item in items:
+        quote = quotes.get(item["code"]) or {}
+        item["price"] = quote.get("price")
+        item["pct_chg"] = quote.get("pct_chg")
+        item["price_ts"] = quote.get("ts")
+        item["price_source"] = quote.get("source")
     return {"count": len(items), "items": items, "resolved": is_preset(pool)}
 
 

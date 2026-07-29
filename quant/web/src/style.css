@@ -116,6 +116,11 @@ textarea {
   color: var(--color-text-primary);
 }
 
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--color-accent);
+}
+
 input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
@@ -182,23 +187,147 @@ select:disabled {
   padding: 0.5rem 0.75rem;
 }
 
+/* 统一按钮体系:主/次/危险/幽灵四级 + 小尺寸修饰,颜色全部走主题变量 */
+.btn {
+  display: inline-flex;
+  height: 2.25rem;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 0.375rem;
+  border: 1px solid transparent;
+  border-radius: 0.375rem;
+  padding: 0 0.875rem;
+  font-size: 0.875rem;
+  line-height: 1;
+  white-space: nowrap;
+  transition: color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    background-color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+}
+
+.btn-sm {
+  height: 2rem;
+  padding: 0 0.625rem;
+  font-size: 0.75rem;
+}
+
+.btn-primary {
+  background: var(--color-accent);
+  color: var(--color-on-accent);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--color-accent-hover);
+}
+
+.btn-secondary {
+  border-color: var(--color-border);
+  background: var(--color-surface-raised);
+  color: var(--color-text-secondary);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--color-hover);
+  color: var(--color-text-primary);
+}
+
+.btn-danger {
+  border-color: color-mix(in oklch, var(--color-up) 40%, transparent);
+  background: transparent;
+  color: var(--color-up);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: var(--color-danger-soft);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--color-text-secondary);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--color-hover);
+  color: var(--color-text-primary);
+}
+
+.btn-ghost-danger {
+  background: transparent;
+  color: var(--color-text-tertiary);
+}
+
+.btn-ghost-danger:hover:not(:disabled) {
+  background: var(--color-danger-soft);
+  color: var(--color-up);
+}
+
+/* 兼容旧类:与 .btn .btn-secondary .btn-sm 视觉一致 */
 .workspace-command {
   display: inline-flex;
   height: 2rem;
   flex-shrink: 0;
   align-items: center;
+  justify-content: center;
   gap: 0.35rem;
   border: 1px solid var(--color-border);
-  border-radius: 0.25rem;
-  padding: 0 0.55rem;
+  border-radius: 0.375rem;
+  padding: 0 0.625rem;
   background: var(--color-surface-raised);
   color: var(--color-text-secondary);
   font-size: 0.75rem;
+  white-space: nowrap;
+  transition: color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    background-color 160ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
-.workspace-command:hover {
+.workspace-command:hover:not(:disabled) {
   background: var(--color-hover);
   color: var(--color-text-primary);
+}
+
+.workspace-command:disabled {
+  opacity: 0.5;
+}
+
+/* 分段切换控件(如 单次回测/参数扫描) */
+.segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.125rem;
+  border: 1px solid var(--color-border);
+  border-radius: 0.375rem;
+  background: var(--color-surface-raised);
+  padding: 0.125rem;
+}
+
+.segmented > button {
+  height: 1.75rem;
+  border-radius: 0.25rem;
+  padding: 0 0.75rem;
+  font-size: 0.8125rem;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  transition: color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    background-color 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.segmented > button:hover:not(:disabled) {
+  color: var(--color-text-primary);
+}
+
+.segmented > button[aria-pressed="true"] {
+  background: var(--color-active);
+  color: var(--color-text-primary);
+  font-weight: 500;
+}
+
+.segmented > button:disabled {
+  opacity: 0.45;
 }
 
 .terminal-table {

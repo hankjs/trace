@@ -784,6 +784,34 @@ def run_backtest(db: Session, strategy, codes: list[str],
     if not dfs:
         raise ValueError("所有标的都数据不足,无法回测")
 
+    # 股票池范围(dynamic_universe)对单标的同样逐日生效:入池前/出池后
+    # 目标仓位归零。出池当天的 1->0 跳变由后续信号转换形成一笔强制退出,
+    # 与组合资格掩码同一口径,防止「用区间末成分回测区间初」的会员前视。
+    eligibility = None
+    if dynamic_universe and pool_id is not None:
+        pool = db.get(Pool, pool_id)
+        if pool is not None:
+            idx = pd.DatetimeIndex(
+                sorted({d for df in dfs.values() for d in df["date"]})
+            )
+            eligibility = pool_eligibility_matrix(
+                db, idx, list(dfs), kind=pool.kind,
+                index_name=pool.ref if pool.ref in INDEX_NAMES else None,
+                min_list_days=pool.min_list_days, daily_frames=dfs,
+            )
+            for code in list(positions):
+                if code not in eligibility.columns:
+                    continue
+                eligible = eligibility[code].reindex(
+                    pd.DatetimeIndex(dfs[code]["date"]), fill_value=False,
+                ).to_numpy()
+                pos = positions[code]
+                masked = np.where(eligible, np.asarray(pos, dtype=float), 0.0)
+                positions[code] = (
+                    pd.Series(masked, index=pos.index)
+                    if isinstance(pos, pd.Series) else masked
+                )
+
     results = _batch_single(
         dfs, positions, costs, start, exit_reasons_by_code=exit_reasons,
     )
@@ -817,6 +845,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
         end=end,
         pool_id=pool_id,
         dynamic_universe=dynamic_universe,
+        eligibility=eligibility,
     )
     data_quality = frames_data_quality(dfs, required_fields=extra_fields)
     evidence = {

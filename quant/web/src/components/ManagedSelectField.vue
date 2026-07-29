@@ -44,7 +44,7 @@ function onSelect(value: string) {
   <div class="text-sm">
     <div class="flex items-end gap-2">
       <label class="block">
-        <span class="mb-1 block text-xs text-text-tertiary">{{ label }}</span>
+        <span v-if="label" class="mb-1 block text-xs text-text-tertiary">{{ label }}</span>
         <select
           :value="model ?? ''"
           :disabled="disabled || loading || (!options.length && !allowEmpty)"

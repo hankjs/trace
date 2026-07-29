@@ -48,7 +48,7 @@ class BacktestIn(BaseModel):
     codes: list[str] = Field(default_factory=list, max_length=800)  # 可留空用动态池
     start: date
     end: date
-    pool_id: int | None = None  # 组合策略可临时覆盖 spec.universe.pool_id
+    pool_id: int | None = None  # 组合策略可临时覆盖 spec.universe.pool_id;单标的策略也可用它定义研究范围(与 codes 互斥)
     # 仅兼容旧客户端；结构化策略应先保存完整规格再运行。
     params: dict = Field(default_factory=dict)
     costs: dict = Field(default_factory=dict)  # 可选覆盖费用
@@ -257,6 +257,11 @@ def _prepare_backtest(
     if body.pool_id is not None:
         pool = get_pool_or_404(db, body.pool_id, user_id)
     use_pool = strategy.kind == "portfolio" and not codes
+    if strategy.kind != "portfolio" and pool is not None:
+        # 单标的策略也允许用股票池定义研究范围;与手动 codes 互斥,避免语义含糊
+        if codes:
+            raise HTTPException(400, "codes 与 pool_id 只能选其一")
+        use_pool = True
     if use_pool:
         if pool is None:
             pool = get_pool_or_404(

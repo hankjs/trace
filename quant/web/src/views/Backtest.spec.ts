@@ -68,6 +68,14 @@ async function mountPage(item: Strategy) {
     limits: { max_total: 50, max_enabled: 10 },
   })
   vi.spyOn(api, 'watchlist').mockResolvedValue({ count: 0, items: [] })
+  vi.spyOn(api, 'stockList').mockResolvedValue({
+    count: 1,
+    items: [{ code: 'sh.600519', name: '贵州茅台', industry: '白酒', is_watch: false }],
+  })
+  vi.spyOn(api, 'pools').mockResolvedValue({
+    count: 1,
+    items: [{ id: 2, kind: 'all', name: '全部A股', min_list_days: 60, is_system: true }],
+  })
   const router = createRouter({
     history: createMemoryHistory(),
     routes: [
@@ -94,7 +102,11 @@ async function fillScope(wrapper: Awaited<ReturnType<typeof mountPage>>['wrapper
   const dates = wrapper.findAll<HTMLInputElement>('input[type="date"]')
   await dates[0].setValue('2024-01-01')
   await dates[1].setValue('2024-12-31')
-  await wrapper.get<HTMLInputElement>('input[placeholder="sh.600519, sz.000001"]').setValue('sh.600519')
+  // 通过选股器选择 sh.600519:打开弹层,点击对应行
+  await wrapper.get('button[aria-haspopup="listbox"]').trigger('click')
+  const row = wrapper.findAll('button[role="option"]').find((b) => b.text().includes('sh.600519'))
+  expect(row).toBeDefined()
+  await row!.trigger('click')
 }
 
 beforeEach(() => {
@@ -153,6 +165,31 @@ describe('saved StrategySpec backtest workflow', () => {
       start: '2024-01-01',
       end: '2024-12-31',
       param_grid: { '$.overlays.risk.value': [0.05, 0.08] },
+      costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
+    })
+  })
+
+  it('runs a single strategy against a pool', async () => {
+    const { wrapper, api } = await mountPage(strategy())
+    const run = vi.spyOn(api, 'runBacktest').mockResolvedValue(backtestResult())
+    const dates = wrapper.findAll<HTMLInputElement>('input[type="date"]')
+    await dates[0].setValue('2024-01-01')
+    await dates[1].setValue('2024-12-31')
+
+    // 切到「按股票池」模式,PoolSelect 就绪后落到默认池(全部A股 id=2)
+    const poolModeButton = wrapper.findAll('button').find((b) => b.text() === '按股票池')!
+    await poolModeButton.trigger('click')
+    await flushPromises()
+
+    await wrapper.get('form').trigger('submit')
+    await flushPromises()
+
+    expect(run).toHaveBeenCalledWith({
+      strategy_id: 7,
+      codes: [],
+      start: '2024-01-01',
+      end: '2024-12-31',
+      pool_id: 2,
       costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
     })
   })

@@ -3,7 +3,6 @@ import { computed, onMounted, reactive, ref } from 'vue'
 import { api, type PortfolioSummary, type Position, type ResearchPlanSummary, type Trade } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
-import PageHeader from '../components/PageHeader.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
@@ -126,8 +125,6 @@ onMounted(load)
 
 <template>
   <div class="space-y-6">
-    <PageHeader title="我的持仓" description="记录已在外部交易软件中完成的成交，并查看持仓估值。" />
-
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <LoadingRows v-if="loading" :rows="5" />
 

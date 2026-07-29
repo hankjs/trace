@@ -130,6 +130,27 @@ def test_preset_index_pool_members_resolve_current_constituents():
     assert result["items"][0]["name"] == "贵州茅台"
 
 
+def test_pool_members_include_latest_price():
+    """成员项附最新参考价:有日线给收盘价,无行情给空字段。"""
+    with _session() as db:
+        _seed(db)
+        db.add(DailyBar(
+            code="sh.600519", date=TODAY,
+            open=1700, high=1710, low=1690, close=1705.5, raw_close=1705.5,
+            volume=1, amount=1, is_st=False,
+        ))
+        db.commit()
+        result = list_pool_members(pool_id=3, db=db, claims=CLAIMS_A)
+
+    by_code = {item["code"]: item for item in result["items"]}
+    assert by_code["sh.600519"]["price"] == 1705.5
+    assert by_code["sh.600519"]["price_source"] == "close"
+    assert by_code["sh.600519"]["pct_chg"] is None
+    assert by_code["sh.600519"]["price_ts"] == str(TODAY)
+    assert by_code["sz.000001"]["price"] is None
+    assert by_code["sz.000001"]["price_source"] is None
+
+
 def test_preset_all_market_pool_members_resolve_from_stock_table():
     from app.data.clock import today_cst
 
@@ -657,3 +678,67 @@ def test_explicit_codes_backtest_does_not_echo_pool():
 
     assert "pool" not in result
     assert run.pool_id is None
+
+
+def test_single_backtest_resolves_pool_and_persists_pool_id():
+    """单标的策略也可用股票池定义研究范围:codes 留空 + pool_id 解析成分。"""
+    # 起点须在名录最早生效日(LONG_AGO ≈ 2024-05)之后
+    start, end = date(2024, 6, 3), date(2024, 12, 31)
+    with _session() as db:
+        _seed(db)
+        _seed_bars(db, ["sh.600519", "sz.000001"], start, end)
+        result = create_backtest(
+            BacktestIn(strategy_id=MA_CROSS_ID, codes=[],
+                       start=start, end=end, pool_id=3),
+            background_tasks=BackgroundTasks(), db=db, claims=CLAIMS_A,
+        )
+        run = db.get(BacktestRun, result["run_id"])
+        reloaded = get_backtest(run_id=result["run_id"], db=db, claims=CLAIMS_A)
+
+    # 沪深300 预置池(id=3)成分为 sh.600519 / sz.000001
+    assert sorted(result["codes"]) == ["sh.600519", "sz.000001"]
+    assert result["pool"] == {
+        "id": 3, "name": "沪深300", "kind": "index",
+        "has_survivorship_bias": False,
+    }
+    assert run.pool_id == 3
+    assert reloaded["pool"] == result["pool"]
+
+
+def test_single_backtest_rejects_codes_with_pool():
+    """codes 与 pool_id 互斥:同时给出按 400 拒绝,而不是静默忽略一个。"""
+    start, end = date(2024, 1, 1), date(2024, 6, 30)
+    with _session() as db:
+        _seed(db)
+        with pytest.raises(HTTPException) as exc:
+            create_backtest(
+                BacktestIn(strategy_id=MA_CROSS_ID, codes=["sh.600519"],
+                           start=start, end=end, pool_id=3),
+                background_tasks=BackgroundTasks(), db=db, claims=CLAIMS_A,
+            )
+    assert exc.value.status_code == 400
+    assert "互斥" in str(exc.value.detail) or "只能选其一" in str(exc.value.detail)
+
+
+def test_single_backtest_gates_entries_by_membership():
+    """指数池成员资格逐日生效:入池日之前不允许建仓(point-in-time)。"""
+    start, end = date(2024, 6, 3), date(2024, 12, 31)
+    mid = date(2024, 9, 2)
+    with _session() as db:
+        _seed(db)
+        # sz.300750 在区间中段才纳入沪深300;合成行情全程温和上行,
+        # 若不按成员资格掩码,双均线策略会在 1 月就对它建仓
+        db.add(IndexMember(index_name="hs300", code="sz.300750", in_date=mid))
+        _seed_bars(db, ["sh.600519", "sz.300750"], start, end)
+        result = create_backtest(
+            BacktestIn(strategy_id=MA_CROSS_ID, codes=[],
+                       start=start, end=end, pool_id=3),
+            background_tasks=BackgroundTasks(), db=db, claims=CLAIMS_A,
+        )
+
+    assert "sz.300750" in result["codes"]
+    late_trades = [
+        t for t in result["trade_details"] if t["code"] == "sz.300750"
+    ]
+    assert late_trades, "入池后应当产生交易"
+    assert min(t["execution_date"] for t in late_trades) >= str(mid)

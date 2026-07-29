@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { AlertTriangle, CheckCircle2, Code2, Fingerprint, TriangleAlert } from 'lucide-vue-next'
+import { AlertTriangle, CheckCircle2, ChevronRight, Code2, Fingerprint, Plus, TriangleAlert } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
 import {
   api,
@@ -25,7 +25,7 @@ import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
-import StockSearchInput from '../components/StockSearchInput.vue'
+import StockPicker from '../components/StockPicker.vue'
 import StrategySelect from '../components/StrategySelect.vue'
 import { poolById } from '../pools'
 import { strategyById, useStrategies } from '../strategies'
@@ -41,9 +41,10 @@ const result = ref<BacktestResult | null>(null)
 const running = ref(false)
 const error = ref('')
 const runIdInput = ref('')
-const searchCode = ref('')
-/** 组合策略的研究范围;单标的策略不使用 */
+/** 股票池:组合策略的研究范围;单标的策略在「按股票池」模式下使用 */
 const poolId = ref<number | null>(null)
+/** 单标的策略的选股方式:手动选股 / 按股票池(与 codes 互斥) */
+const scopeMode = ref<'stocks' | 'pool'>('stocks')
 /** 选中的数据库策略；回测只按当前完整规格运行。 */
 const strategyId = ref<number | null>(null)
 
@@ -52,7 +53,6 @@ const mode = ref<'single' | 'sweep'>('single')
 
 const form = reactive({
   codes: [] as string[],
-  codesText: '',
   start: '',
   end: '',
 })
@@ -63,7 +63,6 @@ const costForm = reactive({ commissionWan: 2.5, stampTaxWan: 5, slippageWan: 1 }
 const selectedCapability = computed(() => strategy.value?.capability ?? null)
 const strategyRunnable = computed(() => selectedCapability.value?.status === 'supported')
 const selectedHypothesis = computed(() => String(strategy.value?.spec?.metadata?.hypothesis ?? '未提供研究假设'))
-const selectedSpecHash = computed(() => strategy.value?.spec_hash ?? '')
 
 watch(strategy, () => {
   if (isPortfolio.value && mode.value === 'sweep') mode.value = 'single'
@@ -406,7 +405,7 @@ const metrics = computed(() => {
  * 回测结果所用池是否为静态池。优先用后端回显的 pool(查询历史回测时本地没有选择状态),
  * 回退到当前选择。预置池(index/all)按逐日成分解析,不标注。
  */
-const resultPool = computed(() => result.value?.pool ?? (isPortfolio.value ? poolById(poolId.value) : null))
+const resultPool = computed(() => result.value?.pool ?? ((isPortfolio.value || scopeMode.value === 'pool') ? poolById(poolId.value) : null))
 const resultBiased = computed(() => hasSurvivorshipBias(resultPool.value))
 
 const resultCosts = computed(() => result.value?.costs ?? {})
@@ -545,18 +544,6 @@ function exitReasonName(reason: string): string {
   return exitReasonLabels[reason] ?? reason
 }
 
-function toggleCode(code: string) {
-  const i = form.codes.indexOf(code)
-  if (i >= 0) form.codes.splice(i, 1)
-  else form.codes.push(code)
-}
-
-function addSearchCode() {
-  const code = searchCode.value.trim().toLowerCase()
-  if (code && !form.codes.includes(code)) form.codes.push(code)
-  searchCode.value = ''
-}
-
 function stockName(code: string): string {
   return result.value?.stocks?.find((item) => item.code === code)?.name
     || sweepResult.value?.stocks?.find((item) => item.code === code)?.name
@@ -565,16 +552,14 @@ function stockName(code: string): string {
 }
 
 function parsedCodes(): string[] {
-  const extra = form.codesText
-    .split(/[,，\s]+/)
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean)
-  return [...new Set([...form.codes, ...extra])]
+  return [...new Set(form.codes)]
 }
 
 async function run() {
   error.value = ''
-  const codes = parsedCodes()
+  // 组合策略始终可用池;单标的策略仅在「按股票池」模式下用池,与手动 codes 互斥
+  const usePool = poolId.value !== null && (isPortfolio.value || scopeMode.value === 'pool')
+  const codes = usePool ? [] : parsedCodes()
   if (strategyId.value === null) {
     error.value = '请选择策略'
     return
@@ -583,8 +568,8 @@ async function run() {
     error.value = '当前策略存在数据或引擎能力缺口，请先在策略管理中修正'
     return
   }
-  if (!codes.length && !isPortfolio.value) {
-    error.value = '请至少选择一个股票代码'
+  if (!codes.length && !usePool && !isPortfolio.value) {
+    error.value = '请选择股票，或切换为按股票池回测'
     return
   }
   if (!form.start || !form.end) {
@@ -598,8 +583,9 @@ async function run() {
       codes,
       start: form.start,
       end: form.end,
-      // 组合策略按股票池解析成分(取代旧的「codes 留空隐式动态池」约定)
-      ...(isPortfolio.value && poolId.value !== null ? { pool_id: poolId.value } : {}),
+      // 组合策略按股票池解析成分(取代旧的「codes 留空隐式动态池」约定);
+      // 单标的「按股票池」模式同样留空 codes 并下发 pool_id
+      ...(usePool && !codes.length ? { pool_id: poolId.value! } : {}),
       costs: runCosts(),
     })
   } catch (e) {
@@ -668,23 +654,38 @@ watch(
 
 <template>
   <div class="space-y-6">
-    <div class="flex items-center gap-4">
-      <h2 class="text-base font-semibold">历史回测</h2>
-      <div class="flex rounded-md border border-border text-sm">
-        <button
-          class="rounded-l-md px-3 py-1"
-          :class="mode === 'single' ? 'bg-active font-medium text-text-primary' : 'text-text-secondary hover:bg-hover'"
-          @click="mode = 'single'"
-        >
-          单次回测
-        </button>
-        <button
-          class="rounded-r-md px-3 py-1 disabled:cursor-not-allowed disabled:opacity-40"
-          :disabled="isPortfolio"
-          :class="mode === 'sweep' ? 'bg-active font-medium text-text-primary' : 'text-text-secondary hover:bg-hover'"
-          @click="mode = 'sweep'"
-        >
-          参数扫描
+    <div class="flex flex-wrap items-center justify-between gap-3">
+      <div class="flex items-center gap-4">
+        <h2 class="text-base font-semibold">历史回测</h2>
+        <div class="segmented" role="group" aria-label="回测模式">
+          <button
+            type="button"
+            :aria-pressed="mode === 'single'"
+            @click="mode = 'single'"
+          >
+            单次回测
+          </button>
+          <button
+            type="button"
+            :aria-pressed="mode === 'sweep'"
+            :disabled="isPortfolio"
+            @click="mode = 'sweep'"
+          >
+            参数扫描
+          </button>
+        </div>
+      </div>
+      <div v-if="mode === 'single'" class="flex items-center gap-2">
+        <label for="history-run-id" class="text-xs text-text-tertiary">查询历史回测编号</label>
+        <input
+          id="history-run-id"
+          v-model="runIdInput"
+          type="number"
+          min="1"
+          class="h-8 w-28 rounded-md border border-border px-2.5 text-sm"
+        />
+        <button :disabled="running" class="btn btn-secondary btn-sm" @click="loadRun">
+          查询
         </button>
       </div>
     </div>
@@ -695,17 +696,6 @@ watch(
     >
       <div class="flex flex-wrap items-end gap-3">
         <StrategySelect v-model="strategyId" />
-        <label class="text-sm">
-          <span class="mb-1 block text-xs text-text-tertiary">开始日期</span>
-          <input v-model="form.start" type="date" class="rounded-md border border-border px-2 py-1.5" />
-        </label>
-        <label class="text-sm">
-          <span class="mb-1 block text-xs text-text-tertiary">结束日期</span>
-          <input v-model="form.end" type="date" class="rounded-md border border-border px-2 py-1.5" />
-        </label>
-        <button type="submit" :disabled="running || !strategyRunnable" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50">
-          {{ running ? '运行中…' : mode === 'single' ? '运行回测' : '开始扫描' }}
-        </button>
       </div>
 
       <div v-if="strategy" class="border-t border-border-subtle pt-3">
@@ -718,15 +708,9 @@ watch(
             {{ issue.message }} <code class="text-text-tertiary">{{ issue.path }}</code>
           </li>
         </ul>
-        <div v-else class="grid gap-3 text-xs md:grid-cols-[minmax(0,1fr)_auto]">
-          <div class="min-w-0">
-            <p class="font-medium text-text-primary">{{ selectedHypothesis }}</p>
-            <p class="mt-1 text-text-tertiary">回测将固化当前完整规格，页面不提供临时规则覆盖。</p>
-          </div>
-          <div class="text-text-tertiary md:text-right">
-            <p>{{ isPortfolio ? '组合目标权重' : '单标的目标仓位' }}</p>
-            <code v-if="selectedSpecHash" class="mt-1 block">{{ selectedSpecHash.slice(0, 16) }}</code>
-          </div>
+        <div v-else class="text-xs">
+          <p class="font-medium text-text-primary">{{ selectedHypothesis }}</p>
+          <p class="mt-1 text-text-tertiary">回测将固化当前完整规格，页面不提供临时规则覆盖。</p>
         </div>
       </div>
 
@@ -734,39 +718,57 @@ watch(
         <PoolSelect v-model="poolId" label="股票池（组合策略的选股范围）" />
       </div>
 
-      <div>
-        <span class="mb-1 block text-xs text-text-tertiary">
-          {{ isPortfolio ? '股票（留空则使用所选股票池在区间内的动态成分）' : '股票（点击选择自选股，或逗号分隔输入）' }}
-        </span>
-        <div class="mb-2 flex flex-wrap gap-2">
-          <button
-            v-for="w in watchlist"
-            :key="w.code"
-            type="button"
-            class="rounded-md border px-2.5 py-1 text-xs"
-            :class="form.codes.includes(w.code)
-              ? 'border-accent bg-active text-text-primary'
-              : 'border-border text-text-secondary hover:bg-hover'"
-            @click="toggleCode(w.code)"
-          >
-            {{ w.name || '名称待同步' }} · {{ w.code }}
-          </button>
+      <div class="flex flex-wrap items-end gap-3 border-t border-border-subtle pt-3">
+        <label class="text-sm">
+          <span class="mb-1 block text-xs text-text-tertiary">开始日期</span>
+          <input v-model="form.start" type="date" class="h-9 rounded-md border border-border px-2.5 text-sm" />
+        </label>
+        <label class="text-sm">
+          <span class="mb-1 block text-xs text-text-tertiary">结束日期</span>
+          <input v-model="form.end" type="date" class="h-9 rounded-md border border-border px-2.5 text-sm" />
+        </label>
+        <div class="min-w-64 flex-1">
+          <div class="mb-1 flex items-center justify-between gap-2">
+            <span class="text-xs text-text-tertiary">
+              {{ isPortfolio
+                ? '股票（留空则使用所选股票池在区间内的动态成分）'
+                : scopeMode === 'pool'
+                  ? '股票池（按成分逐日解析，入池前不会建仓）'
+                  : '股票' }}
+            </span>
+            <div v-if="!isPortfolio && mode === 'single'" class="segmented" role="group" aria-label="选股方式">
+              <button
+                type="button"
+                :aria-pressed="scopeMode === 'stocks'"
+                @click="scopeMode = 'stocks'"
+              >
+                手动选股
+              </button>
+              <button
+                type="button"
+                :aria-pressed="scopeMode === 'pool'"
+                @click="scopeMode = 'pool'"
+              >
+                按股票池
+              </button>
+            </div>
+          </div>
+          <StockPicker
+            v-if="isPortfolio || scopeMode === 'stocks'"
+            v-model="form.codes"
+            placeholder="点击选择股票（可多选）"
+          />
+          <PoolSelect v-else v-model="poolId" hide-label :manage-link="false" />
         </div>
-        <div class="mb-2 flex items-end gap-2">
-          <StockSearchInput v-model="searchCode" label="搜索其他股票" />
-          <button type="button" :disabled="!searchCode" class="h-9 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-40" @click="addSearchCode">添加</button>
-        </div>
-        <input
-          v-model="form.codesText"
-          placeholder="sh.600519, sz.000001"
-          class="w-full rounded-md border border-border px-2 py-1.5 text-sm sm:w-96"
-        />
       </div>
 
-      <div v-if="mode === 'sweep'">
+      <div v-if="mode === 'sweep'" class="border-t border-border-subtle pt-3">
         <div class="mb-1 flex items-center justify-between">
           <span class="text-xs text-text-tertiary">规格路径与候选值</span>
-          <button type="button" class="text-xs text-accent hover:underline" @click="addGridRow">添加路径</button>
+          <button type="button" class="btn btn-ghost btn-sm" @click="addGridRow">
+            <Plus :size="13" />
+            添加路径
+          </button>
         </div>
         <div class="space-y-2">
           <div v-for="(row, i) in gridRows" :key="i" class="flex items-center gap-2">
@@ -775,18 +777,18 @@ watch(
               data-testid="sweep-path"
               list="strategy-scan-paths"
               placeholder="$.overlays.risk.value"
-              class="w-72 rounded-md border border-border px-2 py-1.5 font-mono text-sm"
+              class="h-9 w-72 rounded-md border border-border px-2.5 font-mono text-sm"
             />
             <input
               v-model="row.valuesText"
               data-testid="sweep-values"
               :placeholder="gridPlaceholder(row.path)"
-              class="w-64 rounded-md border border-border px-2 py-1.5 text-sm"
+              class="h-9 w-64 rounded-md border border-border px-2.5 text-sm"
             />
             <button
               v-if="gridRows.length > 1"
               type="button"
-              class="text-xs text-text-tertiary hover:text-up"
+              class="btn btn-ghost-danger btn-sm"
               @click="removeGridRow(i)"
             >
               删除
@@ -806,40 +808,42 @@ watch(
           <button
             type="button"
             :disabled="running || !strategyRunnable"
-            class="rounded-md border border-border px-2.5 py-1 text-xs text-text-secondary hover:bg-hover disabled:opacity-50"
+            class="btn btn-secondary btn-sm"
             @click="runDeclaredSweep"
           >按规格声明扫描</button>
         </div>
       </div>
 
-      <fieldset class="border-t border-border-subtle pt-3">
-        <legend class="mb-2 text-xs font-medium text-text-secondary">模拟费用假设（万分）</legend>
-        <div class="flex flex-wrap gap-3">
+      <details class="group border-t border-border-subtle pt-3">
+        <summary class="flex cursor-pointer list-none items-center gap-1.5 text-xs font-medium text-text-secondary transition-colors hover:text-text-primary">
+          <ChevronRight :size="13" class="text-text-tertiary transition-transform group-open:rotate-90" />
+          模拟费用假设（万分）
+          <span class="font-normal text-text-tertiary">
+            佣金 {{ costForm.commissionWan }} · 印花税 {{ costForm.stampTaxWan }} · 滑点 {{ costForm.slippageWan }}
+          </span>
+        </summary>
+        <div class="mt-3 flex flex-wrap gap-3">
           <label class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">双边佣金</span>
-            <input v-model.number="costForm.commissionWan" type="number" min="0" max="500" step="0.1" class="h-9 w-28 rounded-md border border-border px-2" />
+            <input v-model.number="costForm.commissionWan" type="number" min="0" max="500" step="0.1" class="h-9 w-28 rounded-md border border-border px-2.5 text-sm" />
           </label>
           <label class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">卖出印花税</span>
-            <input v-model.number="costForm.stampTaxWan" type="number" min="0" max="500" step="0.1" class="h-9 w-28 rounded-md border border-border px-2" />
+            <input v-model.number="costForm.stampTaxWan" type="number" min="0" max="500" step="0.1" class="h-9 w-28 rounded-md border border-border px-2.5 text-sm" />
           </label>
           <label class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">双边滑点</span>
-            <input v-model.number="costForm.slippageWan" type="number" min="0" max="1000" step="0.1" class="h-9 w-28 rounded-md border border-border px-2" />
+            <input v-model.number="costForm.slippageWan" type="number" min="0" max="1000" step="0.1" class="h-9 w-28 rounded-md border border-border px-2.5 text-sm" />
           </label>
         </div>
-      </fieldset>
-    </form>
+      </details>
 
-    <div v-if="mode === 'single'" class="flex items-end gap-3 rounded-lg border border-border bg-surface-raised p-4">
-      <label class="text-sm">
-        <span class="mb-1 block text-xs text-text-tertiary">查询历史回测编号</span>
-        <input v-model="runIdInput" type="number" min="1" class="w-32 rounded-md border border-border px-2 py-1.5" />
-      </label>
-      <button :disabled="running" class="rounded-md border border-border px-4 py-1.5 text-sm text-text-secondary hover:bg-hover disabled:opacity-50" @click="loadRun">
-        查询
-      </button>
-    </div>
+      <div class="flex justify-end border-t border-border-subtle pt-3">
+        <button type="submit" :disabled="running || !strategyRunnable" class="btn btn-primary">
+          {{ running ? '运行中…' : mode === 'single' ? '运行回测' : '开始扫描' }}
+        </button>
+      </div>
+    </form>
 
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
 

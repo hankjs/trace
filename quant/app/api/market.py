@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import case, select
@@ -35,10 +36,11 @@ def _stock_out(stock: Stock, is_watch: bool = False) -> dict:
 def search_stocks(
     q: str = Query("", max_length=64, description="中文名、六位代码或 sh.600519"),
     limit: int = Query(20, ge=1, le=100),
+    all_stocks: Annotated[bool, Query(alias="all", description="下发全市场清单(选股器一次拉取,忽略 limit)")] = False,
     db: Session = Depends(get_db),
     claims: dict = Depends(require_client),
 ):
-    """搜索股票基础信息；空查询只返回自选股，不下发全市场列表。"""
+    """搜索股票基础信息；空查询只返回自选股，all=true 时下发全市场清单。"""
     query = q.strip()
     normalized = query.lower()
     user_id = user_id_from_claims(claims)
@@ -47,6 +49,15 @@ def search_stocks(
     ).scalars().all())
     stmt = select(Stock)
     watch_order = case((Stock.code.in_(watch_codes), 0), else_=1)
+
+    if all_stocks and not query:
+        # 选股器一次拉取全量:自选在前,其余按代码排序,客户端自行过滤与虚拟滚动
+        rows = db.execute(stmt.order_by(watch_order, Stock.code)).scalars().all()
+        return {
+            "query": query,
+            "count": len(rows),
+            "items": [_stock_out(stock, stock.code in watch_codes) for stock in rows],
+        }
 
     full_code = _FULL_CODE_RE.fullmatch(normalized)
     partial_code = _PARTIAL_CODE_RE.fullmatch(normalized)

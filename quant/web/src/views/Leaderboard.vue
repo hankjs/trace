@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
+import { ChevronDown, ChevronRight } from 'lucide-vue-next'
 import { api, type LeaderboardItem } from '../api'
 import { loadCatalog, metricName, templateName } from '../catalog'
 import InlineFeedback from '../components/InlineFeedback.vue'
@@ -125,7 +126,13 @@ onMounted(async () => {
         <template #cell-sharpe="{ row: item }">{{ metricText(metricNum(item, 'sharpe'), false) }}</template>
         <template #cell-win-rate="{ row: item }">{{ metricText(metricNum(item, 'win_rate')) }}</template>
         <template #cell-run-at="{ row: item }">{{ item.run_at || '--' }}</template>
-        <template #cell-actions="{ row: item }">{{ expanded === rowKey(item) ? '收起 ▲' : '明细 ▼' }}</template>
+        <template #cell-actions="{ row: item }">
+          <span class="btn btn-ghost btn-sm">
+            {{ expanded === rowKey(item) ? '收起' : '明细' }}
+            <ChevronDown v-if="expanded === rowKey(item)" :size="13" />
+            <ChevronRight v-else :size="13" />
+          </span>
+        </template>
         <template #after-row="{ row: item, colspan }">
           <tr v-if="expanded === rowKey(item)" class="border-b border-border-subtle bg-hover/50">
             <td :colspan="colspan" class="px-4 py-3">

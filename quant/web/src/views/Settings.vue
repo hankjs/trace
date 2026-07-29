@@ -6,7 +6,6 @@
 import { onMounted, ref } from 'vue'
 import { Settings as SettingsIcon } from 'lucide-vue-next'
 import { api, type UserSettings } from '../api'
-import PageHeader from '../components/PageHeader.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import { useAsyncAction } from '../useAsyncAction'
 
@@ -55,12 +54,6 @@ async function onToggleBse(event: Event) {
 
 <template>
   <div class="space-y-4">
-    <PageHeader
-      eyebrow="账户"
-      title="账户设置"
-      description="记录与实盘能力相关的偏好。系统仍只做研究与记账，不会代为下单；开关默认关闭。"
-    />
-
     <InlineFeedback :error="error" :notice="notice" />
 
     <section class="rounded border border-border bg-surface-raised">

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import PageHeader from '../components/PageHeader.vue'
 import WorkspaceTabs from '../components/WorkspaceTabs.vue'
 import Picks from './Picks.vue'
 import Screener from './Screener.vue'
@@ -23,10 +22,6 @@ function changeTab(tab: string) {
 
 <template>
   <div class="space-y-5">
-    <PageHeader
-      title="选股"
-      description="查看每日量化候选，或用技术面、估值和财务条件独立组合筛选。"
-    />
     <WorkspaceTabs :tabs="tabs" :active="active" @change="changeTab" />
     <KeepAlive>
       <component :is="activeComponent" />

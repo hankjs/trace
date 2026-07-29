@@ -8,7 +8,6 @@
 import { onMounted, ref } from 'vue'
 import { Star, Trash2 } from 'lucide-vue-next'
 import { api, type WatchItem } from '../api'
-import PageHeader from '../components/PageHeader.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import QuTable from '../components/QuTable.vue'
@@ -73,12 +72,6 @@ async function remove(item: WatchItem) {
 
 <template>
   <div class="space-y-4">
-    <PageHeader
-      eyebrow="行情研究"
-      title="自选股"
-      description="自选股票决定行情总览「自选行情」的展示范围，盘中快照也按自选名单采集。股票资料全系统共享，自选关系仅自己可见。"
-    />
-
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <InlineFeedback v-else-if="notice">{{ notice }}</InlineFeedback>
 

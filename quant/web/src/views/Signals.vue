@@ -5,7 +5,6 @@ import { api, type ResearchPlanSummary, type SignalItem, type WatchItem } from '
 import { loadCatalog, reasonText, signalName, templateName } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
-import PageHeader from '../components/PageHeader.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import StockSearchInput from '../components/StockSearchInput.vue'
@@ -132,8 +131,6 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-5">
-    <PageHeader title="信号提醒" description="查看策略在日线数据上发生的状态变化，并阅读产生提示的原因。" />
-
     <form class="flex flex-wrap items-end gap-3 border-b border-border-subtle pb-4" @submit.prevent="load">
       <label class="text-sm">
         <span class="mb-1 block text-xs text-text-tertiary">日期</span>

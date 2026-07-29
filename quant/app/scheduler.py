@@ -335,7 +335,8 @@ def job_intraday_snapshot() -> None:
     now = _now()
     if not _is_trading_day(now.date()):
         return
-    if not (dtime(9, 30) <= now.time() <= dtime(15, 0)):
+    # 上限放宽到 15:05:15:00 档任务实际触发于 15:00:00.00x,不能卡在 15:00:00 整
+    if not (dtime(9, 30) <= now.time() <= dtime(15, 5)):
         return
     try:
         with SessionLocal() as db:

@@ -126,7 +126,6 @@ onMounted(load)
   <div class="flex min-h-full flex-col gap-3 xl:h-full xl:min-h-0">
     <header class="flex min-h-10 shrink-0 flex-wrap items-center justify-between gap-2 border-b border-border pb-2.5">
       <div class="flex min-w-0 items-baseline gap-3">
-        <h1 class="text-base font-semibold">行情总览</h1>
         <span class="hidden text-xs text-text-tertiary sm:inline">研究基准 {{ researchDate }}</span>
       </div>
       <div class="grid w-full grid-cols-2 gap-1.5 sm:flex sm:w-auto sm:flex-wrap sm:justify-end">

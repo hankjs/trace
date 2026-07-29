@@ -360,11 +360,10 @@ void init()
 </script>
 
 <template>
-  <div class="space-y-4">
+  <div class="space-y-4 lg:flex lg:h-full lg:min-h-0 lg:flex-col lg:gap-4 lg:space-y-0">
     <div class="flex flex-wrap items-end justify-between gap-3">
       <div>
         <h2 class="text-base font-semibold">策略管理</h2>
-        <p class="mt-0.5 text-xs text-text-tertiary">数据库规格是当前策略定义的唯一来源，修改后原地生效。</p>
       </div>
       <p v-if="limits.max_total" class="text-xs text-text-tertiary">
         我的策略 {{ customStrategies.length }} / {{ limits.max_total }}
@@ -375,8 +374,8 @@ void init()
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
-    <div class="grid gap-5 lg:grid-cols-[18rem_minmax(0,1fr)]">
-      <section class="space-y-3" aria-labelledby="strategy-list-heading">
+    <div class="grid gap-5 lg:min-h-0 lg:flex-1 lg:grid-cols-[18rem_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]">
+      <section class="space-y-3 lg:min-h-0 lg:overflow-y-auto" aria-labelledby="strategy-list-heading">
         <h3 id="strategy-list-heading" class="text-sm font-semibold">全部策略</h3>
         <LoadingRows v-if="strategiesLoading" :rows="3" />
         <template v-else>
@@ -389,7 +388,7 @@ void init()
               <li v-for="strategy in group.items" :key="strategy.id">
                 <button
                   type="button"
-                  class="w-full rounded-md border px-3 py-2 text-left text-sm"
+                  class="w-full rounded-md border px-3 py-2 text-left text-sm transition-colors"
                   :class="strategy.id === selectedId && !creating
                     ? 'border-accent bg-active text-text-primary'
                     : 'border-border bg-surface-raised text-text-secondary hover:bg-hover'"
@@ -414,7 +413,7 @@ void init()
         <button
           type="button"
           :disabled="busy || quotaFull"
-          class="inline-flex h-9 w-full items-center justify-center gap-1.5 rounded-md bg-accent px-3 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
+          class="btn btn-primary w-full"
           @click="startCreate"
         >
           <Plus :size="15" />
@@ -423,7 +422,7 @@ void init()
         <p v-if="quotaFull" class="text-xs text-text-tertiary">策略数量已达上限 {{ limits.max_total }}。</p>
       </section>
 
-      <section v-if="creating || selected" class="min-w-0 space-y-4" aria-labelledby="strategy-detail-heading">
+      <section v-if="creating || selected" class="min-w-0 space-y-4 lg:min-h-0 lg:overflow-y-auto" aria-labelledby="strategy-detail-heading">
         <div class="flex flex-wrap items-end justify-between gap-3 border-b border-border-subtle pb-3">
           <div class="min-w-0">
             <h3 id="strategy-detail-heading" class="text-base font-semibold">
@@ -452,7 +451,7 @@ void init()
                 v-if="selected.editable && selected.evidence_actions?.includes('mark_design_complete')"
                 type="button"
                 :disabled="busy || !canMarkDesign"
-                class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
+                class="btn btn-secondary btn-sm"
                 :title="canMarkDesign ? '标记为验证设计完成' : designBlockReason"
                 @click="runEvidenceAction('mark_design_complete')"
               >标记设计完成</button>
@@ -460,7 +459,7 @@ void init()
                 v-if="selected.editable && selected.evidence_actions?.includes('reset_rejected')"
                 type="button"
                 :disabled="busy || !canMarkDesign"
-                class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
+                class="btn btn-secondary btn-sm"
                 :title="canMarkDesign ? '复位否决结论' : designBlockReason"
                 @click="runEvidenceAction('reset_rejected')"
               >复位否决</button>
@@ -500,7 +499,7 @@ void init()
               v-if="!creating && selected"
               type="button"
               :disabled="busy || quotaFull"
-              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              class="btn btn-secondary"
               @click="saveAsMine"
             >
               <Copy :size="14" />
@@ -509,7 +508,7 @@ void init()
             <button
               v-if="!creating && selected"
               type="button"
-              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover"
+              class="btn btn-secondary"
               @click="openBacktest"
             >
               <FlaskConical :size="14" />
@@ -518,7 +517,7 @@ void init()
             <button
               v-if="creating"
               type="button"
-              class="h-9 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover"
+              class="btn btn-secondary"
               @click="creating = false; selectedId = strategies[0]?.id ?? null"
             >
               取消
@@ -567,7 +566,7 @@ void init()
             <button
               type="button"
               :disabled="busy || validating"
-              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              class="btn btn-secondary"
               @click="runAction(validateCurrent)"
             >
               <RefreshCw :size="14" :class="validating ? 'animate-spin' : ''" />
@@ -603,7 +602,7 @@ void init()
             <button
               type="button"
               :disabled="busy"
-              class="h-9 rounded-md border border-border px-3 text-sm text-text-secondary hover:bg-hover disabled:opacity-50"
+              class="btn btn-secondary"
               @click="selected && toggleEnabled(selected)"
             >
               {{ selected?.enabled ? '停用策略' : '启用策略' }}
@@ -611,7 +610,7 @@ void init()
             <button
               type="button"
               :disabled="busy || usedByBacktests > 0"
-              class="inline-flex h-9 items-center gap-1.5 rounded-md border border-up/40 px-3 text-sm text-up hover:bg-danger-soft disabled:opacity-40"
+              class="btn btn-danger"
               :title="usedByBacktests > 0 ? '已有回测引用，不能删除，可改为停用' : '删除策略'"
               @click="deleteStrategy"
             >
@@ -624,7 +623,7 @@ void init()
             v-if="creating || !readonlyStrategy"
             type="button"
             :disabled="busy || validating"
-            class="h-9 rounded-md bg-accent px-4 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
+            class="btn btn-primary"
             @click="creating ? createStrategy() : saveStrategy()"
           >
             {{ creating ? '校验并创建' : '校验并保存' }}

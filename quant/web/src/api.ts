@@ -100,6 +100,12 @@ export interface PoolMember {
   code: string
   name?: string
   industry?: string
+  /** 最新参考价(盘中快照优先,否则最近收盘);无行情数据为 null */
+  price?: number | null
+  /** 仅盘中快照提供涨跌幅(小数) */
+  pct_chg?: number | null
+  price_ts?: string | null
+  price_source?: 'snapshot' | 'close' | null
 }
 
 /**
@@ -1387,6 +1393,11 @@ export const api = {
   stockSearch(query: string, limit = 10) {
     const params = new URLSearchParams({ q: query, limit: String(limit) })
     return request<{ count?: number; items: StockSearchItem[] }>(`/api/market/stocks?${params}`)
+  },
+
+  /** 全市场股票清单:选股器一次拉取,客户端过滤与虚拟滚动 */
+  stockList() {
+    return request<{ count: number; items: StockSearchItem[] }>('/api/market/stocks?all=true')
   },
 
   watchlist() {

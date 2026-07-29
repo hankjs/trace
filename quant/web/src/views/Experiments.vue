@@ -383,14 +383,14 @@ onMounted(async () => {
       <div class="grid gap-2 md:grid-cols-2">
         <label class="text-xs">
           标题
-          <input v-model="form.title" class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-sm" />
+          <input v-model="form.title" class="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
         </label>
         <label class="text-xs">
           永久候选 ID
           <input
             v-model="form.permanent_candidate_id"
             placeholder="CAN-TRD-01"
-            class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-sm"
+            class="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm"
           />
         </label>
         <label class="text-xs md:col-span-2">
@@ -398,14 +398,14 @@ onMounted(async () => {
           <textarea
             v-model="form.hypothesis"
             rows="2"
-            class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-sm"
+            class="mt-1 w-full rounded-md border border-border bg-surface px-2.5 py-2 text-sm"
           />
         </label>
         <label class="text-xs md:col-span-2">
           关联策略(冻结其当前规格)
           <select
             v-model.number="form.strategy_id"
-            class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-sm"
+            class="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm"
           >
             <option :value="null">请选择</option>
             <option v-for="s in strategies" :key="s.id" :value="s.id">
@@ -414,16 +414,18 @@ onMounted(async () => {
           </select>
         </label>
       </div>
-      <button type="button" class="workspace-command" @click="create">
-        <Plus :size="14" /> 创建实验
-      </button>
+      <div>
+        <button type="button" class="btn btn-primary" @click="create">
+          <Plus :size="14" /> 创建实验
+        </button>
+      </div>
     </section>
 
     <div class="grid gap-4 lg:grid-cols-[minmax(260px,0.9fr)_minmax(0,1.4fr)]">
       <section class="terminal-panel min-h-[280px]">
         <div class="terminal-panel-header">
           <h2 class="text-sm font-semibold">实验列表</h2>
-          <button type="button" class="workspace-command" :disabled="loading" @click="refreshList">
+          <button type="button" class="icon-button !h-8 !w-8" :disabled="loading" aria-label="刷新列表" @click="refreshList">
             <RefreshCw :size="14" :class="loading ? 'animate-spin' : ''" />
           </button>
         </div>
@@ -455,7 +457,7 @@ onMounted(async () => {
           </div>
           <button
             type="button"
-            class="workspace-command"
+            class="btn btn-secondary btn-sm"
             :disabled="selected.status === 'archived' || trialBusy"
             @click="archiveSelected"
           >
@@ -491,13 +493,13 @@ onMounted(async () => {
               <div class="flex shrink-0 gap-1.5">
                 <button
                   type="button"
-                  class="workspace-command"
+                  class="btn btn-primary btn-sm"
                   :disabled="trialBusy"
                   @click="acceptPromotion(todo)"
                 >采纳为证据</button>
                 <button
                   type="button"
-                  class="workspace-command"
+                  class="btn btn-ghost btn-sm"
                   :disabled="trialBusy"
                   @click="dismissPromotion(todo)"
                 >忽略</button>
@@ -540,7 +542,7 @@ onMounted(async () => {
         <div class="flex flex-wrap items-center gap-3 text-xs">
           <label class="flex items-center gap-1">
             优化目标
-            <select v-model="objective" class="rounded border border-border bg-surface px-1.5 py-1">
+            <select v-model="objective" class="h-8 rounded-md border border-border bg-surface px-2 text-xs">
               <option value="sharpe">夏普</option>
               <option value="annual_return">年化</option>
               <option value="total_return">总收益</option>
@@ -557,36 +559,36 @@ onMounted(async () => {
         <div class="grid gap-2 md:grid-cols-2">
           <label class="text-xs">
             代码(逗号分隔)
-            <input v-model="trialForm.codesText" class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-sm" />
+            <input v-model="trialForm.codesText" class="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
           </label>
           <label class="text-xs">
             区间
             <div class="mt-1 flex gap-1">
-              <input v-model="trialForm.start" type="date" class="w-full rounded border border-border bg-surface px-2 py-1.5 text-sm" />
-              <input v-model="trialForm.end" type="date" class="w-full rounded border border-border bg-surface px-2 py-1.5 text-sm" />
+              <input v-model="trialForm.start" type="date" class="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
+              <input v-model="trialForm.end" type="date" class="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
             </div>
           </label>
           <label class="text-xs">
             参数路径(可选)
-            <input v-model="trialForm.paramPath" class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-sm" />
+            <input v-model="trialForm.paramPath" class="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
           </label>
           <label class="text-xs">
             参数值
-            <input v-model="trialForm.paramValue" class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 text-sm" />
+            <input v-model="trialForm.paramValue" class="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
           </label>
           <label class="text-xs md:col-span-2">
             批量 param_patches JSON(最多 32)
             <textarea
               v-model="trialForm.batchJson"
               rows="2"
-              class="mt-1 w-full rounded border border-border bg-surface px-2 py-1.5 font-mono text-xs"
+              class="mt-1 w-full rounded-md border border-border bg-surface px-2.5 py-2 font-mono text-xs"
             />
           </label>
         </div>
         <div class="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            class="workspace-command"
+            class="btn btn-primary"
             :disabled="selected.status === 'archived' || trialBusy"
             @click="runTrial"
           >
@@ -595,7 +597,7 @@ onMounted(async () => {
           </button>
           <button
             type="button"
-            class="workspace-command"
+            class="btn btn-secondary"
             :disabled="selected.status === 'archived' || trialBusy"
             @click="runBatch"
           >
@@ -604,10 +606,10 @@ onMounted(async () => {
         </div>
 
         <div class="overflow-x-auto">
-          <table class="w-full text-left text-xs">
-            <thead class="text-text-tertiary">
+          <table class="terminal-table">
+            <thead>
               <tr>
-                <th class="cursor-pointer py-1" @click="toggleSort('trial_index')">#</th>
+                <th class="cursor-pointer" @click="toggleSort('trial_index')">#</th>
                 <th class="cursor-pointer" @click="toggleSort('outcome')">结果</th>
                 <template v-if="paramCols.mode === 'columns'">
                   <th v-for="k in paramCols.keys" :key="k">{{ k.replace(/^\$\./, '') }}</th>
@@ -627,13 +629,12 @@ onMounted(async () => {
               <tr
                 v-for="t in sortedRows"
                 :key="t.id"
-                class="border-t border-border-subtle"
                 :class="{
                   'bg-info-soft/60 font-medium': best && t.id === best.id,
                   'opacity-60': t.outcome !== 'ok',
                 }"
               >
-                <td class="py-1.5">{{ t.trial_index }}</td>
+                <td>{{ t.trial_index }}</td>
                 <td>
                   {{ outcomeName[t.outcome] ?? t.outcome }}
                   <span v-if="!Object.keys(t.param_patch || {}).length" class="ml-1 text-[10px] text-text-tertiary">基准</span>
