@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0017_data_quality_cache
+-- Schema revision: 0018_evidence_promotion
 
 SET NAMES utf8mb4;
 
@@ -317,6 +317,40 @@ CREATE TABLE `quant_experiment_trial` (
     ON DELETE RESTRICT
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+-- 试验达标后的证据推进待办(不自动改 evidence_status;用户采纳才推进)
+CREATE TABLE `quant_evidence_promotion` (
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `owner_id` VARCHAR(36) NOT NULL,
+  `strategy_id` INT NOT NULL,
+  `experiment_id` INT NOT NULL,
+  `trial_id` INT NOT NULL,
+  `backtest_run_id` INT NOT NULL,
+  `status` VARCHAR(16) NOT NULL DEFAULT 'pending',
+  `suggested_target` VARCHAR(16) NOT NULL,
+  `quality_checks` JSON DEFAULT NULL,
+  `metrics_summary` JSON DEFAULT NULL,
+  `created_at` DATETIME NOT NULL,
+  `resolved_at` DATETIME DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_evidence_promotion_trial` (`trial_id`),
+  KEY `ix_quant_evidence_promotion_owner_id` (`owner_id`),
+  KEY `ix_quant_evidence_promotion_strategy_id` (`strategy_id`),
+  KEY `ix_quant_evidence_promotion_experiment_id` (`experiment_id`),
+  KEY `ix_quant_evidence_promotion_status` (`status`),
+  CONSTRAINT `fk_evidence_promotion_strategy`
+    FOREIGN KEY (`strategy_id`) REFERENCES `quant_strategy` (`id`)
+    ON DELETE CASCADE,
+  CONSTRAINT `fk_evidence_promotion_experiment`
+    FOREIGN KEY (`experiment_id`) REFERENCES `quant_experiment` (`id`)
+    ON DELETE CASCADE,
+  CONSTRAINT `fk_evidence_promotion_trial`
+    FOREIGN KEY (`trial_id`) REFERENCES `quant_experiment_trial` (`id`)
+    ON DELETE CASCADE,
+  CONSTRAINT `fk_evidence_promotion_run`
+    FOREIGN KEY (`backtest_run_id`) REFERENCES `quant_backtest_run` (`id`)
+    ON DELETE RESTRICT
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 CREATE TABLE `quant_pool_grant` (
   `pool_id` INT NOT NULL,
   `user_id` VARCHAR(36) NOT NULL,
@@ -524,6 +558,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0017_data_quality_cache');
+VALUES ('0018_evidence_promotion');
 
 COMMIT;

@@ -18,6 +18,7 @@ from ..strategy.spec import (
     resolve_capabilities,
     strategy_spec_hash,
 )
+from .promotion import list_promotions, maybe_create_promotion_todo
 
 EXPERIMENT_STATUSES = ("design", "running", "completed", "rejected", "archived")
 TRIAL_OUTCOMES = ("ok", "no_trades", "error", "rejected")
@@ -244,11 +245,19 @@ def create_trial_and_run(
     pool_id: int | None = None,
     dynamic_universe: bool = False,
     strategy: Strategy | None = None,
-) -> tuple[ExperimentTrial, dict[str, Any] | None]:
+) -> tuple[ExperimentTrial, dict[str, Any] | None, dict[str, Any]]:
     """创建 trial 并同步执行回测(写入 run + 回填 trial)。
 
     失败也会落 trial(outcome=error),保证账本完整。
+    第三项为证据推进评估(达标则含 pending todo;试验从不自动改 evidence_status)。
     """
+    empty_promotion: dict[str, Any] = {
+        "eligible": False,
+        "suggested_target": None,
+        "checks": [],
+        "block_reasons": [],
+        "todo": None,
+    }
     exp, _ = get_experiment(db, experiment_id, owner_id)
     if exp.status == "archived":
         raise ValueError("已归档实验不能新增试验")
@@ -272,7 +281,10 @@ def create_trial_and_run(
         db.add(trial)
         db.commit()
         db.refresh(trial)
-        return trial, None
+        return trial, None, {
+            **empty_promotion,
+            "block_reasons": [str(exc)[:200]],
+        }
 
     try:
         costs_eff = _validate_costs(costs or exp.cost_snapshot or DEFAULT_COSTS)
@@ -288,7 +300,10 @@ def create_trial_and_run(
         db.add(trial)
         db.commit()
         db.refresh(trial)
-        return trial, None
+        return trial, None, {
+            **empty_promotion,
+            "block_reasons": [str(exc)[:200]],
+        }
 
     # 落库回测需要合法 strategy_id(FK RESTRICT);试验必须挂到真实策略行
     if strategy is None and exp.strategy_id is not None:
@@ -340,14 +355,47 @@ def create_trial_and_run(
             exp.status = "rejected"
         elif exp.status in {"design", "running"}:
             exp.status = "completed"
+        # 试验永不自动推进 evidence_status;达标仅生成用户待办
+        promotion = maybe_create_promotion_todo(
+            db,
+            owner_id=owner_id,
+            strategy=strategy,
+            experiment=exp,
+            trial=trial,
+            result=result,
+        )
     except Exception as exc:  # noqa: BLE001
         trial.outcome = "error"
         trial.error = str(exc)[:2000]
         exp.status = "running"
+        promotion = {
+            "eligible": False,
+            "suggested_target": None,
+            "checks": [],
+            "block_reasons": [str(exc)[:200]],
+            "todo": None,
+        }
     exp.updated_at = _now()
     db.commit()
     db.refresh(trial)
-    return trial, result
+    return trial, result, promotion
+
+
+def get_experiment_detail(
+    db: Session, experiment_id: int, owner_id: str,
+) -> dict[str, Any]:
+    """实验详情 + trials + 该实验下的证据推进待办。"""
+    exp, trials = get_experiment(db, experiment_id, owner_id)
+    promotions = list_promotions(
+        db, owner_id, status=None, experiment_id=experiment_id,
+    )
+    pending = [p for p in promotions if p["status"] == "pending"]
+    return {
+        **experiment_out(exp, trial_count=len(trials)),
+        "trials": [trial_out(t) for t in trials],
+        "evidence_promotions": promotions,
+        "pending_promotions": pending,
+    }
 
 
 __all__ = [
@@ -356,6 +404,7 @@ __all__ = [
     "create_trial_and_run",
     "experiment_out",
     "get_experiment",
+    "get_experiment_detail",
     "list_experiments",
     "trial_out",
 ]

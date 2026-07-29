@@ -950,6 +950,33 @@ export interface ExperimentTrial {
   created_at?: string | null
 }
 
+export type EvidencePromotionStatus = 'pending' | 'accepted' | 'dismissed' | 'superseded'
+export type EvidencePromotionTarget = 'backtested' | 'oos_passed' | 'rejected'
+
+/** 试验达标后系统提名的证据推进待办(用户确认才改 evidence_status) */
+export interface EvidencePromotionTodo {
+  id: number
+  owner_id: string
+  strategy_id: number
+  experiment_id: number
+  trial_id: number
+  backtest_run_id: number
+  status: EvidencePromotionStatus
+  suggested_target: EvidencePromotionTarget | string
+  quality_checks?: Array<{ id: string, ok: boolean, message: string }>
+  metrics_summary?: Partial<BacktestMetrics> | null
+  created_at?: string | null
+  resolved_at?: string | null
+}
+
+export interface EvidencePromotionEval {
+  eligible: boolean
+  suggested_target?: EvidencePromotionTarget | string | null
+  checks?: Array<{ id: string, ok: boolean, message: string }>
+  block_reasons?: string[]
+  todo?: EvidencePromotionTodo | null
+}
+
 export interface ExperimentDetail extends ExperimentSummary {
   frozen_spec_snapshot?: StrategySpec
   validation_snapshot?: Record<string, unknown> | null
@@ -957,6 +984,8 @@ export interface ExperimentDetail extends ExperimentSummary {
   cost_snapshot?: Record<string, unknown> | null
   trials: ExperimentTrial[]
   multiplicity?: MultiplicityReport
+  evidence_promotions?: EvidencePromotionTodo[]
+  pending_promotions?: EvidencePromotionTodo[]
 }
 
 export interface BacktestResult {
@@ -1626,6 +1655,7 @@ export const api = {
   }) {
     return request<{
       trial: ExperimentTrial
+      promotion?: EvidencePromotionEval
       backtest?: {
         run_id?: number
         metrics?: BacktestMetrics
@@ -1652,11 +1682,47 @@ export const api = {
   }) {
     return request<{
       count: number
-      items: Array<{ trial: ExperimentTrial, error: string | null, backtest_run_id?: number }>
+      items: Array<{
+        trial: ExperimentTrial
+        error: string | null
+        backtest_run_id?: number
+        promotion?: EvidencePromotionEval
+      }>
+      pending_promotions?: EvidencePromotionTodo[]
     }>(`/api/experiments/${id}/trials/batch`, {
       method: 'POST',
       body: JSON.stringify(body),
     })
+  },
+
+  listEvidencePromotions(opts?: {
+    status?: string | null
+    strategy_id?: number
+    experiment_id?: number
+  }) {
+    const params = new URLSearchParams()
+    if (opts?.status != null) params.set('status', opts.status)
+    if (opts?.strategy_id != null) params.set('strategy_id', String(opts.strategy_id))
+    if (opts?.experiment_id != null) params.set('experiment_id', String(opts.experiment_id))
+    const qs = params.toString()
+    return request<{ count: number, items: EvidencePromotionTodo[] }>(
+      `/api/experiments/promotions${qs ? `?${qs}` : ''}`,
+    )
+  },
+
+  acceptEvidencePromotion(todoId: number) {
+    return request<{
+      todo: EvidencePromotionTodo
+      evidence_transition?: { from: string, to: string } | null
+      evaluation?: EvidencePromotionEval
+    }>(`/api/experiments/promotions/${todoId}/accept`, { method: 'POST' })
+  },
+
+  dismissEvidencePromotion(todoId: number) {
+    return request<EvidencePromotionTodo>(
+      `/api/experiments/promotions/${todoId}/dismiss`,
+      { method: 'POST' },
+    )
   },
 
   archiveExperiment(id: number) {

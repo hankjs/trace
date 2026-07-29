@@ -10,6 +10,11 @@ from sqlalchemy.orm import Session
 
 from ..auth import require_client, user_id_from_claims
 from ..db import get_db
+from ..experiment.promotion import (
+    accept_promotion,
+    dismiss_promotion,
+    list_promotions,
+)
 from ..experiment.service import (
     archive_experiment,
     create_experiment,
@@ -97,6 +102,62 @@ def api_create_experiment(
     return experiment_out(exp, trial_count=0)
 
 
+@router.get("/promotions")
+def api_list_promotions(
+    status: str | None = "pending",
+    strategy_id: int | None = None,
+    experiment_id: int | None = None,
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """列出证据推进待办。默认仅 pending(系统达标提名、待用户确认)。"""
+    owner_id = user_id_from_claims(claims)
+    items = list_promotions(
+        db,
+        owner_id,
+        status=status if status not in (None, "", "all") else None,
+        strategy_id=strategy_id,
+        experiment_id=experiment_id,
+    )
+    return {"count": len(items), "items": items}
+
+
+@router.post("/promotions/{todo_id}/accept")
+def api_accept_promotion(
+    todo_id: int,
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """用户确认：将达标试验写入策略证据状态机。"""
+    owner_id = user_id_from_claims(claims)
+    try:
+        result = accept_promotion(db, todo_id, owner_id)
+        db.commit()
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return result
+
+
+@router.post("/promotions/{todo_id}/dismiss")
+def api_dismiss_promotion(
+    todo_id: int,
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """用户忽略：不写入证据，试验账本保留。"""
+    owner_id = user_id_from_claims(claims)
+    try:
+        todo = dismiss_promotion(db, todo_id, owner_id)
+        db.commit()
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return todo
+
+
 @router.get("/{experiment_id}")
 def api_get_experiment(
     experiment_id: int,
@@ -121,10 +182,16 @@ def api_get_experiment(
                     "sharpe": summary.get("sharpe"),
                 },
             })
+    promotions = list_promotions(
+        db, owner_id, status=None, experiment_id=experiment_id,
+    )
+    pending = [p for p in promotions if p["status"] == "pending"]
     return {
         **experiment_out(exp, trial_count=len(trial_items)),
         "trials": trial_items,
         "multiplicity": multiplicity_report(rows),
+        "evidence_promotions": promotions,
+        "pending_promotions": pending,
     }
 
 
@@ -140,7 +207,7 @@ def api_create_trial(
     owner_id = user_id_from_claims(claims)
     codes = list(dict.fromkeys(c.lower() for c in body.codes))
     try:
-        trial, result = create_trial_and_run(
+        trial, result, promotion = create_trial_and_run(
             db,
             experiment_id=experiment_id,
             owner_id=owner_id,
@@ -156,7 +223,10 @@ def api_create_trial(
         raise HTTPException(404, str(exc))
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    payload: dict[str, Any] = {"trial": trial_out(trial)}
+    payload: dict[str, Any] = {
+        "trial": trial_out(trial),
+        "promotion": promotion,
+    }
     if result is not None:
         payload["backtest"] = {
             "run_id": result.get("run_id"),
@@ -188,7 +258,7 @@ def api_create_trials_batch(
     items: list[dict[str, Any]] = []
     for patch in body.param_patches:
         try:
-            trial, result = create_trial_and_run(
+            trial, result, promotion = create_trial_and_run(
                 db,
                 experiment_id=experiment_id,
                 owner_id=owner_id,
@@ -200,7 +270,11 @@ def api_create_trials_batch(
                 pool_id=body.pool_id,
                 dynamic_universe=body.dynamic_universe,
             )
-            item: dict[str, Any] = {"trial": trial_out(trial), "error": None}
+            item: dict[str, Any] = {
+                "trial": trial_out(trial),
+                "error": None,
+                "promotion": promotion,
+            }
             if result is not None:
                 item["backtest_run_id"] = result.get("run_id")
             items.append(item)
@@ -212,6 +286,9 @@ def api_create_trials_batch(
     return {
         "count": len(items),
         "items": items,
+        "pending_promotions": list_promotions(
+            db, owner_id, status="pending", experiment_id=experiment_id,
+        ),
     }
 
 

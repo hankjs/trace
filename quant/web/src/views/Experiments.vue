@@ -3,6 +3,7 @@ import { computed, onMounted, ref, watch } from 'vue'
 import { Archive, FlaskConical, Plus, RefreshCw } from 'lucide-vue-next'
 import {
   api,
+  type EvidencePromotionTodo,
   type ExperimentDetail,
   type ExperimentSummary,
   type ExperimentTrial,
@@ -50,6 +51,8 @@ const trialForm = ref({
 
 const objective = ref<ObjectiveKey>('sharpe')
 const sort = ref<SortState>({ key: 'sharpe', dir: 'desc' })
+/** 单次/批量 trial 运行中,防双提交并给出反馈 */
+const trialBusy = ref(false)
 
 const columnPrefs = ref({
   win_rate: false,
@@ -90,18 +93,61 @@ const sortedRows = computed(() => sortTrials(compareRows.value, sort.value))
 const best = computed(() => pickBestTrial(compareRows.value, objective.value))
 const summary = computed(() => summarizeTrials(compareRows.value, objective.value))
 const paramCols = computed(() => expandParamColumns(compareRows.value))
+const pendingPromotions = computed<EvidencePromotionTodo[]>(
+  () => selected.value?.pending_promotions
+    ?? (selected.value?.evidence_promotions ?? []).filter((p) => p.status === 'pending'),
+)
+
+const TARGET_NAMES: Record<string, string> = {
+  backtested: '已回测（样本内）',
+  oos_passed: '样本外否决条件通过',
+  rejected: '已否决',
+}
+
+function targetName(t: string) {
+  return TARGET_NAMES[t] ?? t
+}
+
+function describePromotionNotice(evalResult?: {
+  eligible?: boolean
+  block_reasons?: string[]
+  todo?: EvidencePromotionTodo | null
+  suggested_target?: string | null
+} | null): string {
+  if (!evalResult) return ''
+  if (evalResult.todo?.status === 'pending') {
+    return `系统提名证据推进 → ${targetName(evalResult.todo.suggested_target)}（待你确认）`
+  }
+  if (evalResult.eligible === false && evalResult.block_reasons?.length) {
+    return `未达证据门槛：${evalResult.block_reasons[0]}`
+  }
+  return ''
+}
 
 function toggleSort(key: SortState['key']) {
   if (sort.value.key === key) {
     sort.value = { key, dir: sort.value.dir === 'desc' ? 'asc' : 'desc' }
   } else {
-    sort.value = { key, dir: key === 'max_drawdown' ? 'desc' : 'desc' }
+    // 指标默认 desc(含 max_drawdown: 负回撤数值越大越接近 0)
+    sort.value = { key, dir: 'desc' }
   }
+}
+
+/** 收益/回撤/胜率为百分比小数;夏普/Calmar 为原值 */
+function isPctMetric(key: string): boolean {
+  return key === 'annual_return'
+    || key === 'total_return'
+    || key === 'max_drawdown'
+    || key === 'win_rate'
 }
 
 function fmtMetric(v: number | null | undefined, pct = false): string {
   if (v == null || !Number.isFinite(v)) return '—'
   return pct ? fmtPct(v) : v.toFixed(3)
+}
+
+function fmtObjectiveMetric(v: number | null | undefined, key: ObjectiveKey = objective.value): string {
+  return fmtMetric(v, isPctMetric(key))
 }
 
 async function refreshList() {
@@ -166,16 +212,26 @@ function parseCodes(): string[] {
 }
 
 async function runTrial() {
-  if (!selected.value) return
+  if (!selected.value || trialBusy.value) return
   error.value = ''
   notice.value = ''
   const codes = parseCodes()
+  if (!codes.length) {
+    error.value = '请至少填写一个股票代码'
+    return
+  }
+  if (trialForm.value.start >= trialForm.value.end) {
+    error.value = '开始日期必须早于结束日期'
+    return
+  }
   const param_patch: Record<string, number | string | boolean> = {}
   if (trialForm.value.paramPath) {
     const raw = trialForm.value.paramValue
     const num = Number(raw)
     param_patch[trialForm.value.paramPath] = Number.isFinite(num) && raw !== '' ? num : raw
   }
+  trialBusy.value = true
+  notice.value = '正在运行试验…'
   try {
     const result = await api.createExperimentTrial(selected.value.id, {
       codes,
@@ -183,17 +239,31 @@ async function runTrial() {
       end: trialForm.value.end,
       param_patch,
     })
-    notice.value = `试验 #${result.trial.trial_index} 结果: ${outcomeName[result.trial.outcome] ?? result.trial.outcome}`
+    const base = `试验 #${result.trial.trial_index} 结果: ${outcomeName[result.trial.outcome] ?? result.trial.outcome}`
+    const promoNote = describePromotionNotice(result.promotion)
+    notice.value = promoNote ? `${base} · ${promoNote}` : base
     await openExperiment(selected.value.id)
   } catch (e) {
+    notice.value = ''
     error.value = (e as Error).message
+  } finally {
+    trialBusy.value = false
   }
 }
 
 async function runBatch() {
-  if (!selected.value) return
+  if (!selected.value || trialBusy.value) return
   error.value = ''
   notice.value = ''
+  const codes = parseCodes()
+  if (!codes.length) {
+    error.value = '请至少填写一个股票代码'
+    return
+  }
+  if (trialForm.value.start >= trialForm.value.end) {
+    error.value = '开始日期必须早于结束日期'
+    return
+  }
   let patches: Array<Record<string, number | string | boolean>>
   try {
     const parsed = JSON.parse(trialForm.value.batchJson)
@@ -210,22 +280,76 @@ async function runBatch() {
     error.value = 'batch JSON 解析失败'
     return
   }
+  trialBusy.value = true
+  notice.value = `正在批量运行 ${patches.length} 个 trial…`
   try {
     const result = await api.createExperimentTrialsBatch(selected.value.id, {
-      codes: parseCodes(),
+      codes,
       start: trialForm.value.start,
       end: trialForm.value.end,
       param_patches: patches,
     })
-    notice.value = `批量完成 ${result.count} 个 trial`
+    const counts = { ok: 0, no_trades: 0, error: 0, rejected: 0, other: 0 }
+    for (const item of result.items ?? []) {
+      const outcome = item.trial?.outcome
+      if (outcome === 'ok') counts.ok += 1
+      else if (outcome === 'no_trades') counts.no_trades += 1
+      else if (outcome === 'error') counts.error += 1
+      else if (outcome === 'rejected') counts.rejected += 1
+      else counts.other += 1
+    }
+    const pendingN = result.pending_promotions?.length
+      ?? result.items.filter((i) => i.promotion?.todo?.status === 'pending').length
+    notice.value = `批量完成 ${result.count} 个：完成 ${counts.ok} / 无交易 ${counts.no_trades} / 失败 ${counts.error}`
+      + (counts.rejected ? ` / 否决 ${counts.rejected}` : '')
+      + (pendingN ? ` · 新增 ${pendingN} 条证据推进待办` : '')
     await openExperiment(selected.value.id)
   } catch (e) {
+    notice.value = ''
     error.value = (e as Error).message
+  } finally {
+    trialBusy.value = false
+  }
+}
+
+async function acceptPromotion(todo: EvidencePromotionTodo) {
+  if (trialBusy.value) return
+  trialBusy.value = true
+  error.value = ''
+  notice.value = '正在写入证据状态…'
+  try {
+    const result = await api.acceptEvidencePromotion(todo.id)
+    const tr = result.evidence_transition
+    notice.value = tr
+      ? `已采纳：证据 ${tr.from} → ${tr.to}`
+      : '已采纳（状态机未再前进，可能已是更高状态）'
+    if (selected.value) await openExperiment(selected.value.id)
+    await loadStrategies(true)
+  } catch (e) {
+    notice.value = ''
+    error.value = (e as Error).message
+  } finally {
+    trialBusy.value = false
+  }
+}
+
+async function dismissPromotion(todo: EvidencePromotionTodo) {
+  if (trialBusy.value) return
+  trialBusy.value = true
+  error.value = ''
+  try {
+    await api.dismissEvidencePromotion(todo.id)
+    notice.value = '已忽略该推进待办（试验账本保留）'
+    if (selected.value) await openExperiment(selected.value.id)
+  } catch (e) {
+    error.value = (e as Error).message
+  } finally {
+    trialBusy.value = false
   }
 }
 
 async function archiveSelected() {
-  if (!selected.value) return
+  if (!selected.value || trialBusy.value) return
   error.value = ''
   try {
     await api.archiveExperiment(selected.value.id)
@@ -245,7 +369,7 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-4">
-    <InlineFeedback v-if="error" tone="warning">{{ error }}</InlineFeedback>
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <InlineFeedback v-if="notice" tone="info">{{ notice }}</InlineFeedback>
 
     <section class="terminal-panel space-y-3 p-4">
@@ -332,12 +456,58 @@ onMounted(async () => {
           <button
             type="button"
             class="workspace-command"
-            :disabled="selected.status === 'archived'"
+            :disabled="selected.status === 'archived' || trialBusy"
             @click="archiveSelected"
           >
             <Archive :size="14" /> 归档
           </button>
         </div>
+
+        <!-- 证据推进待办：系统达标提名，用户确认才改 evidence_status -->
+        <div
+          v-if="pendingPromotions.length"
+          class="rounded border border-accent/40 bg-info-soft px-3 py-2 text-xs leading-5 text-text-secondary"
+        >
+          <strong class="text-text-primary">证据推进待办</strong>
+          <span class="text-text-tertiary"> · 试验不自动改状态；质量未达标不会出现在此</span>
+          <ul class="mt-2 space-y-2">
+            <li
+              v-for="todo in pendingPromotions"
+              :key="todo.id"
+              class="flex flex-wrap items-start justify-between gap-2 rounded border border-border bg-surface px-2 py-1.5"
+            >
+              <div class="min-w-0">
+                <div class="font-medium text-text-primary">
+                  建议 → {{ targetName(todo.suggested_target) }}
+                  <span class="font-normal text-text-tertiary">
+                    · trial #{{ selected?.trials.find((t) => t.id === todo.trial_id)?.trial_index ?? todo.trial_id }}
+                    · run {{ todo.backtest_run_id }}
+                  </span>
+                </div>
+                <p class="mt-0.5 text-[11px] text-text-tertiary">
+                  通过门槛 ≠ 策略有效。采纳将写入策略证据状态机。
+                </p>
+              </div>
+              <div class="flex shrink-0 gap-1.5">
+                <button
+                  type="button"
+                  class="workspace-command"
+                  :disabled="trialBusy"
+                  @click="acceptPromotion(todo)"
+                >采纳为证据</button>
+                <button
+                  type="button"
+                  class="workspace-command"
+                  :disabled="trialBusy"
+                  @click="dismissPromotion(todo)"
+                >忽略</button>
+              </div>
+            </li>
+          </ul>
+        </div>
+        <p v-else class="text-[11px] text-text-tertiary">
+          试验账本不自动推进证据。基准 trial 达标后会出现「证据推进待办」供你确认；质量差（无交易/样本不足/未设计完成等）由系统拦截。
+        </p>
 
         <!-- 对比摘要卡 -->
         <div class="rounded border border-border bg-surface-muted px-3 py-2 text-xs leading-5 text-text-secondary">
@@ -348,10 +518,10 @@ onMounted(async () => {
           · 失败 {{ summary.error }}
           · 否决 {{ summary.rejected }}
           <template v-if="summary.best_trial_index != null">
-            · 最优 #{{ summary.best_trial_index }} ({{ objective }}={{ fmtMetric(summary.best_value) }})
+            · 最优 #{{ summary.best_trial_index }} ({{ objective }}={{ fmtObjectiveMetric(summary.best_value) }})
           </template>
           <template v-if="summary.min != null">
-            · ok 子集 min/median/max {{ fmtMetric(summary.min) }} / {{ fmtMetric(summary.median) }} / {{ fmtMetric(summary.max) }}
+            · ok 子集 min/median/max {{ fmtObjectiveMetric(summary.min) }} / {{ fmtObjectiveMetric(summary.median) }} / {{ fmtObjectiveMetric(summary.max) }}
           </template>
         </div>
 
@@ -413,19 +583,20 @@ onMounted(async () => {
             />
           </label>
         </div>
-        <div class="flex flex-wrap gap-2">
+        <div class="flex flex-wrap items-center gap-2">
           <button
             type="button"
             class="workspace-command"
-            :disabled="selected.status === 'archived'"
+            :disabled="selected.status === 'archived' || trialBusy"
             @click="runTrial"
           >
-            运行试验
+            <RefreshCw v-if="trialBusy" :size="14" class="animate-spin" />
+            {{ trialBusy ? '运行中…' : '运行试验' }}
           </button>
           <button
             type="button"
             class="workspace-command"
-            :disabled="selected.status === 'archived'"
+            :disabled="selected.status === 'archived' || trialBusy"
             @click="runBatch"
           >
             批量运行

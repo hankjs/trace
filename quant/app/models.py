@@ -486,6 +486,48 @@ class ExperimentTrial(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
 
+class EvidencePromotion(Base):
+    """试验达标后的「是否推进策略证据」用户待办。
+
+    试验路径不自动改 evidence_status;质量闸门通过才写 pending,
+    用户采纳时才调用 advance_after_backtest。
+    """
+
+    __tablename__ = "quant_evidence_promotion"
+    __table_args__ = (
+        UniqueConstraint("trial_id", name="uq_evidence_promotion_trial"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    strategy_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_strategy.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    experiment_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_experiment.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    trial_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_experiment_trial.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    backtest_run_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("quant_backtest_run.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    # pending | accepted | dismissed | superseded
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", nullable=False, index=True,
+    )
+    # backtested | oos_passed | rejected
+    suggested_target: Mapped[str] = mapped_column(String(16), nullable=False)
+    quality_checks: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    metrics_summary: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class Strategy(Base):
     """用户可管理的当前完整策略规格。
 

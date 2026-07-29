@@ -70,13 +70,42 @@ const draftSpec = computed(() => buildStrategySpec(form.value))
 const previewSpec = computed(() => validation.value?.normalized_spec ?? draftSpec.value)
 const previewJson = computed(() => JSON.stringify(previewSpec.value, null, 2))
 const capability = computed(() => validation.value?.capability ?? selected.value?.capability ?? null)
+/** 与 StrategySpecEditor 的 id-prefix 保持一致,供清单点击滚动定位 */
+const specIdPrefix = computed(() => (creating.value ? 'create-spec' : 'edit-spec'))
 
+/**
+ * 验证设计清单以**已保存规格**为准,与后端 apply_manual_action 一致。
+ * 草稿变更不即时改清单,避免「全绿但未保存」或「已合规草稿却灰掉」的死胡同。
+ */
 const designChecks = computed<DesignCheckItem[]>(() => {
-  const capOk = (capability.value?.status ?? 'supported') === 'supported'
-  const spec = draftSpec.value ?? selected.value?.spec
-  return evaluateDesignCompleteChecklist(spec, capOk)
+  const strategy = selected.value
+  if (!strategy) return []
+  const capOk = (strategy.capability?.status ?? 'supported') === 'supported'
+  return evaluateDesignCompleteChecklist(strategy.spec, capOk)
 })
 const designReady = computed(() => designCompleteReady(designChecks.value))
+/**
+ * 草稿相对已保存是否有未提交修改。
+ * 两侧都经 form 归一化再比较,避免 API 额外字段导致「永远 dirty」。
+ */
+const specDirty = computed(() => {
+  if (creating.value || !selected.value?.spec) return false
+  try {
+    const savedNormalized = buildStrategySpec(strategySpecToForm(selected.value.spec))
+    return JSON.stringify(draftSpec.value) !== JSON.stringify(savedNormalized)
+  } catch {
+    return true
+  }
+})
+const canMarkDesign = computed(() => designReady.value && !specDirty.value)
+const designBlockReason = computed(() => {
+  if (specDirty.value) return '有未保存修改，请先保存后再标记'
+  if (!designReady.value) {
+    const first = designChecks.value.find((c) => !c.ok)
+    return first ? `${first.id}: ${first.message}` : '清单未全部通过'
+  }
+  return ''
+})
 const designGateMessage = ref('')
 
 const capabilityText: Record<StrategyCapabilityStatus, string> = {
@@ -96,16 +125,22 @@ const CHECK_FIELD_ANCHORS: Record<string, string> = {
   REJECT_KNOWN: 'validation',
   LOCKED_OOS: 'validation',
   NATIVE_EXIT: 'exit',
-  CAPABILITY: 'data',
+  CAPABILITY: 'capability',
 }
 
 function scrollToCheckField(checkId: string) {
+  // CAPABILITY 落在页内「校验与能力」区块,不在 Spec 编辑器内
+  if (checkId === 'CAPABILITY') {
+    document.getElementById('capability-heading')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    return
+  }
   const key = CHECK_FIELD_ANCHORS[checkId]
+  const prefix = specIdPrefix.value
   const map: Record<string, string> = {
-    hypothesis: 'strategy-spec-hypothesis',
-    validation: 'strategy-spec-validation-heading',
-    exit: 'strategy-spec-exit-heading',
-    data: 'strategy-spec-data-heading',
+    hypothesis: `${prefix}-hypothesis`,
+    validation: `${prefix}-validation-heading`,
+    exit: `${prefix}-exit-heading`,
+    data: `${prefix}-data-heading`,
   }
   const elId = key ? map[key] : undefined
   if (!elId) return
@@ -132,12 +167,18 @@ function evidenceStatusName(status?: StrategyEvidenceStatus) {
 async function runEvidenceAction(action: StrategyEvidenceAction) {
   const strategy = selected.value
   if (!strategy || !strategy.editable) return
-  if (
-    (action === 'mark_design_complete' || action === 'reset_rejected')
-    && !designReady.value
-  ) {
-    designGateMessage.value = '验证设计清单未全部通过,请先补全假说/基线/否决/锁定样本外等项。'
-    return
+  if (action === 'mark_design_complete' || action === 'reset_rejected') {
+    if (specDirty.value) {
+      designGateMessage.value = '有未保存修改，请先保存后再操作。'
+      return
+    }
+    if (!designReady.value) {
+      const first = designChecks.value.find((c) => !c.ok)
+      designGateMessage.value = first
+        ? `验证设计清单未全部通过：${first.message}`
+        : '验证设计清单未全部通过,请先补全假说/基线/否决/锁定样本外等项。'
+      return
+    }
   }
   designGateMessage.value = ''
   await runAction(async () => {
@@ -149,6 +190,8 @@ async function runEvidenceAction(action: StrategyEvidenceAction) {
       if (err.detail?.error === 'design_complete_checklist_failed' && err.detail.checks) {
         const failed = err.detail.checks.filter((c) => !c.ok)
         designGateMessage.value = failed.map((c) => c.message).join('；') || err.message
+        // 清单区已给出可操作明细,顶栏只给一句人话,避免刷机器码
+        throw new Error('清单未通过，见下方验证设计清单')
       }
       throw caught
     }
@@ -194,7 +237,10 @@ watch(strategies, (items) => {
   if (selectedId.value === null && items.length) selectedId.value = items[0].id
 }, { immediate: true })
 
-watch(selectedId, () => clear())
+watch(selectedId, () => {
+  clear()
+  designGateMessage.value = ''
+})
 
 function startCreate() {
   creating.value = true
@@ -405,26 +451,34 @@ void init()
               <button
                 v-if="selected.editable && selected.evidence_actions?.includes('mark_design_complete')"
                 type="button"
-                :disabled="busy || !designReady"
+                :disabled="busy || !canMarkDesign"
                 class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
-                :title="designReady ? '标记为验证设计完成' : '清单未全绿,不可标记'"
+                :title="canMarkDesign ? '标记为验证设计完成' : designBlockReason"
                 @click="runEvidenceAction('mark_design_complete')"
               >标记设计完成</button>
               <button
                 v-if="selected.editable && selected.evidence_actions?.includes('reset_rejected')"
                 type="button"
-                :disabled="busy || !designReady"
+                :disabled="busy || !canMarkDesign"
                 class="rounded border border-border px-1.5 py-0.5 text-text-secondary hover:bg-hover disabled:opacity-50"
+                :title="canMarkDesign ? '复位否决结论' : designBlockReason"
                 @click="runEvidenceAction('reset_rejected')"
               >复位否决</button>
             </p>
+            <p
+              v-if="!creating && selected?.editable && selected.evidence_actions?.includes('mark_design_complete') && designBlockReason"
+              class="mt-1 text-[11px] text-text-tertiary"
+            >{{ designBlockReason }}</p>
             <div
               v-if="!creating && selected?.editable && (selected.evidence_actions?.length || designChecks.length)"
               class="mt-2 rounded border border-border-subtle bg-surface-muted px-2.5 py-2"
             >
               <div class="text-[11px] font-medium text-text-secondary">验证设计清单</div>
               <p class="mt-0.5 text-[10px] leading-4 text-text-tertiary">
-                通过清单 ≠ 策略有效,仅表示可以开始严肃回测证据链。
+                通过清单 ≠ 策略有效,仅表示可以开始严肃回测证据链。清单按<strong>已保存规格</strong>判定。
+              </p>
+              <p v-if="specDirty" class="mt-1 text-[11px] text-warning">
+                当前有未保存修改。请先「校验并保存」后再标记设计完成。
               </p>
               <ul class="mt-1.5 space-y-0.5">
                 <li

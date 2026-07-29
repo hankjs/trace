@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { AlertTriangle, CheckCircle2, Code2, Fingerprint, TriangleAlert } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
@@ -626,26 +626,44 @@ async function loadRun() {
   }
 }
 
+/** 从路由同步策略预选。KeepAlive 下需 watch / onActivated,不能只在 onMounted 读一次。 */
+function syncStrategyFromRoute() {
+  const raw = route.query.strategy
+  const requested = Number(Array.isArray(raw) ? raw[0] : raw)
+  if (requested && strategyById(requested)) {
+    strategyId.value = requested
+  }
+}
+
 onMounted(async () => {
   try {
     // 策略列表由 StrategySelect 自行加载,这里只补自选股;
     // 仍等待策略列表完成，确保 strategy_id 与能力状态先落位。
     const [, w] = await Promise.all([loadStrategies(), api.watchlist()])
     watchlist.value = w.items
-    const requestedStrategyId = Number(route.query.strategy)
-    if (requestedStrategyId && strategyById(requestedStrategyId)) {
-      strategyId.value = requestedStrategyId
-    }
+    syncStrategyFromRoute()
   } catch (e) {
     error.value = (e as Error).message
   }
   // 支持 /backtest?run=1 直接查看历史回测
-  const q = Number(route.query.run)
+  const q = Number(Array.isArray(route.query.run) ? route.query.run[0] : route.query.run)
   if (q) {
     runIdInput.value = String(q)
     await loadRun()
   }
 })
+
+// KeepAlive: 从策略管理再次「回测验证」时组件可能已挂载,需在激活/query 变化时重读
+onActivated(() => {
+  syncStrategyFromRoute()
+})
+
+watch(
+  () => route.query.strategy,
+  () => {
+    syncStrategyFromRoute()
+  },
+)
 </script>
 
 <template>
