@@ -7,6 +7,8 @@ import LoadingRows from '../components/LoadingRows.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
+import QuSelect from '../components/QuSelect.vue'
+import QuDatePicker from '../components/QuDatePicker.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import StrategySelect from '../components/StrategySelect.vue'
 import ResearchPlanSummaryView from '../components/ResearchPlanSummary.vue'
@@ -21,6 +23,14 @@ const fCode = ref('')
 /** null = 全部策略 */
 const fStrategyId = ref<number | null>(null)
 const fSide = ref('')
+const sideOptions = [
+  { value: '', label: '全部类型' },
+  { value: 'buy', label: '满足入场规则' },
+  { value: 'sell', label: '满足退出规则' },
+  { value: 'watch', label: '继续观察' },
+  { value: 'add', label: '上调模拟仓位' },
+  { value: 'reduce', label: '下调模拟仓位' },
+]
 const expandedIds = ref<Set<number>>(new Set())
 const plansBySignal = ref<Record<number, ResearchPlanSummary>>({})
 const loadingPlanIds = ref<Set<number>>(new Set())
@@ -131,23 +141,16 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-5">
-    <form class="flex flex-wrap items-end gap-3 border-b border-border-subtle pb-4" @submit.prevent="load">
+    <form data-tour="signals-form" class="flex flex-wrap items-end gap-3 border-b border-border-subtle pb-4" @submit.prevent="load">
       <label class="text-sm">
         <span class="mb-1 block text-xs text-text-tertiary">日期</span>
-        <input v-model="fDate" type="date" class="rounded-md border border-border px-2 py-1.5" />
+        <QuDatePicker v-model="fDate" class="rounded-md border border-border bg-surface-raised px-2 py-1.5" />
       </label>
       <StockSearchInput v-model="fCode" label="股票" />
-      <StrategySelect v-model="fStrategyId" allow-empty :manage-link="false" />
+      <StrategySelect v-model="fStrategyId" allow-empty :manage-link="false" data-tour="signals-strategy" />
       <label class="text-sm">
         <span class="mb-1 block text-xs text-text-tertiary">提示类型</span>
-        <select v-model="fSide" class="rounded-md border border-border px-2 py-1.5">
-          <option value="">全部类型</option>
-          <option value="buy">满足入场规则</option>
-          <option value="sell">满足退出规则</option>
-          <option value="watch">继续观察</option>
-          <option value="add">上调模拟仓位</option>
-          <option value="reduce">下调模拟仓位</option>
-        </select>
+        <QuSelect v-model="fSide" :options="sideOptions" class="rounded-md border border-border bg-surface-raised px-2 py-1.5" />
       </label>
       <button type="submit" :disabled="loading" class="inline-flex h-9 items-center gap-1.5 rounded-md bg-accent px-4 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-50">
         <Search :size="16" /> 查询
@@ -157,7 +160,7 @@ onMounted(async () => {
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <LoadingRows v-if="loading" :rows="5" />
 
-    <div v-else-if="items.length" class="overflow-x-auto rounded-md border border-border bg-surface-raised">
+    <div v-else-if="items.length" data-tour="signals-result" class="overflow-x-auto rounded-md border border-border bg-surface-raised">
       <QuTable
         :data="items"
         :columns="signalColumns"

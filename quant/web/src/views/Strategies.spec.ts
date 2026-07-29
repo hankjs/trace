@@ -114,7 +114,7 @@ describe('StrategySpec editor', () => {
 
     // 结构化表单:基础字段与递归表达式编辑器均渲染
     expect(wrapper.get<HTMLInputElement>('#create-spec-listing-days').element.value).toBe('120')
-    expect(wrapper.findAll('select[aria-label="算子"]').length).toBeGreaterThan(0)
+    expect(wrapper.findAll('button[aria-label="算子"]').length).toBeGreaterThan(0)
 
     const submit = wrapper.findAll('button').find((button) => button.text() === '校验并创建')
     await submit!.trigger('click')
@@ -175,9 +175,9 @@ describe('StrategySpec editor', () => {
     expect(wrapper.text()).toContain('组合构建')
     expect(wrapper.text()).toContain('评分表达式')
     expect(wrapper.text()).not.toContain('原生离场')
-    expect(wrapper.find<HTMLSelectElement>('#edit-spec-rebalance').exists()).toBe(true)
-    expect(wrapper.get<HTMLSelectElement>('#edit-spec-rebalance').element.value).toBe('monthly')
-    expect(wrapper.get<HTMLSelectElement>('#edit-spec-kind').element.disabled).toBe(true)
+    expect(wrapper.find<HTMLButtonElement>('#edit-spec-rebalance').exists()).toBe(true)
+    expect(wrapper.get<HTMLButtonElement>('#edit-spec-rebalance').text()).toContain('每月调仓')
+    expect(wrapper.get<HTMLButtonElement>('#edit-spec-kind').element.disabled).toBe(true)
     expect(wrapper.text()).toContain('公共策略只读')
     expect(wrapper.text()).not.toContain('尚未覆盖的受控组件')
   })

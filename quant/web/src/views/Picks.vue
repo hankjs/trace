@@ -5,6 +5,7 @@ import { api, type PickItem } from '../api'
 import { catalogEntry, factorName, loadCatalog } from '../catalog'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import QuDatePicker from '../components/QuDatePicker.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import { fmtBigAmount, fmtPct, localDateISO } from '../format'
@@ -93,10 +94,10 @@ onMounted(async () => {
         <h2 class="text-base font-semibold">系统候选</h2>
         <p class="mt-1 text-xs text-text-tertiary">按每日量化评分生成，展开可查看各项指标。</p>
       </div>
-      <form class="flex items-end gap-3" @submit.prevent="load">
+      <form data-tour="picks-form" class="flex items-end gap-3" @submit.prevent="load">
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">日期</span>
-          <input v-model="date" type="date" class="rounded-md border border-border bg-surface-raised px-2 py-1.5" />
+          <QuDatePicker v-model="date" class="rounded-md border border-border bg-surface-raised px-2 py-1.5" />
         </label>
         <button type="submit" class="rounded-md bg-accent px-4 py-1.5 text-sm text-on-accent hover:bg-accent-hover">
           查询
@@ -108,7 +109,7 @@ onMounted(async () => {
     <LoadingRows v-if="loading" :rows="5" />
 
     <template v-else>
-      <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
+      <div data-tour="picks-result" class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
         <QuTable :data="items" :columns="columns" row-key="code">
           <template #cell-stock="{ row: p }">
             <router-link :to="`/stock/${p.code}`" class="text-accent hover:underline" @click.stop>

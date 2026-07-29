@@ -10,6 +10,8 @@ import {
   type Strategy,
 } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
+import QuSelect from '../components/QuSelect.vue'
+import QuDatePicker from '../components/QuDatePicker.vue'
 import {
   expandParamColumns,
   formatParamPatch,
@@ -50,6 +52,18 @@ const trialForm = ref({
 })
 
 const objective = ref<ObjectiveKey>('sharpe')
+const objectiveOptions: { value: ObjectiveKey; label: string }[] = [
+  { value: 'sharpe', label: '夏普' },
+  { value: 'annual_return', label: '年化' },
+  { value: 'total_return', label: '总收益' },
+  { value: 'calmar', label: 'Calmar' },
+  { value: 'max_drawdown', label: '回撤(越接近0越好)' },
+]
+/** 创建实验的关联策略下拉:null = 未选择 */
+const strategyOptions = computed(() => [
+  { value: null, label: '请选择' },
+  ...strategies.value.map((s) => ({ value: s.id, label: `${s.name} (#${s.id})` })),
+])
 const sort = ref<SortState>({ key: 'sharpe', dir: 'desc' })
 /** 单次/批量 trial 运行中,防双提交并给出反馈 */
 const trialBusy = ref(false)
@@ -403,15 +417,11 @@ onMounted(async () => {
         </label>
         <label class="text-xs md:col-span-2">
           关联策略(冻结其当前规格)
-          <select
-            v-model.number="form.strategy_id"
+          <QuSelect
+            v-model="form.strategy_id"
+            :options="strategyOptions"
             class="mt-1 h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm"
-          >
-            <option :value="null">请选择</option>
-            <option v-for="s in strategies" :key="s.id" :value="s.id">
-              {{ s.name }} (#{{ s.id }})
-            </option>
-          </select>
+          />
         </label>
       </div>
       <div>
@@ -542,13 +552,7 @@ onMounted(async () => {
         <div class="flex flex-wrap items-center gap-3 text-xs">
           <label class="flex items-center gap-1">
             优化目标
-            <select v-model="objective" class="h-8 rounded-md border border-border bg-surface px-2 text-xs">
-              <option value="sharpe">夏普</option>
-              <option value="annual_return">年化</option>
-              <option value="total_return">总收益</option>
-              <option value="calmar">Calmar</option>
-              <option value="max_drawdown">回撤(越接近0越好)</option>
-            </select>
+            <QuSelect v-model="objective" :options="objectiveOptions" class="h-8 rounded-md border border-border bg-surface px-2 text-xs" />
           </label>
           <label class="flex items-center gap-1"><input v-model="columnPrefs.win_rate" type="checkbox" /> 胜率</label>
           <label class="flex items-center gap-1"><input v-model="columnPrefs.trade_count" type="checkbox" /> 交易数</label>
@@ -564,8 +568,8 @@ onMounted(async () => {
           <label class="text-xs">
             区间
             <div class="mt-1 flex gap-1">
-              <input v-model="trialForm.start" type="date" class="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
-              <input v-model="trialForm.end" type="date" class="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
+              <QuDatePicker v-model="trialForm.start" class="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
+              <QuDatePicker v-model="trialForm.end" class="h-9 w-full rounded-md border border-border bg-surface px-2.5 text-sm" />
             </div>
           </label>
           <label class="text-xs">

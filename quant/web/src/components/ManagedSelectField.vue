@@ -1,13 +1,15 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { Settings2 } from 'lucide-vue-next'
 import type { RouteLocationRaw } from 'vue-router'
+import QuSelect from './QuSelect.vue'
 
 export interface ManagedSelectOption {
   value: number
   label: string
 }
 
-withDefaults(defineProps<{
+const props = withDefaults(defineProps<{
   label: string
   options: ManagedSelectOption[]
   loading?: boolean
@@ -34,10 +36,16 @@ withDefaults(defineProps<{
 const model = defineModel<number | null>({ required: true })
 const emit = defineEmits<{ change: [value: number | null] }>()
 
-function onSelect(value: string) {
-  model.value = value === '' ? null : Number(value)
-  emit('change', model.value)
-}
+// 空选项(筛选场景的「全部」)作为 value=null 的真实选项;loading/无选项走占位文案 + 禁用
+const selectOptions = computed(() => [
+  ...(props.allowEmpty ? [{ value: null, label: props.emptyLabel }] : []),
+  ...props.options,
+])
+const placeholder = computed(() => {
+  if (props.loading) return '加载中…'
+  if (!props.options.length && !props.allowEmpty) return props.unavailableLabel
+  return '请选择'
+})
 </script>
 
 <template>
@@ -45,20 +53,15 @@ function onSelect(value: string) {
     <div class="flex items-end gap-2">
       <label class="block">
         <span v-if="label" class="mb-1 block text-xs text-text-tertiary">{{ label }}</span>
-        <select
-          :value="model ?? ''"
+        <QuSelect
+          v-model="model"
+          :options="selectOptions"
+          :placeholder="placeholder"
           :disabled="disabled || loading || (!options.length && !allowEmpty)"
           :aria-describedby="describedBy"
           class="min-w-52 rounded-md border border-border bg-surface-raised px-2.5 py-1.5 text-sm disabled:opacity-50"
-          @change="onSelect(($event.target as HTMLSelectElement).value)"
-        >
-          <option v-if="loading" value="">加载中…</option>
-          <option v-else-if="allowEmpty" value="">{{ emptyLabel }}</option>
-          <option v-else-if="!options.length" value="">{{ unavailableLabel }}</option>
-          <option v-for="option in options" :key="option.value" :value="option.value">
-            {{ option.label }}
-          </option>
-        </select>
+          @change="emit('change', $event)"
+        />
       </label>
       <router-link
         v-if="manageLink"

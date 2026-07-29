@@ -14,6 +14,7 @@ import {
   snippetsForTarget,
 } from '../specSnippets'
 import SpecExpressionEditor from './SpecExpressionEditor.vue'
+import QuSelect from './QuSelect.vue'
 
 const props = withDefaults(defineProps<{
   pools: Pool[]
@@ -194,6 +195,39 @@ const smallInputClass = 'h-8 w-full rounded-md border border-border bg-surface-r
 const removeButtonClass = 'inline-flex h-8 w-8 shrink-0 items-center justify-center self-end rounded-md border border-border text-text-tertiary transition-colors hover:bg-hover hover:text-text-primary disabled:opacity-40'
 const addButtonClass = 'inline-flex h-8 items-center gap-1.5 rounded-md border border-dashed border-border px-2.5 text-xs text-text-secondary transition-colors hover:bg-hover hover:text-text-primary disabled:opacity-40'
 const snippetBtnClass = 'btn btn-secondary btn-sm'
+
+// ---- QuSelect 选项(值类型与表单字段的字面量联合类型对齐) ----
+const kindOptions: { value: StrategySpecFormState['kind']; label: string }[] = [
+  { value: 'single', label: '单标的目标仓位' },
+  { value: 'portfolio', label: '组合目标权重' },
+]
+const poolOptions = computed(() => props.pools.map((pool) => ({ value: pool.id, label: pool.name })))
+const dataFieldOptions = SUPPORTED_FIELDS.map((field) => ({ value: field.name, label: `${field.label} (${field.name})` }))
+const availabilityOptions: { value: StrategySpecFormState['dataRequirements'][number]['availability']; label: string }[] = [
+  { value: 'daily_close', label: '日收盘' },
+  { value: 'daily_open', label: '日开盘' },
+  { value: 'point_in_time', label: '时点数据' },
+]
+const weightingOptions: { value: StrategySpecFormState['weightingType']; label: string }[] = [
+  { value: 'equal', label: '等权' },
+  { value: 'rank', label: '按排名加权' },
+]
+const rebalanceOptions: { value: StrategySpecFormState['rebalance']; label: string }[] = [
+  { value: 'fixed', label: '固定持有周期' },
+  { value: 'weekly', label: '每周调仓' },
+  { value: 'monthly', label: '每月调仓' },
+]
+const positionTypeOptions: { value: StrategySpecFormState['positionType']; label: string }[] = [
+  { value: 'binary', label: '二元(满足条件即到目标仓位)' },
+  { value: 'fixed', label: '固定目标仓位' },
+]
+const overlayTypeOptions: { value: StrategySpecFormState['riskType']; label: string }[] = [
+  { value: 'fixed_pct', label: '固定比例' },
+  { value: 'atr_multiple', label: 'ATR 倍数' },
+]
+const snippetOptions = computed(() =>
+  availableSnippets.value.map((s) => ({ value: s.id, label: `${s.name} (${s.id})` })),
+)
 </script>
 
 <template>
@@ -204,10 +238,7 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
       </div>
       <label :for="id('kind')" class="text-xs font-medium text-text-secondary">
         策略类型
-        <select :id="id('kind')" v-model="model.kind" :disabled="disabled" :class="['mt-1', inputClass]">
-          <option value="single">单标的目标仓位</option>
-          <option value="portfolio">组合目标权重</option>
-        </select>
+        <QuSelect :id="id('kind')" v-model="model.kind" :options="kindOptions" :disabled="disabled" :class="['mt-1', inputClass]" />
       </label>
       <label :for="id('canonical-id')" class="text-xs font-medium text-text-secondary">
         规则标识
@@ -224,10 +255,7 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
       </div>
       <label :for="id('pool')" class="text-xs font-medium text-text-secondary">
         股票池
-        <select :id="id('pool')" v-model="model.poolId" :disabled="disabled" :class="['mt-1', inputClass]">
-          <option :value="null" disabled>请选择股票池</option>
-          <option v-for="pool in pools" :key="pool.id" :value="pool.id">{{ pool.name }}</option>
-        </select>
+        <QuSelect :id="id('pool')" v-model="model.poolId" :options="poolOptions" placeholder="请选择股票池" :disabled="disabled" :class="['mt-1', inputClass]" />
       </label>
       <label :for="id('hypothesis')" class="text-xs font-medium text-text-secondary md:col-span-2">
         研究假设
@@ -295,19 +323,11 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
       <div v-for="(item, index) in model.dataRequirements" :key="index" class="mb-1.5 flex items-end gap-2">
         <label class="min-w-0 flex-1 text-[11px] text-text-tertiary">
           字段
-          <select v-model="item.field" :disabled="disabled" :class="['mt-0.5', smallInputClass]">
-            <option v-for="fieldOption in SUPPORTED_FIELDS" :key="fieldOption.name" :value="fieldOption.name">
-              {{ fieldOption.label }} ({{ fieldOption.name }})
-            </option>
-          </select>
+          <QuSelect v-model="item.field" :options="dataFieldOptions" :disabled="disabled" :class="['mt-0.5', smallInputClass]" />
         </label>
         <label class="min-w-0 flex-1 text-[11px] text-text-tertiary">
           可用性
-          <select v-model="item.availability" :disabled="disabled" :class="['mt-0.5', smallInputClass]">
-            <option value="daily_close">日收盘</option>
-            <option value="daily_open">日开盘</option>
-            <option value="point_in_time">时点数据</option>
-          </select>
+          <QuSelect v-model="item.availability" :options="availabilityOptions" :disabled="disabled" :class="['mt-0.5', smallInputClass]" />
         </label>
         <label class="flex h-8 shrink-0 items-center gap-1.5 text-xs text-text-secondary">
           <input v-model="item.required" type="checkbox" :disabled="disabled" :class="checkClass" />
@@ -390,18 +410,11 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
           </label>
           <label :for="id('weighting')" class="text-xs font-medium text-text-secondary">
             权重方法
-            <select :id="id('weighting')" v-model="model.weightingType" :disabled="disabled" :class="['mt-1', inputClass]">
-              <option value="equal">等权</option>
-              <option value="rank">按排名加权</option>
-            </select>
+            <QuSelect :id="id('weighting')" v-model="model.weightingType" :options="weightingOptions" :disabled="disabled" :class="['mt-1', inputClass]" />
           </label>
           <label :for="id('rebalance')" class="text-xs font-medium text-text-secondary">
             调仓周期
-            <select :id="id('rebalance')" v-model="model.rebalance" :disabled="disabled" :class="['mt-1', inputClass]">
-              <option value="fixed">固定持有周期</option>
-              <option value="weekly">每周调仓</option>
-              <option value="monthly">每月调仓</option>
-            </select>
+            <QuSelect :id="id('rebalance')" v-model="model.rebalance" :options="rebalanceOptions" :disabled="disabled" :class="['mt-1', inputClass]" />
           </label>
           <label v-if="model.rebalance === 'fixed'" :for="id('rebalance-days')" class="text-xs font-medium text-text-secondary">
             调仓间隔
@@ -450,10 +463,7 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
       <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <label v-if="!isPortfolio" :for="id('position-type')" class="text-xs font-medium text-text-secondary">
           仓位类型
-          <select :id="id('position-type')" v-model="model.positionType" :disabled="disabled" :class="['mt-1', inputClass]">
-            <option value="binary">二元(满足条件即到目标仓位)</option>
-            <option value="fixed">固定目标仓位</option>
-          </select>
+          <QuSelect :id="id('position-type')" v-model="model.positionType" :options="positionTypeOptions" :disabled="disabled" :class="['mt-1', inputClass]" />
         </label>
         <label v-if="!isPortfolio" :for="id('target-weight')" class="text-xs font-medium text-text-secondary">
           目标仓位
@@ -526,10 +536,7 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
           </label>
           <label :for="id('risk-type')" class="text-xs font-medium text-text-secondary">
             口径
-            <select :id="id('risk-type')" v-model="model.riskType" :disabled="disabled || !model.riskEnabled" :class="['mt-1', inputClass]">
-              <option value="fixed_pct">固定比例</option>
-              <option value="atr_multiple">ATR 倍数</option>
-            </select>
+            <QuSelect :id="id('risk-type')" v-model="model.riskType" :options="overlayTypeOptions" :disabled="disabled || !model.riskEnabled" :class="['mt-1', inputClass]" />
           </label>
           <label :for="id('risk-value')" class="text-xs font-medium text-text-secondary">
             {{ model.riskType === 'fixed_pct' ? '回撤比例(≤1)' : 'ATR 倍数(≤50)' }}
@@ -551,10 +558,7 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
           </label>
           <label :for="id('profit-type')" class="text-xs font-medium text-text-secondary">
             口径
-            <select :id="id('profit-type')" v-model="model.takeProfitType" :disabled="disabled || !model.takeProfitEnabled" :class="['mt-1', inputClass]">
-              <option value="fixed_pct">固定比例</option>
-              <option value="atr_multiple">ATR 倍数</option>
-            </select>
+            <QuSelect :id="id('profit-type')" v-model="model.takeProfitType" :options="overlayTypeOptions" :disabled="disabled || !model.takeProfitEnabled" :class="['mt-1', inputClass]" />
           </label>
           <label :for="id('profit-value')" class="text-xs font-medium text-text-secondary">
             {{ model.takeProfitType === 'fixed_pct' ? '上涨比例(≤1)' : 'ATR 倍数(≤50)' }}
@@ -683,13 +687,12 @@ const snippetBtnClass = 'btn btn-secondary btn-sm'
         </div>
         <label class="block text-xs font-medium text-text-secondary">
           片段
-          <select
+          <QuSelect
             class="mt-1 w-full rounded-md border border-border bg-surface-raised px-2.5 py-1.5 text-sm"
-            :value="selectedSnippetId"
-            @change="onSnippetSelect(($event.target as HTMLSelectElement).value)"
-          >
-            <option v-for="s in availableSnippets" :key="s.id" :value="s.id">{{ s.name }} ({{ s.id }})</option>
-          </select>
+            :model-value="selectedSnippetId"
+            :options="snippetOptions"
+            @change="onSnippetSelect"
+          />
         </label>
         <p v-if="selectedSnippet" class="mt-2 text-xs text-text-secondary">{{ selectedSnippet.description }}</p>
         <div v-if="selectedSnippet" class="mt-3 grid gap-2 sm:grid-cols-2">

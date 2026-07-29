@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { StrategyOverlayConfig } from '../api'
+import type { StrategyOverlayConfig, StrategyOverlayType } from '../api'
 import { overlaySummary } from '../researchPlans'
+import QuSelect from './QuSelect.vue'
 
 const props = withDefaults(defineProps<{
   disabled?: boolean
@@ -16,6 +17,15 @@ const takeProfit = defineModel<StrategyOverlayConfig>('takeProfit', { required: 
 
 const riskSummary = computed(() => overlaySummary(risk.value, 'risk'))
 const takeProfitSummary = computed(() => overlaySummary(takeProfit.value, 'take_profit'))
+
+const riskTypeOptions: { value: StrategyOverlayType; label: string }[] = [
+  { value: 'fixed_pct', label: '固定百分比' },
+  { value: 'atr_multiple', label: 'ATR 波动倍数' },
+]
+const takeProfitTypeOptions: { value: StrategyOverlayType; label: string }[] = [
+  { value: 'fixed_pct', label: '固定收益率' },
+  { value: 'atr_multiple', label: 'ATR 波动倍数' },
+]
 </script>
 
 <template>
@@ -40,10 +50,7 @@ const takeProfitSummary = computed(() => overlaySummary(takeProfit.value, 'take_
       <div v-if="risk.enabled" class="mt-3 flex flex-wrap gap-3">
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">风险类型</span>
-          <select v-model="risk.type" :disabled="disabled" class="h-9 rounded-md border border-border px-2 disabled:opacity-50">
-            <option value="fixed_pct">固定百分比</option>
-            <option value="atr_multiple">ATR 波动倍数</option>
-          </select>
+          <QuSelect v-model="risk.type" :options="riskTypeOptions" :disabled="disabled" class="h-9 rounded-md border border-border bg-surface-raised px-2 disabled:opacity-50" />
         </label>
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">{{ risk.type === 'fixed_pct' ? '回落比例（小数）' : 'ATR 倍数' }}</span>
@@ -77,10 +84,7 @@ const takeProfitSummary = computed(() => overlaySummary(takeProfit.value, 'take_
       <div v-if="takeProfit.enabled" class="mt-3 flex flex-wrap gap-3">
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">止盈类型</span>
-          <select v-model="takeProfit.type" :disabled="disabled" class="h-9 rounded-md border border-border px-2 disabled:opacity-50">
-            <option value="fixed_pct">固定收益率</option>
-            <option value="atr_multiple">ATR 波动倍数</option>
-          </select>
+          <QuSelect v-model="takeProfit.type" :options="takeProfitTypeOptions" :disabled="disabled" class="h-9 rounded-md border border-border bg-surface-raised px-2 disabled:opacity-50" />
         </label>
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">{{ takeProfit.type === 'fixed_pct' ? '上涨比例（小数）' : 'ATR 倍数' }}</span>

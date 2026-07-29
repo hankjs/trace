@@ -93,17 +93,41 @@ async function mountPage(item: Strategy) {
     },
   })
   await flushPromises()
-  await wrapper.get('select').setValue(String(item.id))
+  // 通过 QuSelect 选择策略:打开下拉,点击对应选项
+  const strategyTrigger = wrapper.findAll('button[aria-haspopup="listbox"]')
+    .find((button) => button.text().includes(item.name))
+  expect(strategyTrigger).toBeDefined()
+  await strategyTrigger!.trigger('click')
+  const strategyOption = wrapper.findAll('button[role="option"]')
+    .find((button) => button.text().includes(item.name))
+  expect(strategyOption).toBeDefined()
+  await strategyOption!.trigger('click')
   await flushPromises()
   return { wrapper, api }
 }
 
+/** QuDatePicker 选日期:打开面板,向前翻月直到目标日期出现在网格里再点选 */
+async function pickDate(wrapper: Awaited<ReturnType<typeof mountPage>>['wrapper'], ariaLabel: string, iso: string) {
+  await wrapper.get(`button[aria-label="${ariaLabel}"]`).trigger('click')
+  for (let i = 0; i < 120; i++) {
+    const day = wrapper.find(`button[data-date="${iso}"]`)
+    if (day.exists()) {
+      await day.trigger('click')
+      return
+    }
+    await wrapper.get('button[aria-label="上个月"]').trigger('click')
+  }
+  throw new Error(`未能在日历中定位日期 ${iso}`)
+}
+
 async function fillScope(wrapper: Awaited<ReturnType<typeof mountPage>>['wrapper']) {
-  const dates = wrapper.findAll<HTMLInputElement>('input[type="date"]')
-  await dates[0].setValue('2024-01-01')
-  await dates[1].setValue('2024-12-31')
-  // 通过选股器选择 sh.600519:打开弹层,点击对应行
-  await wrapper.get('button[aria-haspopup="listbox"]').trigger('click')
+  await pickDate(wrapper, '开始日期', '2024-01-01')
+  await pickDate(wrapper, '结束日期', '2024-12-31')
+  // 通过选股器选择 sh.600519:打开弹层,点击对应行(排除 QuSelect 的触发按钮)
+  const pickerTrigger = wrapper.findAll('button[aria-haspopup="listbox"]')
+    .find((button) => button.text().includes('点击选择股票'))
+  expect(pickerTrigger).toBeDefined()
+  await pickerTrigger!.trigger('click')
   const row = wrapper.findAll('button[role="option"]').find((b) => b.text().includes('sh.600519'))
   expect(row).toBeDefined()
   await row!.trigger('click')
@@ -172,9 +196,8 @@ describe('saved StrategySpec backtest workflow', () => {
   it('runs a single strategy against a pool', async () => {
     const { wrapper, api } = await mountPage(strategy())
     const run = vi.spyOn(api, 'runBacktest').mockResolvedValue(backtestResult())
-    const dates = wrapper.findAll<HTMLInputElement>('input[type="date"]')
-    await dates[0].setValue('2024-01-01')
-    await dates[1].setValue('2024-12-31')
+    await pickDate(wrapper, '开始日期', '2024-01-01')
+    await pickDate(wrapper, '结束日期', '2024-12-31')
 
     // 切到「按股票池」模式,PoolSelect 就绪后落到默认池(全部A股 id=2)
     const poolModeButton = wrapper.findAll('button').find((b) => b.text() === '按股票池')!

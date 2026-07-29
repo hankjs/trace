@@ -5,6 +5,7 @@
 import { computed } from 'vue'
 import { Plus, X } from 'lucide-vue-next'
 import type { StrategyAstNode } from '../api'
+import QuSelect from './QuSelect.vue'
 import {
   MAX_EXPRESSION_DEPTH,
   MAX_EXPRESSION_NODES,
@@ -48,6 +49,18 @@ const overLimit = computed(
 )
 const tooDeep = computed(() => props.depth >= MAX_EXPRESSION_DEPTH)
 
+// QuSelect 选项:算子/字段/布尔常量/排序方向
+const opOptions = computed(() => options.value.map((option) => ({ value: option.op, label: option.label })))
+const fieldOptions = SUPPORTED_FIELDS.map((item) => ({ value: item.name, label: `${item.label} (${item.name})` }))
+const boolLiteralOptions = [
+  { value: true, label: '真 (true)' },
+  { value: false, label: '假 (false)' },
+]
+const ascendingOptions = [
+  { value: false, label: '降序(值大在前)' },
+  { value: true, label: '升序(值小在前)' },
+]
+
 const literalNumber = computed({
   get: () => (typeof model.value.value === 'number' ? model.value.value : 0),
   set: (value: number) => {
@@ -66,8 +79,7 @@ function hasParam(name: string) {
   return (def.value?.params as string[] | undefined)?.includes(name) ?? false
 }
 
-function onOpChange(event: Event) {
-  const op = (event.target as HTMLSelectElement).value
+function onOpChange(op: string) {
   model.value = switchNodeOp(model.value, op, props.expectedType)
 }
 
@@ -109,27 +121,19 @@ const numberClass = 'h-7 w-20 rounded border border-border bg-surface-raised px-
     :class="depth === 0 ? 'border-border bg-surface-muted/50' : 'border-border-subtle bg-surface-raised/70'"
   >
     <div class="flex flex-wrap items-center gap-x-3 gap-y-1.5 px-2.5 py-2">
-      <select
-        :value="model.op"
+      <QuSelect
+        :model-value="model.op"
+        :options="opOptions"
         :disabled="disabled"
         :class="selectClass"
         aria-label="算子"
         @change="onOpChange"
-      >
-        <option v-for="option in options" :key="option.op" :value="option.op">{{ option.label }}</option>
-      </select>
+      />
 
-      <select v-if="model.op === 'field'" v-model="model.name" :disabled="disabled" :class="selectClass" aria-label="字段">
-        <option v-for="item in SUPPORTED_FIELDS" :key="item.name" :value="item.name">
-          {{ item.label }} ({{ item.name }})
-        </option>
-      </select>
+      <QuSelect v-if="model.op === 'field'" v-model="model.name" :options="fieldOptions" :disabled="disabled" :class="selectClass" aria-label="字段" />
 
       <template v-else-if="model.op === 'literal'">
-        <select v-if="expectedType === 'bool'" v-model="literalBool" :disabled="disabled" :class="selectClass" aria-label="常量值">
-          <option :value="true">真 (true)</option>
-          <option :value="false">假 (false)</option>
-        </select>
+        <QuSelect v-if="expectedType === 'bool'" v-model="literalBool" :options="boolLiteralOptions" :disabled="disabled" :class="selectClass" aria-label="常量值" />
         <input v-else v-model.number="literalNumber" type="number" step="any" :disabled="disabled" :class="numberClass" aria-label="常量值" />
       </template>
 
@@ -151,10 +155,7 @@ const numberClass = 'h-7 w-20 rounded border border-border bg-surface-raised px-
       </label>
       <label v-if="hasParam('ascending')" class="flex items-center gap-1 text-xs text-text-tertiary">
         排序
-        <select v-model="model.ascending" :disabled="disabled" :class="selectClass">
-          <option :value="false">降序(值大在前)</option>
-          <option :value="true">升序(值小在前)</option>
-        </select>
+        <QuSelect v-model="model.ascending" :options="ascendingOptions" :disabled="disabled" :class="selectClass" />
       </label>
 
       <span v-if="!def" class="text-xs text-warning">未知算子 {{ model.op }},后端校验会拒绝</span>

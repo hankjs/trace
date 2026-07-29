@@ -28,7 +28,9 @@ describe('StrategyOverlayFields', () => {
     expect(wrapper.get('input[type="number"]').attributes('max')).toBe('1')
     expect(wrapper.text()).toContain('相对模拟入场价回落 8.00%')
 
-    await wrapper.get('select').setValue('atr_multiple')
+    // QuSelect:打开风险类型下拉,选择 ATR 波动倍数
+    await wrapper.get('button[aria-haspopup="listbox"]').trigger('click')
+    await wrapper.get('button[role="option"][data-value="atr_multiple"]').trigger('click')
     expect(wrapper.findAll('input[type="number"]')).toHaveLength(2)
     expect(wrapper.text()).toContain('14 日 ATR')
   })

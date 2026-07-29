@@ -16,6 +16,7 @@ import { categoryLabels, operatorLabels, useCatalog } from '../catalog'
 import LoadingRows from '../components/LoadingRows.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
+import QuSelect from '../components/QuSelect.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import { isKnownPoolId } from '../pools'
@@ -82,6 +83,26 @@ const groupedFields = computed(() => {
 })
 
 const activeConditions = computed(() => groups.value.flatMap((group) => group.conditions).filter((condition) => condition.enabled))
+/** 筛选字段下拉选项:按目录分类打平,group 字段驱动 QuSelect 渲染分组标题(替代 optgroup) */
+const fieldOptions = computed(() => groupedFields.value.flatMap((category) =>
+  category.fields.map((field) => ({
+    value: field.key,
+    label: `${field.name}${field.available === false ? '（数据待接入）' : ''}`,
+    disabled: field.available === false,
+    group: category.name,
+  })),
+))
+const boolValueOptions = [
+  { value: true, label: '是' },
+  { value: false, label: '否' },
+]
+const schemeOptions = computed(() => [
+  { value: '', label: '选择方案' },
+  ...savedSchemes.value.map((scheme) => ({ value: scheme.name, label: scheme.name })),
+])
+function operatorOptions(condition: ScreenerCondition) {
+  return operatorsOf(condition).map((operator) => ({ value: operator, label: operatorLabels[operator] ?? operator }))
+}
 const resultFields = computed(() => [...new Set(activeConditions.value.map((condition) => condition.field))].slice(0, 4))
 const missingDataFields = computed(() => [...new Set(
   activeConditions.value
@@ -433,7 +454,7 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-5">
-    <section aria-labelledby="preset-heading">
+    <section data-tour="screener-pool" aria-labelledby="preset-heading">
       <div class="flex flex-wrap items-start justify-between gap-3">
         <PoolSelect v-model="poolId" label="研究范围（股票池）" />
         <div class="flex flex-wrap items-center gap-2">
@@ -451,7 +472,7 @@ onMounted(async () => {
       </div>
     </section>
 
-    <section class="rounded-md border border-border bg-surface-raised" aria-labelledby="builder-heading">
+    <section data-tour="screener-builder" class="rounded-md border border-border bg-surface-raised" aria-labelledby="builder-heading">
       <div class="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
         <div>
           <h2 id="builder-heading" class="text-sm font-semibold">筛选条件</h2>
@@ -500,20 +521,12 @@ onMounted(async () => {
 
               <label>
                 <span class="sr-only">筛选字段</span>
-                <select v-model="condition.field" class="w-full rounded-md border border-border px-2 py-1.5 text-sm" @change="updateField(condition)">
-                  <optgroup v-for="category in groupedFields" :key="category.key" :label="category.name">
-                    <option v-for="field in category.fields" :key="field.key" :value="field.key" :disabled="field.available === false">
-                      {{ field.name }}{{ field.available === false ? '（数据待接入）' : '' }}
-                    </option>
-                  </optgroup>
-                </select>
+                <QuSelect v-model="condition.field" :options="fieldOptions" class="w-full rounded-md border border-border bg-surface-raised px-2 py-1.5 text-sm" @change="updateField(condition)" />
               </label>
 
               <label>
                 <span class="sr-only">判断关系</span>
-                <select v-model="condition.operator" class="w-full rounded-md border border-border px-2 py-1.5 text-sm">
-                  <option v-for="operator in operatorsOf(condition)" :key="operator" :value="operator">{{ operatorLabels[operator] ?? operator }}</option>
-                </select>
+                <QuSelect v-model="condition.operator" :options="operatorOptions(condition)" class="w-full rounded-md border border-border bg-surface-raised px-2 py-1.5 text-sm" />
               </label>
 
               <div class="flex items-center gap-1.5">
@@ -521,10 +534,7 @@ onMounted(async () => {
                 <template v-else-if="fieldOf(condition.field)?.data_type === 'boolean'">
                   <label class="w-full">
                     <span class="sr-only">条件值</span>
-                    <select v-model="condition.value" class="w-full rounded-md border border-border px-2 py-1.5 text-sm">
-                      <option :value="true">是</option>
-                      <option :value="false">否</option>
-                    </select>
+                    <QuSelect v-model="condition.value" :options="boolValueOptions" class="w-full rounded-md border border-border bg-surface-raised px-2 py-1.5 text-sm" />
                   </label>
                 </template>
                 <template v-else>
@@ -583,10 +593,7 @@ onMounted(async () => {
           <template v-if="savedSchemes.length">
             <label>
               <span class="mb-1 block text-[11px] text-text-tertiary">已保存方案</span>
-              <select v-model="selectedScheme" class="w-36 rounded-md border border-border px-2 py-1.5 text-xs">
-                <option value="">选择方案</option>
-                <option v-for="scheme in savedSchemes" :key="scheme.name" :value="scheme.name">{{ scheme.name }}</option>
-              </select>
+              <QuSelect v-model="selectedScheme" :options="schemeOptions" class="w-36 rounded-md border border-border bg-surface-raised px-2 py-1.5 text-xs" />
             </label>
             <button type="button" :disabled="!selectedScheme" class="icon-button border border-border disabled:opacity-40" title="载入筛选方案" @click="loadScheme">
               <FolderOpen :size="15" />
@@ -597,7 +604,7 @@ onMounted(async () => {
               <span class="sr-only">删除筛选方案</span>
             </button>
           </template>
-          <button type="button" :disabled="loading" class="inline-flex h-9 items-center gap-1.5 rounded-md bg-accent px-4 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-50" @click="search">
+          <button type="button" data-tour="screener-run" :disabled="loading" class="inline-flex h-9 items-center gap-1.5 rounded-md bg-accent px-4 text-sm font-medium text-on-accent hover:bg-accent-hover disabled:opacity-50" @click="search">
             <Search :size="16" /> {{ loading ? '筛选中' : '开始筛选' }}
           </button>
         </div>
@@ -619,7 +626,7 @@ onMounted(async () => {
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <LoadingRows v-if="loading" :rows="5" />
 
-    <section v-else-if="searched && !error" aria-labelledby="result-heading">
+    <section v-else-if="searched && !error" data-tour="screener-result" aria-labelledby="result-heading">
       <div class="mb-3 flex flex-wrap items-baseline justify-between gap-2">
         <h2 id="result-heading" class="text-sm font-semibold">
           组合命中 <span class="text-base text-accent">{{ combinedCount }}</span> 只

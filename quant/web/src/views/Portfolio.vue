@@ -5,6 +5,8 @@ import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
+import QuSelect from '../components/QuSelect.vue'
+import QuDatePicker from '../components/QuDatePicker.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import PortfolioResearchPlan from '../components/PortfolioResearchPlan.vue'
 import { fmtAmount, fmtPrice, fmtQty, fmtSigned, localDateISO, pnlClass } from '../format'
@@ -29,6 +31,11 @@ const positionColumns: QuTableColumn<Position>[] = [
   { key: 'market-value', label: '市值', align: 'right' },
   { key: 'unrealized-pnl', label: '浮动盈亏', align: 'right', cellClass: (position) => pnlClass(position.unrealized_pnl) },
   { key: 'realized-pnl', label: '已实现盈亏', align: 'right', cellClass: (position) => pnlClass(position.realized_pnl) },
+]
+
+const sideOptions = [
+  { value: 'buy', label: '买入' },
+  { value: 'sell', label: '卖出' },
 ]
 
 const tradeColumns: QuTableColumn<Trade>[] = [
@@ -131,7 +138,7 @@ onMounted(load)
     <template v-else-if="summary">
       <PortfolioResearchPlan v-if="latestRebalancePlan" :plan="latestRebalancePlan" />
 
-      <section class="grid overflow-hidden rounded-md border border-border bg-surface-raised sm:grid-cols-3">
+      <section data-tour="portfolio-summary" class="grid overflow-hidden rounded-md border border-border bg-surface-raised sm:grid-cols-3">
         <div class="border-b border-border-subtle p-4 sm:border-b-0 sm:border-r">
           <div class="text-xs text-text-tertiary">总市值</div>
           <div class="mt-1 text-lg font-semibold">{{ fmtAmount(summary.total_market_value) }}</div>
@@ -169,7 +176,7 @@ onMounted(load)
         </div>
       </section>
 
-      <section>
+      <section data-tour="portfolio-form">
         <div class="mb-2 flex flex-wrap items-baseline justify-between gap-2">
           <h3 class="text-base font-semibold">手工记账</h3>
           <span class="text-xs text-text-tertiary">这里只记录已完成的成交，不会提交订单</span>
@@ -178,14 +185,11 @@ onMounted(load)
           <StockSearchInput v-model="form.code" label="股票" required />
           <label class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">日期</span>
-            <input v-model="form.trade_date" required type="date" class="rounded-md border border-border px-2 py-1.5" />
+            <QuDatePicker v-model="form.trade_date" :clearable="false" aria-label="交易日期" class="rounded-md border border-border bg-surface-raised px-2 py-1.5" />
           </label>
           <label class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">方向</span>
-            <select v-model="form.side" class="rounded-md border border-border px-2 py-1.5">
-              <option value="buy">买入</option>
-              <option value="sell">卖出</option>
-            </select>
+            <QuSelect v-model="form.side" :options="sideOptions" class="rounded-md border border-border bg-surface-raised px-2 py-1.5" />
           </label>
           <label class="text-sm">
             <span class="mb-1 block text-xs text-text-tertiary">价格</span>
@@ -210,7 +214,7 @@ onMounted(load)
         </form>
       </section>
 
-      <section>
+      <section data-tour="portfolio-trades">
         <h3 class="mb-2 text-base font-semibold">成交记录</h3>
         <div class="overflow-x-auto rounded-lg border border-border bg-surface-raised">
           <QuTable :data="trades" :columns="tradeColumns" row-key="id">
