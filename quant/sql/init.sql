@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0020_drop_stock_is_watch
+-- Schema revision: 0021_drop_redundant_indexes
 
 SET NAMES utf8mb4;
 
@@ -85,8 +85,7 @@ CREATE TABLE `quant_index_member` (
   `out_date` DATE DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_index_member` (`index_name`, `code`, `in_date`),
-  KEY `ix_quant_index_member_code` (`code`),
-  KEY `ix_quant_index_member_index_name` (`index_name`)
+  KEY `ix_quant_index_member_code` (`code`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `quant_pick` (
@@ -468,7 +467,6 @@ CREATE TABLE `quant_signal` (
   `plan_id` BIGINT DEFAULT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_signal` (`code`, `date`, `strategy_id`, `side`),
-  KEY `ix_quant_signal_code` (`code`),
   KEY `ix_quant_signal_date` (`date`),
   KEY `ix_quant_signal_spec_hash` (`spec_hash`),
   KEY `ix_quant_signal_strategy_id` (`strategy_id`),
@@ -511,7 +509,6 @@ CREATE TABLE `quant_backtest_equity` (
   `equity` DECIMAL(18, 8) NOT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_bt_equity_run_date` (`run_id`, `date`),
-  KEY `ix_quant_backtest_equity_run_id` (`run_id`),
   CONSTRAINT `quant_backtest_equity_ibfk_1`
     FOREIGN KEY (`run_id`) REFERENCES `quant_backtest_run` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
@@ -564,6 +561,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0020_drop_stock_is_watch');
+VALUES ('0021_drop_redundant_indexes');
 
 COMMIT;

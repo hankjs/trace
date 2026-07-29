@@ -95,8 +95,59 @@ def import_stock_list(db: Session) -> dict:
     db.commit()
     logger.info("股票名录导入: 新增 %d,更新 %d,新标退市 %d",
                 inserted, updated, delisted)
+    recon = reconcile_stock_master(db, basic)
     return {"imported": inserted, "updated": updated, "delisted": delisted,
-            "total": len(seen)}
+            "total": len(seen),
+            "reconciled_inserted": recon["inserted"],
+            "reconciled_delist_fixed": recon["delist_fixed"]}
+
+
+def reconcile_stock_master(db: Session,
+                           basic: dict[str, dict] | None = None) -> dict:
+    """对账日线与股票主表的漂移,分两类修复。
+
+    1. **有日线但主表缺失的孤儿 code**:批量日线按日全市场落库(含已退市股),
+       而 akshare 名录只含在市股 —— 退市股永远进不了主表,缺名称/上市日,也进
+       不了 kind='all' 池解析。按 baostock 证券资料(含已退市股)补插。
+    2. **主表在册但退市未标的**:名录任务失败期间退市的股票 delist_date 为
+       NULL,会被池解析误当在市股。按证券资料补标 delist_date 与 is_st。
+
+    baostock 证券资料拿不到元数据的 code(如北交所)跳过,不臆造。
+    """
+    if basic is None:
+        basic = _fetch_stock_basic_map()
+    if not basic:
+        return {"inserted": 0, "delist_fixed": 0, "skipped": 0}
+
+    orphans = db.execute(
+        select(DailyBar.code.distinct())
+        .where(~DailyBar.code.in_(select(Stock.code)))
+    ).scalars().all()
+    inserted = skipped = 0
+    for code in orphans:
+        meta = basic.get(code)
+        if not meta:
+            skipped += 1
+            continue
+        stock = Stock(code=code, name=meta.get("name") or "")
+        _apply_lifecycle(stock, stock.name, meta)
+        db.add(stock)
+        inserted += 1
+
+    delist_fixed = 0
+    for stock in db.execute(select(Stock)).scalars().all():
+        if stock.delist_date is not None:
+            continue
+        meta = basic.get(stock.code)
+        if meta and (meta.get("delist_date") or meta.get("status") == "0"):
+            stock.delist_date = meta.get("delist_date") or today_cst()
+            stock.is_st = True  # 已退市即不可交易,统一纳入 is_st 过滤口径
+            delist_fixed += 1
+    db.commit()
+    logger.info("主表对账: 补插孤儿 %d,补标退市 %d,跳过无元数据 %d",
+                inserted, delist_fixed, skipped)
+    return {"inserted": inserted, "delist_fixed": delist_fixed,
+            "skipped": skipped}
 
 
 def _fetch_stock_basic_map() -> dict[str, dict]:

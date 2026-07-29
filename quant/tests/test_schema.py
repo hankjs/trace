@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0020_drop_stock_is_watch"}
+    assert heads == {"0021_drop_redundant_indexes"}
     assert current_heads(migrated_db) == heads
 
 
@@ -471,12 +471,17 @@ def test_system_strategies_have_complete_hashed_specs(migrated_db):
 
 def test_init_sql_uses_same_strategy_specs_and_head():
     """空库初始化种子必须与运行时预置规格、Alembic head 完全一致。"""
+    from app.migrations import expected_heads
     from app.strategy.presets import SYSTEM_STRATEGY_SPECS
     from app.strategy.spec import canonical_spec_json, strategy_spec_hash
 
     source = (QUANT_DIR / "sql" / "init.sql").read_text()
-    assert "Schema revision: 0016_experiment_registry" in source
-    assert "VALUES ('0016_experiment_registry');" in source
+    # 版本戳与 Alembic head 动态对齐,避免新增迁移后这里留成过期常量
+    heads = expected_heads()
+    assert len(heads) == 1
+    head = next(iter(heads))
+    assert f"Schema revision: {head}" in source
+    assert f"VALUES ('{head}');" in source
     for template, spec in SYSTEM_STRATEGY_SPECS.items():
         canonical = canonical_spec_json(spec).replace("'", "''")
         assert f"'{template}'" in source

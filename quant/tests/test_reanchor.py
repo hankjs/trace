@@ -386,6 +386,53 @@ def test_backfill_list_dates_falls_back_to_first_bar(monkeypatch):
         assert db.get(Stock, "sh.600003").list_date == date(2015, 3, 2)
 
 
+# --- reconcile_stock_master:日线与主表漂移对账 --------------------------------
+
+
+def test_reconcile_inserts_orphan_bar_codes():
+    """有日线但主表缺失的退市股,按 baostock 证券资料补插完整生命周期。"""
+    with _session() as db:
+        _seed_bars(db, "sh.600069", [(date(2020, 8, 26), 1.0, 1.0)])
+        basic = {"sh.600069": {"name": "退市银鸽", "list_date": date(1997, 4, 30),
+                               "delist_date": date(2020, 8, 27), "status": "0"}}
+
+        result = ingest.reconcile_stock_master(db, basic)
+
+        assert result["inserted"] == 1
+        stock = db.get(Stock, "sh.600069")
+        assert stock is not None, "孤儿 code 未补入主表,池解析与名称展示都缺它"
+        assert stock.name == "退市银鸽"
+        assert stock.delist_date == date(2020, 8, 27)
+        assert stock.is_st is True
+
+
+def test_reconcile_fixes_unmarked_delisted_stock():
+    """主表在册但退市未标的,补标 delist_date 与 is_st(名录任务失败期的漏网)。"""
+    with _session() as db:
+        db.add(Stock(code="sh.600636", name="三爱富"))
+        db.commit()
+        basic = {"sh.600636": {"name": "退市国化", "list_date": date(1993, 3, 16),
+                               "delist_date": date(2026, 6, 29), "status": "0"}}
+
+        result = ingest.reconcile_stock_master(db, basic)
+
+        assert result["delist_fixed"] == 1
+        stock = db.get(Stock, "sh.600636")
+        assert stock.delist_date == date(2026, 6, 29)
+        assert stock.is_st is True
+
+
+def test_reconcile_skips_codes_without_metadata():
+    """证券资料查不到的 code(如北交所)跳过,不臆造主表行。"""
+    with _session() as db:
+        _seed_bars(db, "bj.920000", [(date(2026, 7, 24), 14.0, 14.0)])
+
+        result = ingest.reconcile_stock_master(db, {})
+
+        assert result["inserted"] == 0
+        assert db.get(Stock, "bj.920000") is None
+
+
 def test_reanchor_tolerance_ignores_float_noise():
     """阈值内的浮点噪声不得误判为重锚(否则全市场天天全量重拉)。"""
     code = "sh.600004"

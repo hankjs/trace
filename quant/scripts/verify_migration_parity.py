@@ -1,7 +1,8 @@
 #!/usr/bin/env python
 """校验「全新库 alembic upgrade head」与「models.py 的 create_all」产出的 schema 一致。
 
-用 SQLAlchemy inspect() 逐表比对列(名/类型/可空)、主键、索引、唯一约束。
+用 SQLAlchemy inspect() 逐表比对列(名/类型/可空)、主键、索引、唯一约束、
+外键(列->引用表.列 + ondelete 行为)。
 不一致则打印差异并以非零码退出 —— scripts/check_migrate_done.sh 依赖此行为。
 
 **只在临时 sqlite 文件库上跑,不连任何 MySQL**(brief §2:生产库严格只读)。
@@ -87,11 +88,24 @@ def _snapshot(db_path: Path) -> dict:
             (item["name"], tuple(item["column_names"]))
             for item in inspector.get_unique_constraints(table)
         }
+        # 外键比对:ON DELETE 策略是明确设计决策(如 Signal/StrategyEval 对策略
+        # CASCADE、BacktestRun RESTRICT),只改 models.py 的 ondelete 必须能被拦住。
+        # sqlite 反射走 PRAGMA foreign_key_list,ondelete 从中取得;两侧同口径。
+        fks = {
+            (
+                tuple(fk["constrained_columns"]),
+                fk["referred_table"],
+                tuple(fk["referred_columns"]),
+                ((fk.get("options") or {}).get("ondelete") or "NO ACTION").upper(),
+            )
+            for fk in inspector.get_foreign_keys(table)
+        }
         snapshot[table] = {
             "columns": columns,
             "primary_key": pk,
             "indexes": indexes,
             "unique_constraints": uniques,
+            "foreign_keys": fks,
         }
     engine.dispose()
     return snapshot
@@ -125,8 +139,9 @@ def _diff(alembic_snap: dict, models_snap: dict) -> list[str]:
             problems.append(
                 f"{table} 主键: 迁移 {a['primary_key']} != models {m['primary_key']}")
 
-        for key in ("indexes", "unique_constraints"):
-            label = "索引" if key == "indexes" else "唯一约束"
+        for key in ("indexes", "unique_constraints", "foreign_keys"):
+            label = {"indexes": "索引", "unique_constraints": "唯一约束",
+                     "foreign_keys": "外键"}[key]
             for item in sorted(a[key] - m[key]):
                 problems.append(f"{table} {label} {item}: 迁移有,models.py 无")
             for item in sorted(m[key] - a[key]):

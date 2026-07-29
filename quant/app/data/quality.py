@@ -13,7 +13,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import case, func, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -48,6 +48,15 @@ ST_COMPLETE_WARN = 0.85
 ST_COMPLETE_CRITICAL = 0.50
 VALUATION_WARN = 0.10
 
+# 股票级 ST 覆盖口径:窗口内非空 is_st bar 占比达到该阈值,才计为「ST 历史完整」。
+# 避免一只股票仅靠 1 根非空 bar 就被计为已覆盖(宽口径失真)
+ST_STOCK_MIN_KNOWN_SHARE = 0.8
+
+# 财务覆盖率的近期窗口:只统计 report_period 落在 as_of 前 N 天(约最近 4 个报告期)
+# 内的财报。窗口固定覆盖 4 个季度末,任意 as_of 下至少 2 个报告期的披露截止日
+# (季报 4/8/10 月底、年报 4 月底)已过,正常披露滞后不会被误判为缺口
+FUNDAMENTAL_RECENT_DAYS = 365
+
 # 全库扫描代价过高:默认只统计最近 N 个日历日(约 40 个交易日)的 ST / 活跃股票
 DEFAULT_LOOKBACK_DAYS = 60
 
@@ -55,16 +64,18 @@ DEFAULT_LOOKBACK_DAYS = 60
 CACHE_SCOPE_LATEST = "latest"
 
 
-def _ratio(num: int, den: int) -> float:
+def _ratio(num: int, den: int) -> float | None:
+    """占比 0~1。分母为 0(空库/空窗口)时返回 None,与「真的 0% 覆盖」区分。"""
     if den <= 0:
-        return 0.0
+        return None
     return round(num / den, 4)
 
 
-def _coverage_ratio(num: int, den: int) -> float:
-    """覆盖率 0~1。分子偶发大于分母(口径窗口不一致)时钳到 1,避免看板 100.02%。"""
+def _coverage_ratio(num: int, den: int) -> float | None:
+    """覆盖率 0~1。分子偶发大于分母(口径窗口不一致)时钳到 1,避免看板 100.02%。
+    分母为 0 时返回 None,与「真的 0% 覆盖」区分。"""
     if den <= 0:
-        return 0.0
+        return None
     return round(min(num, den) / den, 4)
 
 
@@ -158,6 +169,10 @@ def st_history_coverage(
 ) -> dict[str, Any]:
     """逐日 is_st 覆盖率(bar 级 + 股票级)。
 
+    bar 级 = 非空 is_st bar / 窗口内全部 bar;股票级 = 窗口内非空 is_st bar 占比
+    >= ST_STOCK_MIN_KNOWN_SHARE 的股票数 / 窗口内有 bar 的股票数(阈值口径,
+    只有零星非空 bar 的股票不算已覆盖)。分母为 0 时比率字段为 None。
+
     未指定 start/end/codes 时默认只扫最近 lookback_days 日历日(走 date 索引)。
     传入 start/end 或 codes 则按调用方范围统计;lookback_days=None 且无范围时
     才全表扫描(运维慎用)。
@@ -180,13 +195,11 @@ def st_history_coverage(
     if window_end is not None:
         filters.append(DailyBar.date <= window_end)
 
-    # 单次扫描:COUNT(col) 自动跳过 NULL;股票级用 CASE 去重
-    known_code = case((DailyBar.is_st.is_not(None), DailyBar.code), else_=None)
+    # 单次扫描:COUNT(col) 自动跳过 NULL;股票总数用 DISTINCT
     q = select(
         func.count().label("total_bars"),
         func.count(DailyBar.is_st).label("known_bars"),
         func.count(func.distinct(DailyBar.code)).label("total_stocks"),
-        func.count(func.distinct(known_code)).label("known_stocks"),
     ).select_from(DailyBar)
     for f in filters:
         q = q.where(f)
@@ -195,7 +208,21 @@ def st_history_coverage(
     total_bars = int(row.total_bars or 0)
     known_bars = int(row.known_bars or 0)
     total_stocks = int(row.total_stocks or 0)
-    known_stocks = int(row.known_stocks or 0)
+
+    # 股票级口径:窗口内该股票非空 is_st bar 占比 >= ST_STOCK_MIN_KNOWN_SHARE
+    # 才计为「ST 历史完整」;只有 1 根非空 bar 的股票不算已覆盖
+    qualified_q = (
+        select(DailyBar.code)
+        .select_from(DailyBar)
+        .group_by(DailyBar.code)
+        .having(
+            func.count(DailyBar.is_st) >= func.count() * ST_STOCK_MIN_KNOWN_SHARE
+        )
+    )
+    for f in filters:
+        qualified_q = qualified_q.where(f)
+    known_stocks = len(db.execute(qualified_q).all())
+
     return {
         "total_bars": total_bars,
         "known_bars": known_bars,
@@ -204,6 +231,8 @@ def st_history_coverage(
         "total_stocks_with_bars": total_stocks,
         "stocks_with_st_history": known_stocks,
         "stock_coverage_ratio": _ratio(known_stocks, total_stocks),
+        # 股票级口径说明:非空 is_st bar 占比阈值(见 ST_STOCK_MIN_KNOWN_SHARE)
+        "stock_min_known_share": ST_STOCK_MIN_KNOWN_SHARE,
         "incomplete": total_bars > 0 and known_bars < total_bars,
         "scope": scope,
         "lookback_days": lookback_days if scope == "recent_window" else None,
@@ -259,9 +288,16 @@ def snapshot_coverage(
     lookback_days: int = 7,
     include_fields: bool = True,
 ) -> dict[str, Any]:
-    """估值/财务在研究日附近的可用覆盖(点时:available_date <= as_of)。"""
+    """估值/财务在研究日附近的可用覆盖(点时:available_date <= as_of)。
+
+    估值侧限定 data_date 在最近 lookback_days 窗口;财务侧对齐「近期窗口」口径:
+    只统计 report_period 落在 as_of 前 FUNDAMENTAL_RECENT_DAYS 天(约最近 4 个
+    报告期)内的财报,避免「历史上任何一期有过财报即算覆盖」的失真。窗口内恒有
+    披露截止日已过的报告期,正常披露滞后不会被误判为缺口。
+    """
     as_of = as_of or today_cst()
     window_start = as_of - timedelta(days=lookback_days)
+    fun_period_start = as_of - timedelta(days=FUNDAMENTAL_RECENT_DAYS)
 
     universe_q = select(func.count(func.distinct(DailyBar.code))).where(
         DailyBar.date >= window_start,
@@ -278,6 +314,7 @@ def snapshot_coverage(
     )
     fun_codes_q = select(func.count(func.distinct(FundamentalSnapshot.code))).where(
         FundamentalSnapshot.available_date <= as_of,
+        FundamentalSnapshot.report_period >= fun_period_start,
         FundamentalSnapshot.report_period <= as_of,
     )
     if codes is not None:
@@ -309,6 +346,7 @@ def snapshot_coverage(
             column = getattr(FundamentalSnapshot, col)
             q = select(func.count(func.distinct(FundamentalSnapshot.code))).where(
                 FundamentalSnapshot.available_date <= as_of,
+                FundamentalSnapshot.report_period >= fun_period_start,
                 FundamentalSnapshot.report_period <= as_of,
                 column.is_not(None),
             )
@@ -324,6 +362,8 @@ def snapshot_coverage(
     return {
         "as_of": str(as_of),
         "lookback_days": lookback_days,
+        # 财务侧近期窗口下界:report_period >= 该日期才计入覆盖(约最近 4 个报告期)
+        "fundamental_period_start": str(fun_period_start),
         "universe_stocks": universe,
         "valuation_stocks": val_codes,
         "fundamental_stocks": fun_codes,
@@ -405,7 +445,7 @@ def frames_data_quality(
             f"涉及 {len(incomplete_codes)} 只股票;历史池解析不会回退当前 ST 标记"
         )
     for field, stats in field_coverage.items():
-        if stats["total"] and stats["ratio"] < 0.5:
+        if stats["total"] and stats["ratio"] is not None and stats["ratio"] < 0.5:
             warnings.append(
                 f"字段 {field} 覆盖率仅 {stats['ratio']:.0%}"
                 f"({stats['available']}/{stats['total']})"
@@ -421,10 +461,14 @@ def frames_data_quality(
     }
 
 
-def _alert_level(st_ratio: float, valuation_ratio: float) -> str:
-    if st_ratio < ST_COMPLETE_CRITICAL:
+def _alert_level(st_ratio: float | None, valuation_ratio: float | None) -> str:
+    # None 表示分母为 0(空库/空窗口),无从判定覆盖好坏:
+    # 不按 0% 误报 critical/warning,直接跳过该项判定
+    if st_ratio is not None and st_ratio < ST_COMPLETE_CRITICAL:
         return "critical"
-    if st_ratio < ST_COMPLETE_WARN or valuation_ratio < VALUATION_WARN:
+    if (st_ratio is not None and st_ratio < ST_COMPLETE_WARN) or (
+        valuation_ratio is not None and valuation_ratio < VALUATION_WARN
+    ):
         return "warning"
     return "ok"
 

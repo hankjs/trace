@@ -27,7 +27,8 @@ from ..data.universe import (DEFAULT_MIN_LIST_DAYS, INDEX_NAMES,
                              MissingIndexHistoryError, resolve_pool,
                              resolve_pool_during)
 from ..db import get_db
-from ..models import Pool, PoolGrant, PoolMember
+from ..models import (BacktestRun, Pool, PoolGrant, PoolMember,
+                      ResearchPlan, StrategyEval)
 from ..stock_repository import StockRepository
 
 router = APIRouter(prefix="/api/pools", tags=["pools"])
@@ -306,11 +307,40 @@ def update_pool(pool_id: int, body: PoolPatchIn, db: Session = Depends(get_db),
     return pool_out(pool, _member_counts(db, [pool.id]).get(pool.id, 0))
 
 
+def _pool_reference_counts(db: Session, pool_id: int) -> dict[str, int]:
+    """池的历史引用数(回测/评估/研究计划,均无 pool_id 外键)。
+
+    与策略删除的引用保护同理(见 app/api/strategies.py):这些记录是「可复现
+    审计资产」,池删了 pool_id 就悬空,审计快照指向不存在的池。
+    """
+    refs: dict[str, int] = {}
+    for label, model in (("回测", BacktestRun), ("评估", StrategyEval),
+                         ("研究计划", ResearchPlan)):
+        count = db.execute(
+            select(func.count()).select_from(model)
+            .where(model.pool_id == pool_id)
+        ).scalar_one()
+        if count:
+            refs[label] = int(count)
+    return refs
+
+
 @router.delete("/{pool_id}")
 def delete_pool(pool_id: int, db: Session = Depends(get_db),
                 claims: dict = Depends(require_client)):
-    """删除自定义池及其成员。deleted 为被删除的池 id。"""
+    """删除自定义池及其成员。deleted 为被删除的池 id。
+
+    仍被回测/评估/研究计划引用时返回 409,与策略删除的保护同款。
+    """
     pool = _writable_pool(db, pool_id, user_id_from_claims(claims))
+    refs = _pool_reference_counts(db, pool.id)
+    if refs:
+        detail = "、".join(f"{label} {n} 条" for label, n in refs.items())
+        raise HTTPException(
+            409,
+            f"「{pool.name}」仍被历史记录引用({detail})，不能删除，"
+            "否则这些审计记录的 pool_id 会悬空。请先删除相关记录，或保留该池",
+        )
     db.execute(delete(PoolMember).where(PoolMember.pool_id == pool.id))
     db.delete(pool)
     db.commit()

@@ -17,7 +17,7 @@ The Vue 3 frontend is in `web/`. Page-level components live in `web/src/views/`,
 
 ## Database & Migrations
 
-Schema changes go through Alembic (`alembic/versions/`, currently at `0016_experiment_registry`); never create or alter tables at app startup — `app/migrations.py` verifies the database revision on boot and refuses to start when `schema_strict` is true (default). For an existing database, run `uv run alembic upgrade head` before deploying new code. For a brand-new empty database, `sql/init.sql` (full DDL plus seed rows for the four preset pools and six public strategies) is an equivalent shortcut and stamps the current Alembic version; never run it against a populated database. After editing any migration, keep `sql/init.sql` in sync and verify equivalence with `uv run python scripts/verify_migration_parity.py`. `DATA-ARCHITECTURE.md` is the authoritative reference for table semantics and data flows.
+Schema changes go through Alembic (`alembic/versions/`, currently at `0021_drop_redundant_indexes`); never create or alter tables at app startup — `app/migrations.py` verifies the database revision on boot and refuses to start when `schema_strict` is true (default). For an existing database, run `uv run alembic upgrade head` before deploying new code. For a brand-new empty database, `sql/init.sql` (full DDL plus seed rows for the four preset pools and six public strategies) is an equivalent shortcut and stamps the current Alembic version; never run it against a populated database. After editing any migration, keep `sql/init.sql` in sync and verify equivalence with `uv run python scripts/verify_migration_parity.py`. `DATA-ARCHITECTURE.md` is the authoritative reference for table semantics and data flows.
 
 ## Coding Style & Naming Conventions
 

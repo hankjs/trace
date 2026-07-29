@@ -190,7 +190,8 @@ class Signal(Base):
     )
 
     id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
-    code: Mapped[str] = mapped_column(String(16), index=True)
+    # code 不再单独建索引:与 uq_signal(code,date,strategy_id,side) 前缀完全冗余
+    code: Mapped[str] = mapped_column(String(16))
     date: Mapped[date] = mapped_column(Date, index=True)
     strategy_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("quant_strategy.id", ondelete="CASCADE"),
@@ -286,7 +287,8 @@ class IndexMember(Base):
     )
 
     id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
-    index_name: Mapped[str] = mapped_column(String(16), index=True)  # hs300 / zz500
+    # index_name 不再单独建索引:与 uq_index_member(index_name,code,in_date) 前缀完全冗余
+    index_name: Mapped[str] = mapped_column(String(16))  # hs300 / zz500
     code: Mapped[str] = mapped_column(String(16), index=True)
     in_date: Mapped[date] = mapped_column(Date)
     out_date: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -416,8 +418,9 @@ class BacktestEquity(Base):
     )
 
     id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    # run_id 不再单独建索引:与 uq_bt_equity_run_date(run_id,date) 前缀完全冗余
     run_id: Mapped[int] = mapped_column(
-        Integer, ForeignKey("quant_backtest_run.id"), index=True
+        Integer, ForeignKey("quant_backtest_run.id")
     )
     date: Mapped[date] = mapped_column(Date)
     equity: Mapped[float] = mapped_column(_EQUITY)

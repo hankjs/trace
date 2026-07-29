@@ -4,12 +4,13 @@
 1. 预置池 members 返回**当日解析出的成分**(空列表会让前端「另存为」静默建空池);
 2. 预置池不可改名/不可删/不可增删成员;
 3. 自定义池按 user_id 隔离,跨用户访问按 404 处理;
-4. 批量导入部分成功(未入库代码进 skipped),create 带 codes 一步建池。
+4. 批量导入部分成功(未入库代码进 skipped),create 带 codes 一步建池;
+5. 仍被回测/评估/研究计划引用的池不可删(409,与策略删除的保护同款)。
 """
 from __future__ import annotations
 
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -17,7 +18,7 @@ from fastapi import BackgroundTasks, HTTPException
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, delete, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -28,7 +29,8 @@ from app.api.pools import (add_pool_members, create_pool, default_pool,
                            PoolCreateIn, PoolMembersIn, PoolPatchIn)
 from app.db import Base
 from app.models import (SYSTEM_OWNER_ID, BacktestRun, DailyBar, IndexMember,
-                        Pool, PoolMember, Stock, Strategy)
+                        Pool, PoolMember, ResearchPlan, Stock, Strategy,
+                        StrategyEval)
 from app.strategy.presets import get_preset_spec
 from app.strategy.spec import strategy_spec_hash
 
@@ -433,6 +435,88 @@ def test_blank_pool_name_is_rejected():
 
 
 # ---- 契约点 4:GET /api/backtest/{run_id} 回显 pool ----
+
+# ---- 契约点:被历史记录引用的池不可删(与策略删除的 409 保护同款) ----
+
+def test_delete_pool_referenced_by_backtest_returns_409():
+    with _session() as db:
+        _seed(db)
+        created = create_pool(PoolCreateIn(name="被引用池"), db=db, claims=CLAIMS_A)
+        pool_id = created["id"]
+        db.add(BacktestRun(user_id=USER_A, strategy_id=ROTATION_ID,
+                           params={}, pool_id=pool_id,
+                           start=date(2024, 1, 1), end=date(2024, 6, 30),
+                           metrics={"total_return": 0.1}))
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc:
+            delete_pool(pool_id=pool_id, db=db, claims=CLAIMS_A)
+        assert exc.value.status_code == 409
+        assert "回测" in exc.value.detail
+        # 池与审计引用都保持原样
+        assert db.get(Pool, pool_id) is not None
+        # 引用清掉后即可正常删除
+        db.execute(delete(BacktestRun))
+        db.commit()
+        assert delete_pool(pool_id=pool_id, db=db, claims=CLAIMS_A) == {
+            "deleted": pool_id,
+        }
+        assert db.get(Pool, pool_id) is None
+
+
+def test_delete_pool_referenced_by_eval_or_plan_returns_409():
+    with _session() as db:
+        _seed(db)
+        eval_pool = create_pool(PoolCreateIn(name="评估引用池"), db=db,
+                                claims=CLAIMS_A)
+        db.add(StrategyEval(strategy_id=ROTATION_ID, params={}, scope="daily",
+                            batch_id="batch-1", pool_id=eval_pool["id"],
+                            start=date(2024, 1, 1), end=date(2024, 6, 30),
+                            metrics={}))
+        plan_pool = create_pool(PoolCreateIn(name="计划引用池"), db=db,
+                                claims=CLAIMS_A)
+        db.add(ResearchPlan(
+            owner_id=USER_A, strategy_is_system=True, strategy_id=ROTATION_ID,
+            strategy_name="强势股票轮动策略", template="momentum_rotation",
+            strategy_kind="portfolio", strategy_version="v1",
+            params_snapshot={}, plan_type="pool_scan",
+            pool_id=plan_pool["id"], data_date=date(2024, 6, 28),
+            generated_at=datetime(2024, 6, 28, 15, 30), signal_type="entry",
+            status="pending", status_reason={}, entry_observation={},
+            risk_rules=[], take_profit={}, native_exit=[], exit_hits=[],
+            backtest_evidence={}, product_boundary="信息研究,不自动交易",
+        ))
+        db.commit()
+
+        with pytest.raises(HTTPException) as exc:
+            delete_pool(pool_id=eval_pool["id"], db=db, claims=CLAIMS_A)
+        assert exc.value.status_code == 409
+        assert "评估" in exc.value.detail
+        with pytest.raises(HTTPException) as exc:
+            delete_pool(pool_id=plan_pool["id"], db=db, claims=CLAIMS_A)
+        assert exc.value.status_code == 409
+        assert "研究计划" in exc.value.detail
+        assert db.get(Pool, eval_pool["id"]) is not None
+        assert db.get(Pool, plan_pool["id"]) is not None
+
+
+def test_delete_unreferenced_pool_still_works():
+    with _session() as db:
+        _seed(db)
+        created = create_pool(
+            PoolCreateIn(name="无引用池", codes=["sh.600519"]),
+            db=db, claims=CLAIMS_A,
+        )
+        pool_id = created["id"]
+
+        assert delete_pool(pool_id=pool_id, db=db, claims=CLAIMS_A) == {
+            "deleted": pool_id,
+        }
+        assert db.get(Pool, pool_id) is None
+        assert db.execute(
+            select(PoolMember).where(PoolMember.pool_id == pool_id)
+        ).all() == []
+
 
 def test_historical_backtest_echoes_pool_for_survivorship_annotation():
     """按编号查历史回测时前端没有本地选择状态,偏差标注只能靠回显的 kind。"""
