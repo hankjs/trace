@@ -6,11 +6,13 @@
 选股 delete/insert 互相竞争、评估产出重复批次。
 
 方案(见 logs/decisions-migrate.md D8):
-1. `settings.scheduler_enabled` 粗开关 —— 纯 API worker 可置 false 完全不参与调度;
-2. 开关为真时再抢 MySQL 会话级 advisory lock `GET_LOCK(name, 0)`,
+1. 仅 production 环境允许调度 —— dev/local 只跑业务 API,避免本地
+   reload 触发 baostock/akshare 日线与盘中同步、污染共享库;
+2. `settings.scheduler_enabled` 粗开关 —— 纯 API worker 可置 false 完全不参与调度;
+3. 开关为真时再抢 MySQL 会话级 advisory lock `GET_LOCK(name, 0)`,
    只有抢到的那个实例真正运行定时任务。锁随连接生命周期释放,
    实例崩溃不会留下死锁(不同于表里插一行「我是 leader」的做法)。
-3. 非 MySQL 方言(sqlite 测试环境)无 GET_LOCK,退化为「开关为真即运行」——
+4. 非 MySQL 方言(sqlite 测试环境)无 GET_LOCK,退化为「开关为真即运行」——
    单进程测试不存在跨进程竞态。
 
 本模块刻意独立于 `app/scheduler.py`:那个文件属 agent-data 的 scope
@@ -23,7 +25,7 @@ import logging
 
 from sqlalchemy import text
 
-from .config import settings
+from .config import ENV_PROD, settings
 from .db import engine
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,14 @@ _lock_connection = None
 def acquire_scheduler_slot() -> bool:
     """本实例是否应该运行定时任务。"""
     global _lock_connection
+
+    if settings.env != ENV_PROD:
+        logger.info(
+            "env=%s,非生产环境不启动调度器"
+            "(日线/盘中/估值等定时任务仅 production 运行)",
+            settings.env,
+        )
+        return False
 
     if not settings.scheduler_enabled:
         logger.info("scheduler_enabled=false,本实例不参与调度")

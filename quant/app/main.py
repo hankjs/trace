@@ -39,8 +39,12 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     check_schema_version(engine)
-    # 多 worker / 多副本部署时只有一个实例运行定时任务,
-    # 否则会重复抓取写入(REVIEW 问题 6)
+    logger.info(
+        "quant 启动: env=%s scheduler_enabled=%s",
+        settings.env, settings.scheduler_enabled,
+    )
+    # 仅 production 且抢到互斥锁的实例运行定时任务
+    # (dev 只跑业务 API;多副本时避免重复抓取,REVIEW 问题 6)
     owns_scheduler = acquire_scheduler_slot()
     if owns_scheduler:
         start_scheduler()
@@ -81,7 +85,7 @@ app.include_router(admin.router, dependencies=[Depends(require_admin)])
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "env": settings.env}
 
 
 # 生产模式:若存在前端构建产物(quant/web/dist),由本进程直接托管,

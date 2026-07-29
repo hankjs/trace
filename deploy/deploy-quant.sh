@@ -86,7 +86,7 @@ import tomllib
 with open('$PROJECT_ROOT/config.toml', 'rb') as f:
     print(tomllib.load(f)['server']['database_url'])
 ")
-  ssh "$SSH_HOST" "printf '[quant]\ndatabase_url = \"%s\"\n' '$DB_URL' > $REMOTE_APP/config.toml && chmod 600 $REMOTE_APP/config.toml"
+  ssh "$SSH_HOST" "printf '[quant]\nenv = \"prod\"\ndatabase_url = \"%s\"\n' '$DB_URL' > $REMOTE_APP/config.toml && chmod 600 $REMOTE_APP/config.toml"
 else
   log "服务器已有 config.toml, 跳过 (如需更新请手动 ssh 修改 $REMOTE_APP/config.toml)"
 fi

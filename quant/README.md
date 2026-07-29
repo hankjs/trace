@@ -52,8 +52,19 @@ Swagger UI：`http://localhost:8100/docs`。
 
 数据库和 JWT 默认读取上级仓库 `config.toml` 的 `[server].database_url` 与
 `[server].jwt_secret`；本目录 `config.toml` 的 `[quant]` 可覆盖
-`database_url`、`jwt_secret`、`cors_origins`、`snapshot_retention_days` 和
-`backfill_start`。配置文件均不得提交。
+`database_url`、`jwt_secret`、`cors_origins`、`snapshot_retention_days`、
+`backfill_start`、`env` 和 `scheduler_enabled`。配置文件均不得提交。
+
+**运行环境 `env`**（也可用环境变量 `QUANT_ENV` 覆盖，优先级更高）：
+
+| 值 | 行为 |
+|---|---|
+| `dev`（默认） | 只跑业务 API；**不**启动 APScheduler（日线/盘中/估值等定时同步） |
+| `prod` | 允许调度；仍受 `scheduler_enabled` 与 MySQL 互斥锁约束 |
+
+本地 `make quant-dev` 保持 `env = "dev"`。需要数据时用 `/api/admin/*` 手工触发，
+不要在开发机开 `prod` 抢采集锁。线上 systemd（`hank-quant.service`）注入
+`QUANT_ENV=prod`。
 
 Schema 由 Alembic 管理，**后端启动时不再建表或改表**。首次部署与升级都需显式执行：
 
@@ -286,6 +297,9 @@ ST 有两个字段，**只有一个能用于回测**：`quant_daily_bar.is_st` �
 | POST | `/api/admin/run-selection`、`/api/admin/run-signals`、`/api/admin/run-eval`、`/api/admin/snapshot` | 管理员：手动触发研究任务 |
 
 ## 自动调度
+
+**仅 `env=prod`（或 `QUANT_ENV=prod`）且 `scheduler_enabled=true` 时启动**；
+dev 环境只提供 HTTP 业务接口。多副本时再抢 MySQL `GET_LOCK`，只有一个实例真正跑任务。
 
 APScheduler 使用 `Asia/Shanghai` 时区：
 

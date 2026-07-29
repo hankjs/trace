@@ -1,13 +1,39 @@
 """配置加载:读取仓库根目录 config.toml 的 [server].database_url,
 并可用 quant/config.toml 的 [quant] 段做覆盖。
+
+环境区分:
+- env=dev(默认):只跑业务 API,不启动 APScheduler(日线/盘中/估值等同步仅生产跑)
+- env=prod:允许调度;仍受 scheduler_enabled 与 MySQL 互斥锁约束
+优先级:环境变量 QUANT_ENV > quant/config.toml [quant].env > 默认 dev
 """
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 
 QUANT_DIR = Path(__file__).resolve().parent.parent
 REPO_ROOT = QUANT_DIR.parent
+
+# 规范化后的合法取值
+ENV_DEV = "dev"
+ENV_PROD = "prod"
+_PROD_ALIASES = frozenset({"prod", "production"})
+_DEV_ALIASES = frozenset({"dev", "development", "local"})
+
+
+def normalize_env(raw: str | None) -> str:
+    """将配置/环境变量规范化为 dev|prod;未知值按 dev 处理(安全默认)。"""
+    if raw is None:
+        return ENV_DEV
+    value = str(raw).strip().lower()
+    if not value:
+        return ENV_DEV
+    if value in _PROD_ALIASES:
+        return ENV_PROD
+    if value in _DEV_ALIASES:
+        return ENV_DEV
+    return ENV_DEV
 
 
 class Settings:
@@ -35,9 +61,12 @@ class Settings:
         ]
         self.snapshot_retention_days: int = 30
         self.backfill_start: str = "2015-01-01"
+        # 运行环境:dev 不启调度;prod 才允许定时采集/研究流水线
+        self.env: str = ENV_DEV
         # 调度器跨进程互斥:多 worker/多副本部署时,即使本开关为 True,
         # 也只有抢到 MySQL GET_LOCK 的那个实例真正运行定时任务(见 scheduler.py)。
         # 置 False 可让某些实例彻底不参与调度(如纯 API worker)。
+        # 注意:env!=prod 时即使本开关为 True 也不会启动调度。
         self.scheduler_enabled: bool = True
         # schema 版本不一致时是否拒绝启动(开发默认 True;临时排障可在 quant 配置关)
         self.schema_strict: bool = True
@@ -48,6 +77,7 @@ class Settings:
         self.bulk_daily_bars: bool = False
 
         # quant 自己的覆盖配置(可选)
+        cfg_env: str | None = None
         local_cfg = QUANT_DIR / "config.toml"
         if local_cfg.exists():
             with open(local_cfg, "rb") as f:
@@ -65,6 +95,8 @@ class Settings:
                 self.backfill_start = str(local["backfill_start"])
             if local.get("jwt_secret"):
                 self.jwt_secret = str(local["jwt_secret"])
+            if "env" in local:
+                cfg_env = str(local["env"])
             if "scheduler_enabled" in local:
                 self.scheduler_enabled = bool(local["scheduler_enabled"])
             if "schema_strict" in local:
@@ -73,6 +105,9 @@ class Settings:
                 self.backtest_async = bool(local["backtest_async"])
             if "bulk_daily_bars" in local:
                 self.bulk_daily_bars = bool(local["bulk_daily_bars"])
+
+        # QUANT_ENV 优先于 config.toml,便于 systemd 注入而无需改配置文件
+        self.env = normalize_env(os.environ.get("QUANT_ENV") or cfg_env)
 
         if not self.database_url:
             raise ValueError(
@@ -84,6 +119,10 @@ class Settings:
                 "缺少 JWT 密钥配置: 请在根 config.toml 配置 [server].jwt_secret, "
                 "或在 quant/config.toml 配置 [quant].jwt_secret"
             )
+
+    @property
+    def is_production(self) -> bool:
+        return self.env == ENV_PROD
 
 
 settings = Settings()

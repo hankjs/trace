@@ -35,6 +35,8 @@ History follows Conventional Commits, for example `feat(quant): ...` and `fix(we
 
 Keep database URLs in the repository-level or local `config.toml`; both are ignored and must not be committed. Preserve the `quant_` table prefix and never add automatic trade execution: this project is an information and backtesting system only. Auth shares the server's `users` table (read-only, raw SQL in `app/auth.py`) and JWT secret: `jwt_secret` is read from the root `[server].jwt_secret` or overridden by `[quant].jwt_secret` — on the production host (no root config.toml) it must be set in `quant/config.toml`.
 
+**Environment (`env` / `QUANT_ENV`)**: default `dev` runs API only and **does not** start APScheduler (daily bars, intraday snapshots, valuation/fundamental sync, evening research pipeline). Set `env = "prod"` in `quant/config.toml` or inject `QUANT_ENV=prod` (systemd does this via `deploy/hank-quant.service`) for production scheduling. `scheduler_enabled=false` still disables scheduling on pure API workers even in prod. Local data gaps: use `/api/admin/*` or scripts, not `env=prod` on a shared DB.
+
 **baostock hard limits** (by egress IP): ≤50k API calls/day; **no concurrent connections**; overage → blacklist. Prefer bulk APIs (`query_daily_history_k_AStock` / `query_daily_adjust_factor` = 1 call per day for the whole market); do **not** loop `query_history_k_data_plus` per code for full-market jobs. Never parallelize shards on the same IP. See `DATA-ARCHITECTURE.md` §5 and `app/data/baostock_client.py`.
 
 ## Product Boundary: Daily Research, Manual Trading
