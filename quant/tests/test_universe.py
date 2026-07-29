@@ -6,10 +6,55 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from app.db import Base
-from app.data.universe import (membership_intervals, pool_during,
-                               pool_eligibility_matrix,
-                               resolve_pool_during)
+from app.data.universe import (
+    intervals_from_snapshots,
+    membership_intervals,
+    pool_during,
+    pool_eligibility_matrix,
+    rebuild_index_members_from_snapshots,
+    resolve_pool_during,
+    sample_dates,
+)
 from app.models import DailyBar, IndexMember, Stock
+
+
+def test_sample_dates_includes_end():
+    days = sample_dates(date(2015, 1, 1), date(2015, 2, 15), step_days=14)
+    assert days[0] == date(2015, 1, 1)
+    assert days[-1] == date(2015, 2, 15)
+    assert date(2015, 1, 15) in days
+
+
+def test_intervals_from_snapshots_merge_membership():
+    snaps = [
+        (date(2015, 1, 1), {"a": "A", "b": "B"}),
+        (date(2015, 1, 15), {"a": "A", "c": "C"}),
+        (date(2015, 1, 29), {"a": "A", "c": "C"}),
+    ]
+    by_code = {row["code"]: row for row in intervals_from_snapshots(snaps)}
+    assert by_code["a"]["in_date"] == date(2015, 1, 1)
+    assert by_code["a"]["out_date"] is None
+    assert by_code["b"]["out_date"] == date(2015, 1, 15)
+    assert by_code["c"]["in_date"] == date(2015, 1, 15)
+
+
+def test_rebuild_index_members_from_snapshots_writes_table():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        result = rebuild_index_members_from_snapshots(db, "hs300", [
+            (date(2015, 1, 1), {"sh.600000": "浦发", "sh.600001": "旧"}),
+            (date(2015, 1, 15), {"sh.600000": "浦发", "sh.600519": "茅台"}),
+        ])
+        assert result["samples"] == 2
+        assert result["intervals"] == 3
+        rows = {
+            (r.code, r.in_date, r.out_date)
+            for r in db.query(IndexMember).all()
+        }
+        assert ("sh.600001", date(2015, 1, 1), date(2015, 1, 15)) in rows
+        assert ("sh.600000", date(2015, 1, 1), None) in rows
+        assert db.get(Stock, "sh.600519").name == "茅台"
 
 
 def test_pool_during_uses_half_open_membership_intervals():
