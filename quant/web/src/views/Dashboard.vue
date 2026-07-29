@@ -150,6 +150,7 @@ onMounted(load)
 
     <template v-else>
       <section
+        data-tour="dashboard-data-trust"
         class="flex shrink-0 flex-col gap-2 rounded-md border px-4 py-3 sm:flex-row sm:items-center sm:justify-between"
         :class="dataQualityAlertClass"
         aria-labelledby="data-trust-heading"
@@ -193,7 +194,7 @@ onMounted(load)
       </dl>
 
       <div class="grid items-stretch gap-3 xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(420px,1.25fr)_minmax(330px,0.9fr)] xl:grid-rows-2 2xl:grid-cols-[minmax(390px,1.08fr)_minmax(320px,0.88fr)_minmax(340px,1fr)] 2xl:grid-rows-1">
-        <section class="terminal-panel flex min-h-0 min-w-0 flex-col xl:row-span-2 2xl:row-span-1" aria-labelledby="watch-heading">
+        <section data-tour="dashboard-watch" class="terminal-panel flex min-h-0 min-w-0 flex-col xl:row-span-2 2xl:row-span-1" aria-labelledby="watch-heading">
           <div class="terminal-panel-header shrink-0 flex-wrap">
             <div class="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-0.5">
               <h2 id="watch-heading" class="text-sm font-semibold">自选行情</h2>
@@ -241,7 +242,7 @@ onMounted(load)
           </div>
         </section>
 
-        <section class="terminal-panel flex min-h-0 min-w-0 flex-col" aria-labelledby="picks-heading">
+        <section data-tour="dashboard-picks" class="terminal-panel flex min-h-0 min-w-0 flex-col" aria-labelledby="picks-heading">
           <div class="terminal-panel-header shrink-0">
             <div class="flex items-baseline gap-2">
               <h2 id="picks-heading" class="text-sm font-semibold">系统候选</h2>
@@ -279,7 +280,7 @@ onMounted(load)
           <div v-else class="flex min-h-32 items-center justify-center px-4 py-10 text-center text-sm text-text-tertiary xl:flex-1">该研究日暂无系统候选</div>
         </section>
 
-        <section class="terminal-panel flex min-h-0 min-w-0 flex-col" aria-labelledby="signal-heading">
+        <section data-tour="dashboard-signal" class="terminal-panel flex min-h-0 min-w-0 flex-col" aria-labelledby="signal-heading">
           <div class="terminal-panel-header shrink-0">
             <div class="flex items-baseline gap-2">
               <h2 id="signal-heading" class="text-sm font-semibold">策略提示</h2>

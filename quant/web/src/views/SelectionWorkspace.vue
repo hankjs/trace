@@ -22,7 +22,7 @@ function changeTab(tab: string) {
 
 <template>
   <div class="space-y-5">
-    <WorkspaceTabs :tabs="tabs" :active="active" @change="changeTab" />
+    <WorkspaceTabs :tabs="tabs" :active="active" data-tour="selection-tabs" @change="changeTab" />
     <KeepAlive>
       <component :is="activeComponent" />
     </KeepAlive>

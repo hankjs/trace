@@ -375,7 +375,7 @@ void init()
     <InlineFeedback v-if="notice">{{ notice }}</InlineFeedback>
 
     <div class="grid gap-5 lg:min-h-0 lg:flex-1 lg:grid-cols-[18rem_minmax(0,1fr)] lg:grid-rows-[minmax(0,1fr)]">
-      <section class="space-y-3 lg:min-h-0 lg:overflow-y-auto" aria-labelledby="strategy-list-heading">
+      <section data-tour="strategies-list" class="space-y-3 lg:min-h-0 lg:overflow-y-auto" aria-labelledby="strategy-list-heading">
         <h3 id="strategy-list-heading" class="text-sm font-semibold">全部策略</h3>
         <LoadingRows v-if="strategiesLoading" :rows="3" />
         <template v-else>
@@ -422,7 +422,7 @@ void init()
         <p v-if="quotaFull" class="text-xs text-text-tertiary">策略数量已达上限 {{ limits.max_total }}。</p>
       </section>
 
-      <section v-if="creating || selected" class="min-w-0 space-y-4 lg:min-h-0 lg:overflow-y-auto" aria-labelledby="strategy-detail-heading">
+      <section v-if="creating || selected" data-tour="strategies-detail" class="min-w-0 space-y-4 lg:min-h-0 lg:overflow-y-auto" aria-labelledby="strategy-detail-heading">
         <div class="flex flex-wrap items-end justify-between gap-3 border-b border-border-subtle pb-3">
           <div class="min-w-0">
             <h3 id="strategy-detail-heading" class="text-base font-semibold">
@@ -498,6 +498,7 @@ void init()
             <button
               v-if="!creating && selected"
               type="button"
+              data-tour="strategies-save-as"
               :disabled="busy || quotaFull"
               class="btn btn-secondary"
               @click="saveAsMine"

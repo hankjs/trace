@@ -75,7 +75,7 @@ async function remove(item: WatchItem) {
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
     <InlineFeedback v-else-if="notice">{{ notice }}</InlineFeedback>
 
-    <section class="terminal-panel" aria-labelledby="watchlist-add-heading">
+    <section data-tour="watchlist-add" class="terminal-panel" aria-labelledby="watchlist-add-heading">
       <div class="terminal-panel-header">
         <h2 id="watchlist-add-heading" class="text-sm font-semibold">添加自选</h2>
         <span class="text-[11px] text-text-tertiary">按名称或代码搜索</span>
@@ -89,6 +89,7 @@ async function remove(item: WatchItem) {
         />
         <button
           type="submit"
+          data-tour="watchlist-add-button"
           :disabled="busy || !stockCode"
           class="inline-flex items-center justify-center gap-1.5 rounded-md bg-accent px-3 py-1.5 text-sm text-on-accent hover:bg-accent-hover disabled:opacity-50"
         >
@@ -98,7 +99,7 @@ async function remove(item: WatchItem) {
       </form>
     </section>
 
-    <section class="terminal-panel" aria-labelledby="watchlist-heading">
+    <section data-tour="watchlist-list" class="terminal-panel" aria-labelledby="watchlist-heading">
       <div class="terminal-panel-header">
         <div class="flex items-baseline gap-2">
           <h2 id="watchlist-heading" class="text-sm font-semibold">我的自选</h2>

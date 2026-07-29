@@ -26,6 +26,8 @@ import {
 } from 'lucide-vue-next'
 import { clearAuth, currentUsername, getToken } from './api'
 import { loadCatalog } from './catalog'
+import OnboardingGuide from './components/OnboardingGuide.vue'
+import QuTour from './components/QuTour.vue'
 import ResearchAssistant from './components/ResearchAssistant.vue'
 import StockSearchInput from './components/StockSearchInput.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
@@ -473,6 +475,8 @@ onBeforeUnmount(() => {
     </div>
 
     <ResearchAssistant variant="mobile" :guide="guide" />
+    <OnboardingGuide />
+    <QuTour />
 
     <Transition name="nav-drawer">
       <div v-if="mobileNavOpen" class="fixed inset-0 z-50 lg:hidden" @keydown.esc="mobileNavOpen = false">

@@ -19,10 +19,12 @@ import {
   type WatchItem,
 } from '../api'
 import { metricName } from '../catalog'
+import { markEventDone } from '../onboarding'
 import { aggregateMetric, fmtPct, fmtPrice } from '../format'
 import EChart from '../components/EChart.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
+import QuDatePicker from '../components/QuDatePicker.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
 import StockPicker from '../components/StockPicker.vue'
@@ -588,6 +590,7 @@ async function run() {
       ...(usePool && !codes.length ? { pool_id: poolId.value! } : {}),
       costs: runCosts(),
     })
+    markEventDone('run_backtest')
   } catch (e) {
     error.value = (e as Error).message
   } finally {
@@ -694,7 +697,7 @@ watch(
       class="space-y-3 rounded-lg border border-border bg-surface-raised p-4"
       @submit.prevent="mode === 'single' ? run() : runSweep()"
     >
-      <div class="flex flex-wrap items-end gap-3">
+      <div data-tour="backtest-strategy" class="flex flex-wrap items-end gap-3">
         <StrategySelect v-model="strategyId" />
       </div>
 
@@ -718,16 +721,16 @@ watch(
         <PoolSelect v-model="poolId" label="股票池（组合策略的选股范围）" />
       </div>
 
-      <div class="flex flex-wrap items-end gap-3 border-t border-border-subtle pt-3">
+      <div data-tour="backtest-dates" class="flex flex-wrap items-end gap-3 border-t border-border-subtle pt-3">
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">开始日期</span>
-          <input v-model="form.start" type="date" class="h-9 rounded-md border border-border px-2.5 text-sm" />
+          <QuDatePicker v-model="form.start" aria-label="开始日期" class="h-9 rounded-md border border-border px-2.5 text-sm" />
         </label>
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">结束日期</span>
-          <input v-model="form.end" type="date" class="h-9 rounded-md border border-border px-2.5 text-sm" />
+          <QuDatePicker v-model="form.end" aria-label="结束日期" class="h-9 rounded-md border border-border px-2.5 text-sm" />
         </label>
-        <div class="min-w-64 flex-1">
+        <div data-tour="backtest-scope" class="min-w-64 flex-1">
           <div class="mb-1 flex items-center justify-between gap-2">
             <span class="text-xs text-text-tertiary">
               {{ isPortfolio
@@ -814,7 +817,7 @@ watch(
         </div>
       </div>
 
-      <details class="group border-t border-border-subtle pt-3">
+      <details data-tour="backtest-cost" class="group border-t border-border-subtle pt-3">
         <summary class="flex cursor-pointer list-none items-center gap-1.5 text-xs font-medium text-text-secondary transition-colors hover:text-text-primary">
           <ChevronRight :size="13" class="text-text-tertiary transition-transform group-open:rotate-90" />
           模拟费用假设（万分）
@@ -839,7 +842,7 @@ watch(
       </details>
 
       <div class="flex justify-end border-t border-border-subtle pt-3">
-        <button type="submit" :disabled="running || !strategyRunnable" class="btn btn-primary">
+        <button type="submit" data-tour="backtest-run" :disabled="running || !strategyRunnable" class="btn btn-primary">
           {{ running ? '运行中…' : mode === 'single' ? '运行回测' : '开始扫描' }}
         </button>
       </div>

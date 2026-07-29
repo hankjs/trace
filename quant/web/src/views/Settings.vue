@@ -4,15 +4,24 @@
  * 不改动行情入库;默认关闭北交所,避免研究池混入自己买不了的票时误判。
  */
 import { onMounted, ref } from 'vue'
-import { Settings as SettingsIcon } from 'lucide-vue-next'
+import { ListChecks, Settings as SettingsIcon } from 'lucide-vue-next'
 import { api, type UserSettings } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import { useAsyncAction } from '../useAsyncAction'
+import { useOnboarding } from '../onboarding'
 
 const loading = ref(true)
 const canTradeBse = ref(false)
 const updatedAt = ref<string | null>(null)
 const { busy, error, notice, fail, run } = useAsyncAction()
+const { dismissed, hideForever, showGuide } = useOnboarding()
+
+function onToggleGuide(event: Event) {
+  const input = event.target as HTMLInputElement
+  // 仅保存在本浏览器(localStorage),不涉及服务端设置
+  if (input.checked) showGuide()
+  else hideForever()
+}
 
 async function load() {
   loading.value = true
@@ -83,6 +92,29 @@ async function onToggleBse(event: Event) {
           </span>
           <span v-if="updatedAt" class="mt-1.5 block text-[10px] text-text-tertiary">
             最近更新：{{ updatedAt }}
+          </span>
+        </span>
+      </label>
+    </section>
+
+    <section class="rounded border border-border bg-surface-raised">
+      <div class="flex items-center gap-2 border-b border-border px-3 py-2.5">
+        <ListChecks :size="15" class="text-accent" />
+        <h2 class="text-sm font-medium text-text-primary">界面</h2>
+      </div>
+
+      <label class="flex cursor-pointer items-start gap-3 px-3 py-3.5 transition-colors hover:bg-hover">
+        <input
+          class="mt-0.5 h-4 w-4 shrink-0 accent-[var(--color-accent)]"
+          type="checkbox"
+          :checked="!dismissed"
+          @change="onToggleGuide"
+        />
+        <span class="min-w-0">
+          <span class="block text-sm font-medium text-text-primary">显示「新手上路」引导入口</span>
+          <span class="mt-1 block text-xs leading-5 text-text-secondary">
+            页面右下角的新手任务浮动按钮。在任务面板里点了「永远隐藏」后，从这里重新打开。
+            该选择只保存在当前浏览器，进度不会受影响。
           </span>
         </span>
       </label>
