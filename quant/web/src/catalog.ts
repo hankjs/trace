@@ -253,7 +253,7 @@ export const fallbackCatalog: CatalogPayload = {
     { key: 'pe_ttm', name: '滚动市盈率', description: '总市值相对最近四个季度净利润的倍数。', category: 'valuation', unit: '倍', data_type: 'number', operators: numberOperators },
     { key: 'pb', name: '市净率', description: '总市值相对净资产的倍数。', category: 'valuation', unit: '倍', data_type: 'number', operators: numberOperators },
     { key: 'ps_ttm', name: '滚动市销率', description: '总市值相对最近四个季度营业收入的倍数。', category: 'valuation', unit: '倍', data_type: 'number', operators: numberOperators },
-    { key: 'dividend_yield', name: '股息率', description: '最近一年现金分红相对当前股价的比例。', category: 'valuation', unit: '%', data_type: 'number', input_scale: 0.01, operators: numberOperators },
+    { key: 'dividend_yield', name: '股息率', description: '当前数据源未稳定提供，本字段不维护。', category: 'valuation', unit: '%', data_type: 'number', input_scale: 0.01, operators: numberOperators, available: false },
     { key: 'total_market_cap', name: '总市值', description: '全部已发行股份按当前价格计算的价值。', category: 'valuation', unit: '亿元', data_type: 'number', input_scale: 100000000, operators: numberOperators },
     { key: 'roe', name: '净资产收益率', description: '公司使用股东资本创造利润的能力。', category: 'quality', unit: '%', data_type: 'number', input_scale: 0.01, operators: numberOperators },
     { key: 'gross_margin', name: '毛利率', description: '营业收入扣除营业成本后剩余的比例。', category: 'quality', unit: '%', data_type: 'number', input_scale: 0.01, operators: numberOperators },

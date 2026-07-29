@@ -155,8 +155,9 @@ FUNDAMENTAL_FILTER_FIELDS: dict[str, dict[str, Any]] = {
     "dividend_yield": _field(
         "dividend_yield", "股息率", "近12个月现金分红相对当前股价的比例。",
         category="估值", unit="%", direction="数值越高表示历史现金分红回报越高",
-        limits="历史分红不保证延续；除权和特殊分红会影响口径。",
+        limits="当前数据源未稳定提供 TTM 股息率，本字段不维护、不回填，筛选中不可用。",
         source="fundamental",
+        available=False,
     ),
     "total_market_cap": _field(
         "total_market_cap", "总市值", "全部已发行股份按当前价格计算的市场价值。",
