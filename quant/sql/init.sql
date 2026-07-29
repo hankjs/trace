@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0019_user_settings
+-- Schema revision: 0020_drop_stock_is_watch
 
 SET NAMES utf8mb4;
 
@@ -134,7 +134,6 @@ CREATE TABLE `quant_stock` (
   `code` VARCHAR(16) NOT NULL,
   `name` VARCHAR(64) NOT NULL,
   `industry` VARCHAR(64) NOT NULL,
-  `is_watch` TINYINT(1) NOT NULL,
   `list_date` DATE DEFAULT NULL,
   `delist_date` DATE DEFAULT NULL,
   `is_st` TINYINT(1) NOT NULL DEFAULT 0,
@@ -565,6 +564,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0019_user_settings');
+VALUES ('0020_drop_stock_is_watch');
 
 COMMIT;

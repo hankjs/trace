@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0019_user_settings"}
+    assert heads == {"0020_drop_stock_is_watch"}
     assert current_heads(migrated_db) == heads
 
 
@@ -285,6 +285,8 @@ def test_stock_has_listing_columns(migrated_db):
     assert bool(columns["list_date"]["nullable"]) is True
     assert bool(columns["delist_date"]["nullable"]) is True
     assert bool(columns["is_st"]["nullable"]) is False
+    # 自选在 quant_watchlist;主表不再挂 is_watch(0020)
+    assert "is_watch" not in columns
 
 
 def test_pool_member_has_no_date_column(migrated_db):

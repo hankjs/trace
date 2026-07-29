@@ -102,7 +102,6 @@ class StockWithListing(_StockBase):
     code: Mapped[str] = mapped_column(String(16), primary_key=True)
     name: Mapped[str] = mapped_column(String(64), default="")
     industry: Mapped[str] = mapped_column(String(64), default="")
-    is_watch: Mapped[bool] = mapped_column(Boolean, default=False)
     list_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     delist_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     is_st: Mapped[bool | None] = mapped_column(Boolean, nullable=True)

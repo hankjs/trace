@@ -30,20 +30,17 @@ def is_st_name(name: str | None) -> bool:
     return any(marker in upper for marker in ST_NAME_MARKERS)
 
 
-def upsert_stock(db: Session, code: str, name: str = "", industry: str = "",
-                 is_watch: bool | None = None) -> Stock:
+def upsert_stock(db: Session, code: str, name: str = "",
+                 industry: str = "") -> Stock:
     stock = db.get(Stock, code)
     if stock is None:
-        stock = Stock(code=code, name=name, industry=industry,
-                      is_watch=bool(is_watch))
+        stock = Stock(code=code, name=name, industry=industry)
         db.add(stock)
     else:
         if name:
             stock.name = name
         if industry:
             stock.industry = industry
-        if is_watch is not None:
-            stock.is_watch = is_watch
     if name:
         # 改名为 *ST 的股票必须同步刷新标记,否则 ST 过滤永远漏它
         stock.is_st = is_st_name(name)

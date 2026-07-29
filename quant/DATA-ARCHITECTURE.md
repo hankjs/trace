@@ -15,7 +15,11 @@
 | **原始事实** | `quant_daily_bar` 的 `raw_close`/`volume`/`amount`、`quant_adjust_factor`、`quant_trade_calendar`、`quant_stock` | 永不改写 | 高（重拉需数小时） |
 | **外部版本指标** | `quant_valuation_snapshot`、`quant_fundamental_snapshot` | 按交易日或报告版本追加；同版本可被数据源修订 | 中（可重拉，但需保留 `source`/`available_date`） |
 | **派生视图** | `quant_daily_bar` 的 `open/high/low/close`（前复权）、`quant_factor_daily`、`quant_pick`、`quant_signal`、`quant_strategy_eval`、`quant_backtest_*` | 会被重算或重写 | 低（可从原始事实重建） |
-| **用户数据** | `quant_trade`、`quant_watchlist`、`quant_pool`、`quant_pool_member` | 只由用户改 | 最高（不可再生） |
+| **用户数据** | `quant_trade`、`quant_watchlist`、`quant_user_settings`、`quant_pool`、`quant_pool_member` | 只由用户改 | 最高（不可再生） |
+
+**自选股**：真源是 `quant_watchlist(user_id, code)`。`quant_stock` 上早期的 `is_watch`
+列已删除（`0020_drop_stock_is_watch`）；API 响应里的 `is_watch` 由当前用户的
+watchlist join 计算，不是股票主表字段。
 
 实践含义：
 
@@ -39,6 +43,20 @@
   负债率和现金流质量指标，修订后新增可用版本，防止历史研究看到未来值；
 - 技术指标仍从日线计算，可随时重建，不混入上述两张外部版本指标表。
 
+#### `valuation.report_period`：预留列，不是 baostock 日 K 字段
+
+估值表与财务表共用「版本化 snapshot」形状，因此估值侧也有可空的 `report_period`
+（「这条估值数字锚定哪一期财报」）。**它不是 baostock 批量日 K 带来的列**——日 K 的
+`peTTM`/`pbMRQ`/`psTTM` 是市场日频口径，接口不返回对应报告期。
+
+| 表 | `report_period` | 当前状态 |
+|---|---|---|
+| `quant_fundamental_snapshot` | **必填**，报告期版本主键的一部分 | 在用 |
+| `quant_valuation_snapshot` | **可空**，schema 预留 | 日频 pe 源写 `NULL`；勿为填而填假报告期 |
+
+何时才会有值：若将来接入「基于最新年报/季报口径」的估值源，再写入对应报告期。在那
+之前保持 `NULL` 是正确语义（「无报告期锚点的日频市场估值」），不是数据缺漏。
+
 只有在后续引入完整的利润表、资产负债表、现金流量表、股本与分红事实表后，才适合把
 这些比率改成查询时或物化视图计算。当前再建一张“计算后基础数据表”只会复制现有两张
 snapshot 表的职责。
@@ -59,6 +77,19 @@ snapshot 表的职责。
 `quant_adjust_factor(code, divid_operate_date, fore_factor, back_factor, source)`
 按除权日**稀疏**存储（`sh.600519` 的 2808 行日线只对应 17 个除权日，压缩 175:1；
 全市场约 4.2 万行）。
+
+#### `fore_factor` 与 `back_factor`
+
+baostock `query_adjust_factor` 一次返回前复权因子（`foreAdjustFactor`）与后复权因子
+（`backAdjustFactor`），入库时成对写入，源数据原样保留。
+
+| 列 | baostock 字段 | 本系统用途 |
+|---|---|---|
+| **`fore_factor`** | `foreAdjustFactor` | **当前唯一使用路径**：批量日 K 换算前复权、尺度审计、重锚检测 |
+| **`back_factor`** | `backAdjustFactor` | **入库保留、业务不读**。本系统日线 `open/high/low/close` 存的是**前复权价**，不构造后复权序列 |
+
+`source='sina'`（北交所自算）通常只写 `fore_factor`，`back_factor` 为空。若日后需要与
+券商后复权对账或展示后复权净值，再消费 `back_factor`，不要为「填满列」去反推假值。
 
 重锚检测分两层，权威基准优先：
 

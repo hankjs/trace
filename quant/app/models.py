@@ -65,7 +65,7 @@ class Stock(Base):
     code: Mapped[str] = mapped_column(String(16), primary_key=True)  # 如 sh.600519
     name: Mapped[str] = mapped_column(String(64), default="")
     industry: Mapped[str] = mapped_column(String(64), default="")
-    is_watch: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 自选关系不在本表:见 quant_watchlist(user_id, code)。早期 is_watch 列已删(0020)。
     list_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     delist_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     is_st: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -149,7 +149,10 @@ class AdjustFactor(Base):
     code: Mapped[str] = mapped_column(String(16), primary_key=True)
     # baostock 字段名 dividOperateDate:除权除息日
     divid_operate_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    # 前复权因子:业务路径(换算/审计/重锚)唯一使用。
     fore_factor: Mapped[float] = mapped_column(_ADJ_FACTOR)   # foreAdjustFactor
+    # 后复权因子:baostock 成对返回,入库保留;当前系统只做前复权,业务不读
+    # (见 DATA-ARCHITECTURE.md §2「fore_factor 与 back_factor」)。
     back_factor: Mapped[float | None] = mapped_column(        # backAdjustFactor
         _ADJ_FACTOR, nullable=True)
     # 'baostock' = query_adjust_factor 的权威值;
@@ -323,6 +326,9 @@ class ValuationSnapshot(Base):
     id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
     code: Mapped[str] = mapped_column(String(16), index=True)
     data_date: Mapped[date] = mapped_column(Date, index=True)
+    # schema 预留「估值锚定的财报期」;日频 pe 源(baostock 日 K)不提供报告期,
+    # 当前写入 NULL。勿与 fundamental.report_period(必填、在用)混淆。
+    # 见 DATA-ARCHITECTURE.md §1「valuation.report_period」。
     report_period: Mapped[date | None] = mapped_column(Date, nullable=True)
     available_date: Mapped[date] = mapped_column(Date, index=True)
     source: Mapped[str] = mapped_column(String(96))

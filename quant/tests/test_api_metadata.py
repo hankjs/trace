@@ -57,7 +57,7 @@ def _session() -> Session:
 
 def _seed_stock_and_bar(db: Session) -> None:
     db.add(Stock(
-        code="sh.600519", name="贵州茅台", industry="白酒", is_watch=False,
+        code="sh.600519", name="贵州茅台", industry="白酒",
     ))
     db.add(DailyBar(
         code="sh.600519", date=date(2026, 7, 24),
@@ -69,13 +69,13 @@ def _seed_stock_and_bar(db: Session) -> None:
 
 def _seed_search_stocks(db: Session) -> None:
     db.add_all([
-        Stock(code="sh.600519", name="贵州茅台", industry="白酒", is_watch=False),
-        Stock(code="sz.000001", name="平安银行", industry="银行", is_watch=False),
-        Stock(code="bj.430047", name="诺思兰德", industry="医药", is_watch=True),
-        Stock(code="bj.920001", name="北交新股", industry="制造", is_watch=False),
-        Stock(code="sh.600000", name="浦发银行", industry="银行", is_watch=True),
-        Stock(code="sz.300750", name="宁德时代", industry="电池", is_watch=False),
-        Stock(code="sh.601111", name="百分百科技", industry="软件", is_watch=False),
+        Stock(code="sh.600519", name="贵州茅台", industry="白酒"),
+        Stock(code="sz.000001", name="平安银行", industry="银行"),
+        Stock(code="bj.430047", name="诺思兰德", industry="医药"),
+        Stock(code="bj.920001", name="北交新股", industry="制造"),
+        Stock(code="sh.600000", name="浦发银行", industry="银行"),
+        Stock(code="sz.300750", name="宁德时代", industry="电池"),
+        Stock(code="sh.601111", name="百分百科技", industry="软件"),
     ])
     db.add_all([
         WatchlistItem(user_id=1, code="bj.430047"),
