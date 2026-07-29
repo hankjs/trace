@@ -16,7 +16,11 @@ from ..config import settings
 from ..backtest.evaluate import run_evaluation
 from ..data import fundamentals, ingest, universe
 from ..data import calendar as trade_calendar
-from ..data.quality import data_quality_report
+from ..data.quality import (
+    clear_quality_cache,
+    data_quality_report,
+    refresh_data_quality_cache,
+)
 from ..db import SessionLocal
 from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
@@ -35,6 +39,11 @@ async def run_db_job(job: Callable[[Session], T]) -> T:
     return await asyncio.to_thread(invoke)
 
 
+def _invalidate_data_quality_cache(db: Session) -> None:
+    """源数据变更后作废旁路缓存;下次读接口会现算写回。不碰源表。"""
+    clear_quality_cache(db)
+
+
 @router.post("/backfill")
 async def backfill(code: str = Query(..., description="如 sh.600519"),
                    start: date = Query(None, description="默认取配置 backfill_start"),
@@ -49,9 +58,13 @@ async def backfill(code: str = Query(..., description="如 sh.600519"),
     start = start or date.fromisoformat(settings.backfill_start)
 
     try:
-        n = await run_db_job(
-            lambda db: ingest.safe_backfill(
-                db, code.lower(), start, end, force=force_rescale))
+        def _job(db: Session) -> int:
+            n = ingest.safe_backfill(
+                db, code.lower(), start, end, force=force_rescale)
+            _invalidate_data_quality_cache(db)
+            return n
+
+        n = await run_db_job(_job)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"回填失败: {e}")
     return {"code": code.lower(), "start": str(start),
@@ -129,10 +142,14 @@ async def sync_adjust_factors_now(
                  if codes else None)
 
     try:
-        return await run_db_job(
-            lambda db: ingest.sync_adjust_factors(
+        def _job(db: Session):
+            result = ingest.sync_adjust_factors(
                 db, codes=code_list, start=start,
-                sleep_per_code=sleep_per_code))
+                sleep_per_code=sleep_per_code)
+            _invalidate_data_quality_cache(db)
+            return result
+
+        return await run_db_job(_job)
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"复权因子采集失败: {e}")
 
@@ -159,8 +176,8 @@ async def sync_fundamentals_now(
         explicit_codes = [code for code in codes.split(",") if code.strip()]
 
     try:
-        return await run_db_job(
-            lambda db: fundamentals.sync_fundamental_universe(
+        def _job(db: Session):
+            result = fundamentals.sync_fundamental_universe(
                 db,
                 universe=universe_,
                 codes=explicit_codes,
@@ -168,7 +185,11 @@ async def sync_fundamentals_now(
                 include_valuation=include_valuation,
                 include_financials=include_financials,
                 valuation_history=valuation_history,
-            ))
+            )
+            _invalidate_data_quality_cache(db)
+            return result
+
+        return await run_db_job(_job)
     except fundamentals.FundamentalSyncInProgressError as exc:
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
@@ -210,6 +231,16 @@ async def run_eval_now(date_: date | None = Query(None, alias="date"),
 
 
 @router.get("/data-quality")
-async def data_quality_now():
-    """全库数据信任报告(ST/估值/财务/复权因子覆盖,只读)。"""
+async def data_quality_now(
+    force: bool = Query(
+        False,
+        description="true=忽略旁路缓存现算并写回;默认读 quant_data_quality_cache",
+    ),
+):
+    """全库数据信任报告(ST/估值/财务/复权因子覆盖)。
+
+    源表只读;结果落旁路表 quant_data_quality_cache。force 时强制重算。
+    """
+    if force:
+        return await run_db_job(lambda db: refresh_data_quality_cache(db))
     return await run_db_job(lambda db: data_quality_report(db))

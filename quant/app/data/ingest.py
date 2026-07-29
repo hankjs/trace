@@ -248,50 +248,68 @@ def upsert_valuations_from_daily_bulk(db: Session, day: date,
 
 
 def upsert_bars(db: Session, code: str, df: pd.DataFrame) -> int:
-    """日线 upsert(code+date 唯一键)。
-
-    重锚修复依赖「同 code+date 的旧行被新尺度覆盖」这一语义,所以这里必须
-    真正 upsert 而不是 insert-ignore。生产是 MySQL,测试是 SQLite,两种
-    方言各用各自的 upsert 语法(否则重锚覆盖行为无法在测试中验证)。
-    """
-    # 长期停牌股可能返回 OHLC 缺失的行,无法入库,直接丢弃
-    df = df.dropna(subset=["close"])
+    """日线 upsert(code+date 唯一键)。df 可无 code 列(则用参数 code)。"""
     if df.empty:
         return 0
-    rows = [
-        {
-            "code": code,
+    work = df.copy()
+    if "code" not in work.columns:
+        work["code"] = code
+    return upsert_bars_frame(db, work)
+
+
+def upsert_bars_frame(db: Session, df: pd.DataFrame) -> int:
+    """多 code 日线批量 upsert(code+date 唯一键)。
+
+    重锚修复依赖「同 code+date 的旧行被新尺度覆盖」;必须真正 upsert。
+    按批提交,避免单次包过大;比按只循环快一个数量级。
+    """
+    if df.empty:
+        return 0
+    need = {"code", "date", "open", "high", "low", "close"}
+    if not need.issubset(df.columns):
+        raise ValueError(f"upsert_bars_frame 缺列: {need - set(df.columns)}")
+    work = df.dropna(subset=["close"])
+    if work.empty:
+        return 0
+
+    rows = []
+    for r in work.itertuples():
+        raw = getattr(r, "raw_close", None)
+        is_st = getattr(r, "is_st", None)
+        rows.append({
+            "code": r.code,
             "date": r.date,
             "open": float(r.open),
             "high": float(r.high),
             "low": float(r.low),
             "close": float(r.close),
-            "raw_close": None if pd.isna(r.raw_close) else float(r.raw_close),
-            "volume": 0.0 if pd.isna(r.volume) else float(r.volume),
-            "amount": 0.0 if pd.isna(r.amount) else float(r.amount),
-            # 逐日 ST 状态:NULL 表示未采集,不能当 False 用(见 alembic 0010)
-            "is_st": (None if getattr(r, "is_st", None) is None
-                      or pd.isna(r.is_st) else bool(r.is_st)),
-        }
-        for r in df.itertuples()
-    ]
+            "raw_close": None if raw is None or pd.isna(raw) else float(raw),
+            "volume": 0.0 if pd.isna(getattr(r, "volume", 0)) else float(r.volume),
+            "amount": 0.0 if pd.isna(getattr(r, "amount", 0)) else float(r.amount),
+            "is_st": (None if is_st is None or (isinstance(is_st, float) and pd.isna(is_st))
+                      else bool(is_st)),
+        })
     updated_cols = ("open", "high", "low", "close", "raw_close", "volume",
                     "amount", "is_st")
     dialect = db.get_bind().dialect.name
-    if dialect == "sqlite":
-        stmt = sqlite_insert(DailyBar).values(rows)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[DailyBar.code, DailyBar.date],
-            set_={c: getattr(stmt.excluded, c) for c in updated_cols},
-        )
-    else:
-        stmt = mysql_insert(DailyBar).values(rows)
-        stmt = stmt.on_duplicate_key_update(
-            **{c: getattr(stmt.inserted, c) for c in updated_cols}
-        )
-    db.execute(stmt)
+    total = 0
+    for i in range(0, len(rows), 800):
+        chunk = rows[i:i + 800]
+        if dialect == "sqlite":
+            stmt = sqlite_insert(DailyBar).values(chunk)
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[DailyBar.code, DailyBar.date],
+                set_={c: getattr(stmt.excluded, c) for c in updated_cols},
+            )
+        else:
+            stmt = mysql_insert(DailyBar).values(chunk)
+            stmt = stmt.on_duplicate_key_update(
+                **{c: getattr(stmt.inserted, c) for c in updated_cols}
+            )
+        db.execute(stmt)
+        total += len(chunk)
     db.commit()
-    return len(rows)
+    return total
 
 
 def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame,

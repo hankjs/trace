@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -17,18 +17,19 @@ from app.data.quality import (
     data_quality_public_summary,
     data_quality_report,
     frames_data_quality,
+    refresh_data_quality_cache,
     st_history_coverage,
 )
 from app.db import Base
-from app.models import DailyBar, Stock
+from app.models import DailyBar, DataQualityCache, Stock
 
 
 @pytest.fixture()
 def db():
-    clear_quality_cache()
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as session:
+        clear_quality_cache(session)
         session.add_all([
             Stock(code="sh.a", name="A", list_date=date(2020, 1, 1), is_st=False),
             Stock(code="sh.b", name="B", list_date=date(2020, 1, 1), is_st=False),
@@ -52,7 +53,7 @@ def db():
         ])
         session.commit()
         yield session
-    clear_quality_cache()
+        clear_quality_cache(session)
 
 
 def test_st_history_coverage_counts_null_bars(db):
@@ -87,6 +88,11 @@ def test_data_quality_report_summary_shape(db):
     assert "snapshots" in report
     assert "adjust_factors" in report
     assert report["snapshots"]["fields"]  # admin 路径含字段明细
+    assert report["cache"]["computed_at"]
+    # 旁路表已落一行
+    row = db.get(DataQualityCache, "latest")
+    assert row is not None
+    assert row.as_of == date(2024, 6, 2)
 
 
 def test_data_quality_public_summary_skips_field_detail(db):
@@ -94,6 +100,31 @@ def test_data_quality_public_summary_skips_field_detail(db):
     assert summary["stock_count"] == 2
     assert "alert_level" in summary
     assert "fields" not in summary
+    assert "computed_at" in summary
+
+
+def test_data_quality_cache_hit_skips_rebuild(db):
+    first = data_quality_report(db, as_of=date(2024, 6, 2), force=True)
+    # 污染 payload,验证第二次不重算而是读缓存
+    row = db.get(DataQualityCache, "latest")
+    assert row is not None
+    poisoned = dict(row.payload)
+    poisoned["summary"] = {**poisoned["summary"], "stock_count": 999}
+    row.payload = poisoned
+    db.commit()
+
+    second = data_quality_report(db, as_of=date(2024, 6, 2), force=False)
+    assert second["summary"]["stock_count"] == 999
+
+    refreshed = data_quality_report(db, as_of=date(2024, 6, 2), force=True)
+    assert refreshed["summary"]["stock_count"] == first["summary"]["stock_count"]
+
+
+def test_refresh_and_clear_quality_cache(db):
+    refresh_data_quality_cache(db, as_of=date(2024, 6, 2))
+    assert db.execute(select(DataQualityCache)).scalars().first() is not None
+    clear_quality_cache(db)
+    assert db.get(DataQualityCache, "latest") is None
 
 
 def test_frames_data_quality_flags_incomplete_st():

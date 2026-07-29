@@ -883,6 +883,12 @@ export interface DataQualitySummary {
   valuation_coverage_ratio?: number
   fundamental_coverage_ratio?: number
   adjust_factor_missing_stocks?: number
+  /** ST 统计窗口(日历日),默认约 60 */
+  st_window_days?: number | null
+  st_window_start?: string | null
+  st_window_end?: string | null
+  /** 旁路缓存写入时间(ISO),缺省表示现场现算 */
+  computed_at?: string
 }
 
 export interface BacktestDataQuality {

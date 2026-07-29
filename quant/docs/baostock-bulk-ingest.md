@@ -68,8 +68,15 @@ else:  # 单票补洞、重锚全历史
 
 ### 4.3 多年历史 / is_st 补列
 
-**本仓库不做**——历史数据由外部流程处理，按日历史回填脚本已移除。  
-若将来需要：按交易日循环批量约 `年数 × 250` 次，而非 `股票数 × 2`；断点记 `last_done_trade_date`；**禁止**同 IP 多 shard。
+离线 catch-up（不打业务表循环写库，避免 wananyun 上慢 SQL 拖死 API 配额）：
+
+1. **服务器只落盘**：`scripts/download_by_day.py` → `data/baostock_raw/{k,factor}/YYYY-MM-DD.csv.gz`  
+   （每交易日 2 次 bulk API；`flock` + `max-requests`；断点 `download_state.json`）
+2. **rsync** 到开发机（`quant/data/baostock_raw/` 已 gitignore）
+3. **本机灌库**：`scripts/ingest_from_raw_files.py` → 批量 upsert 日线 / 因子 / 估值，结束后刷新 `data-quality` 缓存
+
+按交易日循环约 `年数 × 250 × 2` 次请求，远小于按 code。**禁止**同 IP 多 shard。  
+日常盘后仍走 `job_daily_bars`（开关 `bulk_daily_bars`）；`backfill_is_st.py` 仅作 is_st 列补洞。
 
 ### 4.4 仍用单条
 
@@ -88,7 +95,7 @@ Admin 单票回填、`safe_backfill` 重锚、小池短区间补洞。
 | `baostock_client` | `fetch_market_daily_bars` / `fetch_market_adjust_factors`；保留单票 API | **已实现**（P1） |
 | `ingest` | `raw_to_qfq`（换算公式单点，待 P0 验证）；`ingest_market_day`；`sync_adjust_factors_for_day`（因子按日） | **已实现**（P2/P3），开关默认关闭，待 P0 spike 验证后开启 |
 | `scheduler` | `job_daily_bars` 按 `[quant] bulk_daily_bars` 开关切批量（默认 `false`，走原按 code 路径）；因子按日同步在 `ingest_market_day` 内完成（同一次批量因子请求，不重复调用） | **已实现**，待 P0 spike 验证后开启 |
-| 脚本 | `spike_bulk_vs_single.py`（P0 真网对照）；旧按 code 脚本降级/弃用 | spike **已写出，未执行**；按日历史回填脚本已移除（历史数据外部处理，见 §4.3） |
+| 脚本 | `download_by_day.py` + `ingest_from_raw_files.py`（离线 catch-up，§4.3）；`backfill_is_st.py`；`spike_bulk_vs_single.py` | **离线链路已用**；盘后 bulk 开关仍默认关 |
 
 ## 6. 实施顺序
 
@@ -98,7 +105,7 @@ Admin 单票回填、`safe_backfill` 重锚、小池短区间补洞。
 | P1 | 客户端封装 + 单测 |
 | P2 | 盘后切批量 |
 | P3 | 因子按日 |
-| P4 | ~~按日历史回填脚本~~ 取消——历史数据由外部流程处理（§4.3） |
+| P4 | 离线 catch-up：`download_by_day` + rsync + `ingest_from_raw_files`（§4.3） |
 | P5 | is_st 并入按日；文档改「已切换」 |
 | P6 | 盘中临时当日 K（§4.5，依赖 P2 的覆盖能力） |
 

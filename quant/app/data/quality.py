@@ -1,17 +1,16 @@
 """数据覆盖率与信任信号。
 
 回测/选股是否可信,取决于 ST 历史、估值/财务点时数据和复权因子是否完整。
-本模块只做只读汇总,不触发采集;供看板、admin 与回测 metrics.data_quality 使用。
+本模块对源表只读;完整报告物化到旁路表 quant_data_quality_cache,
+供看板、admin 与回测 metrics.data_quality 使用。
 
 性能约束:quant_daily_bar 可达千万级。全表 COUNT / COUNT(DISTINCT) 会卡死看板,
 因此默认 ST/活跃股票口径落在「最近 lookback 日历日」窗口内,走 date 索引;
-进程内短 TTL 缓存避免重复重扫。
+报告结果写入旁路缓存表(不进进程内存),采集任务结束后 refresh。
 """
 from __future__ import annotations
 
-import threading
-import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import case, func, select
@@ -20,11 +19,12 @@ from sqlalchemy.orm import Session
 from ..models import (
     AdjustFactor,
     DailyBar,
+    DataQualityCache,
     FundamentalSnapshot,
     Stock,
     ValuationSnapshot,
 )
-from .clock import today_cst
+from .clock import now_cst, today_cst
 
 # 回测 frames 侧字段名 → 库内列名(估值表 total_market_cap / 财务表 yoy 命名不同)
 _VALUATION_FRAME_FIELDS = {
@@ -49,11 +49,9 @@ VALUATION_WARN = 0.10
 
 # 全库扫描代价过高:默认只统计最近 N 个日历日(约 40 个交易日)的 ST / 活跃股票
 DEFAULT_LOOKBACK_DAYS = 60
-# 看板/admin 共享的报告缓存(秒);数据质量非秒级变化
-REPORT_CACHE_TTL_SECONDS = 300.0
 
-_cache_lock = threading.Lock()
-_report_cache: dict[str, tuple[float, Any]] = {}
+# 旁路缓存固定主键;全库只保留最新一份完整报告
+CACHE_SCOPE_LATEST = "latest"
 
 
 def _ratio(num: int, den: int) -> float:
@@ -62,28 +60,75 @@ def _ratio(num: int, den: int) -> float:
     return round(num / den, 4)
 
 
-def _cache_get(key: str) -> Any | None:
-    with _cache_lock:
-        hit = _report_cache.get(key)
-        if hit is None:
-            return None
-        ts, value = hit
-        if time.monotonic() - ts >= REPORT_CACHE_TTL_SECONDS:
-            _report_cache.pop(key, None)
-            return None
-        return value
+def _coverage_ratio(num: int, den: int) -> float:
+    """覆盖率 0~1。分子偶发大于分母(口径窗口不一致)时钳到 1,避免看板 100.02%。"""
+    if den <= 0:
+        return 0.0
+    return round(min(num, den) / den, 4)
 
 
-def _cache_set(key: str, value: Any) -> Any:
-    with _cache_lock:
-        _report_cache[key] = (time.monotonic(), value)
-    return value
+def _naive_now() -> datetime:
+    return now_cst().replace(tzinfo=None)
 
 
-def clear_quality_cache() -> None:
-    """测试或主动刷新时清空进程内缓存。"""
-    with _cache_lock:
-        _report_cache.clear()
+def _cache_row(db: Session) -> DataQualityCache | None:
+    return db.get(DataQualityCache, CACHE_SCOPE_LATEST)
+
+
+def _load_cached_report(db: Session) -> dict[str, Any] | None:
+    row = _cache_row(db)
+    if row is None or not isinstance(row.payload, dict):
+        return None
+    return row.payload
+
+
+def _store_report(db: Session, *, as_of: date, report: dict[str, Any]) -> dict[str, Any]:
+    """把完整报告写入旁路表并 commit。不触碰任何源表。"""
+    now = _naive_now()
+    # 在 payload 内嵌 meta,读路径无需二次 join 即可返回 computed_at
+    stored = {
+        **report,
+        "cache": {
+            "scope": CACHE_SCOPE_LATEST,
+            "as_of": str(as_of),
+            "computed_at": now.isoformat(timespec="seconds"),
+        },
+    }
+    row = _cache_row(db)
+    if row is None:
+        db.add(DataQualityCache(
+            scope=CACHE_SCOPE_LATEST,
+            as_of=as_of,
+            payload=stored,
+            computed_at=now,
+        ))
+    else:
+        row.as_of = as_of
+        row.payload = stored
+        row.computed_at = now
+    db.commit()
+    return stored
+
+
+def clear_quality_cache(db: Session | None = None) -> None:
+    """清空旁路缓存行。测试或主动作废时调用;不影响源数据。"""
+    if db is None:
+        return
+    row = _cache_row(db)
+    if row is not None:
+        db.delete(row)
+        db.commit()
+
+
+def refresh_data_quality_cache(
+    db: Session,
+    *,
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    """强制重算并落库(调度/回填后调用)。源表只读。"""
+    as_of = as_of or today_cst()
+    report = _build_data_quality_report(db, as_of=as_of, include_fields=True)
+    return _store_report(db, as_of=as_of, report=report)
 
 
 def _latest_bar_date(db: Session) -> date | None:
@@ -257,7 +302,7 @@ def snapshot_coverage(
             fields[frame_name] = {
                 "available": available,
                 "total": universe,
-                "ratio": _ratio(available, universe),
+                "ratio": _coverage_ratio(available, universe),
             }
         for frame_name, col in _FUNDAMENTAL_FRAME_FIELDS.items():
             column = getattr(FundamentalSnapshot, col)
@@ -272,7 +317,7 @@ def snapshot_coverage(
             fields[frame_name] = {
                 "available": available,
                 "total": universe,
-                "ratio": _ratio(available, universe),
+                "ratio": _coverage_ratio(available, universe),
             }
 
     return {
@@ -281,8 +326,9 @@ def snapshot_coverage(
         "universe_stocks": universe,
         "valuation_stocks": val_codes,
         "fundamental_stocks": fun_codes,
-        "valuation_ratio": _ratio(val_codes, universe),
-        "fundamental_ratio": _ratio(fun_codes, universe),
+        # 估值/财务股票集合与「近 lookback 有 bar」宇宙不完全同构,覆盖率钳制到 1
+        "valuation_ratio": _coverage_ratio(val_codes, universe),
+        "fundamental_ratio": _coverage_ratio(fun_codes, universe),
         "fields": fields,
     }
 
@@ -388,17 +434,22 @@ def _build_data_quality_report(
     as_of: date,
     include_fields: bool,
 ) -> dict[str, Any]:
+    latest_bar = _latest_bar_date(db)
+    # 研究日对齐最新日线:用「今天」当 as_of 时估值窗口会落在无 bar 的日历日上
+    research_as_of = as_of
+    if latest_bar is not None and as_of > latest_bar:
+        research_as_of = latest_bar
+
     st = st_history_coverage(db)
-    snaps = snapshot_coverage(db, as_of=as_of, include_fields=include_fields)
+    snaps = snapshot_coverage(db, as_of=research_as_of, include_fields=include_fields)
     factors = adjust_factor_summary(db)
     stock_count = int(db.execute(select(func.count()).select_from(Stock)).scalar() or 0)
-    latest_bar = _latest_bar_date(db)
     level = _alert_level(
         st["stock_coverage_ratio"],
         snaps["valuation_ratio"],
     )
     summary = {
-        "as_of": str(as_of),
+        "as_of": str(research_as_of),
         "alert_level": level,
         "stock_count": stock_count,
         "latest_bar_date": str(latest_bar) if latest_bar else None,
@@ -407,6 +458,10 @@ def _build_data_quality_report(
         "valuation_coverage_ratio": snaps["valuation_ratio"],
         "fundamental_coverage_ratio": snaps["fundamental_ratio"],
         "adjust_factor_missing_stocks": factors["missing_factor_stocks"],
+        # 前端可读的口径提示(覆盖率非涨跌幅)
+        "st_window_days": st.get("lookback_days"),
+        "st_window_start": st.get("window_start"),
+        "st_window_end": st.get("window_end"),
     }
     return {
         "summary": summary,
@@ -416,29 +471,42 @@ def _build_data_quality_report(
     }
 
 
-def data_quality_report(db: Session, *, as_of: date | None = None) -> dict[str, Any]:
-    """全库数据信任报告(admin / 看板摘要共用)。"""
+def data_quality_report(
+    db: Session,
+    *,
+    as_of: date | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """全库数据信任报告(admin / 看板摘要共用)。
+
+    默认读旁路缓存;force=True 或缓存缺失时现算并写回。
+    as_of 仅在重算时生效(缓存固定一份 latest)。
+    """
+    if not force:
+        cached = _load_cached_report(db)
+        if cached is not None:
+            return cached
     as_of = as_of or today_cst()
-    cache_key = f"report:{as_of.isoformat()}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
     report = _build_data_quality_report(db, as_of=as_of, include_fields=True)
-    return _cache_set(cache_key, report)
+    return _store_report(db, as_of=as_of, report=report)
 
 
-def data_quality_public_summary(db: Session, *, as_of: date | None = None) -> dict[str, Any]:
+def data_quality_public_summary(
+    db: Session,
+    *,
+    as_of: date | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
     """登录用户可读摘要:只暴露比率与告警,不含运维细节表。
 
-    不跑 admin 字段级覆盖明细;并与完整报告共享缓存键前缀策略,独立缓存。
+    与完整报告共用旁路缓存行;缓存命中时不再扫源表。
     """
-    as_of = as_of or today_cst()
-    cache_key = f"public:{as_of.isoformat()}"
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
-    report = _build_data_quality_report(db, as_of=as_of, include_fields=False)
-    return _cache_set(cache_key, report["summary"])
+    report = data_quality_report(db, as_of=as_of, force=force)
+    summary = dict(report.get("summary") or {})
+    cache_meta = report.get("cache") if isinstance(report.get("cache"), dict) else {}
+    if cache_meta.get("computed_at"):
+        summary["computed_at"] = cache_meta["computed_at"]
+    return summary
 
 
 __all__ = [
@@ -447,6 +515,7 @@ __all__ = [
     "data_quality_public_summary",
     "data_quality_report",
     "frames_data_quality",
+    "refresh_data_quality_cache",
     "snapshot_coverage",
     "st_history_coverage",
 ]

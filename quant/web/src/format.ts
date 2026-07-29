@@ -25,11 +25,21 @@ export function fmtBigAmount(v: number | null | undefined): string {
   return v.toFixed(2)
 }
 
-/** 百分比:v 为小数(0.0123 -> +1.23%) */
+/** 百分比:v 为小数(0.0123 -> +1.23%)。用于涨跌/收益,带符号。 */
 export function fmtPct(v: number | null | undefined): string {
   if (v === null || v === undefined || Number.isNaN(v)) return '--'
   if (v === 0) return '0.00%'
   return (v > 0 ? '+' : '') + (v * 100).toFixed(2) + '%'
+}
+
+/**
+ * 覆盖率:v 为 0~1 小数(0.1105 -> 11.1%)。
+ * 无正负号;勿用 fmtPct(覆盖率会变成 +11.05%)。
+ */
+export function fmtCoverage(v: number | null | undefined, digits = 1): string {
+  if (v === null || v === undefined || Number.isNaN(v)) return '—'
+  const pct = Math.min(1, Math.max(0, v)) * 100
+  return pct.toFixed(digits) + '%'
 }
 
 /** 带符号金额 */

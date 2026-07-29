@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0016_experiment_registry
+-- Schema revision: 0017_data_quality_cache
 
 SET NAMES utf8mb4;
 
@@ -187,6 +187,15 @@ CREATE TABLE `quant_trade_calendar` (
   `is_open` TINYINT(1) NOT NULL,
   `source` VARCHAR(16) NOT NULL DEFAULT 'baostock',
   PRIMARY KEY (`date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- 旁路缓存:仅存 data-quality 聚合 JSON,与行情/财务源表无 FK
+CREATE TABLE `quant_data_quality_cache` (
+  `scope` VARCHAR(32) NOT NULL,
+  `as_of` DATE NOT NULL,
+  `payload` JSON NOT NULL,
+  `computed_at` DATETIME NOT NULL,
+  PRIMARY KEY (`scope`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `quant_valuation_snapshot` (
@@ -515,6 +524,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0016_experiment_registry');
+VALUES ('0017_data_quality_cache');
 
 COMMIT;

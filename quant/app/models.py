@@ -700,3 +700,18 @@ class TradeCalendar(Base):
     date: Mapped[date] = mapped_column(Date, primary_key=True)
     is_open: Mapped[bool] = mapped_column(Boolean, default=True)
     source: Mapped[str] = mapped_column(String(16), default="baostock")
+
+
+class DataQualityCache(Base):
+    """数据质量报告旁路缓存(只存聚合 JSON,不写任何行情/财务源表)。
+
+    固定一行 scope='latest':读接口走缓存,采集任务结束后 refresh 重算。
+    可随时 truncate/drop,不影响源数据完整性。
+    """
+
+    __tablename__ = "quant_data_quality_cache"
+
+    scope: Mapped[str] = mapped_column(String(32), primary_key=True)
+    as_of: Mapped[date] = mapped_column(Date, nullable=False)
+    payload: Mapped[dict] = mapped_column(JSON, nullable=False)
+    computed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

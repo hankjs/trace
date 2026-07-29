@@ -30,6 +30,7 @@ from .config import settings
 from .data import baostock_client, fundamentals, ingest, universe
 from .data import calendar as trade_calendar
 from .data.clock import SHANGHAI_TZ, now_cst
+from .data.quality import refresh_data_quality_cache
 from .db import SessionLocal
 from .models import Pick, WatchlistItem
 from .selection.pipeline import run_selection
@@ -57,6 +58,22 @@ def _is_trading_day(d: date | None = None) -> bool:
     with SessionLocal() as db:
         trade_calendar.ensure_calendar_loaded(db, d)
         return trade_calendar.is_trading_day(db, d)
+
+
+def _refresh_data_quality() -> None:
+    """重算 data-quality 旁路缓存(源表只读,失败不影响主链路)。"""
+    with SessionLocal() as db:
+        try:
+            report = refresh_data_quality_cache(db)
+            summary = report.get("summary") or {}
+            logger.info(
+                "data-quality 缓存已刷新: alert=%s latest_bar=%s",
+                summary.get("alert_level"),
+                summary.get("latest_bar_date"),
+            )
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("data-quality 缓存刷新失败")
 
 
 def _watch_codes() -> list[str]:
@@ -221,6 +238,8 @@ def job_evening_pipeline() -> None:
             len(bars.get("empty", [])), bars["empty_ratio"] * 100,
         )
         return
+    # 日线落库后刷新信任摘要(旁路表);后续选股失败也不丢最新覆盖率
+    _refresh_data_quality()
     if job_factors_and_selection() is None:
         logger.error("盘后流水线中止: 选股阶段失败")
         return
@@ -289,10 +308,11 @@ def job_sync_valuations(day: date | None = None) -> dict | None:
         try:
             result = fundamentals.sync_market_valuations(db, day)
             logger.info("估值同步完成: %s", result)
-            return result
         except Exception:  # noqa: BLE001
             logger.exception("估值同步失败")
             return None
+    _refresh_data_quality()
+    return result
 
 
 def job_sync_fundamentals(day: date | None = None) -> dict | None:
@@ -303,10 +323,11 @@ def job_sync_fundamentals(day: date | None = None) -> dict | None:
         try:
             result = fundamentals.sync_market_financials(db, periods)
             logger.info("财务指标同步完成: %s", result)
-            return result
         except Exception:  # noqa: BLE001
             logger.exception("财务指标同步失败")
             return None
+    _refresh_data_quality()
+    return result
 
 
 def job_intraday_snapshot() -> None:

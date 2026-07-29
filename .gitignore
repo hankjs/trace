@@ -36,3 +36,6 @@ coverage/
 
 # Coordinator 的 agent 隔离工作树
 .worktrees/
+
+# quant baostock 原始落盘(大文件)
+quant/data/baostock_raw/

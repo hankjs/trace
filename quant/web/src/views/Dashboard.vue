@@ -7,7 +7,7 @@ import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
 import QuTable from '../components/QuTable.vue'
 import type { QuTableColumn } from '../components/quTable'
-import { fmtPct, fmtPrice, pnlClass } from '../format'
+import { fmtCoverage, fmtPct, fmtPrice, pnlClass } from '../format'
 
 const snapshot = ref<SnapshotItem[]>([])
 const signals = ref<SignalItem[]>([])
@@ -82,16 +82,16 @@ const dataQualityAlertClass = computed(() => {
 
 const dataQualityLabel = computed(() => {
   const level = dataQuality.value?.alert_level
-  if (level === 'critical') return '不可信（覆盖严重不足）'
+  const st = dataQuality.value?.st_stock_coverage_ratio
+  if (level === 'critical') {
+    // 阈值见 app/data/quality.py ST_COMPLETE_CRITICAL=0.50
+    if (st != null) return `不可信（ST 覆盖 ${fmtCoverage(st)}，低于 50% 门槛）`
+    return '不可信（覆盖严重不足）'
+  }
   if (level === 'warning') return '需关注'
   if (level === 'ok') return '覆盖良好'
   return '未知'
 })
-
-function ratioText(value?: number) {
-  if (value == null || Number.isNaN(value)) return '—'
-  return fmtPct(value)
-}
 
 async function load() {
   loading.value = true
@@ -162,13 +162,13 @@ onMounted(load)
             <p class="mt-0.5 text-xs leading-5">
               状态 {{ dataQualityLabel }}
               <template v-if="dataQuality?.latest_bar_date"> · 最新日线 {{ dataQuality.latest_bar_date }}</template>
-              · ST 股票覆盖 {{ ratioText(dataQuality?.st_stock_coverage_ratio) }}
-              · ST bar 覆盖 {{ ratioText(dataQuality?.st_bar_coverage_ratio) }}
-              · 估值覆盖 {{ ratioText(dataQuality?.valuation_coverage_ratio) }}
-              · 财务覆盖 {{ ratioText(dataQuality?.fundamental_coverage_ratio) }}
+              · ST 股票 {{ fmtCoverage(dataQuality?.st_stock_coverage_ratio) }}
+              · ST bar {{ fmtCoverage(dataQuality?.st_bar_coverage_ratio) }}
+              · 估值 {{ fmtCoverage(dataQuality?.valuation_coverage_ratio) }}
+              · 财务 {{ fmtCoverage(dataQuality?.fundamental_coverage_ratio) }}
             </p>
             <p class="mt-0.5 text-[11px] text-text-tertiary">
-              历史回测仅使用逐日 ST；缺 is_st 的标的不会回退当前标记。覆盖不足时结论不可当作干净证据。
+              覆盖率为 0~100% 占比（非涨跌幅）。ST 默认近 60 日窗口；历史回测只用逐日 is_st，缺值不回退当前标记。覆盖不足时结论不可当作干净证据。
             </p>
           </div>
         </div>
