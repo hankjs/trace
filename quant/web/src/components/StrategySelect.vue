@@ -84,7 +84,7 @@ onMounted(() => {
     :empty-label="emptyLabel"
     unavailable-label="暂无可用策略"
     :manage-link="manageLink"
-    :manage-to="{ name: 'strategies', query: { tab: 'manage' } }"
+    :manage-to="{ name: 'strategies-manage' }"
     manage-label="管理策略"
     :described-by="selected?.capability && selected.capability.status !== 'supported' ? 'strategy-capability-hint' : undefined"
     @change="emit('change', $event)"

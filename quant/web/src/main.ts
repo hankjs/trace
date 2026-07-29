@@ -14,7 +14,24 @@ const router = createRouter({
     { path: '/selection', name: 'selection', component: () => import('./views/SelectionWorkspace.vue') },
     { path: '/pools', name: 'pools', component: () => import('./views/Pools.vue') },
     { path: '/signals', name: 'signals', component: () => import('./views/Signals.vue') },
-    { path: '/strategies', name: 'strategies', component: () => import('./views/StrategyWorkspace.vue') },
+    // 策略研究拆为独立页面,左侧导航以二级菜单进入
+    { path: '/strategies/backtest', name: 'strategies-backtest', component: () => import('./views/Backtest.vue') },
+    { path: '/strategies/experiments', name: 'strategies-experiments', component: () => import('./views/Experiments.vue') },
+    { path: '/strategies/leaderboard', name: 'strategies-leaderboard', component: () => import('./views/Leaderboard.vue') },
+    { path: '/strategies/manage', name: 'strategies-manage', component: () => import('./views/Strategies.vue') },
+    {
+      // 旧工作台按 tab 查询参数跳转到对应独立页面
+      path: '/strategies',
+      redirect: (to) => {
+        const { tab, ...query } = to.query
+        const name =
+          tab === 'experiments' ? 'strategies-experiments'
+            : tab === 'leaderboard' ? 'strategies-leaderboard'
+              : tab === 'manage' ? 'strategies-manage'
+                : 'strategies-backtest'
+        return { name, query }
+      },
+    },
     { path: '/portfolio', name: 'portfolio', component: () => import('./views/Portfolio.vue') },
     { path: '/catalog', name: 'catalog', component: () => import('./views/Catalog.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue') },
@@ -28,16 +45,11 @@ const router = createRouter({
     },
     {
       path: '/backtest',
-      redirect: (to) => ({ name: 'strategies', query: { ...to.query, tab: 'backtest' } }),
+      redirect: (to) => ({ name: 'strategies-backtest', query: to.query }),
     },
     {
       path: '/leaderboard',
-      redirect: (to) => ({ name: 'strategies', query: { ...to.query, tab: 'leaderboard' } }),
-    },
-    {
-      // 策略管理是策略研究工作台的一个页签,保留独立路径便于从选择器直达
-      path: '/strategies/manage',
-      redirect: (to) => ({ name: 'strategies', query: { ...to.query, tab: 'manage' } }),
+      redirect: (to) => ({ name: 'strategies-leaderboard', query: to.query }),
     },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],

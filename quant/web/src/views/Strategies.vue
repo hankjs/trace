@@ -346,7 +346,7 @@ async function deleteStrategy() {
 async function openBacktest() {
   const strategy = selected.value
   if (!strategy) return
-  await router.push({ name: 'strategies', query: { tab: 'backtest', strategy: String(strategy.id) } })
+  await router.push({ name: 'strategies-backtest', query: { strategy: String(strategy.id) } })
 }
 
 async function init() {

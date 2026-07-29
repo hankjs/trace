@@ -80,7 +80,7 @@ async function mountPage(item: Strategy) {
     history: createMemoryHistory(),
     routes: [
       { path: '/', component: { template: '<div />' } },
-      { path: '/strategies', name: 'strategies', component: { template: '<div />' } },
+      { path: '/strategies/manage', name: 'strategies-manage', component: { template: '<div />' } },
     ],
   })
   await router.push('/')

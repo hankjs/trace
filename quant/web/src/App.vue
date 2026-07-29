@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import type { Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Activity,
   Bell,
   BookOpen,
   BriefcaseBusiness,
+  ChevronDown,
+  ChevronRight,
   Database,
   FlaskConical,
   Layers,
@@ -58,7 +61,18 @@ function expandSidebarForGuide() {
   localStorage.setItem('quant_sidebar_collapsed', 'false')
 }
 
-const navGroups = [
+interface NavChild {
+  to: { name: string }
+  name: string
+  label: string
+}
+
+interface NavItem extends NavChild {
+  icon: Component
+  children?: NavChild[]
+}
+
+const navGroups: { label: string; items: NavItem[] }[] = [
   {
     label: '行情研究',
     items: [
@@ -72,7 +86,18 @@ const navGroups = [
     label: '研究工具',
     items: [
       { to: { name: 'pools' }, name: 'pools', label: '股票池', icon: Layers },
-      { to: { name: 'strategies' }, name: 'strategies', label: '策略研究', icon: FlaskConical },
+      {
+        to: { name: 'strategies-backtest' },
+        name: 'strategies',
+        label: '策略研究',
+        icon: FlaskConical,
+        children: [
+          { to: { name: 'strategies-backtest' }, name: 'strategies-backtest', label: '回测验证' },
+          { to: { name: 'strategies-experiments' }, name: 'strategies-experiments', label: '试验账本' },
+          { to: { name: 'strategies-leaderboard' }, name: 'strategies-leaderboard', label: '策略比较' },
+          { to: { name: 'strategies-manage' }, name: 'strategies-manage', label: '策略管理' },
+        ],
+      },
       { to: { name: 'portfolio' }, name: 'portfolio', label: '持仓记录', icon: BriefcaseBusiness },
       { to: { name: 'catalog' }, name: 'catalog', label: '研究词典', icon: BookOpen },
     ],
@@ -86,6 +111,10 @@ const routeTitles: Record<string, string> = {
   signals: '信号提醒',
   pools: '股票池',
   strategies: '策略研究',
+  'strategies-backtest': '回测验证',
+  'strategies-experiments': '试验账本',
+  'strategies-leaderboard': '策略比较',
+  'strategies-manage': '策略管理',
   portfolio: '持仓记录',
   catalog: '研究词典',
   stock: '个股研究',
@@ -98,6 +127,10 @@ const routeDescriptions: Record<string, string> = {
   signals: '查看策略在日线数据上发生的状态变化，并阅读产生提示的原因。',
   pools: '选股与回测的研究范围。预置池按成分变动历史逐日解析，自定义池只保存当前名单。',
   strategies: '理解策略规则，用历史日线验证表现，再比较不同策略与参数。',
+  'strategies-backtest': '按历史日线模拟策略表现，用于验证规则，不是收益承诺。',
+  'strategies-experiments': '记录研究假设、回测证据与结论，跟踪策略从设计到验证的过程。',
+  'strategies-leaderboard': '按统一口径比较不同策略与参数的历史模拟表现。',
+  'strategies-manage': '新建、调参与维护自己的策略，公共策略只读。',
   portfolio: '记录已在外部交易软件中完成的成交，并查看持仓估值。',
   catalog: '中文名称用于阅读，英文 key 用于对照系统参数。',
   settings: '记录与实盘能力相关的偏好，系统不会代为下单。',
@@ -107,8 +140,27 @@ const currentRouteTitle = computed(() => routeTitles[String(route.name)] ?? '研
 const currentRouteDescription = computed(() => routeDescriptions[String(route.name)] ?? '')
 const currentRouteSection = computed(() => {
   const routeName = String(route.name)
-  return navGroups.find((group) => group.items.some((item) => item.name === routeName))?.label ?? '行情研究'
+  return navGroups.find((group) =>
+    group.items.some((item) => item.name === routeName || item.children?.some((child) => child.name === routeName)),
+  )?.label ?? '行情研究'
 })
+
+function isNavItemActive(item: NavItem) {
+  const routeName = String(route.name)
+  return item.name === routeName || (item.children?.some((child) => child.name === routeName) ?? false)
+}
+
+// 二级菜单默认收起,点击一级目录或子页面激活时展开
+const expandedMenus = ref<Record<string, boolean>>({})
+
+function toggleSubmenu(item: NavItem) {
+  expandedMenus.value = { ...expandedMenus.value, [item.name]: !expandedMenus.value[item.name] }
+}
+
+function isSubmenuExpanded(item: NavItem) {
+  if (!item.children) return false
+  return Boolean(expandedMenus.value[item.name]) || isNavItemActive(item)
+}
 
 const today = new Intl.DateTimeFormat('zh-CN', {
   month: '2-digit',
@@ -206,7 +258,14 @@ const guides: Record<string, ResearchGuide> = {
   },
 }
 
-const guide = computed(() => guides[String(route.name)] ?? guides.dashboard)
+const guide = computed(() => {
+  const routeName = String(route.name)
+  const direct = guides[routeName]
+  if (direct) return direct
+  // 策略研究的四个子页面共用同一份研究提示
+  if (routeName.startsWith('strategies-')) return guides.strategies
+  return guides.dashboard
+})
 
 function onGlobalKeydown(event: KeyboardEvent) {
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
@@ -258,17 +317,55 @@ onBeforeUnmount(() => {
         <section v-for="group in navGroups" :key="group.label" class="mb-3.5 last:mb-0">
           <h2 v-if="!sidebarCollapsed" class="mb-1 px-2 text-[10px] font-medium text-text-tertiary">{{ group.label }}</h2>
           <div class="space-y-0.5">
-            <router-link
-              v-for="item in group.items"
-              :key="item.name"
-              :to="item.to"
-              class="group flex h-8 items-center gap-2.5 rounded px-2 text-[13px] text-text-secondary transition-colors hover:bg-hover hover:text-text-primary"
-              active-class="!bg-active !text-text-primary font-medium"
-              :title="sidebarCollapsed ? item.label : undefined"
-            >
-              <component :is="item.icon" :size="15" class="shrink-0 group-[.router-link-active]:text-accent" />
-              <span v-if="!sidebarCollapsed" class="truncate">{{ item.label }}</span>
-            </router-link>
+            <div v-for="item in group.items" :key="item.name">
+              <button
+                v-if="item.children"
+                type="button"
+                class="group flex h-8 w-full items-center gap-2.5 rounded px-2 text-[13px] text-text-secondary transition-colors hover:bg-hover hover:text-text-primary"
+                :class="{ '!bg-active !text-text-primary font-medium': isNavItemActive(item) }"
+                :title="sidebarCollapsed ? item.label : undefined"
+                :aria-expanded="isSubmenuExpanded(item)"
+                @click="toggleSubmenu(item)"
+              >
+                <component
+                  :is="item.icon"
+                  :size="15"
+                  class="shrink-0"
+                  :class="{ 'text-accent': isNavItemActive(item) }"
+                />
+                <template v-if="!sidebarCollapsed">
+                  <span class="min-w-0 flex-1 truncate text-left">{{ item.label }}</span>
+                  <ChevronDown v-if="isSubmenuExpanded(item)" :size="13" class="shrink-0 text-text-tertiary" />
+                  <ChevronRight v-else :size="13" class="shrink-0 text-text-tertiary" />
+                </template>
+              </button>
+              <router-link
+                v-else
+                :to="item.to"
+                class="group flex h-8 items-center gap-2.5 rounded px-2 text-[13px] text-text-secondary transition-colors hover:bg-hover hover:text-text-primary"
+                :class="{ '!bg-active !text-text-primary font-medium': isNavItemActive(item) }"
+                :title="sidebarCollapsed ? item.label : undefined"
+              >
+                <component
+                  :is="item.icon"
+                  :size="15"
+                  class="shrink-0"
+                  :class="{ 'text-accent': isNavItemActive(item) }"
+                />
+                <span v-if="!sidebarCollapsed" class="truncate">{{ item.label }}</span>
+              </router-link>
+              <div v-if="item.children && !sidebarCollapsed && isSubmenuExpanded(item)" class="mt-0.5 space-y-0.5">
+                <router-link
+                  v-for="child in item.children"
+                  :key="child.name"
+                  :to="child.to"
+                  class="flex h-7 items-center rounded pl-[35px] pr-2 text-xs text-text-secondary transition-colors hover:bg-hover hover:text-text-primary"
+                  active-class="!bg-active !text-text-primary font-medium"
+                >
+                  <span class="truncate">{{ child.label }}</span>
+                </router-link>
+              </div>
+            </div>
           </div>
         </section>
       </nav>
@@ -397,16 +494,41 @@ onBeforeUnmount(() => {
           <nav class="flex-1 overflow-y-auto px-3 py-4" aria-label="移动端主导航">
             <section v-for="group in navGroups" :key="group.label" class="mb-5">
               <h2 class="mb-1 px-2 text-xs font-medium text-text-tertiary">{{ group.label }}</h2>
-              <router-link
-                v-for="item in group.items"
-                :key="item.name"
-                :to="item.to"
-                class="flex h-10 items-center gap-3 rounded px-2 text-sm text-text-secondary hover:bg-hover hover:text-text-primary"
-                active-class="!bg-active !text-accent font-medium"
-              >
-                <component :is="item.icon" :size="17" />
-                {{ item.label }}
-              </router-link>
+              <template v-for="item in group.items" :key="item.name">
+                <button
+                  v-if="item.children"
+                  type="button"
+                  class="flex h-10 w-full items-center gap-3 rounded px-2 text-sm text-text-secondary hover:bg-hover hover:text-text-primary"
+                  :class="{ '!bg-active !text-accent font-medium': isNavItemActive(item) }"
+                  :aria-expanded="isSubmenuExpanded(item)"
+                  @click="toggleSubmenu(item)"
+                >
+                  <component :is="item.icon" :size="17" />
+                  <span class="min-w-0 flex-1 truncate text-left">{{ item.label }}</span>
+                  <ChevronDown v-if="isSubmenuExpanded(item)" :size="15" class="shrink-0 text-text-tertiary" />
+                  <ChevronRight v-else :size="15" class="shrink-0 text-text-tertiary" />
+                </button>
+                <router-link
+                  v-else
+                  :to="item.to"
+                  class="flex h-10 items-center gap-3 rounded px-2 text-sm text-text-secondary hover:bg-hover hover:text-text-primary"
+                  :class="{ '!bg-active !text-accent font-medium': isNavItemActive(item) }"
+                >
+                  <component :is="item.icon" :size="17" />
+                  {{ item.label }}
+                </router-link>
+                <template v-if="item.children && isSubmenuExpanded(item)">
+                  <router-link
+                    v-for="child in item.children"
+                    :key="child.name"
+                    :to="child.to"
+                    class="flex h-9 items-center rounded pl-11 pr-2 text-[13px] text-text-secondary hover:bg-hover hover:text-text-primary"
+                    active-class="!bg-active !text-accent font-medium"
+                  >
+                    {{ child.label }}
+                  </router-link>
+                </template>
+              </template>
             </section>
           </nav>
           <div class="border-t border-border p-3 text-xs leading-5 text-text-tertiary">
