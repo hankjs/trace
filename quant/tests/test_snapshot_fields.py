@@ -143,19 +143,48 @@ def test_field_name_mapping_and_no_zero_fill():
             FundamentalSnapshot(code=CODE, data_date=date(2025, 12, 31),
                                 report_period=date(2025, 12, 31),
                                 available_date=d1, source="test",
-                                revenue_yoy=0.08, cashflow_ratio=1.1),
+                                revenue_yoy=0.08, cashflow_ratio=1.1,
+                                net_margin=0.15),
         ])
         db.commit()
 
         df = load_bars_df(db, CODE, extra_fields=[
-            "market_cap", "revenue_growth", "cashflow_quality", "pb",
+            "market_cap", "revenue_growth", "cashflow_quality", "net_margin",
+            "pb",
         ])
 
     assert df["market_cap"].iat[-1] == 1.2e11
     assert df["revenue_growth"].iat[-1] == 0.08
     assert df["cashflow_quality"].iat[-1] == 1.1
+    assert df["net_margin"].iat[-1] == 0.15
     # pb 从未写入:NaN,不是 0
     assert df["pb"].isna().all()
+
+
+def test_net_margin_is_supported_and_required_from_spec():
+    """净利率与毛利率同级:白名单 + 快照映射 + data_requirements 可声明。"""
+    from app.data.ingest import FUNDAMENTAL_SPEC_FIELDS
+    from app.strategy.spec import SUPPORTED_FIELDS
+
+    assert "net_margin" in SUPPORTED_FIELDS
+    assert FUNDAMENTAL_SPEC_FIELDS["net_margin"] == "net_margin"
+
+    raw = get_preset_spec("breakout").model_dump(mode="json")
+    raw["entry"]["condition"] = {
+        "op": "all",
+        "args": [
+            raw["entry"]["condition"],
+            {"op": "gt",
+             "left": {"op": "field", "name": "net_margin"},
+             "right": {"op": "literal", "value": 0.05}},
+        ],
+    }
+    raw["data_requirements"].append(
+        {"field": "net_margin", "availability": "point_in_time",
+         "required": True},
+    )
+    spec = parse_strategy_spec(raw)
+    assert "net_margin" in required_snapshot_fields(spec)
 
 
 def test_attach_snapshot_fields_rejects_unknown_and_handles_empty():

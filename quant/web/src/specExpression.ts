@@ -26,6 +26,7 @@ export const SUPPORTED_FIELDS: { name: string; label: string }[] = [
   { name: 'revenue_growth', label: '营收增速' },
   { name: 'profit_growth', label: '利润增速' },
   { name: 'gross_margin', label: '毛利率' },
+  { name: 'net_margin', label: '净利率' },
   { name: 'debt_ratio', label: '资产负债率' },
   { name: 'cashflow_quality', label: '现金流质量' },
 ]

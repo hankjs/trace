@@ -38,6 +38,7 @@ _FUNDAMENTAL_FRAME_FIELDS = {
     "revenue_growth": "revenue_yoy",
     "profit_growth": "profit_yoy",
     "gross_margin": "gross_margin",
+    "net_margin": "net_margin",
     "debt_ratio": "debt_ratio",
     "cashflow_quality": "cashflow_ratio",
 }
@@ -375,7 +376,7 @@ def frames_data_quality(
         if c in (
             "pe_ttm", "pb", "ps_ttm", "market_cap", "roe",
             "revenue_growth", "profit_growth", "gross_margin",
-            "debt_ratio", "cashflow_quality",
+            "net_margin", "debt_ratio", "cashflow_quality",
         )
     ]
     for field in sorted(set(fields) | set(extra)):

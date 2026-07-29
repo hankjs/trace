@@ -80,8 +80,8 @@ def data_fingerprint(frames: Mapping[str, pd.DataFrame]) -> str:
     preferred = (
         "date", "open", "high", "low", "close", "raw_close", "volume",
         "amount", "is_st", "pe_ttm", "pb", "ps_ttm", "market_cap", "roe",
-        "revenue_growth", "profit_growth", "gross_margin", "debt_ratio",
-        "cashflow_quality",
+        "revenue_growth", "profit_growth", "gross_margin", "net_margin",
+        "debt_ratio", "cashflow_quality",
     )
     for code in sorted(frames):
         frame = frames[code]

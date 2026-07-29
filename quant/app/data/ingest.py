@@ -1096,6 +1096,7 @@ FUNDAMENTAL_SPEC_FIELDS = {
     "revenue_growth": "revenue_yoy",
     "profit_growth": "profit_yoy",
     "gross_margin": "gross_margin",
+    "net_margin": "net_margin",
     "debt_ratio": "debt_ratio",
     "cashflow_quality": "cashflow_ratio",
 }

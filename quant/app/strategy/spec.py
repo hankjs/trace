@@ -40,8 +40,8 @@ SUPPORTED_OPERATORS = frozenset({
 SUPPORTED_FIELDS = frozenset({
     "open", "high", "low", "close", "raw_close", "volume", "amount",
     "is_st", "pe_ttm", "pb", "ps_ttm", "market_cap", "roe",
-    "revenue_growth", "profit_growth", "gross_margin", "debt_ratio",
-    "cashflow_quality",
+    "revenue_growth", "profit_growth", "gross_margin", "net_margin",
+    "debt_ratio", "cashflow_quality",
 })
 
 _OP_FIELDS: dict[str, frozenset[str]] = {
