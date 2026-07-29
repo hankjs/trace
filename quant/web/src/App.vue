@@ -22,9 +22,10 @@ import {
   Settings,
   ShieldCheck,
   Star,
+  Timer,
   X,
 } from 'lucide-vue-next'
-import { clearAuth, currentUsername, getToken } from './api'
+import { clearAuth, currentUsername, getToken, isAdmin } from './api'
 import { loadCatalog } from './catalog'
 import OnboardingGuide from './components/OnboardingGuide.vue'
 import QuTour from './components/QuTour.vue'
@@ -74,37 +75,48 @@ interface NavItem extends NavChild {
   children?: NavChild[]
 }
 
-const navGroups: { label: string; items: NavItem[] }[] = [
-  {
-    label: '行情研究',
-    items: [
-      { to: { name: 'dashboard' }, name: 'dashboard', label: '行情总览', icon: LayoutDashboard },
-      { to: { name: 'watchlist' }, name: 'watchlist', label: '自选股', icon: Star },
-      { to: { name: 'selection' }, name: 'selection', label: '选股中心', icon: ListFilter },
-      { to: { name: 'signals' }, name: 'signals', label: '信号提醒', icon: Bell },
-    ],
-  },
-  {
-    label: '研究工具',
-    items: [
-      { to: { name: 'pools' }, name: 'pools', label: '股票池', icon: Layers },
-      {
-        to: { name: 'strategies-backtest' },
-        name: 'strategies',
-        label: '策略研究',
-        icon: FlaskConical,
-        children: [
-          { to: { name: 'strategies-backtest' }, name: 'strategies-backtest', label: '回测验证' },
-          { to: { name: 'strategies-experiments' }, name: 'strategies-experiments', label: '试验账本' },
-          { to: { name: 'strategies-leaderboard' }, name: 'strategies-leaderboard', label: '策略比较' },
-          { to: { name: 'strategies-manage' }, name: 'strategies-manage', label: '策略管理' },
-        ],
-      },
-      { to: { name: 'portfolio' }, name: 'portfolio', label: '持仓记录', icon: BriefcaseBusiness },
-      { to: { name: 'catalog' }, name: 'catalog', label: '研究词典', icon: BookOpen },
-    ],
-  },
-]
+const navGroups = computed(() => {
+  const groups: { label: string; items: NavItem[] }[] = [
+    {
+      label: '行情研究',
+      items: [
+        { to: { name: 'dashboard' }, name: 'dashboard', label: '行情总览', icon: LayoutDashboard },
+        { to: { name: 'watchlist' }, name: 'watchlist', label: '自选股', icon: Star },
+        { to: { name: 'selection' }, name: 'selection', label: '选股中心', icon: ListFilter },
+        { to: { name: 'signals' }, name: 'signals', label: '信号提醒', icon: Bell },
+      ],
+    },
+    {
+      label: '研究工具',
+      items: [
+        { to: { name: 'pools' }, name: 'pools', label: '股票池', icon: Layers },
+        {
+          to: { name: 'strategies-backtest' },
+          name: 'strategies',
+          label: '策略研究',
+          icon: FlaskConical,
+          children: [
+            { to: { name: 'strategies-backtest' }, name: 'strategies-backtest', label: '回测验证' },
+            { to: { name: 'strategies-experiments' }, name: 'strategies-experiments', label: '试验账本' },
+            { to: { name: 'strategies-leaderboard' }, name: 'strategies-leaderboard', label: '策略比较' },
+            { to: { name: 'strategies-manage' }, name: 'strategies-manage', label: '策略管理' },
+          ],
+        },
+        { to: { name: 'portfolio' }, name: 'portfolio', label: '持仓记录', icon: BriefcaseBusiness },
+        { to: { name: 'catalog' }, name: 'catalog', label: '研究词典', icon: BookOpen },
+      ],
+    },
+  ]
+  if (isAdmin()) {
+    groups.push({
+      label: '系统管理',
+      items: [
+        { to: { name: 'admin-jobs' }, name: 'admin-jobs', label: '定时任务', icon: Timer },
+      ],
+    })
+  }
+  return groups
+})
 
 const routeTitles: Record<string, string> = {
   dashboard: '行情总览',
@@ -121,6 +133,7 @@ const routeTitles: Record<string, string> = {
   catalog: '研究词典',
   stock: '个股研究',
   settings: '账户设置',
+  'admin-jobs': '定时任务',
 }
 
 const routeDescriptions: Record<string, string> = {
@@ -136,13 +149,14 @@ const routeDescriptions: Record<string, string> = {
   portfolio: '记录已在外部交易软件中完成的成交，并查看持仓估值。',
   catalog: '中文名称用于阅读，英文 key 用于对照系统参数。',
   settings: '记录与实盘能力相关的偏好，系统不会代为下单。',
+  'admin-jobs': '查看数据采集与研究流水线的调度状态，并可手动触发一次执行。',
 }
 
 const currentRouteTitle = computed(() => routeTitles[String(route.name)] ?? '研究工作台')
 const currentRouteDescription = computed(() => routeDescriptions[String(route.name)] ?? '')
 const currentRouteSection = computed(() => {
   const routeName = String(route.name)
-  return navGroups.find((group) =>
+  return navGroups.value.find((group) =>
     group.items.some((item) => item.name === routeName || item.children?.some((child) => child.name === routeName)),
   )?.label ?? '行情研究'
 })

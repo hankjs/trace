@@ -20,7 +20,7 @@ async function submit() {
   error.value = ''
   try {
     const res = await api.login(username.value, password.value)
-    setAuth(res.token, res.username)
+    setAuth(res.token, res.username, res.can_admin)
     router.push('/')
   } catch (e) {
     error.value = e instanceof Error ? e.message : '登录失败'

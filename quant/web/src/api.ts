@@ -2,23 +2,31 @@
 
 const TOKEN_KEY = 'quant_token'
 const USERNAME_KEY = 'quant_username'
+const CAN_ADMIN_KEY = 'quant_can_admin'
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY)
 }
 
-export function setAuth(token: string, username: string) {
+export function setAuth(token: string, username: string, canAdmin = false) {
   localStorage.setItem(TOKEN_KEY, token)
   localStorage.setItem(USERNAME_KEY, username)
+  localStorage.setItem(CAN_ADMIN_KEY, String(canAdmin))
 }
 
 export function clearAuth() {
   localStorage.removeItem(TOKEN_KEY)
   localStorage.removeItem(USERNAME_KEY)
+  localStorage.removeItem(CAN_ADMIN_KEY)
 }
 
 export function currentUsername(): string {
   return localStorage.getItem(USERNAME_KEY) ?? ''
+}
+
+/** 仅用于界面显隐;接口鉴权以后端 require_admin 为准 */
+export function isAdmin(): boolean {
+  return localStorage.getItem(CAN_ADMIN_KEY) === 'true'
 }
 
 export function normalizeStockCode(value: string): string | null {
@@ -1353,12 +1361,50 @@ export interface UserSettings {
   updated_at: string | null
 }
 
+/** 一次手动执行的状态记录(后端进程内存态,重启即清空) */
+export interface AdminJobRun {
+  status: 'running' | 'finished' | 'failed'
+  started_at: string
+  finished_at: string | null
+  result?: unknown
+  error?: string | null
+}
+
+export interface AdminJob {
+  id: string
+  name: string
+  description: string
+  /** 人类可读的调度说明,如「交易日 16:30」 */
+  schedule: string
+  /** 本进程不负责调度(dev/未抢到互斥锁)时为 null */
+  next_run_time: string | null
+  manual_run: AdminJobRun | null
+}
+
+export interface AdminJobsResponse {
+  scheduler_running: boolean
+  jobs: AdminJob[]
+}
+
 export const api = {
   login(username: string, password: string) {
-    return request<{ token: string; username: string }>('/api/auth/login', {
+    return request<{ token: string; username: string; can_admin: boolean }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password }),
     })
+  },
+
+  /** 定时任务列表(仅 admin) */
+  adminJobs() {
+    return request<AdminJobsResponse>('/api/admin/jobs')
+  },
+
+  /** 手动触发定时任务(仅 admin),后台执行,轮询 adminJobs 看状态 */
+  runAdminJob(jobId: string) {
+    return request<{ status: string; job_id: string }>(
+      `/api/admin/jobs/${encodeURIComponent(jobId)}/run`,
+      { method: 'POST' },
+    )
   },
 
   getSettings() {

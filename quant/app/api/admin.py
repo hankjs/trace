@@ -1,12 +1,13 @@
-"""管理接口:手动触发回填、信号计算、快照、股票列表导入。
+"""管理接口:手动触发回填、信号计算、快照、股票列表导入,定时任务查看/触发。
 
 baostock / akshare 均为同步阻塞调用,统一在线程中执行以免卡住事件循环。
 """
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
-from datetime import date
+from datetime import date, datetime
 from typing import TypeVar
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,6 +23,7 @@ from ..data.quality import (
     refresh_data_quality_cache,
 )
 from ..db import SessionLocal
+from ..scheduler import JOB_DEFS, job_def, scheduler
 from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
 
@@ -244,3 +246,90 @@ async def data_quality_now(
     if force:
         return await run_db_job(lambda db: refresh_data_quality_cache(db))
     return await run_db_job(lambda db: data_quality_report(db))
+
+
+# ---- 定时任务查看与手动触发 ----
+#
+# 手动执行状态是单进程内存态(与 fundamentals 的 threading.Lock 同一思路):
+# 进程重启后清空,不影响任务本身。每 job 一把锁防止重复触发;执行放后台
+# 线程并立即返回,晚间流水线这类长任务不会把 HTTP 请求挂到超时。
+
+_manual_locks: dict[str, threading.Lock] = {
+    j["id"]: threading.Lock() for j in JOB_DEFS}
+_manual_runs: dict[str, dict] = {}
+
+
+def _run_job_thread(job: dict) -> None:
+    job_id = job["id"]
+    try:
+        result = job["func"]()
+        _manual_runs[job_id] = {
+            "status": "finished",
+            "started_at": _manual_runs[job_id]["started_at"],
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "result": result if isinstance(result, (dict, list)) else None,
+            "error": None,
+        }
+    except Exception as e:  # noqa: BLE001 - job 内部已各自隔离,这里兜底记录
+        _manual_runs[job_id] = {
+            "status": "failed",
+            "started_at": _manual_runs[job_id]["started_at"],
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+            "result": None,
+            "error": str(e),
+        }
+    finally:
+        _manual_locks[job_id].release()
+
+
+def _serialize_job(job: dict) -> dict:
+    next_run = None
+    if scheduler.running:
+        scheduled = scheduler.get_job(job["id"])
+        if scheduled is not None and scheduled.next_run_time is not None:
+            next_run = scheduled.next_run_time.isoformat()
+    return {
+        "id": job["id"],
+        "name": job["name"],
+        "description": job["description"],
+        "schedule": job["schedule"],
+        "next_run_time": next_run,
+        "manual_run": _manual_runs.get(job["id"]),
+    }
+
+
+@router.get("/jobs")
+async def list_jobs():
+    """定时任务列表:调度信息、下次执行时间与最近一次手动执行状态。
+
+    scheduler_running=false 表示本进程不负责调度(dev 环境或未抢到
+    互斥锁),此时 next_run_time 为空,但手动执行仍然可用。
+    """
+    return {
+        "scheduler_running": scheduler.running,
+        "jobs": [_serialize_job(j) for j in JOB_DEFS],
+    }
+
+
+@router.post("/jobs/{job_id}/run", status_code=202)
+async def run_job(job_id: str):
+    """手动触发定时任务(后台线程执行,立即返回)。
+
+    不绕过任务内部守卫:非交易日、盘中时间窗外等场景任务会自行跳过,
+    表现为结果中的 skipped 或无输出。轮询 GET /jobs 查看执行状态。
+    """
+    job = job_def(job_id)
+    if job is None:
+        raise HTTPException(404, f"未知任务: {job_id}")
+    lock = _manual_locks[job_id]
+    if not lock.acquire(blocking=False):
+        raise HTTPException(409, "该任务已有手动执行进行中")
+    _manual_runs[job_id] = {
+        "status": "running",
+        "started_at": datetime.now().isoformat(timespec="seconds"),
+        "finished_at": None,
+        "result": None,
+        "error": None,
+    }
+    threading.Thread(target=_run_job_thread, args=(job,), daemon=True).start()
+    return {"status": "started", "job_id": job_id}

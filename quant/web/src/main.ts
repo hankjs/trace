@@ -1,7 +1,7 @@
 import { createApp } from 'vue'
 import { createRouter, createWebHistory } from 'vue-router'
 import App from './App.vue'
-import { getToken } from './api'
+import { getToken, isAdmin } from './api'
 import './style.css'
 
 const router = createRouter({
@@ -35,6 +35,7 @@ const router = createRouter({
     { path: '/portfolio', name: 'portfolio', component: () => import('./views/Portfolio.vue') },
     { path: '/catalog', name: 'catalog', component: () => import('./views/Catalog.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue') },
+    { path: '/admin/jobs', name: 'admin-jobs', component: () => import('./views/AdminJobs.vue'), meta: { admin: true } },
     {
       path: '/picks',
       redirect: (to) => ({ name: 'selection', query: { ...to.query, tab: 'picks' } }),
@@ -55,12 +56,15 @@ const router = createRouter({
   ],
 })
 
-// 未登录一律跳登录页
+// 未登录一律跳登录页;admin 页面非管理员回首页
 router.beforeEach((to) => {
   if (!to.meta.public && !getToken()) {
     return { path: '/login' }
   }
   if (to.path === '/login' && getToken()) {
+    return { path: '/' }
+  }
+  if (to.meta.admin && !isAdmin()) {
     return { path: '/' }
   }
 })

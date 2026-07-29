@@ -21,7 +21,8 @@ def login(body: LoginIn, db: Session = Depends(get_db)):
     user = authenticate(db, body.username.strip(), body.password)
     if user is None:
         raise HTTPException(401, "用户名或密码错误")
-    return {"token": create_token(user), "username": user["username"]}
+    return {"token": create_token(user), "username": user["username"],
+            "can_admin": user["can_admin"]}
 
 
 @router.get("/me")

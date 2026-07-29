@@ -346,6 +346,37 @@ def job_intraday_snapshot() -> None:
         logger.exception("盘中快照失败")
 
 
+# 任务注册表:与下方 add_job 的 id 一一对应,供 /api/admin/jobs 展示与手动触发。
+# 手动触发直接调用 func,不绕过各 job 内部的交易日/盘中时间窗守卫。
+JOB_DEFS: list[dict] = [
+    {"id": "evening_pipeline", "func": job_evening_pipeline,
+     "name": "盘后流水线", "schedule": "交易日 16:30",
+     "description": "日线增量 → 因子+选股 → 信号 →(周五)批量评估。非交易日自动跳过。"},
+    {"id": "sync_trade_calendar", "func": job_sync_trade_calendar,
+     "name": "交易日历同步", "schedule": "每月 1 日 08:30",
+     "description": "baostock query_trade_dates → quant_trade_calendar,覆盖今年至明年初。"},
+    {"id": "sync_index_members", "func": job_sync_index_members,
+     "name": "成分股名录同步", "schedule": "每月 1 日 09:00",
+     "description": "沪深300/中证500 成分变动 → quant_index_member。"},
+    {"id": "sync_stock_list", "func": job_sync_stock_list,
+     "name": "全市场名录同步", "schedule": "每周六 08:00",
+     "description": "维护改名(*ST)、上市与退市标记。"},
+    {"id": "sync_valuations", "func": job_sync_valuations,
+     "name": "全市场估值快照", "schedule": "交易日 18:30",
+     "description": "东财分页接口同步估值。非交易日自动跳过。"},
+    {"id": "sync_fundamentals", "func": job_sync_fundamentals,
+     "name": "全市场财务指标", "schedule": "每周六 09:00",
+     "description": "最近 5 个报告期财务指标,捕获新披露与财报修订。"},
+    {"id": "intraday_snapshot", "func": job_intraday_snapshot,
+     "name": "自选股盘中快照", "schedule": "交易日 9:30-15:00 每 30 分钟",
+     "description": "akshare 快照落 quant_snapshot。非交易日或时间窗外自动跳过。"},
+]
+
+
+def job_def(job_id: str) -> dict | None:
+    return next((j for j in JOB_DEFS if j["id"] == job_id), None)
+
+
 def start_scheduler() -> BackgroundScheduler:
     scheduler.add_job(
         job_evening_pipeline, "cron",
