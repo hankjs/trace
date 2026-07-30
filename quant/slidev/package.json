@@ -7,13 +7,11 @@
     "dev": "slidev slides.md --open",
     "build": "slidev build slides.md",
     "export": "slidev export slides.md",
-    "preview": "slidev slides.md --remote",
-    "capture": "node scripts/capture-screenshots.mjs"
+    "preview": "slidev slides.md --remote"
   },
   "packageManager": "pnpm@10.26.2",
   "devDependencies": {
     "@slidev/cli": "^52.18.0",
-    "@slidev/theme-default": "^0.25.0",
-    "playwright": "^1.62.0"
+    "@slidev/theme-default": "^0.25.0"
   }
 }
