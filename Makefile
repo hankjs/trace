@@ -1,4 +1,30 @@
-.PHONY: server-dev client-dev admin-dev quant quant-web quant-slidev quant-slidev-build deploy deploy-cli deploy-quant deploy-quant-slidev app cli-dev cli
+.PHONY: default help server-dev client-dev admin-dev quant quant-web quant-slidev quant-slidev-build deploy deploy-cli deploy-quant deploy-quant-slidev app cli-dev cli
+
+# 默认目标：仅提示可用命令，不执行任何操作
+default: help
+
+help:
+	@echo "请指定要执行的目标，可用命令："
+	@echo ""
+	@echo "  开发:"
+	@echo "    make server-dev          后端开发服务 (0.0.0.0:3000)"
+	@echo "    make client-dev          客户端前端开发 (Tauri dev)"
+	@echo "    make admin-dev           管理后台前端开发 (Vite)"
+	@echo "    make quant               quant 量化系统后端 (FastAPI :8100, --reload)"
+	@echo "    make quant-web           quant 量化系统前端 (Vite)"
+	@echo "    make quant-slidev        quant 系统介绍 Slidev 预览 (:3030)"
+	@echo "    make cli-dev             hank-cli 远程终端节点开发"
+	@echo ""
+	@echo "  构建:"
+	@echo "    make app                 构建桌面客户端并安装到 /Applications"
+	@echo "    make cli                 构建 hank-cli 并安装到 /opt/homebrew/bin"
+	@echo "    make quant-slidev-build  quant Slidev 静态构建"
+	@echo ""
+	@echo "  部署:"
+	@echo "    make deploy              部署 server + admin (可 SKIP_DEPS=--skip-deps)"
+	@echo "    make deploy-cli          部署 hank-cli"
+	@echo "    make deploy-quant        部署 quant 量化系统 (可 SKIP_DEPS=--skip-deps)"
+	@echo "    make deploy-quant-slidev 部署 quant Slidev 静态站"
 
 # 后端开发服务 (0.0.0.0:3000)
 server-dev:

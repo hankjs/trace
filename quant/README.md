@@ -11,6 +11,7 @@
 |---|---|
 | 本文 | 功能、启动、API、调度 |
 | [`DATA-ARCHITECTURE.md`](DATA-ARCHITECTURE.md) | 数据分层、前复权价的重写风险、精度陷阱、数据源覆盖边界、池与策略抽象 |
+| [`docs/a2a-design.md`](docs/a2a-design.md) | quant × Trace 官方 A2A 方案（纯工具节点、SSE、JWT 透传；Trace/微信编排） |
 | [`docs/baostock-bulk-ingest.md`](docs/baostock-bulk-ingest.md) | baostock 批量采集方案（限速、按日全市场接口、实施顺序） |
 | [`DESIGN.md`](DESIGN.md) | UI 设计系统（与数据架构无关） |
 | `alembic/versions/*.py` | 每次 schema 变更的设计理由（写在 docstring 里） |
