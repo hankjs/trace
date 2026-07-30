@@ -1126,7 +1126,125 @@ def test_signal_side_change_continues_single_plan_version_chain():
         assert second.revision == first.revision + 1
 
 
-def test_portfolio_plan_rejects_non_trading_day():
+@pytest.mark.parametrize(
+    ("signal_type", "execution_open", "expected_status", "expected_code"),
+    [
+        ("reduce", 9.0, "reevaluate", "open_limit_down"),
+        ("reduce", 11.0, "current", None),
+        ("sell", 9.0, "reevaluate", "open_limit_down"),
+    ],
+)
+def test_reduce_and_sell_reevaluate_on_limit_down_not_limit_up(
+    signal_type, execution_open, expected_status, expected_code,
+):
+    """reduce 与 sell 同按卖出方向检查跌停;涨停不应被误判为 open_limit_up。"""
+    with _session() as db:
+        strategy = _strategy("ma_cross")
+        db.add(strategy)
+        db.add_all([
+            TradeCalendar(date=date(2026, 7, 24), is_open=True),
+            TradeCalendar(date=date(2026, 7, 27), is_open=True),
+            DailyBar(
+                code="sh.600000", date=date(2026, 7, 24), open=10,
+                high=10, low=10, close=10, raw_close=10,
+                volume=1_000_000, amount=10_000_000,
+            ),
+            DailyBar(
+                code="sh.600000", date=date(2026, 7, 27),
+                open=execution_open, high=execution_open, low=execution_open,
+                close=execution_open, raw_close=execution_open,
+                volume=1_000_000, amount=execution_open * 1_000_000,
+            ),
+        ])
+        signal = Signal(
+            code="sh.600000", date=date(2026, 7, 24), strategy_id=1,
+            side=signal_type, price=10, reason={},
+        )
+        db.add(signal)
+        db.flush()
+        plan = create_single_plan(db, strategy, signal, _bars())
+
+        status, reason = effective_status(plan, date(2026, 7, 27), db=db)
+
+        assert status == expected_status
+        if expected_code is not None:
+            assert reason["code"] == expected_code
+        else:
+            assert reason["code"] != "open_limit_up"
+
+
+def test_build_single_snapshot_reuses_compilation_without_recompiling():
+    """传入 compilation 时不再调用 compile_single,reasons 与 component_versions 同源。"""
+    from app.research_plan import domain
+    from app.strategy.compiler import SingleCompilation
+
+    bars = _bars()
+    strategy = _strategy("breakout")
+    fake_reasons = {
+        pd.Timestamp(bars["date"].iat[-1]): [
+            {"code": "risk_overlay", "price_line": 9.5},
+        ],
+    }
+    fake_compilation = SingleCompilation(
+        positions=bars["close"] * 0,
+        transitions=[],
+        reasons=fake_reasons,
+        component_versions={"fake_component": "v99"},
+        state={},
+    )
+
+    calls: list = []
+    original_compile_single = domain.compile_single
+
+    def counting_compile_single(spec, df, **kwargs):
+        calls.append((spec, df.shape))
+        return original_compile_single(spec, df, **kwargs)
+
+    domain.compile_single = counting_compile_single
+    try:
+        plan = build_single_snapshot(
+            strategy, bars, side="buy",
+            data_date=bars["date"].iat[-1],
+            next_execution_date=date(2026, 7, 27),
+            compilation=fake_compilation,
+        )
+    finally:
+        domain.compile_single = original_compile_single
+
+    assert calls == []
+    assert plan["component_versions"] == {"fake_component": "v99"}
+    assert plan["status_reason"]["compiler_reasons"] == fake_reasons[
+        pd.Timestamp(bars["date"].iat[-1])
+    ]
+
+
+def test_build_single_snapshot_without_compilation_still_compiles():
+    """不传 compilation 时保持原有行为,继续调用 compile_single。"""
+    from app.research_plan import domain
+
+    bars = _bars()
+    strategy = _strategy("breakout")
+
+    calls: list = []
+    original_compile_single = domain.compile_single
+
+    def counting_compile_single(spec, df, **kwargs):
+        calls.append((spec, df.shape))
+        return original_compile_single(spec, df, **kwargs)
+
+    domain.compile_single = counting_compile_single
+    try:
+        plan = build_single_snapshot(
+            strategy, bars, side="buy",
+            data_date=bars["date"].iat[-1],
+            next_execution_date=date(2026, 7, 27),
+        )
+    finally:
+        domain.compile_single = original_compile_single
+
+    assert len(calls) == 1
+    assert plan["component_versions"]
+    assert plan["strategy_spec_hash"]
     with _session() as db:
         strategy = _strategy("multifactor_hold", kind="portfolio")
         db.add(strategy)
