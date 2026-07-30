@@ -6,7 +6,7 @@
 | 状态 | 已拍板，待实现 |
 | 范围 | quant 作为确定性 A2A Server；Trace（含微信）作为唯一 LLM 编排 Client |
 | 产品边界 | A 股日频研究与模拟回测；不连接券商；不下单；不输出真实交易指令 |
-| 关联 | `PRODUCT.md`、`AGENTS.md`、`docs/summry/00-framework-overview.md`、[A2A Protocol](https://a2a-protocol.org/latest/specification/) |
+| 关联 | `PRODUCT.md`、`AGENTS.md`、`docs/summry/00-framework-overview.md`、`docs/summry/06-gap-and-roadmap.md`、`docs/research/verification-protocol.md`、[A2A Protocol](https://a2a-protocol.org/latest/specification/) |
 
 ---
 
@@ -14,30 +14,43 @@
 
 ### 1.1 要解决的问题
 
-希望在 **Trace 对话** 与 **微信通道** 中，由智能体调用 quant 的研究能力（校验策略、回测、筛选、数据质量），并把结果以可复现的 `run_id` / artifact 形式回传用户。
+希望在 **Trace 对话** 与 **微信通道** 中，由智能体调用 quant 的研究能力，自动完成 **策略验证与参数/结构提炼**，并把结果以可复现的 `run_id` / `experiment_id` / artifact 形式回传用户；在过程中把「能力不够 / 数据不够 / 表达力缺口」沉淀为系统补强信号。
 
-quant 已具备完整 REST 与领域服务，但缺少对 **Agent 间互操作** 的标准入口；若在 Trace 与 quant 各跑一套开放式 LLM Agent，会出现双重推理成本、职责漂移与不可审计问题。
+quant 已具备完整 REST、领域服务与 **Experiment / Trial 试验账本**，但缺少对 **Agent 间互操作** 的标准入口；若在 Trace 与 quant 各跑一套开放式 LLM Agent，会出现双重推理成本、职责漂移与不可审计问题。
 
 ### 1.2 目标
 
 1. quant 以 **官方 A2A** 暴露研究能力：Agent Card 对任意合规 A2A Client 可发现；**调用面向结构化 Client**（能按 §7 约定发送 data part，见 §7.2 规则 4）。
 2. quant **不运行 LLM**，仅做确定性工具执行（Deterministic A2A Agent）。
 3. Trace 是 **唯一会思考的编排方**；微信不直连 quant，统一经 Trace Orchestrator。
-4. 长任务（回测）经 **SSE** 推送生命周期；鉴权采用现有 **用户 JWT 透传**。
+4. 长任务（回测 / trial）经 **SSE** 推送生命周期；鉴权采用现有 **用户 JWT 透传**。
 5. 人机看板继续走现有 REST；A2A 是 Agent 主路径，不替换 Web API。
-6. **支撑 Agent 研究闭环**：提出 → 校验 → 落库（draft）→ 回测 → 查历史 → 迭代。agent 可自主完成「提炼策略/因子候选并验证」的多轮循环，人工只在高成本执行（回测）处按闸门介入（§5.4）；迭代所需的草稿落库与历史查询是一等能力（`strategy.save_draft` / `factor.validate` / `factor.preview` / `backtest.list`），不是二期补充。
+6. **支撑 Agent 策略研究闭环（v1 主叙事）**：提出可检验假设 → 读 catalog/质量 → 校验 Spec → 落库草稿（带谱系）→ **注册 experiment（冻结规格）** → 在闸门内跑 trial / 回测 → 查 trial 与 run 历史 → 对比迭代或停止。人工只在高成本执行（回测/trial）处按闸门介入（§5.4）。严肃验证 **对齐现网 experiment 主链**，不只「乱建草稿再 backtest」。
+7. **因子为辅叙事（v1）**：表达式校验 + 小样本预览 + 草稿落库（admin），**不**宣称全市场有效；IC/分层是已知系统缺口（§1.3 / §13）。
+8. **发现系统不足是一等结果**：校验失败写入 `failure_kind` / `missing_capability` 可聚合；Orchestrator 按停止条件输出结构化 findings；管理端可消费缺口排行（§13）。
 
-### 1.3 非目标（v1）
+### 1.3 产品分层（避免目标漂移）
+
+| 层级 | v1 交付 | 说明 |
+|------|---------|------|
+| **A. 策略研究 Agent MVP** | Phase 3 端到端 | 对话里完成假设→experiment→trial→对比→小结；普通 `can_client` 可用 |
+| **B. 因子卫生工具** | Phase 4 | validate / multi-preview / save_draft（admin）；**不是**「自动发现有效因子」 |
+| **C. 系统缺口闭环** | Phase 2 落审计 + Phase 3 强制 findings + Phase 4 管理端聚合 | 反哺 `06-gap-and-roadmap` 类补强优先级 |
+| **D. 微信入口** | Phase 4b | 同一 Orchestrator；确认更严、无批量授权；**不阻塞** A/C |
+
+### 1.4 非目标（v1）
 
 - quant 内嵌研究 Worker / 多步 LLM loop  
 - 官方 A2A Push Notification（webhook）  
 - service account + on-behalf-of 双身份体系  
-- **仅有 inline `spec`、无已保存 `strategy_id` 的 ephemeral 回测**（须先落库策略再跑，对齐现网 REST）  
+- **仅有 inline `spec`、无已保存 `strategy_id` 的 ephemeral 回测**（须先落库策略再跑，对齐现网 REST / experiment 落库要求）  
 - **协作式中断已 `running` 的回测线程**（Cancel 仅覆盖 `pending`，见 §4.5）  
-- 实验网格扫参、自然语言选股  
-- **因子全市场有效性评估**（IC、分层收益等）：现网无此 domain 能力，v1 因子研究以 `factor.validate` + `factor.preview`（单股序列/原因树）为最小对；该缺口本身是 §13 要沉淀的首要「系统不足」，二期立项  
+- **无界网格扫参**（trial batch 有硬上限；禁止 agent 穷举参数空间）  
+- 自然语言选股  
+- **因子全市场有效性评估**（IC、分层收益、多空组合等）：现网无此 domain 能力；v1 不得用 preview 冒充。该缺口是 §13 首要系统不足，**单独立项**，不混进 A2A 验收  
 - 券商连接、下单、半自动交易  
 - 用 A2A 替换 `web/` 看板 REST  
+- 自动 `accept` 证据推进待办（promotion 仅可读提示；用户在看板确认，v1 Agent 不代点同意）  
 
 ---
 
@@ -48,21 +61,41 @@ quant 已具备完整 REST 与领域服务，但缺少对 **Agent 间互操作**
 | 1 | 第一调用方 | Trace 对话 + 微信 | 微信复用 `server/src/weixin/`，同一 Orchestrator |
 | 2 | quant 智能程度 | **纯工具**（无 LLM） | 研究语义与边界留在 quant；编排与话术在 Trace |
 | 3 | 协议 | **官方 A2A** | 发现、Task、异步、可扩展第三方 Client |
-| 4 | 流式 | **上 SSE** | 对齐 A2A Streaming；回测进度可观测 |
+| 4 | 流式 | **上 SSE** | 对齐 A2A Streaming；回测/trial 进度可观测 |
 | 5 | 鉴权 | **用户 JWT 透传** | 两端已共用 `jwt_secret` 与 claims，实现成本最低 |
-| 6 | 回测规格来源 | **必须 `strategy_id`**（已保存策略） | 对齐 `BacktestIn` / `_prepare_backtest`；不做 v1 ephemeral spec 路径 |
+| 6 | 回测规格来源 | **`backtest.run` 必须 `strategy_id`** | 对齐 `BacktestIn` / `_prepare_backtest`；不做 v1 ephemeral spec 路径 |
 | 7 | Cancel | **仅 `pending` 可取消** | 现网 `cancel_task` 无法安全中断 `running` 线程；协作取消属二期 |
 | 8 | 成本字段 | **`costs` 对齐引擎** | `commission` / `stamp_tax` / `slippage`（价格比例）；无 `initial_cash`、无 `slippage_bps` |
-| 9 | 策略草稿落库 | **`strategy.save_draft`，免确认** | 对齐 `POST /api/strategies`：`enabled=false` 落库（跳过 `_require_supported`），`research_status=unverified`；草稿只是数据、不耗算力，确认闸门留在 `backtest.run`；复用 `_check_quota` 每用户策略配额防刷屏 |
-| 10 | 因子研究最小对 | **`factor.validate` + `factor.preview`** | 对齐 REST `/api/factors/validate` 与 `/preview`；授权对齐 REST `require_admin`（仅 `can_admin` 可调，放宽属 REST 授权变更、二期评估）；全市场 IC/分层评估现网无能力，列入 §13 系统缺口 |
-| 11 | 迭代记忆 | **新增只读 `backtest.list`** | REST 无列表端点（仅 leaderboard / 按 id 查），需新增 domain 查询；agent 多轮迭代必须能查「试过什么、结果如何」，不能只靠对话上下文 |
-| 12 | 批量确认 | **会话级授权（仅对话入口）** | 用户一次确认「本会话内最多 N 次回测」，Trace 拦截层在额度内自动注入 `confirmed`；微信保持单次白名单；批量消耗同一日配额，授权时展示当日剩余 |
+| 9 | 策略草稿落库 | **`strategy.save_draft`，免确认** | `enabled=false` + 列 `research_status=unverified`；可选 `parent_strategy_id` 谱系；闸门留在高成本 skill；复用 `_check_quota` |
+| 10 | **严肃验证主链** | **`experiment.*` 一等 skill** | 对齐 `app/api/experiments.py` / `app/experiment/service.py`：冻结规格 + trial 账本 + 失败不可抹；多轮参数迭代 **优先 experiment**，禁止只靠连建草稿冒充试验 |
+| 11 | 因子 v1 范围 | **卫生工具，非有效性证明** | `factor.validate` + `factor.preview`（支持少量多标的）+ `factor.save_draft`；**仅 `can_admin`**（对齐 REST，不单开口子）；IC/分层二期 |
+| 12 | 迭代记忆 | **`experiment.get` / `experiment.list` + `backtest.list`** | trial 级记忆为主，run 列表为辅；不能只靠对话上下文 |
+| 13 | 批量确认 | **会话级授权（仅对话入口）** | 「本会话最多 N 次高成本执行」（含 `backtest.run` 与 `experiment.trial` / `trial_batch` 内每次回测）；微信单次；共用日配额 |
+| 14 | 证据推进 | **trial 不自动改 `evidence_status`** | 对齐现网：达标只生成 promotion 待办；`backtest.run` 成功仍走 `advance_after_backtest`（与 REST 单次回测路径一致） |
+| 15 | 研究 Agent 规格 | **§10.5 状态机 + 停止条件 + 端到端验收** | 协议正确 ≠ 研究 Agent 可用；两者分开验收 |
 
 概念澄清：
 
 > 官方 A2A 的对端称为 Agent，但 quant **不跑模型**。  
 > quant 实现完整 A2A **服务端语义**（Card / Task / SSE / Cancel），执行路径为：鉴权 → 解析 skill+payload → 调内部 service → 回 artifacts。  
-> 对外仍是标准 A2A 节点；对内是确定性工具网关。
+> 对外仍是标准 A2A 节点；对内是确定性工具网关。  
+> **Trace 侧的 `quant-research` 才是「会思考的研究 Agent」**；本文 §10 是其行为规格，§8 是其工具契约。
+
+### 2.1 两条验证路径（写死，避免 Agent 走歪）
+
+```text
+路径 S — 快速单次回测（探索）
+  save_draft → validate → backtest.run → backtest.list
+  用途：冒烟、看大致收益形状；不构成「试验账本」级证据
+
+路径 E — 严肃试验（默认多轮提炼）
+  save_draft（拿 strategy_id）→ experiment.create（冻结 spec + hypothesis）
+    → experiment.trial | trial_batch（param_patch 变体）
+    → experiment.get（trials + multiplicity + pending promotions）
+  用途：可复现假说验证；失败 trial 保留；与看板 Experiments 同源
+```
+
+Orchestrator **默认走路径 E** 做「提炼/对比/是否值得继续」；路径 S 仅在用户明确要求「先随便跑一下」或 experiment 前置条件不满足时使用。
 
 ---
 
@@ -77,9 +110,10 @@ quant 已具备完整 REST 与领域服务，但缺少对 **Agent 间互操作**
      ┌────────────────────────────────────┐
      │ Trace server                         │
      │  Orchestrator Agent（唯一 LLM loop） │
-     │  skill: quant-research               │
+     │  skill: quant-research（§10.5 循环） │
      │  tools: quant_*（封装 A2A Client）   │
-     │  确认闸门 / 话术 / 微信摘要格式化    │
+     │  确认闸门 / 停止条件 / findings      │
+     │  话术 / 微信摘要格式化               │
      └────────────────┬───────────────────┘
                       │ HTTPS
                       │ Authorization: Bearer <user_jwt>
@@ -90,21 +124,21 @@ quant 已具备完整 REST 与领域服务，但缺少对 **Agent 间互操作**
      │  A2A Server（无 LLM）                │
      │  Agent Card + tasks + stream         │
      │  skill handlers → domain services    │
-     │  长任务 ↔ quant_task / backtest jobs │
+     │  长任务 ↔ quant_task / trial 执行    │
      └────────────────────────────────────┘
                       │
                       ▼
-              strategy / backtest / selection
-              data.quality / catalog / …
+         strategy / experiment / backtest
+         factors / selection / data.quality / catalog
 ```
 
 ### 3.1 职责边界
 
 | 组件 | 负责 | 不负责 |
 |------|------|--------|
-| **Trace Orchestrator** | 理解用户意图、拼 StrategySpec、选 skill、确认写操作、对用户措辞、微信长度适配 | 回测撮合、前视规则、能力解析实现 |
-| **quant A2A** | Card 发现、Task 生命周期、SSE、JWT 校验、skill 确定性执行、artifact | 闲聊、自由文本「想策略」、交易执行 |
-| **quant REST / web** | 人机看板、现有 API | 不强制经 A2A |
+| **Trace Orchestrator** | 理解意图、拼 Spec、选路径 S/E、遵守停止条件、确认闸门、对用户措辞、会话 findings、微信适配 | 回测撮合、前视规则、能力解析、多重检验计算 |
+| **quant A2A** | Card、Task/SSE、JWT、skill 确定性执行、artifact、审计缺口列 | 闲聊、自由「想策略」、交易执行、自动 accept promotion |
+| **quant REST / web** | 人机看板、现有 API（含 promotion 确认） | 不强制经 A2A |
 
 ### 3.2 双层 SSE（勿混淆）
 
@@ -181,8 +215,9 @@ SDK 选型（拍板）：
 > 为何拒绝也产出 Task 而非在 Send Message 层直接返回 JSON-RPC error：**有意为之**。拒绝以 Task `failed` 形式返回，错误文案统一走 SSE / Get Task 通道，Orchestrator 只需一条消费路径；实现者不要再拆「协议层拒绝」第二通道。
 
 **区间上限**：复用现网 `validate_backtest_window`（**最长 10 年**，`MAX_BACKTEST_YEARS`），A2A **不**另起更松默认。  
-**日次数**：新配置项，默认建议 **20 次/用户/自然日**（超限 → Task `failed`，文案含剩余额度与重置时间）；可在 `quant` config 覆盖。**计数口径**：以 `quant_a2a_audit` 中该用户当日 `skill = 'backtest.run'` 的记录数为准（含失败/被拒任务——防止用失败调用绕过配额；这也是审计表必须与回测流同在 Phase 2 落地的原因，见 §12 / §14）。**「自然日」写死为 quant 服务器本地时区**（A 股交易日口径），不随 client 时区变化。  
-**幂等**：`backtest.run` payload 支持可选 `client_request_id`（§8.4）；同一用户当日内重复提交相同 `client_request_id` → 不新建 run，直接返回首个对应 Task / run 引用。SSE 断线后 client 重发不会造成重复落库与重复计配额。
+**日次数**：新配置项，默认建议 **20 次/用户/自然日**（超限 → Task `failed`，文案含剩余额度与重置时间）；可在 `quant` config 覆盖。**计数口径**：以 `quant_a2a_audit` 中该用户当日 **高成本 skill** 记录数为准——`backtest.run`、`experiment.trial` 各计 1 次；`experiment.trial_batch` 按 **成功提交的 param_patch 条数**计（含 outcome=error 的已执行项，防止用失败绕过）。含失败/被拒——防刷；审计表必须与高成本流同在 Phase 2 落地（§12 / §14）。**「自然日」写死为 quant 服务器本地时区**（A 股交易日口径），不随 client 时区变化。  
+**幂等**：`backtest.run` / `experiment.trial` / `experiment.trial_batch` payload 支持可选 `client_request_id`（§8.4 / §8.11）；同一用户当日内重复提交相同 `client_request_id` → 不新建 run/trial，直接返回首个对应 Task / 结果引用。SSE 断线后 client 重发不会造成重复落库与重复计配额。  
+**validate 失败不进高成本配额**：仅在实际进入回测/trial 执行（或明确因 confirmed/配额/互斥拒绝的 `backtest.run`/`experiment.trial*` 请求）时计次；纯 `strategy.validate` / `factor.validate` 只计入读类限速。
 
 ### 4.5 Cancel 语义（v1 拍板：仅 pending）
 
@@ -194,21 +229,30 @@ SDK 选型（拍板）：
 | `running` | **不可中断**（执行线程无协作取消点） | Cancel 请求失败或 Task 保持 `working`；返回模型可读文案：「任务已在执行、无法中断，请等待结束」；**不**伪装为 `canceled` |
 | 已终态 | 幂等：保持原终态 | 返回当前状态 |
 
-验收口径：pending 可取消且无僵尸 pending；**running 不承诺可取消**。协作式中断（`threading.Event` 检查点）列入 §1.3 非目标 / Phase 5 候选。
+验收口径：pending 可取消且无僵尸 pending；**running 不承诺可取消**。协作式中断（`threading.Event` 检查点）列入 §1.4 非目标 / Phase 5 候选。
 
-### 4.6 短任务的 A2A Task 存储
+### 4.6 短任务 vs 长任务的 A2A Task 存储
 
-`strategy.validate` / `strategy.save_draft` / `catalog.get` / `market.data_quality` / `selection.screen` / `backtest.get` / `backtest.list` / `factor.validate` / `factor.preview` **不**写入 `quant_task`。
+**短任务**（不写 `quant_task`）：  
+`strategy.validate` / `strategy.save_draft` / `catalog.get` / `market.data_quality` / `selection.screen` / `backtest.get` / `backtest.list` / `factor.validate` / `factor.preview` / `factor.save_draft` / `experiment.create` / `experiment.get` / `experiment.list` / `system.gap_summary`
 
 | 项 | v1 约定 |
 |----|---------|
 | 存储 | **进程内 ephemeral**（内存 dict），生成 A2A `task_id` 供 SSE / Get Task |
 | TTL | 完成后保留 **15 分钟**，超时 Get Task → not found |
 | 重启 | 进程重启后短任务 Task 全部丢失（可接受；结果已在当次 SSE 推完） |
-| 断线 | 短任务 SSE 断开即视为结果可能丢失；TTL 内可 Get Task 碰运气，但 **client 的可靠路径是直接重发请求**（读类 skill 幂等且廉价），不要实现断点续传 |
+| 断线 | 短任务 SSE 断开即视为结果可能丢失；TTL 内可 Get Task 碰运气，但 **client 的可靠路径是直接重发请求**（读类与 create 类幂等或可安全重试），不要实现断点续传 |
 | 多实例 | **v1 假设 quant 单实例**（与现网 `hank-quant.service` 一致）；多副本需共享 Task 存储，不在 v1 |
 
-仅 `backtest.run` 的 A2A Task ↔ `quant_task`（及 `quant_backtest_run`）持久映射，Get Task / Cancel 以 DB 为准。
+**长任务**（高成本，需确认）：
+
+| skill | 执行模型 | 互斥 / Cancel |
+|-------|----------|---------------|
+| `backtest.run` | A2A Task ↔ `quant_task` + `quant_backtest_run`；Get/Cancel 以 DB 为准 | 复用单任务互斥；Cancel **仅 pending** |
+| `experiment.trial` | REST 现网为 **同步** `create_trial_and_run`。A2A：**后台线程执行同一 service**，A2A Task 进程内（或可选映射 `quant_task` 若实现方便）推 SSE；**占用与 `backtest.run` 同一用户互斥槽**（同时只能跑一个高成本任务），避免双路径打满 CPU | Cancel：若尚未开始跑引擎可 canceled；已进入 `run_backtest` 则同 running 不可中断 |
+| `experiment.trial_batch` | 顺序执行多个 trial（硬上限见 §8.11）；整批一个 A2A Task，进度事件带 `trial_index` | 同上互斥；pending 可整批取消，已开始的当前 trial 不中断 |
+
+> 实现注意：不要在 A2A 层复制撮合逻辑；trial 必须调用 `create_trial_and_run`（或抽出的同函数），保证失败也落 trial、promotion 语义与 REST 一致。
 
 ---
 
@@ -241,7 +285,11 @@ Authorization: Bearer <user_jwt>
 
 ### 5.4 产品级确认闸门（非第二套鉴权）
 
-写类 / 高成本 skill（**仅 `backtest.run`**）要求 payload：
+**高成本 skill**（须 `confirmed: true`）：
+
+- `backtest.run`
+- `experiment.trial`
+- `experiment.trial_batch`（一次确认覆盖整批；批内条数计入会话授权与日配额）
 
 ```json
 "confirmed": true
@@ -249,16 +297,23 @@ Authorization: Bearer <user_jwt>
 
 由 Trace 在用户确认后置位；quant 缺失则 `failed` / 校验错误，防止模型误触。
 
-**免确认**：`strategy.save_draft` 只是落库草稿（`enabled=false`、不耗算力、可随时停用），**不要求 `confirmed`**——否则「提出 → 落库 → 验证」循环每一轮都要人工介入，自动化名存实亡；防刷屏靠复用现网 `_check_quota` 每用户策略配额。未来若新增真正改状态/启用的写 skill，再回到本闸门。
+**免确认**（数据/注册，不耗回测算力或仅轻量写）：
+
+| skill | 理由 |
+|-------|------|
+| `strategy.save_draft` | `enabled=false` 草稿；防刷靠策略配额 |
+| `experiment.create` | 冻结注册，不跑回测；防刷靠读/写限速 + 用户 experiment 数量常识（超限可后续加配额） |
+| `factor.save_draft` | admin 草稿因子 `enabled=false`；对齐 REST 创建但默认不启用 |
+| 全部 read skill | — |
 
 闸门实现要求（Trace 侧，写死）：
 
 1. **`confirmed` 只能由 Trace 工具调用拦截层在用户真实确认后注入**，模型自身输出不得直接置位；模型传 `confirmed: true` 而未经用户确认时拦截层应剥离并先走确认流程。
 2. **对话入口**：UI 确认按钮（复用现有工具确认机制）。
-3. **对话入口·会话级批量授权**：用户可一次性确认「本会话内允许最多 N 次回测」（N 由用户在确认 UI 选择，硬上限 ≤ 当日剩余配额）。拦截层维护剩余授权计数，额度内自动注入 `confirmed`，用尽后回到逐次确认。批量授权消耗与逐次确认**同一日配额**（§4.4），授权确认 UI 必须展示当日剩余次数。**此为有意取舍**：不另设批量专用配额池，避免 agent 绕过用户当日总量；授权是会话态，不落表、重启即失效。
-4. **微信入口**：Orchestrator 先发待确认摘要（含关键参数：策略 id、区间、费用覆盖）；用户回复肯定确认后置位执行；**5 分钟超时未确认自动作废**。微信**不**提供批量授权（无可靠确认 UI，保持单次）。
+3. **对话入口·会话级批量授权**：用户可一次性确认「本会话内允许最多 N 次**高成本执行**」（N 由用户选择，硬上限 ≤ 当日剩余配额）。`backtest.run` 与 `experiment.trial` 各消耗 1；`trial_batch` 按 patch 条数消耗。额度内自动注入 `confirmed`，用尽后回到逐次确认。与日配额**同一池**（§4.4）；授权 UI 展示当日剩余。授权是会话态，不落表、重启即失效。
+4. **微信入口**：Orchestrator 先发待确认摘要（策略/experiment id、区间、费用、trial 数量）；用户肯定白名单确认后置位；**5 分钟超时作废**。微信**无**批量授权。
    - **肯定白名单**（去空白、全半角不敏感，整句匹配其一即可）：`确认` / `好的` / `是` / `OK` / `ok` / `同意`  
-   - 白名单外任意回复视为放弃（不执行）。**此为有意取舍**：用户回「费用是多少？」这类追问也会作废待确认单——宁可不执行，也不在语义模糊时执行；实现时**不要**「优化」成忽略非白名单回复继续等待。用户可重新发起。
+   - 白名单外任意回复视为放弃（不执行）。**有意取舍**：追问也作废待确认单——宁可不执行；**不要**优化成忽略非白名单继续等待。
    - 微信确认状态挂在会话上下文，不落新表
 
 ---
@@ -268,8 +323,8 @@ Authorization: Bearer <user_jwt>
 ```json
 {
   "name": "quant-research",
-  "description": "A-share daily research tools: validate StrategySpec, run simulated backtests, screen universe, report data quality. No broker connectivity or order execution. Deterministic server (no LLM). Invocation requires structured data parts (skill+payload); text-only messages are rejected.",
-  "version": "0.1.0",
+  "description": "A-share daily research tools: validate StrategySpec, register experiments/trials, run simulated backtests, factor hygiene (admin), screen universe, report data quality and capability gaps. No broker connectivity or order execution. Deterministic server (no LLM). Invocation requires structured data parts (skill+payload); text-only messages are rejected.",
+  "version": "0.2.0",
   "protocolVersion": "0.3",
   "url": "https://<quant-host>/a2a",
   "capabilities": {
@@ -291,7 +346,7 @@ Authorization: Bearer <user_jwt>
     {
       "id": "catalog.get",
       "name": "Get research catalog",
-      "description": "Fixed dictionaries: filter fields, labels, snippet metadata.",
+      "description": "Fixed dictionaries: filter fields, operators, labels, snippet metadata. Call before authoring new specs.",
       "tags": ["catalog", "read"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
@@ -315,15 +370,55 @@ Authorization: Bearer <user_jwt>
     {
       "id": "strategy.save_draft",
       "name": "Save strategy draft",
-      "description": "Persist a StrategySpec as a disabled, unverified draft owned by the caller. No confirmation required. Returns strategy_id for backtest.run.",
+      "description": "Persist StrategySpec as disabled unverified draft. Optional parent_strategy_id for lineage. Returns strategy_id for experiments/backtests.",
       "tags": ["strategy", "write-draft"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "experiment.create",
+      "name": "Create experiment",
+      "description": "Register frozen-spec experiment with hypothesis and permanent_candidate_id. Requires strategy_id for trial runs. No confirmation.",
+      "tags": ["experiment", "write-registry"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "experiment.get",
+      "name": "Get experiment",
+      "description": "Experiment detail, trials, multiplicity hints, pending evidence promotions.",
+      "tags": ["experiment", "read"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "experiment.list",
+      "name": "List experiments",
+      "description": "List caller's experiments (summary). Avoid duplicate candidate registrations.",
+      "tags": ["experiment", "read"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "experiment.trial",
+      "name": "Run experiment trial",
+      "description": "Apply param_patch on frozen spec, run simulated backtest, append immutable trial. Long-running. Requires confirmed=true.",
+      "tags": ["experiment", "write-sim"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "experiment.trial_batch",
+      "name": "Run experiment trial batch",
+      "description": "Sequential param_patch trials (hard cap). Requires confirmed=true. Counts as multiple high-cost units.",
+      "tags": ["experiment", "write-sim"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
     },
     {
       "id": "factor.validate",
       "name": "Validate factor expression",
-      "description": "Validate a factor expression against supported fields/operators. Admin only. Does not persist.",
+      "description": "Validate factor expression. Admin only. Does not prove market-wide efficacy.",
       "tags": ["factor", "read"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
@@ -331,15 +426,23 @@ Authorization: Bearer <user_jwt>
     {
       "id": "factor.preview",
       "name": "Preview factor series",
-      "description": "Compute a factor expression (or saved factor_key) on one stock's recent bars; returns sampled series and reason tree. Admin only.",
+      "description": "Compute factor on 1..N codes (small N). Admin only. Spot-check only, not IC/layered returns.",
       "tags": ["factor", "read"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "factor.save_draft",
+      "name": "Save factor draft",
+      "description": "Persist disabled factor definition. Admin only. No confirmation.",
+      "tags": ["factor", "write-draft"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
     },
     {
       "id": "backtest.run",
       "name": "Run backtest",
-      "description": "Simulated T+1 backtest for a saved strategy_id. Long-running. Requires confirmed=true. Returns summary artifact and run_id. Cancel only while pending.",
+      "description": "Simulated T+1 backtest for saved strategy_id (path S). Long-running. Requires confirmed=true. Prefer experiment.trial for multi-round refinement.",
       "tags": ["backtest", "write-sim"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
@@ -355,7 +458,7 @@ Authorization: Bearer <user_jwt>
     {
       "id": "backtest.list",
       "name": "List backtest runs",
-      "description": "List the caller's recent backtest runs (summary level), optionally filtered by strategy_id. Use before proposing new experiments to avoid repeats.",
+      "description": "List caller's recent backtest runs. Secondary memory; prefer experiment.get for trial lineage.",
       "tags": ["backtest", "read"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
@@ -365,6 +468,14 @@ Authorization: Bearer <user_jwt>
       "name": "Structured screener",
       "description": "AND/OR condition screen with per-field coverage warnings.",
       "tags": ["selection", "read"],
+      "inputModes": ["application/json"],
+      "outputModes": ["application/json"]
+    },
+    {
+      "id": "system.gap_summary",
+      "name": "Capability gap summary",
+      "description": "Aggregate missing_capability / failure_kind from A2A audit for the caller or admin global view. Read-only.",
+      "tags": ["system", "read"],
       "inputModes": ["application/json"],
       "outputModes": ["application/json"]
     }
@@ -560,7 +671,7 @@ Authorization: Bearer <user_jwt>
 | 确认 | `confirmed !== true` → 拒绝（Trace 注入 + quant 二次校验，见 §5.4） |
 | 限额 | 并发复用 `quant_task` 单任务互斥（409 → `failed`，见 §4.4）；日次数默认 20/用户/日；区间复用 10 年上限 |
 | 归属 | `quant_backtest_run.user_id = JWT.sub` |
-| 证据状态 | 成功落库回测后与 REST 一致调用 `advance_after_backtest`（有 `strategy_id` 路径），推进策略 `evidence_status`；失败/取消不推进 |
+| 证据状态 | 成功落库后与 REST 单次回测一致调用 `advance_after_backtest`；失败/取消不推进。**注意**：此为路径 S；多轮提炼应走路径 E（trial **不**自动改 `evidence_status`，见 §8.11）。Agent 不得把路径 S 的一次推进表述为「试验账本级验证通过」 |
 
 **artifact `backtest_summary`**
 
@@ -639,7 +750,8 @@ Authorization: Bearer <user_jwt>
 ```json
 {
   "name": "ma_cross_v3_oos",
-  "spec": {}
+  "spec": {},
+  "parent_strategy_id": 41
 }
 ```
 
@@ -647,17 +759,25 @@ Authorization: Bearer <user_jwt>
 |------|------|
 | `name` | 必填；与同 owner 现有策略重名 → 校验错误，文案建议改名后缀（对齐 REST 409 语义，走 A2A 校验错误通道） |
 | `spec` | 必填；完整 StrategySpec，服务端 `parse_strategy_spec` 解析失败 → 校验错误（附 capability/issues） |
-| `confirmed` | **不需要**；出现亦不报错（容忍拦截层统一注入习惯），但不作为本 skill 的执行前提 |
+| `parent_strategy_id` | 可选；变体谱系。必须属于当前用户（或可读的 system 源策略）；写入 `quant_strategy` 扩展元数据或约定列（实现优先：`spec.metadata.parent_strategy_id`，避免未迁移前阻塞；若已有 DB 列则双写）。Orchestrator 迭代小改时应带上 parent，禁止无谱系连建孤儿草稿 |
+| `confirmed` | **不需要**；出现亦不报错 |
+
+**字段名澄清（避免与 evidence 混淆）**：
+
+| 名称 | 位置 | 含义 |
+|------|------|------|
+| `research_status` | **策略表列** `quant_strategy.research_status` | 研究工作流粗状态（草稿默认 `unverified`） |
+| `evidence_status` | **Spec 内** `spec.metadata.evidence_status` | 证据状态机（`advance_after_backtest` / promotion 路径） |
 
 规则：
 
 | 规则 | 说明 |
 |------|------|
-| 落库形态 | **`enabled=false` + `research_status=unverified`**（对齐 `POST /api/strategies`：新建一律 `with_status(spec, "unverified")`；`enabled=false` 跳过 `_require_supported`，即 capability 非 supported 的草稿也可落库留档，但回测预检仍会拦） |
+| 落库形态 | **`enabled=false` + 列 `research_status=unverified`**；`enabled=false` 跳过 `_require_supported`，非 supported 也可留档，但回测/experiment.create 仍会拦 |
 | 归属 | `owner_id = JWT.sub`，`is_system=false` |
-| 配额 | 复用 `_check_quota(db, user_id, adding=True, enabling=False)` 每用户策略配额；超限 → 模型可读错误（提示停用/删除旧草稿） |
-| 证据状态 | 本 skill **不**推进 `evidence_status`；推进仍只发生在成功回测后（§8.4 `advance_after_backtest`） |
-| 严格模式 | 未知顶层字段拒绝（同 §8.4） |
+| 配额 | 复用 `_check_quota(..., adding=True, enabling=False)`；超限 → 提示停用/删除旧草稿或复用 parent 迭代 |
+| 证据 | **不**推进 `evidence_status` |
+| 严格模式 | 未知顶层字段拒绝 |
 
 **artifact `strategy_draft`**
 
@@ -666,6 +786,7 @@ Authorization: Bearer <user_jwt>
   "strategy_id": 42,
   "name": "ma_cross_v3_oos",
   "spec_hash": "<hash>",
+  "parent_strategy_id": 41,
   "enabled": false,
   "research_status": "unverified",
   "capability": { "status": "supported", "issues": [] }
@@ -729,64 +850,237 @@ Authorization: Bearer <user_jwt>
 }
 ```
 
-**artifact `factor_validation`**：与 `ExpressionValidationResult` 逐字对齐（`valid` / `capability` / 规范化哈希、`min_bars` 等，字段名以 `app/strategy/spec.py` 的 `validate_expression` 返回为准）。
+**artifact `factor_validation`**：与 `ExpressionValidationResult` 逐字对齐（`valid` / `capability` / 规范化哈希、`min_bars` 等，字段名以现网 `validate_expression` 返回为准）。
 
-- **授权对齐 REST：仅 `can_admin`**（REST `/api/factors/validate` 为 `require_admin`）。非 admin 调用 → 模型可读拒绝（「因子表达式校验当前仅管理员可用」）。放宽至 `can_client` 属 REST 授权变更，二期评估，A2A 不单方面开口子。
-- 不落库、不触发计算。
+- **授权：仅 `can_admin`**（对齐 REST `require_admin`）。非 admin →「因子表达式校验当前仅管理员可用」。**产品决策**：v1 不单方面把 A2A 放宽到 `can_client`；若未来 REST 同步放宽，A2A 再跟。
+- 不落库、不触发全市场计算。
+- 失败写入审计 `failure_kind` / `missing_capability`（§12）。
 
 ---
 
 ### 8.10 `factor.preview`
 
-**payload**（对齐 `FactorPreviewIn`）
+**payload**（在 REST `FactorPreviewIn` 上扩展多标的）
 
 ```json
 {
   "expression": {},
   "factor_key": null,
   "code": "sh.600000",
+  "codes": ["sh.600000", "sz.000001"],
   "days": 60
 }
 ```
 
-- `expression` / `factor_key` 必须且只能提供其一（同 REST model validator）  
-- `days` 默认 60，A2A 硬上限 **120**（clamp；REST 上限 500 不变）  
-- **授权对齐 REST：仅 `can_admin`**（同 §8.9）
+| 字段 | 说明 |
+|------|------|
+| `expression` / `factor_key` | 必须且只能其一（同 REST） |
+| `code` | 单标的（与 REST 兼容） |
+| `codes` | 可选多标的；与 `code` **至少提供其一**；若两者都有则合并去重 |
+| 标的上限 | A2A 硬上限 **`min(len, 5)`**（clamp 截断并在 artifact 标 `truncated_codes`）；超出部分不报错丢弃——防 agent 扫全市场 |
+| `days` | 默认 60，A2A 硬上限 **120**（clamp） |
+| 授权 | **仅 `can_admin`** |
 
-**artifact `factor_preview`**（对齐 REST `/api/factors/preview` 返回，裁剪体积）
+**artifact `factor_preview`**
 
 ```json
 {
-  "code": "sh.600000",
-  "dates": [],
-  "values": [],
-  "reason_tree": {},
-  "truncated": false
+  "items": [
+    {
+      "code": "sh.600000",
+      "dates": [],
+      "values": [],
+      "reason_tree": {},
+      "error": null
+    }
+  ],
+  "truncated_codes": false,
+  "note": "spot_check_only_not_market_efficacy"
 }
 ```
 
-- 表达式非法 → 校验错误（附 capability/issues，同 REST 422 语义）  
-- 无该股票日线 → 模型可读错误  
-- **边界说明**：preview 是单股序列/原因树，**不是**全市场有效性证据（IC/分层）；后者现网无能力，Orchestrator 不得把 preview 结果表述为「因子有效」（§10.2 / §13）  
+- 单标的时 `items` 长度 1（也可兼容旧 REST 扁平字段，但 A2A 契约以 `items` 为准）。  
+- 表达式非法 → 校验错误（附 capability）。  
+- 某 code 无日线 → 该项 `error` 可读，不整包失败。  
+- **禁止**表述为全市场有效 / IC / 分层收益（§10.2 / §13）。
+
+---
+
+### 8.11 `experiment.create` / `get` / `list` / `trial` / `trial_batch`
+
+对齐 `app/api/experiments.py` 与 `app/experiment/service.py`；handler **只调** domain，禁止复制 patch/回测逻辑。
+
+#### `experiment.create`
+
+**payload**
+
+```json
+{
+  "title": "均线交叉是否在中证500有增量",
+  "hypothesis": "20/60 均线金叉相对等权基线年化更高且否决条件不触发",
+  "permanent_candidate_id": "ma-cross-csi500-v1",
+  "strategy_id": 42,
+  "spec": null,
+  "family_id": "ma-cross",
+  "universe_snapshot": null,
+  "cost_snapshot": null
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `title` / `hypothesis` / `permanent_candidate_id` | 必填；candidate id 规则同 REST（2–64 字母数字等） |
+| `strategy_id` | **A2A 强烈建议必填**；缺省则 create 成功但后续 trial 会失败（现网：`create_trial_and_run` 要求 strategy_id 才能落库回测）。契约：**缺 strategy_id → 校验错误**，文案引导先 `save_draft`（比 REST 更严，避免 agent 建出不可跑实验） |
+| `spec` | 可选；省略则用 `strategy_id` 当前 spec 冻结。若提供则须 `parse` + **capability.supported**（同 `create_experiment`），否则校验错误 |
+| `family_id` 等 | 可选，语义同 REST |
+
+免确认。同 owner 重复 `permanent_candidate_id` → 校验错误（引导 `experiment.get` / 换 id）。
+
+**artifact `experiment`**：对齐 `experiment_out`（`id`, `permanent_candidate_id`, `frozen_spec_hash`, `identity_hash`, `status`, `strategy_id`, …）。
+
+#### `experiment.get`
+
+**payload**：`{ "experiment_id": 1 }`  
+仅 owner。  
+**artifact**：对齐 REST get——experiment + `trials[]` + `multiplicity` + `pending_promotions`（**只读**；不提供 accept/dismiss skill）。
+
+#### `experiment.list`
+
+**payload**：`{ "include_archived": false, "limit": 50 }`（limit 硬上限 50）  
+**artifact**：`{ "items": [ experiment_out 摘要… ], "count": n }`
+
+#### `experiment.trial`（高成本）
+
+**payload**
+
+```json
+{
+  "experiment_id": 1,
+  "codes": ["sh.600000"],
+  "start": "2024-01-01",
+  "end": "2025-12-31",
+  "param_patch": { "$.entry.window": 20 },
+  "costs": {},
+  "pool_id": null,
+  "dynamic_universe": false,
+  "confirmed": true,
+  "client_request_id": "<optional>"
+}
+```
+
+| 规则 | 说明 |
+|------|------|
+| 执行 | `create_trial_and_run`；失败也落 trial（`outcome=error`） |
+| 确认 / 配额 / 互斥 | §5.4 / §4.4 / §4.6 |
+| `param_patch` | 路径须 `$.…`；非法路径 → trial error 或校验错误 |
+| 证据 | **永不**自动改 `evidence_status`；artifact 可含 `promotion` 摘要（eligible / suggested_target / todo id），文案引导用户去看板确认 |
+| 幂等 | `client_request_id` 当日同用户不重复创建 trial |
+
+**artifact `trial_result`**
+
+```json
+{
+  "experiment_id": 1,
+  "trial": { "id": 9, "trial_index": 2, "param_patch": {}, "outcome": "ok", "backtest_run_id": 100, "metrics_summary": {} },
+  "backtest": { "run_id": 100, "metrics": {}, "validation": {} },
+  "promotion": { "eligible": false, "todo": null },
+  "detail_ref": { "experiment_id": 1, "run_id": 100 }
+}
+```
+
+#### `experiment.trial_batch`（高成本）
+
+**payload**：同 trial，但 `param_patches: [{}]` 替代单一 patch。  
+- A2A 硬上限 **`min(len, 8)`**（REST 32；Agent 批更严，防一次烧光配额）  
+- clamp：超过 8 的尾部丢弃并在 artifact 标 `truncated_batch: true`（或校验错误二选一——**拍板：校验错误**，要求 agent 自行拆批，避免静默少跑）  
+- 顺序执行；单项失败 `outcome=error` 不中断  
+- 配额按 **实际执行条数**计  
+- 须 `confirmed: true` + 可选 `client_request_id`（整批幂等）
+
+**artifact `trial_batch_result`**：`{ "items": [ trial_result… ], "executed": n }`
+
+---
+
+### 8.12 `factor.save_draft`
+
+**payload**（对齐 `FactorCreateIn` 裁剪）
+
+```json
+{
+  "key": "draft_mom_20",
+  "name": "20日动量草稿",
+  "expression": {},
+  "description": "",
+  "category": "momentum"
+}
+```
+
+| 规则 | 说明 |
+|------|------|
+| 授权 | **仅 `can_admin`** |
+| 落库 | `enabled=false`（A2A 固定；payload 出现 `enabled:true` → 校验错误，防 agent 启用未验证因子进夜间管道） |
+| 校验 | 先走表达式 validate；失败不落库 |
+| 冲突 | key 已存在 → 校验错误 |
+| 确认 | 不需要 |
+
+**artifact `factor_draft`**：对齐 REST factor out（`key`, `expression_hash`, `min_bars`, `enabled: false`, …）。
+
+---
+
+### 8.13 `system.gap_summary`
+
+**payload**
+
+```json
+{
+  "scope": "me",
+  "limit": 20,
+  "since_days": 30
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `scope` | `me`（默认，当前用户审计）或 `global`（**仅 can_admin**，全站聚合） |
+| `limit` | 默认 20，硬上限 50 |
+| `since_days` | 默认 30，硬上限 90 |
+
+**artifact `gap_summary`**
+
+```json
+{
+  "items": [
+    {
+      "missing_capability": "rolling_foo",
+      "failure_kind": "missing_engine",
+      "count": 12,
+      "last_seen": "2026-07-29T18:00:00"
+    }
+  ],
+  "note": "aggregate_of_a2a_audit_not_llm_advice"
+}
+```
+
+依赖 Phase 2 `quant_a2a_audit`；表空时返回空列表。也可由 REST `GET /api/admin/a2a-gaps` 同源实现（管理页用 REST，Agent 用本 skill）。
 
 ---
 
 ## 9. SSE 时序
 
-### 9.1 长任务（`backtest.run`）
+### 9.1 长任务（`backtest.run` / `experiment.trial` / `experiment.trial_batch`）
 
 ```text
-Client  →  Send Streaming Message (skill=backtest.run)
+Client  →  Send Streaming Message (skill=backtest.run | experiment.trial | …)
 
 Server SSE:
   1) Task { id, status: working }
-  2) statusUpdate { working, message: "validating" | "compiling" | "simulating …" }
-  3) artifactUpdate { name: backtest_summary, parts: [data] }
+  2) statusUpdate { working, message: "validating" | "compiling" | "simulating …" | "trial i/n …" }
+  3) artifactUpdate { name: backtest_summary | trial_result | trial_batch_result, parts: [data] }
   4) statusUpdate { state: completed, final: true }
   5) close stream
 ```
 
-**心跳**：回测 SSE 可能持续数分钟；模拟阶段若无进度事件，Server 每 **~15 秒**发一帧心跳（SSE 注释行 `: ping` 或空 statusUpdate），防止中间代理掐断空闲连接。
+**心跳**：长任务 SSE 可能持续数分钟；无进度时 Server 每 **~15 秒**心跳（`: ping` 或空 statusUpdate）。
 
 失败：
 
@@ -796,32 +1090,32 @@ Server SSE:
   close
 ```
 
-取消（见 §4.5）：
+取消（见 §4.5 / §4.6）：
 
 ```text
 Client Cancel Task
-  ├─ quant_task 仍为 pending → cancelled + A2A canceled + 关流
-  └─ 已是 running → 不可中断；返回可操作错误，流可继续至 completed/failed
+  ├─ 仍为 pending（未进引擎）→ canceled + 关流
+  └─ 已在 run_backtest → 不可中断；可操作错误，流可继续至终态
 ```
 
-### 9.2 短任务（validate / save_draft / quality / catalog / get / list / screen / factor.*）
+### 9.2 短任务
 
-统一走 Streaming 亦可，便于 Client 单路径：
+`validate` / `save_draft` / `quality` / `catalog` / `get` / `list` / `screen` / `factor.*` / `experiment.create|get|list` / `system.gap_summary`：
 
 ```text
 Task working → artifact* → completed → close
 ```
 
-耗时通常毫秒～数秒。A2A Task 仅 ephemeral（§4.6），不占 `quant_task` 互斥槽。
+毫秒～数秒；ephemeral Task（§4.6）；**不**占高成本互斥槽。
 
 ### 9.3 Trace 侧聚合
 
-`quant_run_backtest` 等 tool：
+高成本 tool：
 
 1. 打开 A2A SSE  
-2. 可选：向用户对话发「回测进行中」类状态（微信可跳过中间帧）  
-3. 终态将 **artifact JSON 字符串** 作为 `ToolOutput` 交给模型  
-4. 模型生成用户可见摘要；**禁止**把 oos/回测说成交易建议  
+2. 可选对话「回测/trial 进行中」（微信可跳过中间帧）  
+3. 终态 artifact JSON 作为 `ToolOutput`  
+4. 用户摘要：**禁止**交易建议措辞；**禁止**把 promotion.eligible 说成「已验证可交易」  
 
 ---
 
@@ -835,49 +1129,120 @@ Task working → artifact* → completed → close
 | `quant_data_quality` | `market.data_quality` | 否 |
 | `quant_validate_strategy` | `strategy.validate` | 否 |
 | `quant_save_strategy_draft` | `strategy.save_draft` | 否 |
-| `quant_run_backtest` | `backtest.run` | **是**（逐次或会话级批量授权，§5.4） |
+| `quant_create_experiment` | `experiment.create` | 否 |
+| `quant_get_experiment` | `experiment.get` | 否 |
+| `quant_list_experiments` | `experiment.list` | 否 |
+| `quant_run_trial` | `experiment.trial` | **是** |
+| `quant_run_trial_batch` | `experiment.trial_batch` | **是** |
+| `quant_run_backtest` | `backtest.run` | **是** |
 | `quant_get_backtest` | `backtest.get` | 否 |
 | `quant_list_backtests` | `backtest.list` | 否 |
 | `quant_screen` | `selection.screen` | 否 |
-| `quant_validate_factor` | `factor.validate` | 否（仅 admin 可用） |
-| `quant_preview_factor` | `factor.preview` | 否（仅 admin 可用） |
+| `quant_validate_factor` | `factor.validate` | 否（admin） |
+| `quant_preview_factor` | `factor.preview` | 否（admin） |
+| `quant_save_factor_draft` | `factor.save_draft` | 否（admin） |
+| `quant_gap_summary` | `system.gap_summary` | 否 |
 
 细 tool 利于模型选型；网络层仍是官方 A2A，避免并行维护 MCP 通道。
 
-### 10.2 Orchestrator Skill（`quant-research`）
+### 10.2 Orchestrator Skill（`quant-research`）行为约束
 
-行为约束（写入 Trace skill 文档）：
+写入 Trace skill 文档，**与 §10.5 状态机一起生效**：
 
-1. 回测前 **有则优先** 调用 `data_quality` / `validate`（Phase 3 仅暴露 validate+backtest 时，至少 validate；data_quality 在工具上线后强制优先）  
-2. 仅 `capability.status == supported` 且 `valid == true` 才 `run_backtest`  
-3. 回测前确保策略已保存并持有 **`strategy_id`**（v1 不接受裸 spec 回测）；agent 自研的新策略变体走 `save_strategy_draft` 落库拿 id，**不要求用户逐次确认草稿**  
-4. 高成本回测必须用户确认后再由拦截层注入 `confirmed: true`（逐次或会话级批量授权，§5.4）  
-5. 结果必须带 `run_id` 或等价引用，便于复现  
-6. 文案：研究模拟，非投资建议，系统不下单  
-7. 区分「假说/参数问题」与「系统缺口」（`missing_data` / `missing_engine` / coverage warnings）  
-8. 费用覆盖使用 `costs.slippage` 等比例字段，勿编造 `initial_cash` / `slippage_bps`  
-9. **迭代前先查 `list_backtests`**：提出新实验前查该策略（或同主题）历史 run，避免重复已验证的组合；每轮迭代基于历史 metrics 对比陈述「本轮假设 vs 上轮结果」  
-10. **因子研究**：候选表达式先 `validate_factor` 再 `preview_factor` 抽查；preview 是单股证据，**禁止**表述为「因子在全市场有效」；全市场 IC/分层评估是已知系统缺口，遇到时归入 §13 信号而非编造结论  
-11. 批量回测场景优先引导用户做**会话级批量授权**（§5.4 第 3 条），而不是反复弹出逐次确认  
+1. **新会话写 Spec 前必须 `catalog.get`**（或本会话未过期缓存）。禁止凭记忆编造字段/算子。  
+2. 高成本前 **有则优先** `data_quality` + `strategy.validate`（工具未齐时至少 validate）。  
+3. 仅 `capability.status == supported` 且 `valid == true` 才进高成本 skill。  
+4. **多轮提炼默认路径 E**（`experiment.*`）；路径 S（`backtest.run`）仅冒烟或用户明确要求。  
+5. 新策略：`save_strategy_draft`（带 `parent_strategy_id`）→ `create_experiment`（必填 `strategy_id`）；小参数迭代用 `param_patch`，**不要**每轮新建 strategy 行。  
+6. 高成本须拦截层注入 `confirmed`（§5.4）；优先会话级批量授权。  
+7. 迭代前先 `list_experiments` / `get_experiment`（必要时 `list_backtests`），对比「本轮假设 vs 已有 trial」。  
+8. 结果必须带 `experiment_id` / trial id / `run_id` 等可复现引用。  
+9. 文案：研究模拟，非投资建议，不下单；不把 promotion 说成已采纳证据。  
+10. 区分 **假说失败** vs **系统缺口**；缺口写入 findings（§10.5 / §13）。  
+11. 费用只用 `costs.*`；勿编造 `initial_cash` / `slippage_bps`。  
+12. **因子（admin）**：validate → preview（≤5 标的）→ 可选 save_draft；禁止「全市场有效」；要 IC/分层 → 记 product_gap 后停止。  
+13. 遵守 §10.5 **停止条件**，禁止无限烧配额。  
+14. 遵守 `verification-protocol.md` 精神：可检验假设、失败保留、一次漂亮回测 ≠ 科学验证通过。
 
 ### 10.3 微信
 
 - 入口：`server/src/weixin/` → 同一 Orchestrator  
-- 身份：Trace 内部代签用户 JWT（§5.2，新增实现任务）  
-- 确认：写类操作走「待确认摘要 → 肯定白名单回复 → 5 分钟超时作废」流程（§5.4）  
-- 输出：短摘要 + 关键指标 + 引导到 Trace/看板看详情  
+- 身份：Trace 内部代签用户 JWT（§5.2）  
+- 确认：高成本「待确认摘要 → 白名单 → 5 分钟超时」；**无批量授权**  
+- 输出：短摘要 + 指标 + 引导看板 experiment  
 - **禁止**微信 → quant A2A 旁路  
 
-
 ### 10.4 配置
-
-Trace 侧配置项（示例）：
 
 ```toml
 [quant_a2a]
 base_url = "http://127.0.0.1:8100"
-# Card 路径或完整 card URL；超时、最大回测并发等
 ```
+
+### 10.5 研究 Agent 循环（产品规格，v1 必交付）
+
+> Trace `quant-research` 行为规格，**不是** quant 内 LLM。验收 §15 #18–#21。
+
+#### 状态机
+
+```text
+[Init] catalog.get（强制）+ data_quality（建议）
+   ▼
+[Hypothesize]  可检验假设；用户可改
+   ▼
+[AuthorSpec]  StrategySpec / param_patch → strategy.validate
+   ├─ missing_* → findings → 调整或停止
+   └─ supported
+        ▼
+[Register]  save_draft（parent?）→ experiment.create
+   ▼
+[Authorize]  确认或会话批量授权（§5.4）
+   ▼
+[Execute]  experiment.trial | trial_batch  （或路径 S: backtest.run）
+   │ 互斥：串行等待；勿改参狂重试
+   ▼
+[Evaluate]  experiment.get 对比 trials / multiplicity / validation
+   ├─ 假说失败且未停 → 回 AuthorSpec（优先 param_patch）
+   ├─ 系统缺口 → findings，必要时停止
+   ├─ 达停止条件 → Conclude
+   └─ 用户要求继续 → Authorize…
+   ▼
+[Conclude]  摘要 + 可复现 id + findings[] + 是否去看板看 promotion
+```
+
+#### 停止条件（任一触发 → Conclude，禁止继续高成本）
+
+| # | 条件 |
+|---|------|
+| S1 | 用户停止 / 会话结束 |
+| S2 | 日配额或会话批量授权用尽且用户拒绝再授权 |
+| S3 | 连续 **3** 次 validate 失败且错误同类（同一 missing_capability/字段） |
+| S4 | 同一 experiment 连续 **2** 个 trial `rejected` 且无新消融维度 |
+| S5 | 达本会话最大 trial 数（默认 **5**，批量授权 N 可抬高但 ≤ 日剩余） |
+| S6 | 所需能力明确不在 catalog（如 IC）→ 记缺口后停止 |
+
+#### 会话 findings（Conclude 强制）
+
+```json
+{
+  "findings": [
+    {
+      "kind": "missing_engine",
+      "detail": "需要 rolling_foo 算子",
+      "evidence": "validate capability.issues[0]",
+      "suggested_system_work": "optional"
+    }
+  ],
+  "reproducible_refs": {
+    "experiment_id": 1,
+    "run_ids": [100],
+    "strategy_id": 42
+  }
+}
+```
+
+`kind` 枚举：`missing_engine` | `missing_data` | `low_coverage` | `product_gap` | `ux_friction` | `hypothesis_rejected`。  
+v1 写入对话消息；Phase 4+ 可落表。串行等待 UX：互斥时告知并等 SSE/Get Task，批量授权下顺序执行并展示 i/N。
 
 ---
 
@@ -886,31 +1251,38 @@ base_url = "http://127.0.0.1:8100"
 ```text
 quant/app/a2a/
   __init__.py
-  card.py          # Agent Card 生成
-  server.py        # JSON-RPC / 路由挂载
-  stream.py        # SSE 任务流
-  auth.py          # 复用 JWT，薄封装
-  tasks.py         # A2A Task：短任务 ephemeral；backtest ↔ quant_task 映射（§4.4–4.6）
+  card.py
+  server.py
+  stream.py
+  auth.py
+  tasks.py
   skills/
     catalog.py
     data_quality.py
     strategy_validate.py
     strategy_save_draft.py
+    experiment_create.py
+    experiment_get.py
+    experiment_list.py
+    experiment_trial.py
+    experiment_trial_batch.py
     backtest_run.py
     backtest_get.py
     backtest_list.py
     factor_validate.py
     factor_preview.py
+    factor_save_draft.py
     screen.py
+    gap_summary.py
 ```
 
 原则：
 
-- skill handler **只调**现有 domain（`strategy` / `backtest` / `selection` / `data.quality` / `catalog`）  
-- **禁止**复制撮合或 Spec 校验逻辑  
-- 人机 REST 保持不动；A2A 为并行入口  
+- handler **只调** domain（`strategy` / `experiment` / `backtest` / `factors` / `selection` / `data.quality` / `catalog`）  
+- **禁止**复制撮合、Spec 校验、param_patch、trial 账本  
+- REST 不动；promotion accept **仅**看板/REST  
 
-启动：`app/main.py` 挂载 A2A 路由；Card 与 `/a2a` 在 schema 校验通过后可用。
+启动：`app/main.py` 挂载 A2A；Card 与 `/a2a` 在 schema 通过后可用。
 
 ---
 
@@ -918,104 +1290,147 @@ quant/app/a2a/
 
 | 项 | 要求 |
 |----|------|
-| 鉴权 | 除 Card 发现外全部 Bearer；验签仅在请求入口（§5.1） |
-| 授权 | 仅 `can_client` 或 `can_admin`；跨用户 run 不可读 |
-| 限额 | `backtest.run`：并发复用 `quant_task` 单任务互斥（§4.4）；日配额默认 20/用户/日（计数口径见 §4.4，批量授权共用同一池）；区间复用现网 10 年。**读类 skill**（validate / quality / catalog / screen / get / list / factor.*）：简单限速 **默认 60 次/用户/分钟**（进程内计数，**配置项可调**非写死），防模型重试循环打满全市场计算；超限返回模型可读错误 |
-| 取消 | 用户停对话 → Trace 调 Cancel → **仅 pending 幂等取消**；running 返回不可中断文案（§4.5） |
-| 部署 | v1 **单实例** quant；短任务 Task 进程内存储（§4.6） |
-| 审计 | 落 **新建轻量表 `quant_a2a_audit`**（Phase 2 随 backtest 流一起落，不复用 `quant_job_run`——后者是调度任务日志，语义不同）：`user_id`, `a2a_task_id`, `skill`, `source`, `run_id`, `created_at`, **`failure_kind`**, **`missing_capability`**。后两列是「发现系统不足」的沉淀载体：`strategy.validate` / `factor.validate` 失败时记录 `capability.status`（`missing_data` / `missing_engine` / …）与缺失的字段/算子名，成功为 NULL——**哪个能力被 agent 反复撞到，按这两列聚合排序即得系统补强项的优先级**（§13）。Phase 1（审计表未建前）至少保证应用日志输出 `user_id + skill` 结构化访问记录 |
-| 注入 | 工具返回当数据；不把用户/artifact 文本当系统指令执行 |
-| 产品 | 永不暴露下单接口；Card 与错误文案重申模拟边界 |
+| 鉴权 | 除 Card 外全部 Bearer；仅请求入口验签（§5.1） |
+| 授权 | `can_client`：策略/实验/回测；因子 skill 与 `gap_summary.scope=global`：**can_admin**；跨用户不可读 |
+| 限额 | 高成本：互斥 + 日 20 + 10 年区间；trial_batch ≤8。读/create/draft：默认 60 次/用户/分钟（可配置） |
+| 取消 | 仅未进引擎的 pending；running 不伪装 canceled |
+| 部署 | v1 单实例 quant |
+| 审计 | `quant_a2a_audit`：`user_id`, `a2a_task_id`, `skill`, `source`, `run_id`, `experiment_id`, `trial_id`, `created_at`, `failure_kind`, `missing_capability`。validate 失败写后两列。Phase 1 过渡：结构化日志 |
+| 缺口消费 | `system.gap_summary` + 建议 REST `GET /api/admin/a2a-gaps` 同源 |
+| 注入 | 工具返回当数据 |
+| 产品 | 无下单；模拟边界；不自动 accept promotion |
 
 ---
 
-## 13. 系统优化信号（纯工具下的弱探针）
+## 13. 系统优化信号（发现不足闭环）
 
-v1 **不**在 quant 内跑 LLM 写优化建议。「在过程中发现系统不足」靠两条路径沉淀：
+v1 不在 quant 内跑 LLM 写优化建议。闭环三层：
 
-**路径 A：审计聚合（结构化，quant 侧）**。`quant_a2a_audit.failure_kind` / `missing_capability`（§12）记录每次校验失败的缺口，按列聚合排序即可回答「哪个字段/算子/能力被 agent 反复撞到」：
+### 13.1 路径 A — 审计聚合（quant）
 
-| 信号 | 来源 | 含义 |
-|------|------|------|
-| `missing_engine` | validate（strategy / factor） | 缺算子 |
-| `missing_data` | validate（strategy / factor） | 缺字段/时点数据 |
-| 低 coverage | data_quality / screen | 基本面等覆盖不足 |
-| validate 多轮失败 | 对话轨迹 + 审计 | UX / 片段库缺口 |
-| 因子全市场评估缺位 | agent 显式需要 IC/分层而只有 preview | **已知首要缺口**（§1.3 非目标），agent 遇到时 Orchestrator 应显式归类到此项并告知用户，而非绕过 |
+`failure_kind` / `missing_capability` → `system.gap_summary` / admin API。
 
-**路径 B：Orchestrator 提炼（非结构化，Trace 侧）**。Orchestrator 从工具结果与对话轨迹提炼摩擦点（如某类 Spec 反复写错、某字段名反复编造），在研究会话小结中输出「系统缺口」段，供人决定是否立项。
+| 信号 | 含义 |
+|------|------|
+| `missing_engine` | 缺算子 |
+| `missing_data` | 缺字段/时点 |
+| 低 coverage | 数据覆盖不足 |
+| validate 反复失败 | UX/片段库/catalog 教育 |
+| `product_gap: factor_ic` | 要 IC/分层但仅有 preview——**已知首要缺口** |
 
-可选二期：规则型 skill `system.probe_friction`（仍无 LLM），输入 validate+quality 结果，输出 `findings[]`；以及把路径 B 的小结回写一张 findings 表做跨会话累积。
+对照 `docs/summry/06-gap-and-roadmap.md`：已在路线图标「已知」，否则进候选补强。
+
+### 13.2 路径 B — Orchestrator findings（§10.5）
+
+Conclude **强制** `findings[]`；v1 落对话。
+
+### 13.3 路径 C — 人读后立项
+
+管理端 gap 排行 + 抽查 findings → 人工进 roadmap。不自动改引擎。可选二期 findings 落表。
 
 ---
 
 ## 14. 分阶段实现
 
+> **里程碑对齐 §1.3 产品分层**：Phase 3 = **策略研究 Agent MVP**（路径 E）；微信/因子卫生不阻塞该里程碑。
+
 ### Phase 0 — 契约冻结
 
-- 本文档评审修订通过（含 Cancel 仅 pending、`strategy_id` 必填、`costs` 对齐引擎、研究闭环四件套 `save_draft`/`backtest.list`/`factor.validate`/`factor.preview`、批量授权与幂等键）  
-- 锁定 v1 skill 列表与 payload 字段（`valid`/`spec_hash`、`verdict` 枚举、`alert_level`、screen `total`/`items`、limit clamp 50、`client_request_id` 幂等、审计 `failure_kind`/`missing_capability` 列）  
-- 选定 quant 侧 A2A SDK / spec 小版本；Trace 侧确认手写 client 范围（§4.3）
+- 本文档（含 experiment 主链、§10.5 Agent 循环、因子辅叙事、缺口闭环）评审通过  
+- 锁定 v1 skill 列表与 payload（含 `experiment.*`、`parent_strategy_id`、`client_request_id`、审计列、trial_batch cap 8）  
+- 选定 quant A2A SDK minor；Trace 手写 client 范围（§4.3）
 
 ### Phase 1 — quant 最小闭环
 
-- Agent Card + ephemeral A2A Task 存储（§4.6）  
-- JWT + `strategy.validate`（SSE 或短路径）  
+- Agent Card + ephemeral Task（§4.6）  
+- JWT + `strategy.validate` + `catalog.get`  
 - 单测：鉴权失败、非法 skill、合法 Spec、仅 text 拒绝  
 
-### Phase 2 — 回测流 + 草稿落库
+### Phase 2 — 草稿 + 回测 + **experiment 主链** + 审计
 
-- `backtest.run`（**必须 `strategy_id`**）/ `backtest.get` / **`backtest.list`（新增 domain 查询，§8.8）**  
-- **`strategy.save_draft`（免确认，`enabled=false` 落库，§8.7）**  
-- Task ↔ `quant_task`（含 409 互斥、证据状态推进，见 §4.4 / §8.4）；**`client_request_id` 幂等（§4.4）**  
-- SSE 进度 + Cancel（**仅 pending**，§4.5）  
-- 日次数配置（默认 20）+ 区间复用 10 年校验  
-- `quant_a2a_audit` 表与写入（**含 `failure_kind` / `missing_capability` 两列**，§12）
+- `strategy.save_draft`（含 parent 谱系，§8.7）  
+- `backtest.run` / `get` / `list`  
+- **`experiment.create` / `get` / `list` / `trial` / `trial_batch`**（调 `create_experiment` / `create_trial_and_run`；高成本互斥与配额，§4.4–4.6 / §8.11）  
+- SSE + Cancel 仅 pending；日配额 20；`client_request_id` 幂等  
+- `quant_a2a_audit`（含 `failure_kind` / `missing_capability` / `experiment_id` / `trial_id`）  
+- 可选同期：`system.gap_summary` 读审计（可 Phase 4 补，但表结构 Phase 2 一次到位）
 
-### Phase 3 — Trace 对话（最小工具集 + 研究闭环）
+### Phase 3 — Trace **策略研究 Agent MVP**
 
-- `crates/hank-a2a-client` + `quant_validate_strategy` / **`quant_save_strategy_draft`** / `quant_run_backtest` / `quant_get_backtest` / **`quant_list_backtests`**  
-- `quant-research` skill（约束写「有则优先 data_quality」「迭代前先查 list_backtests」，§10.2）  
-- 确认闸门：拦截层注入 `confirmed`（§5.4），**含会话级批量授权**  
-- 说明：本阶段可不暴露 catalog/quality/screen/factor 工具；skill 不强制调用未上线工具  
+- `crates/hank-a2a-client`  
+- 工具：catalog、validate、save_draft、experiment.*、backtest.*（路径 S 可保留）  
+- **`quant-research` skill 完整实现 §10.2 + §10.5**（状态机、停止条件、findings、默认路径 E）  
+- 确认闸门 + 会话级批量授权（高成本统一计数）  
+- 端到端验收 #18–#21  
+- 本阶段 **不**阻塞于微信、因子、screen  
 
-### Phase 4 — 补全 skill + 微信
+### Phase 4 — 因子卫生 + 缺口消费 + 数据工具
 
-- catalog / data_quality / screen / **`factor.validate` / `factor.preview`** 工具与 skill 约束升级为「回测前优先 quality+validate」  
-- 微信：内部代签 JWT（§5.2）、肯定白名单确认（§5.4，**无批量授权**）、输出模板  
-- 基本可观测（日志/metrics；审计表已在 Phase 2 落地）；**首次基于 `failure_kind` / `missing_capability` 聚合出系统缺口清单**（§13 路径 A）
+- `data_quality` / `screen`  
+- `factor.validate` / `preview`（多标的）/ `save_draft`（admin）  
+- `system.gap_summary` + admin REST 聚合页（若未在 Phase 2 做完）  
+- skill 约束升级：回测前优先 quality+validate；因子话术边界  
+
+### Phase 4b — 微信（可与 4 并行）
+
+- 内部代签 JWT、白名单确认、无批量授权、短摘要模板  
 
 ### Phase 5 — 硬化（按需）
 
-- Subscribe 断线续订加固  
-- 更细进度事件  
-- 协作式 Cancel running（若需要）  
-- findings 规则 skill  
-- 完整 A2A 互操作测试（第三方 Client 冒烟）  
+- Subscribe 续订、更细进度、协作 Cancel running  
+- findings 落表 / 跨会话  
+- 第三方 A2A Client 冒烟  
+- （独立立项，非本 Phase）因子 IC/分层 domain 能力  
 
 ---
 
 ## 15. 验收标准
 
+### 15.1 协议与安全
+
 | # | 标准 |
 |---|------|
 | 1 | 未登录 / 坏 JWT 无法调用 skill |
-| 2 | Trace 对话：用户确认后，对**已保存** `strategy_id` 完成一次回测，回复含 `run_id`，看板可打开同一 run；策略 `evidence_status` 与 REST 路径一致推进 |
-| 3 | validate 非 supported / `valid != true` 时不落成功回测 |
-| 4 | **pending** 阶段 Cancel：A2A Task 与 `quant_task` 均至 `canceled` / `cancelled`，无僵尸 pending；**running** 阶段 Cancel 不伪装成功，返回「无法中断」类文案 |
-| 5 | 微信同一用户可拿到摘要，且不出现「已下单/建议买入」类违规措辞 |
-| 6 | 仅 text 无 skill 的 A2A 请求被拒绝 |
-| 7 | Card 声明 `streaming: true`，`pushNotifications: false` |
+| 2 | 路径 S：确认后对已保存 `strategy_id` 完成回测，回复含 `run_id`，看板可打开；`evidence_status` 与 REST 单次回测路径一致推进 |
+| 3 | validate 非 supported / `valid != true` 时不落成功回测/trial |
+| 4 | pending Cancel 成功且无僵尸；running Cancel 不伪装成功 |
+| 5 | 微信摘要无「已下单/建议买入」类违规措辞 |
+| 6 | 仅 text 无 skill 的请求被拒绝 |
+| 7 | Card：`streaming: true`，`pushNotifications: false` |
 | 8 | 人机 REST 与 web 看板回归不受影响 |
-| 9 | 已有 pending/running 任务时再发 `backtest.run`，Task 置 `failed` 且 message 指出可等待；若仍 pending 可 Cancel（复用 quant_task 409 互斥） |
-| 10 | 微信入口未经肯定白名单确认时 `backtest.run` 不执行；模型自行在 payload 置 `confirmed` 会被 Trace 拦截层剥离 |
-| 11 | 缺少 `strategy_id` 或使用 `fees`/`initial_cash` 等非契约字段时校验失败，错误文案可操作 |
-| 12 | `data_quality.alert_level` ∈ {`ok`,`warning`,`critical`}；validate artifact 使用 `valid`/`spec_hash` |
-| 13 | `strategy.save_draft` 无 `confirmed` 也可落库，落库为 `enabled=false` + `research_status=unverified`；草稿经确认跑通回测后 `evidence_status` 正常推进；重名/超配额给出可操作文案 |
-| 14 | `backtest.run` 带相同 `client_request_id` 当日重发：不新建 run、不重复计配额，返回首个 run 引用 |
-| 15 | `backtest.list` 仅返回当前用户 run，可按 `strategy_id` 过滤与游标翻页；字段名与 `backtest.get` summary 一致 |
-| 16 | `factor.validate` / `factor.preview` 非 admin 调用被拒且文案可读；admin 调用 artifact 与 REST `/api/factors/validate` / `/preview` 字段对齐 |
-| 17 | validate 类失败在 `quant_a2a_audit` 落 `failure_kind` / `missing_capability`，可按列聚合出缺口排行 |
+| 9 | 高成本互斥：已有进行中任务再提交 → failed/可等待文案，不双开引擎 |
+| 10 | 模型自填 `confirmed` 被 Trace 拦截层剥离；微信无白名单确认不执行 |
+| 11 | 缺 `strategy_id` 或非法费用字段 → 校验失败，文案可操作 |
+| 12 | `alert_level` ∈ {ok,warning,critical}；validate 用 `valid`/`spec_hash` |
+| 13 | `strategy.save_draft` 免确认；`enabled=false` + 列 `research_status=unverified`；可带 `parent_strategy_id` |
+| 14 | 相同 `client_request_id` 当日重发：不新建 run/trial、不重复计配额 |
+| 15 | `backtest.list` 仅本人、可过滤翻页，字段与 get summary 一致 |
+| 16 | 因子 skill 非 admin 拒绝；admin preview 支持 ≤5 codes；`save_draft` 固定 `enabled=false` |
+| 17 | validate 失败写 `failure_kind` / `missing_capability`，可聚合 |
+
+### 15.2 Experiment 主链
+
+| # | 标准 |
+|---|------|
+| 18 | `experiment.create` 无 `strategy_id` 被拒；有 id 时冻结 spec，看板可见同一 experiment |
+| 19 | 确认后 `experiment.trial` 调用与 REST 同源逻辑：失败也落 trial；**不**自动改 `evidence_status`；artifact 可含 promotion 只读摘要 |
+| 20 | `experiment.trial_batch`：>8 patch 校验错误；≤8 顺序执行；配额按条数计；与 `backtest.run` 共用日配额与互斥 |
+| 21 | `experiment.get` 返回 trials + multiplicity 提示 + pending_promotions；无 accept skill |
+
+### 15.3 研究 Agent（Trace）
+
+| # | 标准 |
+|---|------|
+| 22 | 端到端：用户一句话研究意图 → catalog → validate → save_draft → create_experiment →（批量）授权 → ≥1 trial → get 对比 → Conclude 含 `findings[]` 与可复现 id |
+| 23 | 默认走路径 E；仅用户要求冒烟时用 `backtest.run` 且话术不称为「试验结论」 |
+| 24 | 触发停止条件 S3/S5 时不再发高成本 skill，并输出 findings |
+| 25 | 用户要「算全市场 IC」时：不调用不存在的能力，findings 含 `product_gap`，明确系统缺口 |
+
+### 15.4 缺口闭环
+
+| # | 标准 |
+|---|------|
+| 26 | `system.gap_summary`（或 admin REST）能按 `missing_capability` 排出 top-N（有审计数据时） |
 
 ---
 
@@ -1024,17 +1439,21 @@ v1 **不**在 quant 内跑 LLM 写优化建议。「在过程中发现系统不�
 | 风险 | 缓解 |
 |------|------|
 | A2A spec/SDK 字段漂移 | 业务 payload 稳定；外壳跟 SDK；集成测试钉版本 |
-| 双入口（REST + A2A）行为不一致 | handler 只调同一 service 函数（`_prepare_backtest` / `validation_out` / `structured_screen` 等） |
-| LLM 乱造 Spec 或费用字段 | validate 硬闸；`strategy_id` 必填；`costs` 键名白名单；未知字段拒绝 |
-| 回测打满机器 | 单任务互斥 + 日限额 20 + 10 年区间；批量授权共用同一日配额、授权 N ≤ 当日剩余（§5.4） |
-| 批量授权被滥用为「无限自动跑」 | 授权是会话态不落表、用尽即回到逐次确认；日配额硬顶；微信无批量授权 |
-| 草稿策略刷屏 | `save_draft` 复用 `_check_quota` 每用户策略配额；草稿 `enabled=false` 不进夜间引擎与批量评估 |
-| SSE 断线重发导致重复回测 | `client_request_id` 当日幂等（§4.4 / §8.4） |
-| 模型循环调用读类 skill（全市场 screen 等） | 读类 skill 60 次/用户/分钟限速（可配置，§12）；Orchestrator skill 约束调用时序（§10.2） |
-| JWT 无吊销机制 | token TTL 30 天（两端一致），期间泄露无法单点吊销；只在请求入口验签（§5.1）。缓解：共享 secret 仅限内网，泄露时轮换 `jwt_secret` 全量失效 |
-| 用户以为 running 可立刻取消 | Card/错误文案与 skill 写明 pending-only Cancel（§4.5） |
+| 双入口行为不一致 | handler 只调同一 service（`_prepare_backtest` / `create_trial_and_run` / `validation_out` / …） |
+| Agent 绕开 experiment 只狂建草稿 | §2.1 / §10.2 默认路径 E；验收 #23；parent 谱系 + 策略配额 |
+| LLM 乱造 Spec 或费用字段 | catalog 强制 + validate 硬闸；`costs` 白名单；未知字段拒绝 |
+| 回测/trial 打满机器 | 高成本互斥 + 日 20 + trial_batch≤8 + 10 年区间；批量授权共用日配额 |
+| 批量授权变「无限自动跑」 | 会话态授权 + 停止条件 S2/S5 + 日配额硬顶；微信无批量 |
+| 草稿/实验刷屏 | 策略 `_check_quota`；create 限速；停止条件 |
+| SSE 重发重复计费 | `client_request_id` 幂等 |
+| 读类死循环 | 60/分钟限速 + Orchestrator 时序 |
+| trial 同步过久占请求 | A2A 后台线程 + SSE；与 backtest 互斥 |
+| JWT 无吊销 | TTL 30 天；secret 仅内网；轮换全量失效 |
+| running 不可取消误解 | Card/文案写明 pending-only |
+| 因子被说成「有效」 | 辅叙事 + skill 约束 + 验收 #25 |
+| promotion 被当成已验证 | 无 accept skill；话术禁止 |
 | 微信刷屏 | 只回终态摘要 |
-| 被误认为 quant「会聊天」 | Card 与拒绝策略明确 deterministic；要求 structured data parts |
+| quant「会聊天」误解 | deterministic Card + 拒绝纯 text |
 
 ---
 
@@ -1063,15 +1482,16 @@ v1 **不**在 quant 内跑 LLM 写优化建议。「在过程中发现系统不�
 |----|----------|
 | 本方案 | `quant/docs/a2a-design.md` |
 | quant A2A 包 | `quant/app/a2a/` |
-| Trace Client / tools | `crates/hank-a2a-client`（新 crate，手写最小 JSON-RPC + SSE client，见 §4.3） |
-| Orchestrator skill | Trace skills 目录下 `quant-research` |
-| 领域服务 | `app/strategy/*`, `app/backtest/*`, `app/selection/*`, `app/data/quality.py`, `app/catalog.py` |
+| Trace Client / tools | `crates/hank-a2a-client`（§4.3） |
+| Orchestrator skill | Trace skills 下 `quant-research`（§10.2 / §10.5） |
+| 领域服务 | `app/strategy/*`, `app/experiment/*`, `app/backtest/*`, `app/api/factors.py`, `app/selection/*`, `app/data/quality.py`, `app/catalog.py` |
+| 验证纪律 | `docs/research/verification-protocol.md`, `docs/summry/06-gap-and-roadmap.md` |
 
 ---
 
 ## 19. 一句话
 
-> **Trace（含微信）是唯一 LLM 编排方；quant 是官方 A2A 下的确定性研究工具节点；JWT 用户透传，SSE 推送任务生命周期；回测必须已保存 strategy_id，Cancel 仅 pending；agent 研究闭环（save_draft 提策略 → validate → 确认回测 → list 查历史 → 迭代）是一等能力，草稿免确认、回测走逐次或会话级批量闸门；业务话术与确认在 Trace，研究语义与模拟边界在 quant；agent 撞到的系统缺口以 `failure_kind` / `missing_capability` 落审计、可聚合。**
+> **Trace 是唯一 LLM 研究 Agent（§10.5 循环 + 停止条件 + findings）；quant 是官方 A2A 确定性工具节点。严肃验证默认走 experiment/trial 主链（路径 E），草稿+单次回测仅冒烟（路径 S）；高成本 skill 共用确认闸门、日配额与互斥；因子 v1 只做 admin 卫生工具（非 IC）；系统缺口经审计列聚合 + 会话 findings 闭环。业务话术与确认在 Trace，研究语义与模拟边界在 quant。**
 
 ---
 
@@ -1080,7 +1500,8 @@ v1 **不**在 quant 内跑 LLM 写优化建议。「在过程中发现系统不�
 | 日期 | 变更 |
 |------|------|
 | 2026-07-30 | 初稿：拍板入口 / 纯工具 / 官方 A2A / SSE / JWT 透传；v1 skill 与分阶段计划 |
-| 2026-07-30 | 评审修订：① `verdict` 对齐 validation 模块（`passed/rejected/incomplete`）；② Task 状态映射用 `quant_task` 真实状态（`done/cancelled`），补单任务互斥 409 的映射决策；③ `data_quality` 收缩为无参全局快照，字段名对齐 `data_quality_public_summary`；④ screen `limit` clamp 50 与 `truncated` 定义；⑤ 确认闸门写死为 Trace 拦截层注入，补微信确认流程；⑥ 微信 JWT 明确为内部代签新任务；⑦ Trace 侧拍板手写 `crates/hank-a2a-client`；⑧ 审计落 `quant_a2a_audit` 表；⑨ 目标 1 收窄为「发现开放、调用面向结构化 Client」；⑩ JWT 风险改写为 30 天无吊销；规格来源拍板显式 spec 优先；新增验收 9/10 |
-| 2026-07-30 | 二次评审落地：① Cancel **仅 pending**（§4.5），验收 #4 改写；② 回测 **必须 `strategy_id`**，撤销 v1 ephemeral spec /「spec 优先」；③ payload `costs` 对齐引擎，删除 `initial_cash`/`fees`/`slippage_bps`；④ 短任务 A2A Task ephemeral + 单实例假设（§4.6）；⑤ validate 用 `valid`/`spec_hash`；`alert_level` 用 `ok\|warning\|critical`；screen 对齐 `total`/`items`；⑥ 成功回测推进 `evidence_status`；⑦ 日配额默认 20、区间复用 10 年；⑧ 微信肯定白名单；⑨ Phase 3/4 工具时序与 skill「有则优先」；⑩ 验收新增 11/12 |
-| 2026-07-30 | 三次评审（对照代码逐项核对后）修订：① §8.4 显式拒绝 `params` 字段（现网 `BacktestIn` 的兼容字段，A2A 不支持）；② §4.4 日配额计数口径写死为 `quant_a2a_audit` 当日 `backtest.run` 记录数（含失败，防绕过），并注明 409→`failed` 拒绝走 Task 通道是有意统一错误路径；③ §12 读类 skill 增加 60 次/用户/分钟限速 + §16 对应风险行；④ §5.4 注明微信「疑问即放弃」为有意取舍；⑤ §9.1 长任务 SSE 增加 ~15s 心跳要求；⑥ §12 审计行补 Phase 1 过渡期结构化访问日志要求 |
-| 2026-07-30 | 四次评审（对齐「agent 自动验证、提炼因子/策略、发现系统不足」核心需求）修订：① 新增目标 6「支撑 Agent 研究闭环」（§1.2）；② 新增 `strategy.save_draft`（免确认，`enabled=false` 落库，复用 `_check_quota`，§8.7）——打通「提出→落库→回测」循环，确认闸门只留 `backtest.run`；③ 新增 `backtest.list`（REST 无列表端点，新增 domain 查询，§8.8）——迭代记忆不依赖对话上下文；④ 新增 `factor.validate` / `factor.preview`（对齐 REST，授权同 `require_admin`，§8.9/8.10）；因子全市场 IC/分层评估现网无能力，列入非目标并标注为首要系统缺口（§1.3/§13）；⑤ 会话级批量授权（仅对话入口，共用同一日配额，微信不开放，§5.4）；⑥ `backtest.run` 增加 `client_request_id` 幂等键，日配额「自然日」写死服务器本地时区（§4.4）；⑦ 审计表加 `failure_kind` / `missing_capability` 两列，缺口可聚合排序（§12/§13）；⑧ 读类限速改为可配置；⑨ §4.6 写死短任务断线重发语义；⑩ Orchestrator 约束补「迭代先查 list_backtests」「preview 不得表述为全市场有效」（§10.2）；⑪ Phase 2/3/4 重排，验收新增 13–17 |
+| 2026-07-30 | 评审修订：① `verdict` 对齐 validation；② Task↔`quant_task`；③ data_quality 无参快照；④ screen limit；⑤ 确认闸门；⑥ 微信代签；⑦ 手写 a2a-client；⑧ 审计表；⑨ 结构化 Client；⑩ JWT 风险 |
+| 2026-07-30 | 二次评审：Cancel 仅 pending；回测必须 strategy_id；costs 对齐；短任务 ephemeral；valid/spec_hash；evidence 推进；日配额 20；微信白名单 |
+| 2026-07-30 | 三次评审：拒绝 params；配额计 audit；读限速；微信疑问即放弃；SSE 心跳 |
+| 2026-07-30 | 四次评审：save_draft / backtest.list / factor 最小对；批量授权；client_request_id；审计缺口列 |
+| 2026-07-30 | **五次修订（选项 A）**：① 目标分层——策略 Agent 主叙事 / 因子辅叙事 / 缺口闭环；② **experiment.\* 一等 skill** 对齐现网试验账本，路径 E 默认、路径 S 冒烟；③ §10.5 研究 Agent 状态机 + 停止条件 + findings 结构 + 端到端验收 #22–#25；④ `parent_strategy_id` 谱系；⑤ `factor.save_draft` + preview 最多 5 标的；⑥ `system.gap_summary` + 审计 experiment/trial 列；⑦ 高成本统一配额（trial 计入）；⑧ Phase 2 含 experiment、Phase 3=策略 MVP、微信 4b；⑨ 关联 verification-protocol 与 gap-roadmap；⑩ 明确 trial 不自动 evidence、无 promotion accept skill |
