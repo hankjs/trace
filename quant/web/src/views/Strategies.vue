@@ -361,11 +361,8 @@ void init()
 
 <template>
   <div class="space-y-4 lg:flex lg:h-full lg:min-h-0 lg:flex-col lg:gap-4 lg:space-y-0">
-    <div class="flex flex-wrap items-end justify-between gap-3">
-      <div>
-        <h2 class="text-base font-semibold">策略管理</h2>
-      </div>
-      <p v-if="limits.max_total" class="text-xs text-text-tertiary">
+    <div v-if="limits.max_total" class="flex flex-wrap items-end justify-end gap-3">
+      <p class="text-xs text-text-tertiary">
         我的策略 {{ customStrategies.length }} / {{ limits.max_total }}
         · 启用 {{ enabledCount }} / {{ limits.max_enabled }}
       </p>

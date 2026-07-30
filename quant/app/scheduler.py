@@ -21,6 +21,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, time as dtime
 
+from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -377,7 +378,25 @@ def job_def(job_id: str) -> dict | None:
     return next((j for j in JOB_DEFS if j["id"] == job_id), None)
 
 
+# 调度器自动执行的日志:监听器在完成回调里写 quant_job_run(旁路,
+# 写库失败不影响任务,见 app/job_log.py)。注意多数 job 内部自己吞异常
+# (记日志返回 None),所以 status=finished 不代表子阶段全部成功,
+# 详细失败仍要看日志。
+def _record_system_run(event) -> None:
+    from . import job_log  # 延迟导入,避免 scheduler<->job_log 循环依赖
+    job_log.record_run(
+        event.job_id, job_log.TRIGGER_SYSTEM,
+        job_log.STATUS_FAILED if event.exception else job_log.STATUS_FINISHED,
+        started_at=now_cst().replace(tzinfo=None),
+        finished_at=now_cst().replace(tzinfo=None),
+        result=getattr(event, "retval", None),
+        error=str(event.exception) if event.exception else None,
+    )
+
+
 def start_scheduler() -> BackgroundScheduler:
+    scheduler.add_listener(
+        _record_system_run, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     scheduler.add_job(
         job_evening_pipeline, "cron",
         day_of_week="mon-fri", hour=16, minute=30,

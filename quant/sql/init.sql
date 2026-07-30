@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0021_drop_redundant_indexes
+-- Schema revision: 0022_job_run
 
 SET NAMES utf8mb4;
 
@@ -194,6 +194,21 @@ CREATE TABLE `quant_data_quality_cache` (
   `payload` JSON NOT NULL,
   `computed_at` DATETIME NOT NULL,
   PRIMARY KEY (`scope`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- 定时任务执行日志(系统调度 + admin 手动触发),旁路日志表,无 FK
+CREATE TABLE `quant_job_run` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `job_id` VARCHAR(64) NOT NULL,
+  `trigger` VARCHAR(16) NOT NULL,
+  `status` VARCHAR(16) NOT NULL,
+  `operator` VARCHAR(64),
+  `started_at` DATETIME NOT NULL,
+  `finished_at` DATETIME,
+  `result` TEXT,
+  `error` TEXT,
+  PRIMARY KEY (`id`),
+  KEY `ix_quant_job_run_job_id` (`job_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `quant_valuation_snapshot` (
@@ -561,6 +576,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0021_drop_redundant_indexes');
+VALUES ('0022_job_run');
 
 COMMIT;

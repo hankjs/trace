@@ -1361,8 +1361,13 @@ export interface UserSettings {
   updated_at: string | null
 }
 
-/** 一次手动执行的状态记录(后端进程内存态,重启即清空) */
+/** 一次执行记录(系统调度或手动触发,落 quant_job_run 持久化) */
 export interface AdminJobRun {
+  id?: number
+  job_id?: string
+  trigger?: 'system' | 'manual'
+  /** 手动触发者的用户名;系统执行为 null */
+  operator?: string | null
   status: 'running' | 'finished' | 'failed'
   started_at: string
   finished_at: string | null
@@ -1378,6 +1383,7 @@ export interface AdminJob {
   schedule: string
   /** 本进程不负责调度(dev/未抢到互斥锁)时为 null */
   next_run_time: string | null
+  last_system_run: AdminJobRun | null
   manual_run: AdminJobRun | null
 }
 
@@ -1404,6 +1410,13 @@ export const api = {
     return request<{ status: string; job_id: string }>(
       `/api/admin/jobs/${encodeURIComponent(jobId)}/run`,
       { method: 'POST' },
+    )
+  },
+
+  /** 单个任务的执行历史(仅 admin),新到旧 */
+  adminJobRuns(jobId: string, limit = 20) {
+    return request<AdminJobRun[]>(
+      `/api/admin/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}`,
     )
   },
 

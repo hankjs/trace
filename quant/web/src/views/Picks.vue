@@ -90,10 +90,7 @@ onMounted(async () => {
 <template>
   <div class="space-y-4">
     <div class="flex flex-wrap items-end justify-between gap-3">
-      <div>
-        <h2 class="text-base font-semibold">系统候选</h2>
-        <p class="mt-1 text-xs text-text-tertiary">按每日量化评分生成，展开可查看各项指标。</p>
-      </div>
+      <p class="text-xs text-text-tertiary">按每日量化评分生成，展开可查看各项指标。</p>
       <form data-tour="picks-form" class="flex items-end gap-3" @submit.prevent="load">
         <label class="text-sm">
           <span class="mb-1 block text-xs text-text-tertiary">日期</span>

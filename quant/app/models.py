@@ -783,3 +783,28 @@ class DataQualityCache(Base):
     as_of: Mapped[date] = mapped_column(Date, nullable=False)
     payload: Mapped[dict] = mapped_column(JSON, nullable=False)
     computed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class JobRun(Base):
+    """定时任务执行日志(系统调度 + admin 手动触发)。
+
+    系统执行只在完成时写一行;手动执行触发时先写 status='running',
+    完成时更新。进程崩溃遗留的 'running' 行会在同一任务下次手动触发时
+    被标记为 failed(见 app/job_log.py)。result 存 JSON 文本(任务返回
+    值里可能含 date 等不可直接入 JSON 列的对象,统一 default=str 序列化)。
+    """
+
+    __tablename__ = "quant_job_run"
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), index=True)
+    trigger: Mapped[str] = mapped_column(String(16))  # system | manual
+    status: Mapped[str] = mapped_column(String(16))  # running | finished | failed
+    operator: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True)
+    result: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)

@@ -10,9 +10,11 @@ from collections.abc import Callable
 from datetime import date, datetime
 from typing import TypeVar
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
+from .. import job_log
+from ..auth import require_admin
 from ..config import settings
 from ..backtest.evaluate import run_evaluation
 from ..data import fundamentals, ingest, universe
@@ -250,39 +252,28 @@ async def data_quality_now(
 
 # ---- 定时任务查看与手动触发 ----
 #
-# 手动执行状态是单进程内存态(与 fundamentals 的 threading.Lock 同一思路):
-# 进程重启后清空,不影响任务本身。每 job 一把锁防止重复触发;执行放后台
-# 线程并立即返回,晚间流水线这类长任务不会把 HTTP 请求挂到超时。
+# 执行记录落 quant_job_run(见 app/job_log.py):手动触发先写 running 行,
+# 后台线程完成后更新;进程崩溃遗留的 running 行在下次触发时收尾为 failed。
+# 每 job 一把内存锁防止同一进程内重复触发;执行放后台线程并立即返回,
+# 晚间流水线这类长任务不会把 HTTP 请求挂到超时。
 
 _manual_locks: dict[str, threading.Lock] = {
     j["id"]: threading.Lock() for j in JOB_DEFS}
-_manual_runs: dict[str, dict] = {}
 
 
-def _run_job_thread(job: dict) -> None:
-    job_id = job["id"]
+def _run_job_thread(job: dict, run_id: int | None) -> None:
     try:
         result = job["func"]()
-        _manual_runs[job_id] = {
-            "status": "finished",
-            "started_at": _manual_runs[job_id]["started_at"],
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-            "result": result if isinstance(result, (dict, list)) else None,
-            "error": None,
-        }
+        job_log.finish_run(run_id, job_log.STATUS_FINISHED,
+                           datetime.now(), result=result)
     except Exception as e:  # noqa: BLE001 - job 内部已各自隔离,这里兜底记录
-        _manual_runs[job_id] = {
-            "status": "failed",
-            "started_at": _manual_runs[job_id]["started_at"],
-            "finished_at": datetime.now().isoformat(timespec="seconds"),
-            "result": None,
-            "error": str(e),
-        }
+        job_log.finish_run(run_id, job_log.STATUS_FAILED,
+                           datetime.now(), error=str(e))
     finally:
-        _manual_locks[job_id].release()
+        _manual_locks[job["id"]].release()
 
 
-def _serialize_job(job: dict) -> dict:
+def _serialize_job(job: dict, latest: dict[tuple[str, str], dict]) -> dict:
     next_run = None
     if scheduler.running:
         scheduled = scheduler.get_job(job["id"])
@@ -294,25 +285,35 @@ def _serialize_job(job: dict) -> dict:
         "description": job["description"],
         "schedule": job["schedule"],
         "next_run_time": next_run,
-        "manual_run": _manual_runs.get(job["id"]),
+        "last_system_run": latest.get((job["id"], job_log.TRIGGER_SYSTEM)),
+        "manual_run": latest.get((job["id"], job_log.TRIGGER_MANUAL)),
     }
 
 
 @router.get("/jobs")
 async def list_jobs():
-    """定时任务列表:调度信息、下次执行时间与最近一次手动执行状态。
+    """定时任务列表:调度信息、下次执行时间与最近一次系统/手动执行。
 
     scheduler_running=false 表示本进程不负责调度(dev 环境或未抢到
     互斥锁),此时 next_run_time 为空,但手动执行仍然可用。
     """
+    latest = await asyncio.to_thread(job_log.latest_runs)
     return {
         "scheduler_running": scheduler.running,
-        "jobs": [_serialize_job(j) for j in JOB_DEFS],
+        "jobs": [_serialize_job(j, latest) for j in JOB_DEFS],
     }
 
 
+@router.get("/jobs/{job_id}/runs")
+async def job_runs(job_id: str, limit: int = Query(20, ge=1, le=100)):
+    """单个任务的执行历史(新到旧),含系统调度与手动触发。"""
+    if job_def(job_id) is None:
+        raise HTTPException(404, f"未知任务: {job_id}")
+    return await run_db_job(lambda db: job_log.recent_runs(db, job_id, limit))
+
+
 @router.post("/jobs/{job_id}/run", status_code=202)
-async def run_job(job_id: str):
+async def run_job(job_id: str, claims: dict = Depends(require_admin)):
     """手动触发定时任务(后台线程执行,立即返回)。
 
     不绕过任务内部守卫:非交易日、盘中时间窗外等场景任务会自行跳过,
@@ -324,12 +325,16 @@ async def run_job(job_id: str):
     lock = _manual_locks[job_id]
     if not lock.acquire(blocking=False):
         raise HTTPException(409, "该任务已有手动执行进行中")
-    _manual_runs[job_id] = {
-        "status": "running",
-        "started_at": datetime.now().isoformat(timespec="seconds"),
-        "finished_at": None,
-        "result": None,
-        "error": None,
-    }
-    threading.Thread(target=_run_job_thread, args=(job,), daemon=True).start()
+    try:
+        job_log.fail_stale_running(job_id)
+        run_id = job_log.record_run(
+            job_id, job_log.TRIGGER_MANUAL, job_log.STATUS_RUNNING,
+            started_at=datetime.now(),
+            operator=str(claims.get("username") or "") or None,
+        )
+        threading.Thread(
+            target=_run_job_thread, args=(job, run_id), daemon=True).start()
+    except Exception:
+        lock.release()
+        raise
     return {"status": "started", "job_id": job_id}

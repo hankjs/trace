@@ -93,9 +93,8 @@ onMounted(async () => {
 
 <template>
   <div class="space-y-4">
-    <div class="flex items-end justify-between gap-3">
-      <h2 class="text-base font-semibold">策略比较</h2>
-      <p v-if="runAt" class="text-xs text-text-tertiary">最近评估:{{ runAt }}</p>
+    <div v-if="runAt" class="flex items-end justify-end gap-3">
+      <p class="text-xs text-text-tertiary">最近评估:{{ runAt }}</p>
     </div>
 
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>

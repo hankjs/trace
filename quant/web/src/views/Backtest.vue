@@ -659,7 +659,6 @@ watch(
   <div class="space-y-6">
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div class="flex items-center gap-4">
-        <h2 class="text-base font-semibold">历史回测</h2>
         <div class="segmented" role="group" aria-label="回测模式">
           <button
             type="button"

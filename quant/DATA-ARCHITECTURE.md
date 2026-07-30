@@ -421,6 +421,15 @@ Schema 由 Alembic 管理（`alembic/versions/`），**启动时不再建表或�
 - 逐列 `MODIFY COLUMN` 的 revision 中断后可安全续跑（幂等），会留下「部分列已转换」
   的中间状态。
 
+### 旁路日志表：`quant_job_run`
+
+定时任务执行日志（`app/job_log.py` 读写，`/api/admin/jobs*` 展示）：系统调度监听器与
+admin 手动触发共用，记录 `job_id`、`trigger`(system/manual)、`status`
+(running/finished/failed)、`operator`、起止时间、结果 JSON 与错误。手动触发先写
+`running` 行、完成时更新；进程崩溃遗留的 `running` 行在下次触发时收尾为 failed。
+它与 `quant_data_quality_cache` 一样是旁路表：不参与任何研究/回测链路，写库失败
+只记日志不影响任务本身，可随时 truncate。
+
 ## 9. 当前数据规模（2026-07-27 实测）
 
 | 项 | 数值 |
