@@ -51,6 +51,7 @@ def test_job_registry_matches_scheduled_ids():
         "sync_stock_list",
         "sync_valuations",
         "sync_fundamentals",
+        "prune_research_plans",
         "intraday_snapshot",
     }
     assert registry_ids == scheduled_ids

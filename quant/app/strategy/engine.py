@@ -25,12 +25,13 @@ from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.orm import Session
 
 from ..data.calendar import is_trading_day
+from ..data.clock import today_cst
 from ..data.ingest import load_bars_df, required_snapshot_fields
 from ..backtest.engine import opening_buy_tradable_mask
 from ..models import Signal, Strategy, WatchlistItem
 from ..research_plan.service import create_holding_plan, create_single_plan
 from .store import enabled_strategies
-from .compiler import compile_single
+from .compiler import SingleCompilation, compile_single
 from .overlays import DEFAULT_SIMULATION_SLIPPAGE
 from .runtime import strategy_spec_for
 from .spec import CapabilityStatus, resolve_capabilities, strategy_spec_hash
@@ -58,7 +59,8 @@ def _save_signal(db: Session, code: str, day: date, strategy_id: int,
 
 def _save_signal_and_plan(db: Session, code: str, day: date,
                           strategy: Strategy, side: str, price: float,
-                          reason: dict, df, spec_hash: str) -> None:
+                          reason: dict, df, spec_hash: str,
+                          compilation: SingleCompilation | None = None) -> None:
     """信号与其研究计划在同一保存点写入，避免出现有信号却无法解释的半状态。"""
     with db.begin_nested():
         _save_signal(
@@ -70,7 +72,7 @@ def _save_signal_and_plan(db: Session, code: str, day: date,
             Signal.strategy_id == strategy.id,
             Signal.side == side,
         )).scalar_one()
-        create_single_plan(db, strategy, signal, df)
+        create_single_plan(db, strategy, signal, df, compilation=compilation)
 
 
 def _resolve_strategies(db: Session,
@@ -106,7 +108,7 @@ def run_signals(db: Session, day: date | None = None,
     strategies: 策略行列表,None 表示库里所有启用的单标的策略。
     返回 {策略名: {code: side}} 汇总。
     """
-    day = day or date.today()
+    day = day or today_cst()
     if not is_trading_day(db, day):
         logger.info("%s 非交易日，不生成信号或研究计划", day)
         return {"date": str(day), "signals": {}, "total": 0}
@@ -203,24 +205,41 @@ def run_signals(db: Session, day: date | None = None,
                 if side in {"sell", "reduce"} and reason_items:
                     reason["primary_exit_reason"] = reason_items[0]
                     reason["all_exit_reasons"] = reason_items
-                _save_signal_and_plan(
-                    db, code, day, strategy, side, price, reason, df,
-                    spec_hashes[strategy.id],
-                )
+                try:
+                    _save_signal_and_plan(
+                        db, code, day, strategy, side, price, reason, df,
+                        spec_hashes[strategy.id],
+                        compilation=compiled,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "策略 %s 计划落库失败 %s %s", strategy.name, code, side,
+                    )
+                    produced.pop((strategy.id, code), None)
+                    continue
                 produced[(strategy.id, code)].add(side)
                 summary[strategy.id][code] = side
                 logger.info("信号 %s %s %s @ %.2f",
                             strategy.name, code, side, price)
             elif cur > 1e-9:
                 # 档位未变且仍持有:刷新每日风险/退出快照,不制造新信号
-                create_holding_plan(
-                    db, strategy, code=code, data_date=day,
-                    df=df,
-                    simulated_entry_price=compiled.state.get(
-                        "simulated_entry_price",
-                    ),
-                    overlay_state_rules=compiled.state.get("rules") or [],
-                )
+                try:
+                    with db.begin_nested():
+                        create_holding_plan(
+                            db, strategy, code=code, data_date=day,
+                            df=df,
+                            simulated_entry_price=compiled.state.get(
+                                "simulated_entry_price",
+                            ),
+                            overlay_state_rules=compiled.state.get("rules") or [],
+                            compilation=compiled,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "策略 %s 持有计划落库失败 %s", strategy.name, code,
+                    )
+                    produced.pop((strategy.id, code), None)
+                    continue
             else:
                 # 空仓且仓位无跳变:入场条件未触发但归一化间距在容差内时,
                 # 产出 watch 信号供继续观察(语义见 strategy/watch.py)。
@@ -245,10 +264,18 @@ def run_signals(db: Session, day: date | None = None,
                     "params": strategy.params or {},
                     "watch": assessment,
                 }
-                _save_signal_and_plan(
-                    db, code, day, strategy, "watch", price, reason, df,
-                    spec_hashes[strategy.id],
-                )
+                try:
+                    _save_signal_and_plan(
+                        db, code, day, strategy, "watch", price, reason, df,
+                        spec_hashes[strategy.id],
+                        compilation=compiled,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "策略 %s watch 计划落库失败 %s", strategy.name, code,
+                    )
+                    produced.pop((strategy.id, code), None)
+                    continue
                 produced[(strategy.id, code)].add("watch")
                 summary[strategy.id][code] = "watch"
                 logger.info("watch %s %s @ %.2f %s",

@@ -16,6 +16,7 @@ from ..models import (BacktestRun, DailyBar, Pool, ResearchPlan,
                       ResearchPlanItem, Signal, Snapshot, Stock, Strategy,
                       TradeCalendar)
 from ..strategy.compiler import compile_portfolio
+from ..strategy.compiler import SingleCompilation
 from ..strategy.runtime import strategy_spec_for
 from .domain import (PLAN_TYPE_NAMES, PRODUCT_BOUNDARY, STATUS_NAMES,
                      build_portfolio_snapshot, build_single_snapshot,
@@ -85,11 +86,10 @@ def _backtest_evidence(
         select(BacktestRun).where(
             BacktestRun.strategy_id == strategy_id,
             BacktestRun.user_id == viewer_user_id,
+            BacktestRun.strategy_spec_hash == strategy_spec_hash,
         ).order_by(BacktestRun.created_at.desc(), BacktestRun.id.desc())
     ).scalars().all()
     for run in candidates:
-        if run.strategy_spec_hash != strategy_spec_hash:
-            continue
         if (run.costs or {}) != expected_costs:
             continue
         if plan_code is not None:
@@ -171,8 +171,12 @@ def _new_plan(strategy: Strategy, snapshot: dict, *, code: str | None,
 
 
 def create_single_plan(db: Session, strategy: Strategy, signal: Signal,
-                       df: pd.DataFrame) -> ResearchPlan:
-    """为已落库的单标的信号新建一版计划，并让信号指向最新版。"""
+                       df: pd.DataFrame,
+                       compilation: SingleCompilation | None = None) -> ResearchPlan:
+    """为已落库的单标的信号新建一版计划，并让信号指向最新版。
+
+    compilation=None 时由 build_single_snapshot 按默认口径编译。
+    """
     if strategy_spec_for(strategy).kind != "single":
         raise ValueError("组合策略不能生成单标的研究计划")
     if not is_trading_day(db, signal.date):
@@ -188,6 +192,7 @@ def create_single_plan(db: Session, strategy: Strategy, signal: Signal,
         entry_price=reason.get("simulated_entry_price"),
         exit_hits=hits,
         overlay_state_rules=reason.get("overlay_state_rules") or [],
+        compilation=compilation,
     )
     previous = db.get(ResearchPlan, signal.plan_id) if signal.plan_id else None
     if previous is None:
@@ -221,8 +226,12 @@ def create_holding_plan(
     df: pd.DataFrame,
     simulated_entry_price: float | None = None,
     overlay_state_rules: list[dict] | None = None,
+    compilation: SingleCompilation | None = None,
 ) -> ResearchPlan:
-    """为持续模拟持有状态生成每日风险/退出快照，不制造新的买卖信号。"""
+    """为持续模拟持有状态生成每日风险/退出快照，不制造新的买卖信号。
+
+    compilation=None 时由 build_single_snapshot 按默认口径编译。
+    """
     if strategy_spec_for(strategy).kind != "single":
         raise ValueError("组合策略不能生成单标的持有计划")
     if not is_trading_day(db, data_date):
@@ -232,6 +241,7 @@ def create_holding_plan(
         next_execution_date=next_trading_day(db, data_date),
         entry_price=simulated_entry_price,
         overlay_state_rules=overlay_state_rules,
+        compilation=compilation,
     )
     previous = db.execute(select(ResearchPlan).where(
         ResearchPlan.strategy_id == strategy.id,
@@ -491,7 +501,7 @@ def _reevaluation_from_market(
     if plan.next_execution_date is not None and plan.code:
         issue = _execution_market_issue(
             db, code=plan.code, execution_date=plan.next_execution_date,
-            direction="sell" if plan.signal_type == "sell" else "buy",
+            direction="sell" if plan.signal_type in ("sell", "reduce") else "buy",
             as_of=as_of,
         )
         if issue is not None:

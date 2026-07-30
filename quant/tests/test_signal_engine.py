@@ -493,3 +493,160 @@ def test_gap_beyond_tolerance_produces_no_watch():
 
     assert result["total"] == 0
     assert rows == []
+
+
+def test_plan_persistence_failure_isolates_other_strategies_and_keeps_old_signals():
+    """单个策略计划落库失败不影响其他策略,且不误删当日旧信号。"""
+    with _session() as db:
+        last = _seed_bars(db)
+        db.add_all([
+            Strategy(id=1, owner_id=SYSTEM_OWNER_ID, is_system=True,
+                     name="会失败的趋势", template="ma_cross", kind="single",
+                     params={}, enabled=True),
+            Strategy(id=2, owner_id=USER_A, is_system=False, name="正常的趋势",
+                     template="ma_cross", kind="single",
+                     params={}, enabled=True),
+        ])
+        db.commit()
+        # 预先写入 strategy 1 的当日旧 watch 信号
+        db.add(Signal(
+            code=CODE, date=last, strategy_id=1, side="watch",
+            price=10.0, reason={},
+        ))
+        db.commit()
+
+        original = signal_engine.create_single_plan
+
+        def failing_create_single_plan(db_, strategy, signal, df,
+                                       compilation=None):
+            if strategy.id == 1:
+                raise RuntimeError("模拟计划生成失败")
+            return original(db_, strategy, signal, df, compilation=compilation)
+
+        signal_engine.create_single_plan = failing_create_single_plan
+        try:
+            result = signal_engine.run_signals(db, day=last, codes=[CODE])
+        finally:
+            signal_engine.create_single_plan = original
+
+        signals = db.execute(
+            select(Signal).where(Signal.code == CODE, Signal.date == last)
+            .order_by(Signal.strategy_id, Signal.side)
+        ).scalars().all()
+        by_strategy = {
+            strategy_id: [row.side for row in rows]
+            for strategy_id, rows in (
+                (1, [s for s in signals if s.strategy_id == 1]),
+                (2, [s for s in signals if s.strategy_id == 2]),
+            )
+        }
+
+        assert result["total"] == 1
+        assert result["signals"]["正常的趋势#2"] == {CODE: "buy"}
+        # strategy 1 的旧 watch 信号未被清理,且没有成功生成 buy
+        assert by_strategy[1] == ["watch"]
+        assert by_strategy[2] == ["buy"]
+        plans = db.execute(select(ResearchPlan)).scalars().all()
+        assert [plan.strategy_id for plan in plans] == [2]
+
+
+def test_holding_plan_persistence_failure_isolates_other_strategies():
+    """持有计划落库失败(保存点回滚)不影响同股票其他策略。"""
+    with _session() as db:
+        last = _seed_bars(db)
+        next_day = last + timedelta(days=1)
+        while next_day.weekday() >= 5:
+            next_day += timedelta(days=1)
+        db.add_all([
+            Strategy(
+                id=1, owner_id=USER_A, is_system=False,
+                name="持有会失败", template="ma_cross", kind="single",
+                params={
+                    "risk_overlay": {
+                        "enabled": True, "type": "fixed_pct", "value": 0.1,
+                    },
+                }, enabled=True,
+            ),
+            Strategy(
+                id=2, owner_id=USER_A, is_system=False,
+                name="持有正常", template="ma_cross", kind="single",
+                params={
+                    "risk_overlay": {
+                        "enabled": True, "type": "fixed_pct", "value": 0.1,
+                    },
+                }, enabled=True,
+            ),
+            TradeCalendar(date=last, is_open=True),
+            TradeCalendar(date=next_day, is_open=True),
+        ])
+        db.commit()
+        signal_engine.run_signals(db, day=last, codes=[CODE])
+        db.add(DailyBar(
+            code=CODE, date=next_day, open=15, high=15, low=15,
+            close=15, raw_close=15, volume=1e6, amount=15e6,
+        ))
+        db.commit()
+
+        original = signal_engine.create_holding_plan
+
+        def failing_create_holding_plan(db_, strategy, *, code, data_date, df,
+                                        simulated_entry_price=None,
+                                        overlay_state_rules=None,
+                                        compilation=None):
+            if strategy.id == 1:
+                raise RuntimeError("模拟持有计划生成失败")
+            return original(
+                db_, strategy, code=code, data_date=data_date, df=df,
+                simulated_entry_price=simulated_entry_price,
+                overlay_state_rules=overlay_state_rules,
+                compilation=compilation,
+            )
+
+        signal_engine.create_holding_plan = failing_create_holding_plan
+        try:
+            result = signal_engine.run_signals(db, day=next_day, codes=[CODE])
+        finally:
+            signal_engine.create_holding_plan = original
+
+        plans = db.execute(
+            select(ResearchPlan).order_by(ResearchPlan.strategy_id,
+                                          ResearchPlan.id)
+        ).scalars().all()
+        holding_plan_strategy_ids = [
+            plan.strategy_id for plan in plans if plan.signal_type == "hold"
+        ]
+
+        assert result["total"] == 0
+        assert holding_plan_strategy_ids == [2]
+
+
+def test_plan_persistence_failure_does_not_corrupt_outer_transaction():
+    """保存点失败只回滚到保存点,外层事务仍可正常 commit。"""
+    with _session() as db:
+        last = _seed_bars(db)
+        db.add(Strategy(id=1, owner_id=SYSTEM_OWNER_ID, is_system=True,
+                        name="会失败的趋势", template="ma_cross", kind="single",
+                        params={}, enabled=True))
+        db.commit()
+        db.add(Signal(
+            code=CODE, date=last, strategy_id=1, side="watch",
+            price=10.0, reason={},
+        ))
+        db.commit()
+
+        original = signal_engine.create_single_plan
+
+        def failing(*args, **kwargs):
+            raise RuntimeError("boom")
+
+        signal_engine.create_single_plan = failing
+        try:
+            signal_engine.run_signals(db, day=last, codes=[CODE])
+        finally:
+            signal_engine.create_single_plan = original
+
+        # 外层 commit 成功,旧 watch 信号仍在
+        signals = db.execute(
+            select(Signal).where(Signal.code == CODE, Signal.date == last)
+        ).scalars().all()
+        assert [s.side for s in signals] == ["watch"]

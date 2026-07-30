@@ -40,6 +40,7 @@ from .db import SessionLocal
 from .models import Pick, WatchlistItem
 from .selection.pipeline import run_selection
 from .research_plan.pipeline import run_portfolio_plans
+from .research_plan.retention import prune_research_plans
 from .strategy.engine import run_signals
 
 logger = logging.getLogger(__name__)
@@ -337,6 +338,20 @@ def job_sync_fundamentals(day: date | None = None) -> dict | None:
     return result
 
 
+def job_prune_research_plans() -> dict | None:
+    """每周清理超出版本保留策略的研究计划。"""
+    with SessionLocal() as db:
+        try:
+            result = prune_research_plans(db)
+            db.commit()
+            logger.info("研究计划保留策略完成: %s", result)
+            return result
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            logger.exception("研究计划保留策略失败")
+            return None
+
+
 def job_intraday_snapshot() -> None:
     """盘中快照:仅在交易日的 9:30-15:00 执行"""
     now = _now()
@@ -374,6 +389,9 @@ JOB_DEFS: list[dict] = [
     {"id": "sync_fundamentals", "func": job_sync_fundamentals,
      "name": "全市场财务指标", "schedule": "每周六 09:00",
      "description": "最近 5 个报告期财务指标,捕获新披露与财报修订。"},
+    {"id": "prune_research_plans", "func": job_prune_research_plans,
+     "name": "研究计划保留策略", "schedule": "每周六 10:00",
+     "description": "清理超出保留策略的研究计划版本,被信号引用的版本保留。"},
     {"id": "intraday_snapshot", "func": job_intraday_snapshot,
      "name": "自选股盘中快照", "schedule": "交易日 9:30-15:00 每 30 分钟",
      "description": "akshare 快照落 quant_snapshot。非交易日或时间窗外自动跳过。"},
@@ -454,6 +472,12 @@ def start_scheduler() -> BackgroundScheduler:
         _run_with_lock_check(job_sync_fundamentals), "cron",
         day_of_week="sat", hour=9, minute=0,
         id="sync_fundamentals", replace_existing=True,
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
+    )
+    scheduler.add_job(
+        _run_with_lock_check(job_prune_research_plans), "cron",
+        day_of_week="sat", hour=10, minute=0,
+        id="prune_research_plans", replace_existing=True,
         max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(

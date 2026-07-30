@@ -14,6 +14,7 @@ import pandas as pd
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from ..data.clock import today_cst
 from ..data.ingest import load_bars_df, load_bars_df_bulk
 from ..data.universe import current_pool, pool_at
 from ..factors import FACTOR_COLUMNS, MIN_BARS, factor_frame
@@ -141,10 +142,10 @@ def compute_factor_rows(db: Session, codes: list[str],
 def run_selection(db: Session, day: date | None = None,
                   top_n: int = TOP_N, codes: list[str] | None = None) -> dict:
     """跑一天选股:过滤 -> 打分 -> Top N 落 quant_pick。返回汇总。"""
-    day = day or date.today()
+    day = day or today_cst()
     if codes is None:
         codes = pool_at(db, day)
-        if not codes and day >= date.today():
+        if not codes and day >= today_cst():
             codes = current_pool(db)
     if not codes:
         raise ValueError("股票池为空,请先同步成分股")

@@ -18,6 +18,7 @@ from ..catalog import STRATEGY_TEMPLATES
 from ..selection.pipeline import SCORE_WEIGHTS
 from ..strategy.compiler import (
     COMPILER_VERSION,
+    SingleCompilation,
     compile_single,
     component_versions_for_spec,
 )
@@ -580,14 +581,16 @@ def build_single_snapshot(strategy: Any, df: pd.DataFrame, *, side: str,
                           data_date: date, next_execution_date: date | None,
                           entry_price: float | None = None,
                           exit_hits: list[dict] | None = None,
-                          overlay_state_rules: list[dict] | None = None) -> dict:
+                          overlay_state_rules: list[dict] | None = None,
+                          compilation: SingleCompilation | None = None) -> dict:
+    """生成单标的研究计划快照;compilation=None 时由本函数自行编译。"""
     spec = strategy_spec_for(strategy)
     if spec.kind != "single":
         raise ValueError("组合策略不能生成单标的研究计划")
     if df.empty or df["date"].iat[-1] != data_date:
         raise ValueError("行情未更新到计划数据基准日")
 
-    compilation = compile_single(spec, df)
+    compilation = compilation if compilation is not None else compile_single(spec, df)
     execution = build_execution_snapshot(
         strategy,
         compiler_version=COMPILER_VERSION,
