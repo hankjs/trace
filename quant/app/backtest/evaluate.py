@@ -38,7 +38,11 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
     """按 as_of(含)之前最近一个因子日的评分取 Top N 代码。
 
     as_of 必须取回测起点:用回测结束时的最新因子选股再回看历史是前视偏差。
+    选股打分现在跟随当前 active 的 SelectionConfig,保证回测与运行时一致。
     """
+    from ..selection.config import load_selection_config
+
+    config = load_selection_config(db)
     q = select(FactorDaily.date)
     if as_of is not None:
         q = q.where(FactorDaily.date <= as_of)
@@ -52,12 +56,11 @@ def top_scored_codes(db: Session, n: int = TOP_SAMPLE,
         select(FactorDaily).where(FactorDaily.date == fdate)
     ).scalars().all()
     # 截面标准化打分:量纲统一,单因子缺失按截面中位数填充而不丢整只
-    scores = score_cross_section([
-        {"code": r.code,
-         **{k: getattr(r, k) for k in
-            ("mom20", "mom60", "ma20_slope", "vol_ratio5")}}
-        for r in rows
-    ])
+    scores = score_cross_section(
+        [{"code": r.code, "values": (r.values or {})} for r in rows],
+        weights=config.score_weights or {},
+        vol_confirm=config.vol_confirm,
+    )
     scored = [(s, code) for code, s in scores.items() if s is not None]
     scored.sort(key=lambda t: (-t[0], t[1]))
     return [c for _, c in scored[:n]]

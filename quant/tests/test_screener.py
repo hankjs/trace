@@ -25,6 +25,7 @@ from app.selection.screener import (
     evaluate_conditions,
     structured_screen,
 )
+from tests.factories import seed_factor_defs, seed_selection_config
 
 
 def _condition(field: str, operator: str, value=None, value_to=None) -> dict:
@@ -120,12 +121,16 @@ def test_structured_screen_excludes_not_yet_available_report() -> None:
     day = date(2025, 1, 10)
     with Session(engine) as db:
         _seed_pools(db)
+        seed_factor_defs(db)
         db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
                      list_date=date(2020, 1, 1)))
         db.add(FactorDaily(
-            id=1, code="sh.600001", date=day, mom20=0.05, mom60=0.08,
-            rsi14=55, atr_pct=0.02, vol_ratio5=1.2,
-            ma20_slope=0.01, amount_avg20=1e8,
+            id=1, code="sh.600001", date=day,
+            values={
+                "mom20": 0.05, "mom60": 0.08, "rsi14": 55,
+                "atr_pct": 0.02, "vol_ratio5": 1.2,
+                "ma20_slope": 0.01, "amount_avg20": 1e8,
+            },
         ))
         db.add_all([
             DailyBar(
@@ -184,11 +189,12 @@ def test_structured_screen_uses_revision_only_after_available_date() -> None:
     after_revision = date(2025, 2, 10)
     with Session(engine) as db:
         _seed_pools(db)
+        seed_factor_defs(db)
         db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
                      list_date=date(2020, 1, 1)))
         db.add_all([
-            FactorDaily(id=1, code="sh.600001", date=before_revision),
-            FactorDaily(id=2, code="sh.600001", date=after_revision),
+            FactorDaily(id=1, code="sh.600001", date=before_revision, values={}),
+            FactorDaily(id=2, code="sh.600001", date=after_revision, values={}),
         ])
         db.add_all([
             DailyBar(
@@ -236,6 +242,7 @@ def test_historical_pool_without_membership_history_fails_explicitly() -> None:
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         _seed_pools(db)
+        seed_factor_defs(db)
         db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
                      list_date=date(2020, 1, 1)))
         db.add(IndexMember(
@@ -261,6 +268,7 @@ def test_explicit_pool_requires_login() -> None:
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         _seed_pools(db)
+        seed_factor_defs(db)
         db.commit()
 
         with pytest.raises(InvalidFilterError, match="需要登录"):
@@ -279,9 +287,10 @@ def test_stale_valuation_is_treated_as_missing() -> None:
     day = date(2025, 1, 10)
     with Session(engine) as db:
         _seed_pools(db)
+        seed_factor_defs(db)
         db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
                      list_date=date(2020, 1, 1)))
-        db.add(FactorDaily(id=1, code="sh.600001", date=day))
+        db.add(FactorDaily(id=1, code="sh.600001", date=day, values={}))
         db.add(ValuationSnapshot(
             code="sh.600001", data_date=date(2025, 1, 2),
             available_date=date(2025, 1, 2), report_period=None,
@@ -314,9 +323,11 @@ def test_structured_screen_skips_listing_history_when_unused(monkeypatch) -> Non
     monkeypatch.setattr(screener, "_listing_days_by_code", fail_if_called)
     with Session(engine) as db:
         _seed_pools(db)
+        seed_factor_defs(db)
         db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
                      list_date=date(2020, 1, 1)))
-        db.add(FactorDaily(id=1, code="sh.600001", date=day, mom20=0.05))
+        db.add(FactorDaily(id=1, code="sh.600001", date=day,
+                           values={"mom20": 0.05}))
         db.add(DailyBar(
             code="sh.600001", date=day,
             open=10, high=11, low=9.9, close=10.5, raw_close=10.5,
@@ -343,9 +354,10 @@ def test_structured_screen_counts_listing_days_when_requested() -> None:
     day = date(2025, 1, 10)
     with Session(engine) as db:
         _seed_pools(db)
+        seed_factor_defs(db)
         db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
                      list_date=date(2020, 1, 1)))
-        db.add(FactorDaily(id=1, code="sh.600001", date=day))
+        db.add(FactorDaily(id=1, code="sh.600001", date=day, values={}))
         db.add_all([
             DailyBar(
                 code="sh.600001", date=date(2025, 1, 9),
@@ -371,3 +383,39 @@ def test_structured_screen_counts_listing_days_when_requested() -> None:
     assert result["combined_count"] == 1
     assert result["field_coverage"] == {"listing_days": 1}
     assert result["items"][0]["values"]["listing_days"] == 2
+
+
+def test_structured_screen_dynamic_factor_filter() -> None:
+    """可在启用因子上做结构化条件筛选。"""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    day = date(2025, 1, 10)
+    with Session(engine) as db:
+        _seed_pools(db)
+        seed_factor_defs(db)
+        db.add(Stock(code="sh.600001", name="测试股份", industry="制造",
+                     list_date=date(2020, 1, 1)))
+        db.add(FactorDaily(
+            id=1, code="sh.600001", date=day,
+            values={"mom20": 0.05, "vol_ratio5": 1.2, "amount_avg20": 1e8},
+        ))
+        db.add(DailyBar(
+            code="sh.600001", date=day,
+            open=10, high=11, low=9.9, close=11, raw_close=11,
+            volume=120, amount=1200, is_st=False,
+        ))
+        db.commit()
+
+        result = structured_screen(db, {
+            "date": day,
+            "logic": "and",
+            "conditions": [
+                _condition("mom20", "gte", 0.04),
+                _condition("vol_ratio5", "gte", 1.0),
+            ],
+            "groups": [],
+            "pool_id": None,
+        })
+
+    assert result["combined_count"] == 1
+    assert result["items"][0]["values"]["mom20"] == pytest.approx(0.05)

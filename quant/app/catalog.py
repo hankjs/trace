@@ -46,46 +46,6 @@ def _field(
     }
 
 
-FACTOR_FIELDS: dict[str, dict[str, Any]] = {
-    "mom20": _field(
-        "mom20", "近20日涨跌幅", "当前收盘价相对20个交易日前的变化幅度。",
-        category="趋势与动量", unit="%", direction="数值越高表示近期走势越强",
-        limits="使用复权日线计算，仅描述过去20个交易日，不代表未来收益。",
-    ),
-    "mom60": _field(
-        "mom60", "近60日涨跌幅", "当前收盘价相对60个交易日前的变化幅度。",
-        category="趋势与动量", unit="%", direction="数值越高表示中期走势越强",
-        limits="使用复权日线计算，短期反转时可能滞后。",
-    ),
-    "rsi14": _field(
-        "rsi14", "近期强弱程度（RSI 14）", "比较近14日上涨和下跌力度，取值通常为0至100。",
-        category="趋势与动量", unit="0-100", direction="高值偏强、低值偏弱，不能简单等同买卖点",
-        limits="强趋势中可长期处于高位或低位，应结合趋势和估值判断。",
-    ),
-    "atr_pct": _field(
-        "atr_pct", "日常价格波动幅度", "14日平均真实波幅占当前收盘价的比例。",
-        category="风险与波动", unit="%", direction="数值越高表示价格波动通常越大",
-        limits="反映历史波动，不预测方向；停牌或异常价格会影响口径。",
-    ),
-    "vol_ratio5": _field(
-        "vol_ratio5", "成交量相对5日平均", "当日成交量相对过去5日平均成交量的倍数。",
-        category="成交与流动性", unit="倍", direction="大于1表示成交量高于近期平均",
-        limits="日频近似量比，与行情软件的盘中量比口径不同。",
-    ),
-    "ma20_slope": _field(
-        "ma20_slope", "20日平均价格趋势", "20日均线相对5个交易日前的变化幅度。",
-        category="趋势与动量", unit="%", direction="正值表示20日均线向上",
-        limits="均线是滞后指标，快速转折时反应较慢。",
-    ),
-    "amount_avg20": _field(
-        "amount_avg20", "近20日日均成交额", "近20个交易日成交额的平均值。",
-        category="成交与流动性", unit="亿元", direction="数值越高通常表示交易更活跃",
-        limits="成交活跃不等同于公司质量或价格上涨。",
-        input_scale=100_000_000,
-    ),
-}
-
-
 MARKET_FILTER_FIELDS: dict[str, dict[str, Any]] = {
     "pct_chg": _field(
         "pct_chg", "当日涨跌幅", "当日收盘价相对前一交易日收盘价的变化幅度。",
@@ -212,10 +172,26 @@ FUNDAMENTAL_FILTER_FIELDS: dict[str, dict[str, Any]] = {
 
 FILTER_FIELDS: dict[str, dict[str, Any]] = {
     **BASIC_FILTER_FIELDS,
-    **FACTOR_FIELDS,
     **MARKET_FILTER_FIELDS,
     **FUNDAMENTAL_FILTER_FIELDS,
 }
+
+
+def filter_fields(db=None) -> dict[str, dict[str, Any]]:
+    """返回包含动态因子的完整筛选字段目录。
+
+    静态字段(基础信息/行情/基本面)与启用状态的动态因子合并;
+    若 quant_factor_def 为空,因子部分为空字典。
+    无 db 时仅返回静态字段(供纯函数测试与低开销调用)。
+    """
+    if db is None:
+        return dict(FILTER_FIELDS)
+    from .factors import factor_catalog_fields
+
+    return {
+        **FILTER_FIELDS,
+        **factor_catalog_fields(db),
+    }
 
 
 INDICATORS: dict[str, dict[str, Any]] = {
@@ -651,8 +627,14 @@ def _ordered_items(items: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     return [deepcopy(item) for item in items.values()]
 
 
-def catalog_payload() -> dict[str, Any]:
-    """返回可直接 JSON 序列化的完整目录副本。"""
+def catalog_payload(db=None) -> dict[str, Any]:
+    """返回可直接 JSON 序列化的完整目录副本。
+
+    `db` 用于拉取动态因子目录;无 db 时因子部分为空(生产 API 始终会传 db)。
+    """
+    from .factors import factor_catalog_fields
+
+    dynamic_factors = factor_catalog_fields(db) if db is not None else {}
     return {
         "version": 1,
         "product_boundary": {
@@ -662,9 +644,9 @@ def catalog_payload() -> dict[str, Any]:
             "execution_name": "用户在外部交易应用中自行决定并手工操作",
             "notice": "本系统只提供研究、模拟回测和手工记账，不连接券商，不提交订单。",
         },
-        "factors": _ordered_items(FACTOR_FIELDS),
+        "factors": _ordered_items(dynamic_factors),
         "indicators": _ordered_items(INDICATORS),
-        "filter_fields": _ordered_items(FILTER_FIELDS),
+        "filter_fields": _ordered_items(filter_fields(db) if db is not None else FILTER_FIELDS),
         # 算法模板元数据。策略实例(用户/公共)走 GET /api/strategies,
         # 那是随用户变化的业务数据,不属于这份静态目录。
         "strategy_templates": _ordered_items(STRATEGY_TEMPLATES),

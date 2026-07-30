@@ -25,6 +25,7 @@ const TYPE_LABELS: Record<TaskType, string> = {
   backtest: '回测',
   sweep: '参数扫描',
   sensitivity: '成本敏感性',
+  factor_backfill: '因子回填',
 }
 
 const STATUS_LABELS: Record<TaskStatus, string> = {

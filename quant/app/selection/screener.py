@@ -16,7 +16,7 @@ from fastapi import HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..catalog import FILTER_FIELDS
+from ..catalog import filter_fields
 from ..models import (
     DailyBar,
     FactorDaily,
@@ -32,10 +32,6 @@ VALUATION_MAX_AGE_DAYS = 7
 MAX_HIGH_WINDOW = 750  # 约 3 年交易日,防止无上界的窗口打爆查询区间
 CODE_BATCH_SIZE = 500
 
-FACTOR_VALUE_FIELDS = {
-    "mom20", "mom60", "rsi14", "atr_pct", "vol_ratio5",
-    "ma20_slope", "amount_avg20",
-}
 MARKET_VALUE_FIELDS = {"pct_chg", "high_dist", "ma_bull"}
 VALUATION_VALUE_FIELDS = {
     "pe_ttm", "pb", "ps_ttm", "dividend_yield", "total_market_cap",
@@ -48,6 +44,13 @@ FUNDAMENTAL_VALUE_FIELDS = {
 
 class InvalidFilterError(ValueError):
     """结构化筛选条件不合法。"""
+
+
+def _factor_value_fields(db: Session) -> set[str]:
+    """当前启用的动态因子 key 集合。"""
+    from ..factors import factor_catalog_fields
+
+    return set(factor_catalog_fields(db))
 
 
 def _latest_factor_date(db: Session, day: date | None) -> date | None:
@@ -99,6 +102,8 @@ def screen(db: Session, day: date | None = None,
     """条件筛选。返回 {date, total, items:[{code, name, 因子..., pct_chg, high_dist}]}
 
     total 为**匹配总数**(截断前),items 才受 limit 限制。
+    因子字段现在跟随 quant_factor_def 的启用定义;默认按 mom20 降序,
+    若未启用则取第一个启用因子。
     """
     if limit <= 0:
         raise InvalidFilterError("limit 必须为正整数")
@@ -108,22 +113,27 @@ def screen(db: Session, day: date | None = None,
     if fdate is None:
         return {"date": None, "total": 0, "items": []}
 
-    q = select(FactorDaily).where(FactorDaily.date == fdate)
-    if vol_ratio_min is not None:
-        q = q.where(FactorDaily.vol_ratio5 >= vol_ratio_min)
-    if amount_min is not None:
-        q = q.where(FactorDaily.amount_avg20 >= amount_min)
-    rows = db.execute(q).scalars().all()
+    factor_keys = _factor_value_fields(db)
+    rows = db.execute(
+        select(FactorDaily).where(FactorDaily.date == fdate)
+    ).scalars().all()
 
     names = dict(db.execute(select(Stock.code, Stock.name)).all())
     start = fdate - timedelta(days=max(high_window, 60) * 2 + 30)
     # 批量取日线,避免逐只往返(全A 口径下 N+1 会直接超时)
     bars = _load_bars_batch(db, [r.code for r in rows], start, fdate)
 
+    sort_key = "mom20" if "mom20" in factor_keys else next(iter(sorted(factor_keys)), None)
+
     items = []
     for r in rows:
         df = bars.get(r.code)
         if df is None or len(df) < 2 or df["date"].iat[-1] != fdate:
+            continue
+        values = r.values or {}
+        if vol_ratio_min is not None and values.get("vol_ratio5", 0) < vol_ratio_min:
+            continue
+        if amount_min is not None and values.get("amount_avg20", 0) < amount_min:
             continue
         close = float(df["close"].iat[-1])
         prev = float(df["close"].iat[-2])
@@ -141,18 +151,20 @@ def screen(db: Session, day: date | None = None,
         if high_dist_max is not None and (
                 high_dist is None or high_dist < -abs(high_dist_max)):
             continue
-        items.append({
+        item = {
             "code": r.code,
             "name": names.get(r.code, ""),
             "close": round(close, 3),
             "pct_chg": None if pct_chg is None else round(pct_chg, 4),
             "high_dist": None if high_dist is None else round(high_dist, 4),
-            "mom20": r.mom20, "mom60": r.mom60, "rsi14": r.rsi14,
-            "atr_pct": r.atr_pct, "vol_ratio5": r.vol_ratio5,
-            "ma20_slope": r.ma20_slope, "amount_avg20": r.amount_avg20,
-        })
+        }
+        for key in sorted(factor_keys):
+            item[key] = values.get(key)
+        items.append(item)
 
-    items.sort(key=lambda x: (-(x["mom20"] or -9), x["code"]))
+    items.sort(
+        key=lambda x: (-(x[sort_key] or -9) if sort_key else x["code"], x["code"]),
+    )
     total = len(items)  # 截断前的匹配总数
     return {"date": str(fdate), "total": total, "items": items[:limit]}
 
@@ -178,9 +190,10 @@ def _coerce_scalar(value: Any, value_type: str) -> Any:
     return value
 
 
-def _compile_condition(raw: dict[str, Any], fallback_id: str) -> dict[str, Any]:
+def _compile_condition(raw: dict[str, Any], fallback_id: str,
+                       field_catalog: dict[str, dict[str, Any]]) -> dict[str, Any]:
     field = str(raw.get("field", ""))
-    metadata = FILTER_FIELDS.get(field)
+    metadata = field_catalog.get(field)
     if metadata is None or not metadata.get("available", True):
         raise InvalidFilterError(f"不支持的筛选字段: {field}")
     operator = str(raw.get("operator", "")).lower()
@@ -248,7 +261,8 @@ def _matches(actual: Any, condition: dict[str, Any]) -> bool:
     raise InvalidFilterError(f"未知操作符: {operator}")
 
 
-def evaluate_conditions(rows: list[dict[str, Any]], payload: dict[str, Any]) -> dict:
+def evaluate_conditions(rows: list[dict[str, Any]], payload: dict[str, Any],
+                        field_catalog: dict[str, dict[str, Any]] | None = None) -> dict:
     """纯函数条件引擎，供 API 与测试共同使用。"""
     root_logic = str(payload.get("logic", "and")).lower()
     if root_logic not in {"and", "or"}:
@@ -261,7 +275,10 @@ def evaluate_conditions(rows: list[dict[str, Any]], payload: dict[str, Any]) -> 
     def compile_one(raw: dict[str, Any], fallback_id: str) -> dict[str, Any] | None:
         if not raw.get("enabled", True):
             return None
-        condition = _compile_condition(raw, fallback_id)
+        condition = _compile_condition(
+            raw, fallback_id,
+            field_catalog if field_catalog is not None else filter_fields(),
+        )
         if condition["id"] in used_ids:
             raise InvalidFilterError(f"条件 id 重复: {condition['id']}")
         used_ids.add(condition["id"])
@@ -630,6 +647,7 @@ def _build_screen_rows(
         db, factor_codes, day, market_fields=market_fields,
     )
 
+    factor_field_keys = _factor_value_fields(db)
     result = []
     for code in codes:
         stock = stocks.get(code)
@@ -638,15 +656,15 @@ def _build_screen_rows(
         fundamental = fundamentals.get(code)
         market = market_values.get(code, {})
 
-        values = {key: None for key in FILTER_FIELDS}
+        values = {key: None for key in filter_fields(db)}
         values["industry"] = stock.industry if stock else ""
         name = stock.name if stock else ""
         values["is_st"] = "ST" in name.upper() or "退" in name
         if "listing_days" in active_fields:
             values["listing_days"] = listing_days.get(code, 0)
         if factor:
-            for field in FACTOR_VALUE_FIELDS & active_fields:
-                values[field] = getattr(factor, field)
+            for field in factor_field_keys & active_fields:
+                values[field] = (factor.values or {}).get(field)
         values.update({
             "pct_chg": market.get("pct_chg"),
             "high_dist": market.get("high_dist"),
@@ -704,6 +722,7 @@ def structured_screen(db: Session, payload: dict[str, Any],
     pool_id = payload.get("pool_id")
     watchlist_only = bool(payload.get("watchlist_only"))
     active_fields = _active_fields(payload)
+    field_catalog = filter_fields(db)
     rows = _build_screen_rows(
         db,
         day,
@@ -712,7 +731,7 @@ def structured_screen(db: Session, payload: dict[str, Any],
         user_id=user_id,
         active_fields=active_fields,
     )
-    evaluated = evaluate_conditions(rows, payload)
+    evaluated = evaluate_conditions(rows, payload, field_catalog=field_catalog)
     combined_count = len(evaluated["items"])
     limit = int(payload.get("limit") or 100)
     items = sorted(evaluated["items"], key=lambda row: row["code"])[:limit]

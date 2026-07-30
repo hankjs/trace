@@ -22,6 +22,7 @@ import {
   Search,
   Settings,
   ShieldCheck,
+  Sigma,
   Star,
   Timer,
   X,
@@ -122,6 +123,7 @@ const navGroups = computed(() => {
       label: '系统管理',
       items: [
         { to: { name: 'admin-jobs' }, name: 'admin-jobs', label: '定时任务', icon: Timer },
+        { to: { name: 'admin-factors' }, name: 'admin-factors', label: '因子库', icon: Sigma },
       ],
     })
   }
@@ -145,6 +147,7 @@ const routeTitles: Record<string, string> = {
   stock: '个股研究',
   settings: '账户设置',
   'admin-jobs': '定时任务',
+  'admin-factors': '因子库管理',
 }
 
 const routeDescriptions: Record<string, string> = {
@@ -162,6 +165,7 @@ const routeDescriptions: Record<string, string> = {
   tasks: '回测、参数扫描等耗时任务在后台执行，这里查看进度与结果。同一时刻只能运行一个任务。',
   settings: '记录与实盘能力相关的偏好，系统不会代为下单。',
   'admin-jobs': '查看数据采集与研究流水线的调度状态，并可手动触发一次执行。',
+  'admin-factors': '动态因子定义、预览、回填与选股评分配置。',
 }
 
 const currentRouteTitle = computed(() => routeTitles[String(route.name)] ?? '研究工作台')

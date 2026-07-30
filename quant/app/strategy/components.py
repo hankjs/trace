@@ -1,164 +1,28 @@
 """StrategySpec 受控操作符的确定性 pandas 实现。"""
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from .operators import OPERATORS, ROLLING_STD_DDOF
 from .spec import Expression
 
 COMPONENT_VERSION = "strategy-components-v1"
 # rolling_std 固定 ddof=0(总体标准差,与波动率实务一致);zscore 复用同口径。
-ROLLING_STD_DDOF = 0
-COMPONENT_VERSIONS = {
-    op: COMPONENT_VERSION for op in (
-        "field", "literal", "all", "any", "not",
-        "gt", "gte", "lt", "lte", "cross_above", "cross_below",
-        "add", "subtract", "multiply", "divide",
-        "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
-        "rolling_rank", "zscore", "shift",
-        "ma", "rsi", "atr", "momentum", "return", "volume_ratio",
-        "rank", "top_n",
-    )
-}
+COMPONENT_VERSIONS = {op: spec.version for op, spec in OPERATORS.items()}
 
 Vector = pd.Series | pd.DataFrame
 
 
 def evaluate_expression(expr: Expression, fields: Mapping[str, Vector]) -> Any:
     """计算一个已校验表达式；不解析字符串，也不调用任何外部资源。"""
-    op = expr.op
-    if op == "field":
-        assert expr.name is not None
-        try:
-            return fields[expr.name]
-        except KeyError as exc:
-            raise ValueError(f"输入数据缺少字段 {expr.name}") from exc
-    if op == "literal":
-        return expr.value
-    if op in {"all", "any"}:
-        values = [evaluate_expression(item, fields) for item in expr.args or []]
-        result = values[0]
-        for value in values[1:]:
-            result = result & value if op == "all" else result | value
-        return result
-    if op == "not":
-        assert expr.arg is not None
-        value = evaluate_expression(expr.arg, fields)
-        return not value if isinstance(value, bool) else ~value
-
-    if op in {
-        "gt", "gte", "lt", "lte", "cross_above", "cross_below",
-        "add", "subtract", "multiply", "divide",
-    }:
-        assert expr.left is not None and expr.right is not None
-        left = evaluate_expression(expr.left, fields)
-        right = evaluate_expression(expr.right, fields)
-        if op == "gt":
-            return left > right
-        if op == "gte":
-            return left >= right
-        if op == "lt":
-            return left < right
-        if op == "lte":
-            return left <= right
-        if op == "cross_above":
-            return (left > right) & (_previous(left) <= _previous(right))
-        if op == "cross_below":
-            return (left < right) & (_previous(left) >= _previous(right))
-        if op == "add":
-            return left + right
-        if op == "subtract":
-            return left - right
-        if op == "multiply":
-            return left * right
-        denominator = right.where(right != 0) if isinstance(right, (pd.Series, pd.DataFrame)) else right
-        if not isinstance(denominator, (pd.Series, pd.DataFrame)) and denominator == 0:
-            return math.nan
-        return left / denominator
-
-    if op == "shift":
-        assert expr.input is not None and expr.periods is not None
-        return _shift(evaluate_expression(expr.input, fields), expr.periods)
-
-    if op in {
-        "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
-        "rolling_rank", "zscore", "volume_ratio",
-    }:
-        assert expr.input is not None and expr.window is not None and expr.shift is not None
-        value = evaluate_expression(expr.input, fields)
-        history = _shift(value, expr.shift)
-        rolling = history.rolling(expr.window)
-        if op == "rolling_mean":
-            return rolling.mean()
-        if op == "rolling_max":
-            return rolling.max()
-        if op == "rolling_min":
-            return rolling.min()
-        if op == "rolling_std":
-            return rolling.std(ddof=ROLLING_STD_DDOF)
-        if op == "rolling_rank":
-            # 窗口末值在窗内的百分位排名 ∈ (0,1];不足 window 根为 NaN
-            return history.rolling(expr.window).apply(
-                _window_percentile_rank, raw=True,
-            )
-        if op == "zscore":
-            mean = rolling.mean()
-            std = rolling.std(ddof=ROLLING_STD_DDOF)
-            return (history - mean) / std.where(std != 0)
-        denominator = rolling.mean()
-        return value / denominator.where(denominator > 0)
-
-    if op in {"ma", "rsi", "momentum", "return"}:
-        assert expr.input is not None and expr.window is not None
-        value = evaluate_expression(expr.input, fields)
-        if op == "ma":
-            return value.rolling(expr.window).mean()
-        if op == "rsi":
-            delta = value.diff()
-            gain = delta.clip(lower=0)
-            loss = -delta.clip(upper=0)
-            avg_gain = gain.ewm(alpha=1 / expr.window, adjust=False).mean()
-            avg_loss = loss.ewm(alpha=1 / expr.window, adjust=False).mean()
-            rs = avg_gain / avg_loss
-            return 100 - 100 / (1 + rs)
-        return value / value.shift(expr.window) - 1
-
-    if op == "atr":
-        assert (
-            expr.high is not None and expr.low is not None
-            and expr.close is not None and expr.window is not None
-        )
-        high = evaluate_expression(expr.high, fields)
-        low = evaluate_expression(expr.low, fields)
-        close = evaluate_expression(expr.close, fields)
-        previous = close.shift(1)
-        true_range = _elementwise_nanmax(
-            high - low,
-            (high - previous).abs(),
-            (low - previous).abs(),
-        )
-        return true_range.rolling(expr.window).mean()
-
-    if op == "rank":
-        assert expr.input is not None and expr.ascending is not None
-        value = evaluate_expression(expr.input, fields)
-        if not isinstance(value, pd.DataFrame):
-            raise ValueError("rank 只能用于组合横截面")
-        return value.rank(axis=1, ascending=expr.ascending, method="first")
-
-    if op == "top_n":
-        assert expr.input is not None and expr.n is not None
-        value = evaluate_expression(expr.input, fields)
-        if not isinstance(value, pd.DataFrame):
-            raise ValueError("top_n 只能用于组合横截面")
-        return value.rank(axis=1, ascending=False, method="first") <= expr.n
-
-    # Expression 已在 Pydantic 层限制操作符，这一分支只保护手工构造的异常对象。
-    raise ValueError(f"不支持的操作符 {op}")
+    spec = OPERATORS.get(expr.op)
+    if spec is None:
+        raise ValueError(f"不支持的操作符 {expr.op}")
+    return spec.evaluate(expr, fields, evaluate_expression)
 
 
 def build_reason_tree(
@@ -210,42 +74,6 @@ def used_component_versions(expr: Expression) -> dict[str, str]:
 
     visit(expr)
     return dict(sorted(versions.items()))
-
-
-def _window_percentile_rank(arr: np.ndarray) -> float:
-    """滚动窗口末值的百分位: (count of values <= last) / n, 输出 (0,1]。"""
-    if arr is None or len(arr) == 0:
-        return math.nan
-    last = arr[-1]
-    if last != last:  # NaN
-        return math.nan
-    valid = arr[~np.isnan(arr)]
-    if len(valid) == 0:
-        return math.nan
-    return float(np.sum(valid <= last) / len(valid))
-
-
-def _shift(value: Any, periods: int) -> Any:
-    if not isinstance(value, (pd.Series, pd.DataFrame)):
-        raise ValueError("shift/cross 操作符不能作用于字面量")
-    return value.shift(periods)
-
-
-def _previous(value: Any) -> Any:
-    return value.shift(1) if isinstance(value, (pd.Series, pd.DataFrame)) else value
-
-
-def _elementwise_nanmax(first: Vector, second: Vector, third: Vector) -> Vector:
-    values = np.stack([
-        first.to_numpy(dtype=float),
-        second.to_numpy(dtype=float),
-        third.to_numpy(dtype=float),
-    ])
-    with np.errstate(all="ignore"):
-        result = np.nanmax(values, axis=0)
-    if isinstance(first, pd.DataFrame):
-        return pd.DataFrame(result, index=first.index, columns=first.columns)
-    return pd.Series(result, index=first.index)
 
 
 def _value_at(value: Any, position: int, column: str | None) -> Any:

@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0023_task"}
+    assert heads == {"0024_dynamic_factors"}
     assert current_heads(migrated_db) == heads
 
 
@@ -75,6 +75,7 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_experiment",
         "quant_experiment_trial",
         "quant_factor_daily",
+        "quant_factor_def",
         "quant_fundamental_snapshot",
         "quant_index_member",
         "quant_job_run",
@@ -84,6 +85,7 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_pool_member",
         "quant_research_plan",
         "quant_research_plan_item",
+        "quant_selection_config",
         "quant_signal",
         "quant_snapshot",
         "quant_stock",
@@ -174,8 +176,6 @@ def test_price_columns_are_decimal(migrated_db, table, column, expected):
 @pytest.mark.parametrize(
     ("table", "column"),
     [
-        ("quant_factor_daily", "mom20"),
-        ("quant_factor_daily", "amount_avg20"),
         ("quant_valuation_snapshot", "pe_ttm"),
         ("quant_valuation_snapshot", "dividend_yield"),
         ("quant_fundamental_snapshot", "roe"),
@@ -277,7 +277,217 @@ def test_other_redundant_indexes_are_dropped(migrated_db):
     assert "ix_quant_pick_code" in pick
 
 
-# --- §3.5 新表 / 新列 / seed --------------------------------------------
+# --- §3.5 动态因子库 -------------------------------------------------------
+
+
+def _expression_hash(expr: dict) -> str:
+    payload = json.dumps(expr, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    import hashlib
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def test_factor_daily_uses_json_values(migrated_db):
+    """硬编码 7 列已迁移到单 JSON 列,便于后续扩展因子。"""
+    columns = _columns(migrated_db, "quant_factor_daily")
+    assert set(columns) == {"id", "code", "date", "values"}
+    assert str(columns["values"]["type"]).upper() == "JSON"
+    assert bool(columns["values"]["nullable"]) is False
+    pk = inspect(migrated_db).get_pk_constraint("quant_factor_daily")
+    assert pk["constrained_columns"] == ["id"]
+    unique = {
+        u["name"]
+        for u in inspect(migrated_db).get_unique_constraints("quant_factor_daily")
+    }
+    assert "uq_factor_code_date" in unique
+
+
+def test_factor_def_shape(migrated_db):
+    columns = _columns(migrated_db, "quant_factor_def")
+    expected = {
+        "id", "key", "name", "description", "category", "unit",
+        "direction", "limits", "value_type", "input_scale", "expression",
+        "expression_hash", "min_bars", "enabled", "is_system",
+        "created_at", "updated_at",
+    }
+    assert set(columns) == expected
+    assert str(columns["id"]["type"]).upper() == "INTEGER"  # sqlite variant
+    assert str(columns["key"]["type"]).upper() == "VARCHAR(64)"
+    assert str(columns["expression"]["type"]).upper() == "JSON"
+    assert str(columns["expression_hash"]["type"]).upper() == "VARCHAR(64)"
+    assert bool(columns["expression_hash"]["nullable"]) is False
+    assert bool(columns["min_bars"]["nullable"]) is False
+    assert bool(columns["enabled"]["nullable"]) is False
+    assert bool(columns["is_system"]["nullable"]) is False
+
+    unique = {
+        u["name"]
+        for u in inspect(migrated_db).get_unique_constraints("quant_factor_def")
+    }
+    assert "uq_factor_def_key" in unique
+
+    index_names = {i["name"] for i in inspect(migrated_db).get_indexes("quant_factor_def")}
+    assert any("expression_hash" in name for name in index_names)
+
+
+def test_selection_config_shape(migrated_db):
+    columns = _columns(migrated_db, "quant_selection_config")
+    assert set(columns) == {
+        "id", "name", "is_active", "score_weights", "vol_confirm",
+        "hard_filters", "top_n", "updated_at",
+    }
+    for col in ("score_weights", "vol_confirm", "hard_filters"):
+        assert str(columns[col]["type"]).upper() == "JSON"
+        assert bool(columns[col]["nullable"]) is False
+    assert bool(columns["top_n"]["nullable"]) is False
+
+
+def test_factor_def_seed_data(migrated_db):
+    expected = {
+        "mom20": {
+            "name": "近20日涨跌幅",
+            "expression": {"op": "momentum", "input": {"op": "field", "name": "close"}, "window": 20},
+            "min_bars": 21,
+            "input_scale": 0.01,
+        },
+        "mom60": {
+            "name": "近60日涨跌幅",
+            "expression": {"op": "momentum", "input": {"op": "field", "name": "close"}, "window": 60},
+            "min_bars": 61,
+            "input_scale": 0.01,
+        },
+        "rsi14": {
+            "name": "近期强弱程度（RSI 14）",
+            "expression": {"op": "rsi", "input": {"op": "field", "name": "close"}, "window": 14},
+            "min_bars": 15,
+            "input_scale": 1.0,
+        },
+        "atr_pct": {
+            "name": "日常价格波动幅度",
+            "expression": {
+                "op": "divide",
+                "left": {
+                    "op": "atr",
+                    "high": {"op": "field", "name": "high"},
+                    "low": {"op": "field", "name": "low"},
+                    "close": {"op": "field", "name": "close"},
+                    "window": 14,
+                },
+                "right": {"op": "field", "name": "close"},
+            },
+            "min_bars": 15,
+            "input_scale": 0.01,
+        },
+        "vol_ratio5": {
+            "name": "成交量相对5日平均",
+            "expression": {
+                "op": "volume_ratio",
+                "input": {"op": "field", "name": "volume"},
+                "window": 5,
+                "shift": 1,
+            },
+            "min_bars": 6,
+            "input_scale": 1.0,
+        },
+        "ma20_slope": {
+            "name": "20日平均价格趋势",
+            "expression": {
+                "op": "subtract",
+                "left": {
+                    "op": "divide",
+                    "left": {"op": "ma", "input": {"op": "field", "name": "close"}, "window": 20},
+                    "right": {
+                        "op": "shift",
+                        "input": {"op": "ma", "input": {"op": "field", "name": "close"}, "window": 20},
+                        "periods": 5,
+                    },
+                },
+                "right": {"op": "literal", "value": 1},
+            },
+            "min_bars": 25,
+            "input_scale": 0.01,
+        },
+        "amount_avg20": {
+            "name": "近20日日均成交额",
+            "expression": {
+                "op": "rolling_mean",
+                "input": {"op": "field", "name": "amount"},
+                "window": 20,
+                "shift": 0,
+            },
+            "min_bars": 20,
+            "input_scale": 100_000_000.0,
+        },
+    }
+    with migrated_db.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT key, name, expression, expression_hash, min_bars, input_scale, "
+            "enabled, is_system FROM quant_factor_def ORDER BY id"
+        )).all()
+
+    assert len(rows) == 7
+    for row in rows:
+        meta = expected[row.key]
+        assert row.name == meta["name"]
+        assert row.min_bars == meta["min_bars"]
+        assert row.input_scale == meta["input_scale"]
+        assert row.enabled == 1
+        assert row.is_system == 1
+        assert row.expression_hash == _expression_hash(meta["expression"])
+
+
+def test_selection_config_seed_data(migrated_db):
+    with migrated_db.connect() as conn:
+        row = conn.execute(text(
+            "SELECT name, is_active, score_weights, vol_confirm, hard_filters, top_n "
+            "FROM quant_selection_config"
+        )).one()
+
+    def _load(value):
+        return json.loads(value) if isinstance(value, str) else value
+
+    assert row.name == "default"
+    assert row.is_active == 1
+    assert _load(row.score_weights) == {"mom20": 0.5, "mom60": 0.3, "ma20_slope": 0.2}
+    assert _load(row.vol_confirm) == {"factor": "vol_ratio5", "cap": 3.0, "weight": 0.05}
+    assert _load(row.hard_filters) == [
+        {"type": "exclude_st"},
+        {"type": "exclude_suspended"},
+        {"type": "min_bars", "value": 120},
+        {"type": "factor_gte", "factor": "amount_avg20", "value": 50000000},
+        {"type": "row_flag", "field": "above_ma20", "value": True},
+    ]
+    assert row.top_n == 30
+
+
+def test_factor_daily_migration_preserves_data(migrated_db):
+    """空表下升级不报错,且 values 为空对象而非 NULL。"""
+    with migrated_db.connect() as conn:
+        count = conn.execute(text("SELECT COUNT(*) FROM quant_factor_daily")).scalar()
+    assert count == 0
+
+
+def test_downgrade_upgrade_roundtrip():
+    """一次 downgrade -1 + upgrade head 能回到目标态,验证迁移可逆。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        db_path = Path(tmp) / "roundtrip.db"
+        assert _alembic(db_path, "upgrade", "head").returncode == 0
+        result = _alembic(db_path, "downgrade", "-1")
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+        result = _alembic(db_path, "upgrade", "head")
+        assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
+
+        engine = create_engine(f"sqlite+pysqlite:///{db_path}")
+        try:
+            columns = _columns(engine, "quant_factor_daily")
+            assert set(columns) == {"id", "code", "date", "values"}
+            assert bool(columns["values"]["nullable"]) is False
+            assert "quant_factor_def" in inspect(engine).get_table_names()
+            assert "quant_selection_config" in inspect(engine).get_table_names()
+        finally:
+            engine.dispose()
+
+
+# --- §3.x 旧测试兼容 / 降级 ------------------------------------------------
 
 
 def test_stock_has_listing_columns(migrated_db):

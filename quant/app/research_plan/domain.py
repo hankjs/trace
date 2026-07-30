@@ -15,7 +15,6 @@ import pandas as pd
 
 from ..indicators import atr, ma, rsi
 from ..catalog import STRATEGY_TEMPLATES
-from ..selection.pipeline import SCORE_WEIGHTS
 from ..strategy.compiler import (
     COMPILER_VERSION,
     SingleCompilation,
@@ -734,7 +733,8 @@ def portfolio_score_details(
         weights = (
             {"mom20": float(params["w_mom20"]),
              "mom60": float(params["w_mom60"])}
-            if template == "momentum_rotation" else dict(SCORE_WEIGHTS)
+            if template == "momentum_rotation" else
+            {"mom20": 0.5, "mom60": 0.3, "ma20_slope": 0.2}
         )
         if template == "multifactor_hold":
             values["ma20_slope"] = float(ma20.iat[-1] / ma20.iat[-6] - 1)

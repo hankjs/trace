@@ -1,4 +1,5 @@
 /** 受控表达式(StrategyAstNode)的算子注册表与类型工具。
+ * mirror of app/strategy/operators.py; backend contract test test_operator_registry.py enforces key parity.
  *
  * 与后端 app/strategy/spec.py 的 _OP_FIELDS / 类型系统保持一致:
  * 每个节点求值结果为 number 或 bool,子节点槽位按类型约束可选算子。

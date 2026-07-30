@@ -4,19 +4,21 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.catalog import (BACKTEST_METRICS, FACTOR_FIELDS, FILTER_FIELDS,
-                         STRATEGY_TEMPLATES, catalog_payload,
-                         render_signal_reason, signal_reason_type)
+from app.catalog import (BACKTEST_METRICS, FILTER_FIELDS, STRATEGY_TEMPLATES,
+                         catalog_payload, filter_fields, render_signal_reason,
+                         signal_reason_type)
+from app.db import Base
 from app.strategy.strategies import REGISTRY
+from tests.factories import seed_factor_defs, seed_selection_config
 
 
 def test_catalog_covers_runtime_factors_and_strategies():
-    assert set(FACTOR_FIELDS) == {
-        "mom20", "mom60", "rsi14", "atr_pct", "vol_ratio5",
-        "ma20_slope", "amount_avg20",
-    }
     assert set(STRATEGY_TEMPLATES) == set(REGISTRY)
     for key, module in REGISTRY.items():
         entry = STRATEGY_TEMPLATES[key]
@@ -44,16 +46,50 @@ def test_filter_field_contract_reserves_fundamental_keys():
             "is_null", "not_null",
         } <= set(FILTER_FIELDS[key]["operators"])
     assert FILTER_FIELDS["roe"]["input_scale"] == 0.01
-    assert FILTER_FIELDS["mom20"]["input_scale"] == 0.01
-    assert FILTER_FIELDS["rsi14"]["input_scale"] == 1.0
-    assert FILTER_FIELDS["amount_avg20"]["input_scale"] == 100_000_000
-    assert FILTER_FIELDS["total_market_cap"]["input_scale"] == 100_000_000
     assert FILTER_FIELDS["is_st"]["value_type"] == "boolean"
     assert FILTER_FIELDS["listing_days"]["unit"] == "交易日"
 
 
-def test_catalog_items_have_explanations_and_limits():
-    payload = catalog_payload()
+def test_dynamic_filter_fields_include_enabled_factors():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_factor_defs(db)
+        fields = filter_fields(db)
+    assert "mom20" in fields
+    assert fields["mom20"]["source"] == "technical"
+    assert fields["mom20"]["input_scale"] == 0.01
+    assert fields["amount_avg20"]["input_scale"] == 100_000_000
+    assert fields["rsi14"]["input_scale"] == 1.0
+
+
+def test_dynamic_factors_disabled_not_in_filter_fields():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_factor_defs(db, include_disabled=True)
+        fields = filter_fields(db)
+    assert "disabled_factor" not in fields
+
+
+def test_catalog_payload_with_db_includes_dynamic_factors():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_factor_defs(db)
+        payload = catalog_payload(db)
+    factor_keys = {item["key"] for item in payload["factors"]}
+    assert "mom20" in factor_keys
+    filter_keys = {item["key"] for item in payload["filter_fields"]}
+    assert "mom20" in filter_keys
+
+
+def test_catalog_items_have_explanations_and_limits() -> None:
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_factor_defs(db)
+        payload = catalog_payload(db)
     assert payload["product_boundary"]["execution"] == "manual_external"
     assert payload["signals"] == payload["signal_sides"]
     for section in (

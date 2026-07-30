@@ -18,6 +18,8 @@ from pydantic import (
     BaseModel, ConfigDict, Field, ValidationError, model_serializer, model_validator,
 )
 
+from .operators import OPERATORS, compute_min_bars
+
 SCHEMA_VERSION = 1
 MAX_AST_DEPTH = 12
 MAX_AST_NODES = 256
@@ -25,15 +27,7 @@ MAX_WINDOW = 500
 MAX_PARAMETER_VALUES = 20
 MAX_PARAMETER_COMBINATIONS = 256
 
-SUPPORTED_OPERATORS = frozenset({
-    "field", "literal", "all", "any", "not",
-    "gt", "gte", "lt", "lte", "cross_above", "cross_below",
-    "add", "subtract", "multiply", "divide",
-    "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
-    "rolling_rank", "zscore", "shift",
-    "ma", "rsi", "atr", "momentum", "return", "volume_ratio",
-    "rank", "top_n",
-})
+SUPPORTED_OPERATORS = frozenset(OPERATORS)
 
 # 字段存在于当前日线、估值或点时财务目录时才可声明。编译时仍要求调用方提供
 # 实际用到的列，避免把“目录支持”误解为某一批数据必然完整。
@@ -44,28 +38,7 @@ SUPPORTED_FIELDS = frozenset({
     "debt_ratio", "cashflow_quality",
 })
 
-_OP_FIELDS: dict[str, frozenset[str]] = {
-    "field": frozenset({"op", "name"}),
-    "literal": frozenset({"op", "value"}),
-    "all": frozenset({"op", "args"}),
-    "any": frozenset({"op", "args"}),
-    "not": frozenset({"op", "arg"}),
-    **{op: frozenset({"op", "left", "right"}) for op in (
-        "gt", "gte", "lt", "lte", "cross_above", "cross_below",
-        "add", "subtract", "multiply", "divide",
-    )},
-    **{op: frozenset({"op", "input", "window", "shift"}) for op in (
-        "rolling_mean", "rolling_max", "rolling_min", "rolling_std",
-        "rolling_rank", "zscore", "volume_ratio",
-    )},
-    "shift": frozenset({"op", "input", "periods"}),
-    **{op: frozenset({"op", "input", "window"}) for op in (
-        "ma", "rsi", "momentum", "return",
-    )},
-    "atr": frozenset({"op", "high", "low", "close", "window"}),
-    "rank": frozenset({"op", "input", "ascending"}),
-    "top_n": frozenset({"op", "input", "n"}),
-}
+_OP_FIELDS: dict[str, frozenset[str]] = {op: spec.fields for op, spec in OPERATORS.items()}
 
 
 class StrictModel(BaseModel):
@@ -136,9 +109,10 @@ class Expression(StrictModel):
         op = value.get("op")
         if not isinstance(op, str):
             raise ValueError("表达式节点必须包含字符串 op")
-        allowed = _OP_FIELDS.get(op)
-        if allowed is None:
+        spec = OPERATORS.get(op)
+        if spec is None:
             raise ValueError(f"不支持的操作符: {op}")
+        allowed = spec.fields
         actual = frozenset(value)
         if actual != allowed:
             missing = sorted(allowed - actual)
@@ -183,42 +157,38 @@ class Expression(StrictModel):
         return self
 
     def _validate_types(self) -> str:
-        child_types: list[str]
-        if self.op == "field":
-            return "number"
-        if self.op == "literal":
+        spec = OPERATORS.get(self.op)
+        if spec is None:
+            raise ValueError(f"不支持的操作符 {self.op}")
+        if spec.result_type == "literal":
             return "bool" if isinstance(self.value, bool) else "number"
-        if self.op in {"all", "any"}:
-            child_types = [item._validate_types() for item in self.args or []]
-            if any(kind != "bool" for kind in child_types):
-                raise ValueError(f"{self.op} 只接受布尔表达式")
-            return "bool"
-        if self.op == "not":
-            if self.arg is None or self.arg._validate_types() != "bool":
-                raise ValueError("not.arg 必须是布尔表达式")
-            return "bool"
-        if self.op in {"gt", "gte", "lt", "lte", "cross_above", "cross_below"}:
-            if self.left is None or self.right is None:
-                raise ValueError(f"{self.op} 缺少比较参数")
-            if self.left._validate_types() != "number" or self.right._validate_types() != "number":
+        for slot, expected in spec.arg_types.items():
+            child = getattr(self, slot)
+            if isinstance(child, list):
+                child_types = [item._validate_types() for item in child]
+                if any(kind != expected for kind in child_types):
+                    if self.op in {"all", "any"}:
+                        raise ValueError(f"{self.op} 只接受布尔表达式")
+                    raise ValueError(f"{self.op} 只接受数值表达式")
+            elif child is None:
+                if self.op in {"gt", "gte", "lt", "lte", "cross_above", "cross_below"}:
+                    raise ValueError(f"{self.op} 缺少比较参数")
+                if self.op in {"add", "subtract", "multiply", "divide"}:
+                    raise ValueError(f"{self.op} 缺少运算参数")
+                if self.op == "not":
+                    raise ValueError("not.arg 必须是布尔表达式")
+            elif child._validate_types() != expected:
+                if self.op == "not":
+                    raise ValueError("not.arg 必须是布尔表达式")
                 raise ValueError(f"{self.op} 只接受数值表达式")
-            return "bool"
-        if self.op in {"add", "subtract", "multiply", "divide"}:
-            if self.left is None or self.right is None:
-                raise ValueError(f"{self.op} 缺少运算参数")
-            if self.left._validate_types() != "number" or self.right._validate_types() != "number":
-                raise ValueError(f"{self.op} 只接受数值表达式")
-            return "number"
-        for child in (self.input, self.high, self.low, self.close):
-            if child is not None and child._validate_types() != "number":
-                raise ValueError(f"{self.op} 只接受数值表达式")
-        return "bool" if self.op == "top_n" else "number"
+        return "bool" if spec.result_type == "bool" else "number"
 
     @model_serializer(mode="plain")
     def serialize_exact_shape(self) -> dict[str, Any]:
         """序列化时只保留该操作符的正式字段，不输出其它可选槽位的 null。"""
+        spec = OPERATORS[self.op]
         result: dict[str, Any] = {"op": self.op}
-        for key in _OP_FIELDS[self.op] - {"op"}:
+        for key in spec.fields - {"op"}:
             value = getattr(self, key)
             if isinstance(value, Expression):
                 result[key] = value.serialize_exact_shape()
@@ -558,6 +528,16 @@ class StrategyValidationResult(StrictModel):
     capability: CapabilityReport
 
 
+class ExpressionValidationResult(StrictModel):
+    valid: bool
+    expression_hash: str | None
+    canonical_json: str | None
+    result_type: str | None
+    min_bars: int | None
+    used_fields: list[str]
+    capability: CapabilityReport
+
+
 def _iter_spec_expressions(spec: StrategySpec):
     yield spec.entry.condition
     if spec.native_exit is not None:
@@ -614,6 +594,35 @@ def parse_strategy_spec(value: StrategySpec | dict[str, Any] | str) -> StrategyS
     if isinstance(value, str):
         value = json.loads(value)
     return StrategySpec.model_validate(value)
+
+
+def parse_expression(value: Expression | dict[str, Any] | str) -> Expression:
+    if isinstance(value, Expression):
+        return value
+    if isinstance(value, str):
+        value = json.loads(value)
+    return Expression.model_validate(value)
+
+
+def canonical_expression_json(expr_or_dict: Expression | dict[str, Any]) -> str:
+    parsed = (
+        expr_or_dict
+        if isinstance(expr_or_dict, Expression)
+        else Expression.model_validate(expr_or_dict)
+    )
+    return json.dumps(
+        parsed.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def expression_hash(expr_or_dict: Expression | dict[str, Any]) -> str:
+    return hashlib.sha256(
+        canonical_expression_json(expr_or_dict).encode("utf-8"),
+    ).hexdigest()
 
 
 def resolve_capabilities(
@@ -702,6 +711,125 @@ def validate_strategy_spec(
         spec=spec,
         spec_hash=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         canonical_json=canonical,
+        capability=capability,
+    )
+
+
+def _resolve_expression_capability_status(
+    issues: list[CapabilityIssue],
+) -> CapabilityReport:
+    if not issues:
+        return CapabilityReport(status=CapabilityStatus.SUPPORTED, issues=[])
+    priority = {
+        CapabilityStatus.BOUNDARY_DENIED: 0,
+        CapabilityStatus.SUBJECTIVE_ONLY: 1,
+        CapabilityStatus.MISSING_DATA: 2,
+        CapabilityStatus.MISSING_ENGINE: 3,
+        CapabilityStatus.SUPPORTED: 4,
+    }
+    status = min((item.status for item in issues), key=priority.__getitem__)
+    return CapabilityReport(status=status, issues=issues)
+
+
+def validate_expression(
+    value: Any,
+    *,
+    require_type: str = "number",
+    available_fields: set[str] | frozenset[str] | None = None,
+) -> ExpressionValidationResult:
+    """对单个表达式子树做解析、能力、AST 与类型校验。"""
+    issues: list[CapabilityIssue] = []
+
+    def add(status: CapabilityStatus, path: str, code: str, message: str) -> None:
+        item = CapabilityIssue(status=status, path=path, code=code, message=message)
+        if item not in issues:
+            issues.append(item)
+
+    _scan_raw_capabilities(value, "$", add)
+
+    expr: Expression | None = None
+    try:
+        expr = parse_expression(value)
+    except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        if isinstance(exc, ValidationError):
+            for error in exc.errors(include_url=False):
+                path = "$" + "".join(
+                    f"[{part}]" if isinstance(part, int) else f".{part}"
+                    for part in error["loc"]
+                )
+                add(
+                    CapabilityStatus.MISSING_ENGINE,
+                    path,
+                    "invalid_spec",
+                    error["msg"],
+                )
+        elif not issues:
+            add(CapabilityStatus.MISSING_ENGINE, "$", "invalid_spec", str(exc))
+
+    if expr is not None:
+        node_count, max_depth = _expression_stats(expr)
+        if node_count > MAX_AST_NODES:
+            add(
+                CapabilityStatus.MISSING_ENGINE,
+                "$",
+                "invalid_spec",
+                f"AST 节点数 {node_count} 超过 {MAX_AST_NODES}",
+            )
+        if max_depth > MAX_AST_DEPTH:
+            add(
+                CapabilityStatus.MISSING_ENGINE,
+                "$",
+                "invalid_spec",
+                f"AST 深度 {max_depth} 超过 {MAX_AST_DEPTH}",
+            )
+
+        if available_fields is not None:
+            for node in _walk_expression(expr):
+                if node.op == "field" and node.name is not None and node.name not in available_fields:
+                    add(
+                        CapabilityStatus.MISSING_DATA,
+                        "$.name",
+                        "field_not_available",
+                        f"本次数据快照缺少字段 {node.name}",
+                    )
+
+        if not issues:
+            try:
+                actual_type = expr._validate_types()
+                if actual_type != require_type:
+                    add(
+                        CapabilityStatus.MISSING_ENGINE,
+                        "$",
+                        "invalid_spec",
+                        f"表达式必须返回 {require_type}，实际返回 {actual_type}",
+                    )
+            except ValueError as exc:
+                add(CapabilityStatus.MISSING_ENGINE, "$", "invalid_spec", str(exc))
+
+    if not issues and expr is not None:
+        canonical = canonical_expression_json(expr)
+        return ExpressionValidationResult(
+            valid=True,
+            expression_hash=expression_hash(expr),
+            canonical_json=canonical,
+            result_type=expr._validate_types(),
+            min_bars=compute_min_bars(expr),
+            used_fields=sorted({
+                node.name
+                for node in _walk_expression(expr)
+                if node.op == "field" and node.name is not None
+            }),
+            capability=CapabilityReport(status=CapabilityStatus.SUPPORTED, issues=[]),
+        )
+
+    capability = _resolve_expression_capability_status(issues)
+    return ExpressionValidationResult(
+        valid=False,
+        expression_hash=None,
+        canonical_json=None,
+        result_type=None,
+        min_bars=None,
+        used_fields=[],
         capability=capability,
     )
 
@@ -841,13 +969,14 @@ def _scan_overlay_requirements(value: Any, add) -> None:
 
 __all__ = [
     "CapabilityIssue", "CapabilityReport", "CapabilityStatus", "DataRequirementSpec",
-    "ExecutionSpec", "Expression", "HoldingSpec", "MAX_AST_DEPTH", "MAX_AST_NODES",
-    "MAX_PARAMETER_COMBINATIONS", "MAX_WINDOW", "MetadataSpec", "OverlaysSpec",
-    "PortfolioConstraintsSpec", "PortfolioPositioningSpec", "REJECTION_RULE_METRICS",
-    "RejectionRuleSpec", "RuleSpec", "SCHEMA_VERSION",
+    "ExecutionSpec", "Expression", "ExpressionValidationResult", "HoldingSpec",
+    "MAX_AST_DEPTH", "MAX_AST_NODES", "MAX_PARAMETER_COMBINATIONS", "MAX_WINDOW",
+    "MetadataSpec", "OverlaysSpec", "PortfolioConstraintsSpec", "PortfolioPositioningSpec",
+    "REJECTION_RULE_METRICS", "RejectionRuleSpec", "RuleSpec", "SCHEMA_VERSION",
     "SUPPORTED_FIELDS", "SUPPORTED_OPERATORS", "SinglePositioningSpec", "StrategySpec",
     "StrategyCapabilityError", "StrategyValidationResult", "UniverseSpec",
-    "ValidationSpec", "canonical_spec_json",
-    "parse_strategy_spec", "resolve_capabilities", "strategy_spec_hash",
+    "ValidationSpec", "canonical_expression_json", "canonical_spec_json",
+    "expression_hash", "parse_expression", "parse_strategy_spec",
+    "resolve_capabilities", "strategy_spec_hash", "validate_expression",
     "validate_strategy_spec",
 ]

@@ -1223,6 +1223,27 @@ def load_bars_df(db: Session, code: str, start: date | None = None,
     return df
 
 
+def merge_snapshot_fields(
+    db: Session,
+    frames: dict[str, pd.DataFrame],
+    end: date | None = None,
+    *,
+    fields: list[str] | None = None,
+) -> dict[str, pd.DataFrame]:
+    """把估值/财务快照字段按 PIT 语义合并到多只股票的日线帧。
+
+    `end` 为合并截止日(默认取每帧自身最大日期),保证任一交易日只看到
+    当日及之前已发布的数据。没有可用记录的交易日为 NaN。
+    """
+    if not fields or not frames:
+        return frames
+    for code, df in frames.items():
+        if df.empty:
+            continue
+        frames[code] = attach_snapshot_fields(db, df, code, fields)
+    return frames
+
+
 def load_bars_df_bulk(db: Session, codes: list[str],
                       start: date | None = None, end: date | None = None,
                       *, extra_fields: list[str] | None = None) -> dict[str, pd.DataFrame]:
@@ -1253,9 +1274,9 @@ def load_bars_df_bulk(db: Session, codes: list[str],
     result: dict[str, pd.DataFrame] = {}
     for code, grp in frame.groupby("code"):
         cdf = grp.drop(columns=["code"]).reset_index(drop=True)
-        if extra_fields:
-            cdf = attach_snapshot_fields(db, cdf, code, extra_fields)
         result[code] = cdf
+    if extra_fields:
+        merge_snapshot_fields(db, result, end=end, fields=extra_fields)
     return result
 
 

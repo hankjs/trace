@@ -295,8 +295,58 @@ class IndexMember(Base):
     out_date: Mapped[date | None] = mapped_column(Date, nullable=True)
 
 
+class FactorDef(Base):
+    """动态因子定义。key 供选股配置/因子值 JSON 引用,expression_hash 用于去重与缓存。"""
+
+    __tablename__ = "quant_factor_def"
+    __table_args__ = (UniqueConstraint("key", name="uq_factor_def_key"),)
+
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(64), index=True)
+    name: Mapped[str] = mapped_column(String(128))
+    description: Mapped[str] = mapped_column(String(512), default="")
+    category: Mapped[str] = mapped_column(String(64), default="")
+    unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    direction: Mapped[str] = mapped_column(String(256), default="")
+    limits: Mapped[str] = mapped_column(String(256), default="")
+    value_type: Mapped[str] = mapped_column(String(16), default="number")
+    input_scale: Mapped[float | None] = mapped_column(Float, nullable=True)
+    expression: Mapped[dict] = mapped_column(JSON)
+    expression_hash: Mapped[str] = mapped_column(String(64), index=True)
+    min_bars: Mapped[int] = mapped_column(Integer, default=1)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now,
+    )
+
+
+class SelectionConfig(Base):
+    """选股流水线配置。is_active 标识当前生效配置,score_weights/hard_filters/vol_confirm
+    均为 JSON 以支持后续扩展,无需每新增一个配置项就改 schema。
+    """
+
+    __tablename__ = "quant_selection_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(64), default="default")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    score_weights: Mapped[dict] = mapped_column(JSON)
+    vol_confirm: Mapped[dict] = mapped_column(JSON)
+    hard_filters: Mapped[dict] = mapped_column(JSON)
+    top_n: Mapped[int] = mapped_column(Integer, default=30)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=datetime.now, onupdate=datetime.now,
+    )
+
+
 class FactorDaily(Base):
-    """每日因子值(股票池向量化计算,供选股/筛选用)"""
+    """每日因子值(股票池向量化计算,供选股/筛选用)。
+
+    values 是 key->value 的 JSON 对象,keys 与 quant_factor_def.key 对应。
+    改 JSON 后新增因子不再需要 schema 变更。
+    """
 
     __tablename__ = "quant_factor_daily"
     __table_args__ = (UniqueConstraint("code", "date", name="uq_factor_code_date"),)
@@ -305,13 +355,7 @@ class FactorDaily(Base):
     # code 不再单独建索引:与 uq_factor_code_date(code,date) 前缀完全冗余
     code: Mapped[str] = mapped_column(String(16))
     date: Mapped[date] = mapped_column(Date, index=True)
-    mom20: Mapped[float | None] = mapped_column(Float, nullable=True)
-    mom60: Mapped[float | None] = mapped_column(Float, nullable=True)
-    rsi14: Mapped[float | None] = mapped_column(Float, nullable=True)
-    atr_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
-    vol_ratio5: Mapped[float | None] = mapped_column(Float, nullable=True)
-    ma20_slope: Mapped[float | None] = mapped_column(Float, nullable=True)
-    amount_avg20: Mapped[float | None] = mapped_column(Float, nullable=True)
+    values: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
 
 
 class ValuationSnapshot(Base):

@@ -919,7 +919,7 @@ export type BacktestJobStatus = 'pending' | 'running' | 'done' | 'failed' | 'can
 // ---- 全局异步任务(/api/tasks,后端 app/tasks.py) ----
 
 export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
-export type TaskType = 'backtest' | 'sweep' | 'sensitivity'
+export type TaskType = 'backtest' | 'sweep' | 'sensitivity' | 'factor_backfill'
 
 export interface QuantTask {
   id: number
@@ -1416,6 +1416,97 @@ export interface AdminJobsResponse {
   jobs: AdminJob[]
 }
 
+// ---- 因子库 (factors) ----
+
+export type FactorDirection = 'asc' | 'desc' | string
+export type FactorValueType = 'number' | 'boolean' | 'string' | string
+
+export interface FactorDef {
+  id: number
+  key: string
+  name: string
+  description: string | null
+  category: string | null
+  unit: string | null
+  direction: FactorDirection | null
+  limits: string | null
+  value_type: FactorValueType | null
+  input_scale: number | null
+  expression: StrategyAstNode | Record<string, unknown>
+  expression_hash: string | null
+  min_bars: number | null
+  enabled: boolean
+  is_system: boolean
+  created_at: string | null
+  updated_at: string | null
+}
+
+export type HardFilter =
+  | { type: 'exclude_st' }
+  | { type: 'exclude_suspended' }
+  | { type: 'min_bars'; value: number }
+  | { type: 'factor_gte' | 'factor_lte' | 'factor_gt' | 'factor_lt'; factor: string; value: number }
+  | { type: 'row_flag'; field: string; value: boolean }
+
+export interface VolConfirmConfig {
+  factor: string
+  cap: number
+  weight: number
+}
+
+export interface SelectionConfig {
+  id: number
+  name: string
+  is_active: boolean
+  score_weights: Record<string, number>
+  vol_confirm: VolConfirmConfig
+  hard_filters: HardFilter[]
+  top_n: number
+  updated_at: string | null
+}
+
+export interface FactorValidationIssue {
+  status: string
+  path: string
+  code: string
+  message: string
+}
+
+export interface FactorValidationCapability {
+  status: string
+  issues: FactorValidationIssue[]
+}
+
+export interface ExpressionValidationResult {
+  valid: boolean
+  expression_hash: string | null
+  canonical_json: string | null
+  result_type: string | null
+  min_bars: number | null
+  used_fields: string[] | null
+  capability: FactorValidationCapability
+}
+
+export interface ReasonNode {
+  op: string
+  value?: number | null
+  field?: string | null
+  literal?: number | boolean | null
+  window?: number | null
+  shift?: number | null
+  periods?: number | null
+  ascending?: boolean | null
+  n?: number | null
+  children?: ReasonNode[]
+}
+
+export interface FactorPreviewResult {
+  code: string
+  dates: string[]
+  values: (number | null)[]
+  reason_tree: ReasonNode
+}
+
 export const api = {
   login(username: string, password: string) {
     return request<{ token: string; username: string; can_admin: boolean }>('/api/auth/login', {
@@ -1899,6 +1990,97 @@ export const api = {
       `/api/strategies/${id}/evidence`,
       { method: 'POST', body: JSON.stringify({ action }) },
     )
+  },
+
+  /** 因子库 */
+
+  listFactors() {
+    return request<{ items: FactorDef[] }>('/api/factors')
+  },
+
+  factor(key: string) {
+    return request<FactorDef>(`/api/factors/${encodeURIComponent(key)}`)
+  },
+
+  createFactor(body: {
+    key: string
+    name: string
+    description?: string
+    category?: string
+    unit?: string
+    direction?: string
+    limits?: string
+    value_type?: string
+    input_scale?: number | null
+    expression: StrategyAstNode | Record<string, unknown>
+    enabled?: boolean
+  }) {
+    return request<FactorDef>('/api/factors', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
+  updateFactor(
+    key: string,
+    body: Partial<Omit<FactorDef, 'id' | 'key' | 'created_at' | 'updated_at' | 'expression_hash' | 'is_system' | 'min_bars'>>,
+  ) {
+    return request<FactorDef>(`/api/factors/${encodeURIComponent(key)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    })
+  },
+
+  deleteFactor(key: string) {
+    return request<void>(`/api/factors/${encodeURIComponent(key)}`, { method: 'DELETE' })
+  },
+
+  validateFactorExpression(expression: StrategyAstNode | Record<string, unknown>) {
+    return request<ExpressionValidationResult>('/api/factors/validate', {
+      method: 'POST',
+      body: JSON.stringify({ expression }),
+    })
+  },
+
+  previewFactor(body: {
+    expression?: StrategyAstNode | Record<string, unknown>
+    factor_key?: string
+    code: string
+    days?: number
+  }) {
+    return request<FactorPreviewResult>('/api/factors/preview', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  },
+
+  getSelectionConfig() {
+    return request<SelectionConfig>('/api/factors/selection-config')
+  },
+
+  putSelectionConfig(body: {
+    name?: string
+    score_weights: Record<string, number>
+    vol_confirm: VolConfirmConfig
+    hard_filters: HardFilter[]
+    top_n: number
+  }) {
+    return request<SelectionConfig>('/api/factors/selection-config', {
+      method: 'PUT',
+      body: JSON.stringify(body),
+    })
+  },
+
+  backfillFactors(body: {
+    factor_key: string | null
+    start: string
+    end: string
+    codes?: string[]
+  }) {
+    return request<{ task: QuantTask }>('/api/factors/backfill', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
   },
 
   backfill(code: string, start?: string, end?: string) {

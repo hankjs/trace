@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0023_task
+-- Schema revision: 0024_dynamic_factors
 
 SET NAMES utf8mb4;
 
@@ -42,16 +42,46 @@ CREATE TABLE `quant_factor_daily` (
   `id` BIGINT NOT NULL AUTO_INCREMENT,
   `code` VARCHAR(16) NOT NULL,
   `date` DATE NOT NULL,
-  `mom20` FLOAT DEFAULT NULL,
-  `mom60` FLOAT DEFAULT NULL,
-  `rsi14` FLOAT DEFAULT NULL,
-  `atr_pct` FLOAT DEFAULT NULL,
-  `vol_ratio5` FLOAT DEFAULT NULL,
-  `ma20_slope` FLOAT DEFAULT NULL,
-  `amount_avg20` FLOAT DEFAULT NULL,
+  `values` JSON NOT NULL,
   PRIMARY KEY (`id`),
   UNIQUE KEY `uq_factor_code_date` (`code`, `date`),
   KEY `ix_quant_factor_daily_date` (`date`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_factor_def` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `key` VARCHAR(64) NOT NULL,
+  `name` VARCHAR(128) NOT NULL,
+  `description` VARCHAR(512) NOT NULL DEFAULT '',
+  `category` VARCHAR(64) NOT NULL DEFAULT '',
+  `unit` VARCHAR(32) DEFAULT NULL,
+  `direction` VARCHAR(256) NOT NULL DEFAULT '',
+  `limits` VARCHAR(256) NOT NULL DEFAULT '',
+  `value_type` VARCHAR(16) NOT NULL DEFAULT 'number',
+  `input_scale` FLOAT DEFAULT NULL,
+  `expression` JSON NOT NULL,
+  `expression_hash` VARCHAR(64) NOT NULL,
+  `min_bars` INT NOT NULL DEFAULT 1,
+  `enabled` TINYINT(1) NOT NULL DEFAULT 1,
+  `is_system` TINYINT(1) NOT NULL DEFAULT 0,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_factor_def_key` (`key`),
+  KEY `ix_quant_factor_def_expression_hash` (`expression_hash`),
+  KEY `ix_quant_factor_def_key` (`key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_selection_config` (
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `name` VARCHAR(64) NOT NULL DEFAULT 'default',
+  `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+  `score_weights` JSON NOT NULL,
+  `vol_confirm` JSON NOT NULL,
+  `hard_filters` JSON NOT NULL,
+  `top_n` INT NOT NULL DEFAULT 30,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `quant_fundamental_snapshot` (
@@ -594,8 +624,74 @@ VALUES
    '8d00c45330301d818cd97c1f9163da61f8fff519036de1c4e0f6e0a7657b4ffe', 'unverified', 1, CURRENT_TIMESTAMP,
    CURRENT_TIMESTAMP);
 
+-- 系统预置因子定义：与 app/catalog.py FACTOR_FIELDS 口径一致。
+INSERT INTO `quant_factor_def`
+  (`key`, `name`, `description`, `category`, `unit`, `direction`, `limits`,
+   `value_type`, `input_scale`, `expression`, `expression_hash`, `min_bars`,
+   `enabled`, `is_system`, `created_at`, `updated_at`)
+VALUES
+  ('mom20', '近20日涨跌幅', '当前收盘价相对20个交易日前的变化幅度。',
+   '趋势与动量', '%', '数值越高表示近期走势越强',
+   '使用复权日线计算，仅描述过去20个交易日，不代表未来收益。',
+   'number', 0.01,
+   '{\"input\":{\"name\":\"close\",\"op\":\"field\"},\"op\":\"momentum\",\"window\":20}',
+   '92dadb2caeb4523b4d7298763ea2ac2ffb8690f07dfc3b8d3f7c3712473a3d93',
+   21, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('mom60', '近60日涨跌幅', '当前收盘价相对60个交易日前的变化幅度。',
+   '趋势与动量', '%', '数值越高表示中期走势越强',
+   '使用复权日线计算，短期反转时可能滞后。',
+   'number', 0.01,
+   '{\"input\":{\"name\":\"close\",\"op\":\"field\"},\"op\":\"momentum\",\"window\":60}',
+   '9cd7a0c98b501e1e104f899aa4d5dc30197276e393eed5f1634f50541dbce69b',
+   61, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('rsi14', '近期强弱程度（RSI 14）', '比较近14日上涨和下跌力度，取值通常为0至100。',
+   '趋势与动量', '0-100', '高值偏强、低值偏弱，不能简单等同买卖点',
+   '强趋势中可长期处于高位或低位，应结合趋势和估值判断。',
+   'number', 1.0,
+   '{\"input\":{\"name\":\"close\",\"op\":\"field\"},\"op\":\"rsi\",\"window\":14}',
+   '5e36305481c85e09ac34a265bf1f94be2a5c8f89d775a1c6eefc1566a5e966b4',
+   15, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('atr_pct', '日常价格波动幅度', '14日平均真实波幅占当前收盘价的比例。',
+   '风险与波动', '%', '数值越高表示价格波动通常越大',
+   '反映历史波动，不预测方向；停牌或异常价格会影响口径。',
+   'number', 0.01,
+   '{\"left\":{\"close\":{\"name\":\"close\",\"op\":\"field\"},\"high\":{\"name\":\"high\",\"op\":\"field\"},\"low\":{\"name\":\"low\",\"op\":\"field\"},\"op\":\"atr\",\"window\":14},\"op\":\"divide\",\"right\":{\"name\":\"close\",\"op\":\"field\"}}',
+   '1cceae6cd71ca38caef6398a424b8f8feee10e1722628cb7029a6abe7ff44d64',
+   15, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('vol_ratio5', '成交量相对5日平均', '当日成交量相对过去5日平均成交量的倍数。',
+   '成交与流动性', '倍', '大于1表示成交量高于近期平均',
+   '日频近似量比，与行情软件的盘中量比口径不同。',
+   'number', 1.0,
+   '{\"input\":{\"name\":\"volume\",\"op\":\"field\"},\"op\":\"volume_ratio\",\"shift\":1,\"window\":5}',
+   'c9867e7be9f7e04e044733ce5a0f41f0a0a794af10f8a410c4d63d7bb7dba7b3',
+   6, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('ma20_slope', '20日平均价格趋势', '20日均线相对5个交易日前的变化幅度。',
+   '趋势与动量', '%', '正值表示20日均线向上',
+   '均线是滞后指标，快速转折时反应较慢。',
+   'number', 0.01,
+   '{\"left\":{\"left\":{\"input\":{\"name\":\"close\",\"op\":\"field\"},\"op\":\"ma\",\"window\":20},\"op\":\"divide\",\"right\":{\"input\":{\"input\":{\"name\":\"close\",\"op\":\"field\"},\"op\":\"ma\",\"window\":20},\"op\":\"shift\",\"periods\":5}},\"op\":\"subtract\",\"right\":{\"op\":\"literal\",\"value\":1}}',
+   '0a909dfc00af30c35fb9cb3c0341f69b2743216e3cf6a43ee140bfddd289751c',
+   25, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP),
+  ('amount_avg20', '近20日日均成交额', '近20个交易日成交额的平均值。',
+   '成交与流动性', '亿元', '数值越高通常表示交易更活跃',
+   '成交活跃不等同于公司质量或价格上涨。',
+   'number', 100000000.0,
+   '{\"input\":{\"name\":\"amount\",\"op\":\"field\"},\"op\":\"rolling_mean\",\"shift\":0,\"window\":20}',
+   '5fdc2b2d77752d93bb91eeaa7b83a7fc29719f216702a5829451e6b2907a38d7',
+   20, 1, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);
+
+-- 默认选股配置：与当前选股流水线口径一致。
+INSERT INTO `quant_selection_config`
+  (`name`, `is_active`, `score_weights`, `vol_confirm`, `hard_filters`, `top_n`, `updated_at`)
+VALUES
+  ('default', 1,
+   '{\"mom20\":0.5,\"mom60\":0.3,\"ma20_slope\":0.2}',
+   '{\"factor\":\"vol_ratio5\",\"cap\":3.0,\"weight\":0.05}',
+   '[{\"type\":\"exclude_st\"},{\"type\":\"exclude_suspended\"},{\"type\":\"min_bars\",\"value\":120},{\"type\":\"factor_gte\",\"factor\":\"amount_avg20\",\"value\":50000000},{\"type\":\"row_flag\",\"field\":\"above_ma20\",\"value\":true}]',
+   30, CURRENT_TIMESTAMP);
+
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0023_task');
+VALUES ('0024_dynamic_factors');
 
 COMMIT;
