@@ -11,6 +11,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ChevronDown, ChevronRight, Loader2, Play, RefreshCw, Timer } from 'lucide-vue-next'
 import { api, type AdminJob, type AdminJobRun } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
+import { confirmDialog } from '../confirmDialog'
 import { useAsyncAction } from '../useAsyncAction'
 
 const loading = ref(true)
@@ -76,7 +77,11 @@ async function trigger(job: AdminJob) {
   const hint = job.id === 'evening_pipeline'
     ? '盘后流水线包含日线采集、选股与信号计算,可能耗时数十分钟。'
     : ''
-  if (!window.confirm(`立即执行「${job.name}」一次？${hint}`)) return
+  const confirmed = await confirmDialog(`立即执行「${job.name}」一次？${hint}`, {
+    title: '手动执行定时任务',
+    confirmText: '立即执行',
+  })
+  if (!confirmed) return
   const ok = await run(async () => {
     await api.runAdminJob(job.id)
     await load()

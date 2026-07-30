@@ -23,6 +23,7 @@ import {
 } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import { confirmDialog } from '../confirmDialog'
 import StrategySpecEditor from '../components/StrategySpecEditor.vue'
 import {
   designCompleteReady,
@@ -335,7 +336,12 @@ async function toggleEnabled(strategy: Strategy) {
 async function deleteStrategy() {
   const strategy = selected.value
   if (!strategy || readonlyStrategy.value || usedByBacktests.value > 0) return
-  if (!window.confirm(`确认删除策略「${strategy.name}」？相关派生信号会一并删除，操作不可撤销。`)) return
+  const confirmed = await confirmDialog(`确认删除策略「${strategy.name}」？相关派生信号会一并删除，操作不可撤销。`, {
+    title: '删除策略',
+    tone: 'danger',
+    confirmText: '删除',
+  })
+  if (!confirmed) return
   await runAction(async () => {
     await api.deleteStrategy(strategy.id)
     selectedId.value = null

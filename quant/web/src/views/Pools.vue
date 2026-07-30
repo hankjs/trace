@@ -10,6 +10,7 @@ import { AlertTriangle, ClipboardPaste, Lock, Plus, Search, Trash2 } from 'lucid
 import { api, isPresetPool, normalizeStockCode, type Pool, type PoolMember } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import LoadingRows from '../components/LoadingRows.vue'
+import { confirmDialog } from '../confirmDialog'
 import { fmtPct, fmtPrice } from '../format'
 import { usePools } from '../pools'
 import { useAsyncAction } from '../useAsyncAction'
@@ -169,7 +170,12 @@ async function saveSettings() {
 async function deletePool() {
   const pool = selected.value
   if (!pool || readonlyPool.value) return
-  if (!window.confirm(`确认删除股票池「${pool.name}」？该操作不可撤销。`)) return
+  const confirmed = await confirmDialog(`确认删除股票池「${pool.name}」？该操作不可撤销。`, {
+    title: '删除股票池',
+    tone: 'danger',
+    confirmText: '删除',
+  })
+  if (!confirmed) return
   await runAction(async () => {
     await api.deletePool(pool.id)
     selectedId.value = null

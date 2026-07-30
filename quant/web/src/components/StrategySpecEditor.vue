@@ -3,6 +3,7 @@
 import { computed, reactive, ref } from 'vue'
 import { Plus, X } from 'lucide-vue-next'
 import type { Pool, StrategyAstNode } from '../api'
+import { confirmDialog } from '../confirmDialog'
 import type { StrategyEvidenceStatus, StrategySpecFormState } from '../strategySpecForm'
 import { parseRejectionRules } from '../strategySpecForm'
 import { SUPPORTED_FIELDS, usedFields } from '../specExpression'
@@ -151,12 +152,16 @@ function currentExprForTarget(target: SnippetTarget): StrategyAstNode | null {
   }
 }
 
-function applySnippet() {
+async function applySnippet() {
   const snip = selectedSnippet.value
   if (!snip || props.disabled) return
   const current = currentExprForTarget(snippetTarget.value)
   if (current && !isPlaceholderExpression(current)) {
-    if (!window.confirm('当前表达式非默认占位，确认整槽替换为片段？')) return
+    const confirmed = await confirmDialog('当前表达式非默认占位，确认整槽替换为片段？', {
+      title: '替换表达式',
+      confirmText: '替换',
+    })
+    if (!confirmed) return
   }
   const ast = snip.build({ ...snippetParams })
   switch (snippetTarget.value) {

@@ -27,6 +27,7 @@ import {
 } from 'lucide-vue-next'
 import { clearAuth, currentUsername, getToken, isAdmin } from './api'
 import { loadCatalog } from './catalog'
+import CoDialog from './components/CoDialog.vue'
 import OnboardingGuide from './components/OnboardingGuide.vue'
 import QuTour from './components/QuTour.vue'
 import ResearchAssistant from './components/ResearchAssistant.vue'
@@ -491,6 +492,7 @@ onBeforeUnmount(() => {
     <ResearchAssistant variant="mobile" :guide="guide" />
     <OnboardingGuide />
     <QuTour />
+    <CoDialog />
 
     <Transition name="nav-drawer">
       <div v-if="mobileNavOpen" class="fixed inset-0 z-50 lg:hidden" @keydown.esc="mobileNavOpen = false">

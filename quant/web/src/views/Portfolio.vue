@@ -9,6 +9,7 @@ import QuSelect from '../components/QuSelect.vue'
 import QuDatePicker from '../components/QuDatePicker.vue'
 import StockSearchInput from '../components/StockSearchInput.vue'
 import PortfolioResearchPlan from '../components/PortfolioResearchPlan.vue'
+import { confirmDialog } from '../confirmDialog'
 import { fmtAmount, fmtPrice, fmtQty, fmtSigned, localDateISO, pnlClass } from '../format'
 
 const summary = ref<PortfolioSummary | null>(null)
@@ -118,7 +119,12 @@ async function submit() {
 }
 
 async function removeTrade(id: number) {
-  if (!window.confirm(`确认删除成交记录 #${id}?`)) return
+  const confirmed = await confirmDialog(`确认删除成交记录 #${id}？该操作不可撤销。`, {
+    title: '删除成交记录',
+    tone: 'danger',
+    confirmText: '删除',
+  })
+  if (!confirmed) return
   try {
     await api.deleteTrade(id)
     await load()
