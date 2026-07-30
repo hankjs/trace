@@ -1,4 +1,4 @@
-.PHONY: server-dev client-dev admin-dev quant-dev quant-web-dev deploy deploy-cli deploy-quant app cli-dev cli
+.PHONY: server-dev client-dev admin-dev quant quant-web quant-slidev quant-slidev-build deploy deploy-cli deploy-quant deploy-quant-slidev app cli-dev cli
 
 # 后端开发服务 (0.0.0.0:3000)
 server-dev:
@@ -13,12 +13,20 @@ admin-dev:
 	cd admin && pnpm dev
 
 # quant 量化系统后端开发 (FastAPI, 0.0.0.0:8100, --reload)
-quant-dev:
+quant:
 	cd quant && uv run uvicorn app.main:app --reload --port 8100
 
 # quant 量化系统前端开发 (Vite, /api 代理到 8100)
-quant-web-dev:
+quant-web:
 	cd quant/web && pnpm dev
+
+# quant 系统介绍 Slidev 预览 (默认 http://localhost:3030)
+quant-slidev:
+	cd quant/slidev && pnpm dev
+
+# quant 系统介绍 Slidev 静态构建 (输出 quant/slidev/dist)
+quant-slidev-build:
+	cd quant/slidev && pnpm build
 
 # 构建桌面客户端 (Tauri release) 并安装到 /Applications
 app:
@@ -40,6 +48,11 @@ deploy-cli:
 # 跳过依赖安装: make deploy-quant SKIP_DEPS=--skip-deps
 deploy-quant:
 	./deploy/deploy-quant.sh $(SKIP_DEPS)
+
+# 部署 quant 系统介绍 Slidev 到线上 (同机 nginx 静态站, 端口 3030)
+# SSH_HOST 可覆盖, 默认 wananyun
+deploy-quant-slidev:
+	./deploy/deploy-quant-slidev.sh
 
 # hank-cli 远程终端节点开发 (前台运行，读取 ~/.hank-cli/config.toml)
 # 可用参数覆盖配置: make cli-dev SERVER=http://x:3000 USERNAME=u PASSWORD=p

@@ -62,7 +62,7 @@ Swagger UI：`http://localhost:8100/docs`。
 | `dev`（默认） | 只跑业务 API；**不**启动 APScheduler（日线/盘中/估值等定时同步） |
 | `prod` | 允许调度；仍受 `scheduler_enabled` 与 MySQL 互斥锁约束 |
 
-本地 `make quant-dev` 保持 `env = "dev"`。需要数据时用 `/api/admin/*` 手工触发，
+本地 `make quant` 保持 `env = "dev"`。需要数据时用 `/api/admin/*` 手工触发，
 不要在开发机开 `prod` 抢采集锁。线上 systemd（`hank-quant.service`）注入
 `QUANT_ENV=prod`。
 

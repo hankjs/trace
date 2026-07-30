@@ -93,8 +93,9 @@ make cli-dev                      # 前台开发运行 (可用 SERVER=/USERNAME=
 make cli                          # release 构建并装到 /opt/homebrew/bin
 
 # quant 量化系统 (独立 Python 项目, 详见 quant/AGENTS.md)
-make quant-dev                    # FastAPI, 0.0.0.0:8100
-make quant-web-dev                # 前端看板
+make quant                        # FastAPI, 0.0.0.0:8100
+make quant-web                    # 前端看板
+make quant-slidev                 # 系统介绍 Slidev 本地预览 (localhost:3030)
 
 # Makefile 汇总
 make server-dev / client-dev / admin-dev
@@ -137,9 +138,10 @@ make app                          # 构建 Trace.app 并安装到 /Applications
 通过 `deploy/` 下的脚本 SSH 到线上服务器（`SSH_HOST`，默认 `wananyun`），systemd 管理服务：
 
 ```bash
-make deploy        # server + admin: 服务器装依赖 -> 本地构建 admin -> rsync 源码 -> 服务器 cargo build -> /opt/hank -> systemctl 重启
-make deploy-cli    # hank-cli (需先跑过 make deploy)
-make deploy-quant  # quant 量化系统 (同机, 端口 8100)
+make deploy               # server + admin: 服务器装依赖 -> 本地构建 admin -> rsync 源码 -> 服务器 cargo build -> /opt/hank -> systemctl 重启
+make deploy-cli           # hank-cli (需先跑过 make deploy)
+make deploy-quant         # quant 量化系统 (同机, 端口 8100)
+make deploy-quant-slidev  # quant 系统介绍 Slidev (同机 nginx 静态, 端口 3030)
 # 跳过依赖安装: make deploy SKIP_DEPS=--skip-deps
 ```
 

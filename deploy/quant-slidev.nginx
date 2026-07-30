@@ -1,0 +1,39 @@
+# quant 系统介绍 Slidev 静态站
+# 部署后由 deploy-quant-slidev.sh 安装到 /etc/nginx/sites-enabled/quant-slidev
+server {
+    listen 3030 default_server;
+    listen [::]:3030 default_server;
+
+    server_name _;
+    root /opt/hank-quant-slidev;
+    index index.html;
+    charset utf-8;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    location = /index.html {
+        expires -1;
+        try_files $uri =404;
+    }
+
+    location /assets/ {
+        access_log off;
+        expires 1y;
+        try_files $uri =404;
+    }
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+}
