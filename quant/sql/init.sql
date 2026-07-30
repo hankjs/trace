@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0022_job_run
+-- Schema revision: 0023_task
 
 SET NAMES utf8mb4;
 
@@ -209,6 +209,26 @@ CREATE TABLE `quant_job_run` (
   `error` TEXT,
   PRIMARY KEY (`id`),
   KEY `ix_quant_job_run_job_id` (`job_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+-- 用户异步任务(全局任务系统),旁路表,无 FK
+CREATE TABLE `quant_task` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `user_id` VARCHAR(36) NOT NULL,
+  `type` VARCHAR(32) NOT NULL,
+  `status` VARCHAR(16) NOT NULL,
+  `title` VARCHAR(255) NOT NULL,
+  `params` JSON,
+  `ref_id` INT,
+  `result` JSON,
+  `error` TEXT,
+  `created_at` DATETIME NOT NULL,
+  `started_at` DATETIME,
+  `finished_at` DATETIME,
+  PRIMARY KEY (`id`),
+  KEY `ix_quant_task_user_id` (`user_id`),
+  KEY `ix_quant_task_status` (`status`),
+  KEY `ix_task_user_status` (`user_id`, `status`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
 CREATE TABLE `quant_valuation_snapshot` (
@@ -576,6 +596,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0022_job_run');
+VALUES ('0023_task');
 
 COMMIT;

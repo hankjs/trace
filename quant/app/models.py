@@ -11,6 +11,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -808,3 +809,38 @@ class JobRun(Base):
         DateTime, nullable=True)
     result: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class Task(Base):
+    """用户异步任务(全局任务系统,见 app/tasks.py)。
+
+    所有耗时操作(回测/参数扫描/成本敏感性…)统一走"提交即返回 202、
+    后台线程执行、任务中心查看"。每个用户同时只能有一个 pending/running
+    任务,提交时冲突返回 409。
+
+    - type: backtest 时 ref_id 指向 quant_backtest_run.id,结果仍走
+      回测查询接口;sweep/sensitivity 结果直接落 result 列(原同步响应体)。
+    - params 是提交时冻结的请求快照,worker 只按快照重放。
+    - status: pending → running → done|failed|cancelled。
+    """
+
+    __tablename__ = "quant_task"
+    __table_args__ = (
+        Index("ix_task_user_status", "user_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(16), default="pending", nullable=False, index=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    params: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    ref_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

@@ -21,6 +21,7 @@ import {
 import { metricName } from '../catalog'
 import { markEventDone } from '../onboarding'
 import { aggregateMetric, fmtPct, fmtPrice } from '../format'
+import { refreshTasks, waitForTask } from '../tasks'
 import EChart from '../components/EChart.vue'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import PoolSelect from '../components/PoolSelect.vue'
@@ -42,6 +43,7 @@ const watchlist = ref<WatchItem[]>([])
 const result = ref<BacktestResult | null>(null)
 const running = ref(false)
 const error = ref('')
+const notice = ref('')
 const runIdInput = ref('')
 let backtestAbort: AbortController | null = null
 /** 股票池:组合策略的研究范围;单标的策略在「按股票池」模式下使用 */
@@ -346,9 +348,15 @@ async function submitSweep(body: {
   param_grid?: Record<string, Array<number | boolean>>
   declared?: boolean
 }) {
+  error.value = ''
+  notice.value = ''
   running.value = true
+  backtestAbort?.abort()
+  const abort = new AbortController()
+  backtestAbort = abort
   try {
-    sweepResult.value = await api.sweepBacktest({
+    // 提交即返回(202):任务进全局队列后台执行,结果落 task.result
+    const submitted = await api.submitSweep({
       strategy_id: strategyId.value as number,
       codes: parsedCodes(),
       start: form.start,
@@ -356,11 +364,26 @@ async function submitSweep(body: {
       costs: runCosts(),
       ...body,
     })
+    // 兼容同步模式(后端任务系统关闭时):直接返回扫描结果
+    if ('results' in (submitted as unknown as SweepResult)) {
+      sweepResult.value = submitted as unknown as SweepResult
+      return
+    }
+    notice.value = `任务 #${submitted.id} 已提交,后台运行中;可离开页面,在任务中心查看进度`
+    void refreshTasks()
+    const task = await waitForTask(submitted.id, { signal: abort.signal })
+    if (task.status === 'failed') throw new Error(task.error || '参数扫描失败')
+    if (task.status === 'cancelled') throw new Error('任务已取消')
+    sweepResult.value = (task.result ?? null) as SweepResult | null
+    notice.value = ''
   } catch (e) {
-    sweepResult.value = null
-    error.value = (e as Error).message
+    if ((e as Error).message !== '已取消') {
+      sweepResult.value = null
+      error.value = (e as Error).message
+    }
   } finally {
     running.value = false
+    if (backtestAbort === abort) backtestAbort = null
   }
 }
 
@@ -560,6 +583,7 @@ function parsedCodes(): string[] {
 
 async function run() {
   error.value = ''
+  notice.value = ''
   // 组合策略始终可用池;单标的策略仅在「按股票池」模式下用池,与手动 codes 互斥
   const usePool = poolId.value !== null && (isPortfolio.value || scopeMode.value === 'pool')
   const codes = usePool ? [] : parsedCodes()
@@ -580,9 +604,12 @@ async function run() {
     return
   }
   running.value = true
-  backtestAbort = new AbortController()
+  backtestAbort?.abort()
+  const abort = new AbortController()
+  backtestAbort = abort
   try {
-    result.value = await api.runBacktest({
+    // 提交即返回(202):任务进全局队列后台执行,不阻塞页面
+    const submitted = await api.submitBacktest({
       strategy_id: strategyId.value,
       codes,
       start: form.start,
@@ -591,15 +618,33 @@ async function run() {
       // 单标的「按股票池」模式同样留空 codes 并下发 pool_id
       ...(usePool && !codes.length ? { pool_id: poolId.value! } : {}),
       costs: runCosts(),
-    }, { signal: backtestAbort.signal })
+    })
     markEventDone('run_backtest')
+    // 兼容同步模式(后端任务系统关闭时):直接返回完整结果
+    if (!submitted.status || submitted.status === 'done') {
+      result.value = submitted
+      return
+    }
+    if (submitted.status === 'failed') {
+      throw new Error(submitted.error || '回测失败')
+    }
+    const runId = submitted.run_id
+    notice.value = `任务 #${submitted.task_id} 已提交,后台运行中;可离开页面,在任务中心查看进度`
+    void refreshTasks()
+    if (submitted.task_id) {
+      const task = await waitForTask(submitted.task_id, { signal: abort.signal })
+      if (task.status === 'failed') throw new Error(task.error || '回测失败')
+      if (task.status === 'cancelled') throw new Error('任务已取消')
+    }
+    result.value = await api.getBacktest(runId)
+    notice.value = ''
   } catch (e) {
-    if ((e as Error).message !== '回测已取消') {
+    if ((e as Error).message !== '已取消') {
       error.value = (e as Error).message
     }
   } finally {
     running.value = false
-    backtestAbort = null
+    if (backtestAbort === abort) backtestAbort = null
   }
 }
 
@@ -648,6 +693,25 @@ onMounted(async () => {
   if (q) {
     runIdInput.value = String(q)
     await loadRun()
+  }
+  // 支持 ?sweep_task=1 从任务中心查看已完成的参数扫描结果
+  const sweepTaskId = Number(
+    Array.isArray(route.query.sweep_task) ? route.query.sweep_task[0] : route.query.sweep_task,
+  )
+  if (sweepTaskId) {
+    try {
+      const task = await api.getTask(sweepTaskId)
+      if (task.type === 'sweep' && task.status === 'done' && task.result) {
+        mode.value = 'sweep'
+        sweepResult.value = task.result as SweepResult
+      } else if (task.type === 'sweep') {
+        error.value = task.status === 'failed'
+          ? `扫描任务失败: ${task.error ?? '未知错误'}`
+          : '扫描任务尚未完成,请稍后在任务中心查看'
+      }
+    } catch (e) {
+      error.value = (e as Error).message
+    }
   }
 })
 
@@ -857,6 +921,7 @@ watch(
     </form>
 
     <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <InlineFeedback v-else-if="notice" tone="info">{{ notice }}</InlineFeedback>
 
     <!-- 参数扫描结果 -->
     <template v-if="mode === 'sweep' && sweepResult">

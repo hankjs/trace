@@ -914,7 +914,29 @@ export interface BacktestDataQuality {
   warnings?: string[]
 }
 
-export type BacktestJobStatus = 'pending' | 'running' | 'done' | 'failed'
+export type BacktestJobStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
+
+// ---- 全局异步任务(/api/tasks,后端 app/tasks.py) ----
+
+export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
+export type TaskType = 'backtest' | 'sweep' | 'sensitivity'
+
+export interface QuantTask {
+  id: number
+  type: TaskType
+  status: TaskStatus
+  title: string
+  /** backtest 任务指向回测编号;其余类型为 null */
+  ref_id: number | null
+  /** 提交时冻结的请求快照 */
+  params: Record<string, unknown>
+  /** 仅详情接口返回:sweep/sensitivity 的结果(原同步响应体) */
+  result?: unknown
+  error: string | null
+  created_at: string | null
+  started_at: string | null
+  finished_at: string | null
+}
 
 export interface ExecutionAttribution {
   buy_blocked_limit_up_or_halt?: number
@@ -1004,7 +1026,9 @@ export interface ExperimentDetail extends ExperimentSummary {
 
 export interface BacktestResult {
   run_id: number
-  /** pending/running 时 metrics/equity 可能为空;轮询直至 done|failed */
+  /** 202 接受时关联的全局任务编号(异步模式) */
+  task_id?: number
+  /** pending/running 时 metrics/equity 可能为空;终态后才有完整结果 */
   status?: BacktestJobStatus
   error?: string | null
   strategy_id?: number
@@ -1664,59 +1688,19 @@ export const api = {
     return request<{ deleted: number }>(`/api/pools/${id}/members/${code}`, { method: 'DELETE' })
   },
 
-  async runBacktest(
-    body: {
-      strategy_id: number
-      codes: string[]
-      start: string
-      end: string
-      pool_id?: number
-      costs?: BacktestCostSnapshot
-    },
-    opts?: { signal?: AbortSignal }
-  ) {
-    const signal = opts?.signal
-    if (signal?.aborted) throw new Error('回测已取消')
-
-    const initial = await request<BacktestResult>('/api/backtests', {
+  /** 提交回测:202 立即返回(含 run_id/task_id),后台执行,不阻塞等待 */
+  submitBacktest(body: {
+    strategy_id: number
+    codes: string[]
+    start: string
+    end: string
+    pool_id?: number
+    costs?: BacktestCostSnapshot
+  }) {
+    return request<BacktestResult>('/api/backtests', {
       method: 'POST',
       body: JSON.stringify(body),
-      signal,
     })
-    if (signal?.aborted) throw new Error('回测已取消')
-    // 同步路径直接 done;异步路径 202 pending 后轮询直到完成
-    if (!initial.status || initial.status === 'done' || initial.status === 'failed') {
-      if (initial.status === 'failed') {
-        throw new Error(initial.error || '回测失败')
-      }
-      return initial
-    }
-    const runId = initial.run_id
-    const deadline = Date.now() + 10 * 60 * 1000
-    while (Date.now() < deadline) {
-      if (signal?.aborted) throw new Error('回测已取消')
-      await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, 1200)
-        if (!signal) return
-        const onAbort = () => {
-          clearTimeout(timer)
-          reject(new Error('回测已取消'))
-        }
-        if (signal.aborted) {
-          onAbort()
-          return
-        }
-        signal.addEventListener('abort', onAbort, { once: true })
-      })
-      const current = await request<BacktestResult>(`/api/backtests/${runId}`, { signal })
-      if (current.status === 'done' || current.status === 'failed' || !current.status) {
-        if (current.status === 'failed') {
-          throw new Error(current.error || '回测失败')
-        }
-        return current
-      }
-    }
-    throw new Error(`回测 #${runId} 超时仍未完成，可稍后用编号查询`)
   },
 
   getBacktest(runId: number) {
@@ -1848,18 +1832,8 @@ export const api = {
     costs?: BacktestCostSnapshot
     slippage_multipliers?: number[]
   }) {
-    return request<{
-      strategy_id: number
-      base_slippage: number
-      results: Array<{
-        slippage_multiplier: number
-        slippage: number
-        metrics?: Partial<BacktestMetrics>
-        error?: string
-        execution_attribution?: ExecutionAttribution
-      }>
-      disclaimer: string
-    }>('/api/backtest/sensitivity', {
+    // 异步模式 202 返回任务;结果落 task.result
+    return request<QuantTask>('/api/backtest/sensitivity', {
       method: 'POST',
       body: JSON.stringify(body),
     })
@@ -1888,7 +1862,8 @@ export const api = {
     return request<{ run_at?: string; items: LeaderboardItem[] }>('/api/backtest/leaderboard')
   },
 
-  sweepBacktest(body: {
+  /** 提交参数扫描:202 立即返回任务,后台执行,结果落 task.result */
+  submitSweep(body: {
     strategy_id: number
     codes: string[]
     start: string
@@ -1898,10 +1873,24 @@ export const api = {
     /** true 时忽略 param_grid,按规格 validation.parameter_scans 声明扫描 */
     declared?: boolean
   }) {
-    return request<SweepResult>('/api/backtest/sweep', {
+    return request<QuantTask>('/api/backtest/sweep', {
       method: 'POST',
       body: JSON.stringify(body),
     })
+  },
+
+  // ---- 全局异步任务 ----
+
+  listTasks(limit = 50) {
+    return request<{ tasks: QuantTask[] }>(`/api/tasks?limit=${limit}`)
+  },
+
+  getTask(id: number) {
+    return request<QuantTask>(`/api/tasks/${id}`)
+  },
+
+  cancelTask(id: number) {
+    return request<QuantTask>(`/api/tasks/${id}/cancel`, { method: 'POST' })
   },
 
   /** 证据状态手动操作:标记设计完成 / 否决复位;其余状态由回测自动推进 */

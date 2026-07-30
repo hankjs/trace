@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0022_job_run"}
+    assert heads == {"0023_task"}
     assert current_heads(migrated_db) == heads
 
 
@@ -89,6 +89,7 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_stock",
         "quant_strategy",
         "quant_strategy_eval",
+        "quant_task",
         "quant_trade",
         "quant_trade_calendar",
         "quant_user_settings",

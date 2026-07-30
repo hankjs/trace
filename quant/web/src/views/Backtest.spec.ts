@@ -141,7 +141,7 @@ beforeEach(() => {
 describe('saved StrategySpec backtest workflow', () => {
   it('submits only the saved strategy id and shows immutable evidence', async () => {
     const { wrapper, api } = await mountPage(strategy())
-    const run = vi.spyOn(api, 'runBacktest').mockResolvedValue(backtestResult())
+    const run = vi.spyOn(api, 'submitBacktest').mockResolvedValue(backtestResult())
     await fillScope(wrapper)
 
     await wrapper.get('form').trigger('submit')
@@ -155,7 +155,6 @@ describe('saved StrategySpec backtest workflow', () => {
       costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
     })
     expect(run.mock.calls[0][0]).not.toHaveProperty('params')
-    expect(run.mock.calls[0][1]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(wrapper.text()).toContain('不可变执行证据')
     expect(wrapper.text()).toContain('与当前策略一致')
     expect(wrapper.text()).toContain('strategy-compiler-v1')
@@ -165,7 +164,8 @@ describe('saved StrategySpec backtest workflow', () => {
 
   it('uses only controlled $.path values for a sweep', async () => {
     const { wrapper, api } = await mountPage(strategy())
-    const sweep = vi.spyOn(api, 'sweepBacktest').mockResolvedValue({
+    // 模拟后端任务系统关闭时的同步响应(带 results 直接返回)
+    const sweep = vi.spyOn(api, 'submitSweep').mockResolvedValue({
       strategy_id: 7,
       strategy_name: '20 日放量突破',
       template: 'strategy_spec',
@@ -174,7 +174,7 @@ describe('saved StrategySpec backtest workflow', () => {
       start: '2024-01-01',
       end: '2024-12-31',
       results: [],
-    })
+    } as never)
 
     await wrapper.findAll('button').find((button) => button.text() === '参数扫描')!.trigger('click')
     await fillScope(wrapper)
@@ -196,7 +196,7 @@ describe('saved StrategySpec backtest workflow', () => {
 
   it('runs a single strategy against a pool', async () => {
     const { wrapper, api } = await mountPage(strategy())
-    const run = vi.spyOn(api, 'runBacktest').mockResolvedValue(backtestResult())
+    const run = vi.spyOn(api, 'submitBacktest').mockResolvedValue(backtestResult())
     await pickDate(wrapper, '开始日期', '2024-01-01')
     await pickDate(wrapper, '结束日期', '2024-12-31')
 
@@ -216,7 +216,6 @@ describe('saved StrategySpec backtest workflow', () => {
       pool_id: 2,
       costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
     })
-    expect(run.mock.calls[0][1]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
   it('blocks a strategy with capability failures', async () => {

@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .api import (admin, auth, backtest, catalog, experiments, market, pools,
                   portfolio, research_plans, selection, settings as settings_api,
-                  signals, strategies, watchlist)
+                  signals, strategies, tasks, watchlist)
 from .auth import require_admin, require_client
 from .config import settings
 from .db import engine
@@ -28,6 +28,7 @@ from . import models  # noqa: F401 - 确保模型注册到 Base.metadata
 from .migrations import check_schema_version
 from .scheduler import start_scheduler, stop_scheduler
 from .scheduler_lock import acquire_scheduler_slot, release_scheduler_slot
+from .tasks import recover_tasks, shutdown_tasks
 
 logging.basicConfig(
     level=logging.INFO,
@@ -48,7 +49,10 @@ async def lifespan(app: FastAPI):
     owns_scheduler = acquire_scheduler_slot()
     if owns_scheduler:
         start_scheduler()
+    # 异步任务恢复:中断的 running 标记失败,pending 重新派发
+    recover_tasks()
     yield
+    shutdown_tasks()
     if owns_scheduler:
         stop_scheduler()
         release_scheduler_slot()
@@ -81,6 +85,7 @@ app.include_router(backtest.router, dependencies=_auth)
 app.include_router(backtest.plural_router, dependencies=_auth)
 app.include_router(experiments.router, dependencies=_auth)
 app.include_router(selection.router, dependencies=_auth)
+app.include_router(tasks.router, dependencies=_auth)
 app.include_router(admin.router, dependencies=[Depends(require_admin)])
 
 

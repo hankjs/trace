@@ -33,6 +33,7 @@ const router = createRouter({
       },
     },
     { path: '/portfolio', name: 'portfolio', component: () => import('./views/Portfolio.vue') },
+    { path: '/tasks', name: 'tasks', component: () => import('./views/Tasks.vue') },
     { path: '/catalog', name: 'catalog', component: () => import('./views/Catalog.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue') },
     { path: '/admin/jobs', name: 'admin-jobs', component: () => import('./views/AdminJobs.vue'), meta: { admin: true } },

@@ -72,6 +72,11 @@ class Settings:
         self.schema_strict: bool = True
         # HTTP 入口是否异步回测(BackgroundTasks)。生产默认 True;pytest 在 conftest 关。
         self.backtest_async: bool = True
+        # 全局异步任务系统(app/tasks.py):提交即返回 202、后台线程池执行。
+        # 生产默认 True;pytest 在 conftest 关掉后任务提交即同步内联执行。
+        self.task_async: bool = True
+        # 任务执行线程池大小(每用户同时只允许一个任务,这里限制全局并发)
+        self.task_workers: int = 2
         # 盘后日 K 是否走 baostock 按日批量链路(P2)。默认关闭:
         # 换算口径待 P0 spike 验证(docs/baostock-bulk-ingest.md §3),验证前不开生产。
         self.bulk_daily_bars: bool = False
@@ -103,6 +108,10 @@ class Settings:
                 self.schema_strict = bool(local["schema_strict"])
             if "backtest_async" in local:
                 self.backtest_async = bool(local["backtest_async"])
+            if "task_async" in local:
+                self.task_async = bool(local["task_async"])
+            if "task_workers" in local:
+                self.task_workers = int(local["task_workers"])
             if "bulk_daily_bars" in local:
                 self.bulk_daily_bars = bool(local["bulk_daily_bars"])
 

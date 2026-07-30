@@ -17,3 +17,12 @@ def _sync_backtest_for_tests():
     settings.backtest_async = False
     yield
     settings.backtest_async = previous
+
+
+@pytest.fixture(autouse=True)
+def _sync_tasks_for_tests():
+    """任务系统默认同步内联执行:submit_task 返回时任务已到终态。"""
+    previous = settings.task_async
+    settings.task_async = False
+    yield
+    settings.task_async = previous

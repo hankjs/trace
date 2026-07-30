@@ -13,6 +13,7 @@ import {
   FlaskConical,
   Layers,
   LayoutDashboard,
+  ListChecks,
   ListFilter,
   LogOut,
   Menu,
@@ -36,6 +37,7 @@ import ThemeToggle from './components/ThemeToggle.vue'
 import type { ResearchGuide } from './guides'
 import { resetPools } from './pools'
 import { resetStrategies } from './strategies'
+import { activeTasks, refreshTasks, resetTasks } from './tasks'
 
 const route = useRoute()
 const router = useRouter()
@@ -51,6 +53,7 @@ function logout() {
   resetStrategies()
   resetPools()
   resetCatalog()
+  resetTasks()
   router.push('/login')
 }
 
@@ -110,6 +113,7 @@ const navGroups = computed(() => {
         },
         { to: { name: 'portfolio' }, name: 'portfolio', label: '持仓记录', icon: BriefcaseBusiness },
         { to: { name: 'catalog' }, name: 'catalog', label: '研究词典', icon: BookOpen },
+        { to: { name: 'tasks' }, name: 'tasks', label: '任务中心', icon: ListChecks },
       ],
     },
   ]
@@ -137,6 +141,7 @@ const routeTitles: Record<string, string> = {
   'strategies-manage': '策略管理',
   portfolio: '持仓记录',
   catalog: '研究词典',
+  tasks: '任务中心',
   stock: '个股研究',
   settings: '账户设置',
   'admin-jobs': '定时任务',
@@ -154,6 +159,7 @@ const routeDescriptions: Record<string, string> = {
   'strategies-manage': '新建、调参与维护自己的策略，公共策略只读。',
   portfolio: '记录已在外部交易软件中完成的成交，并查看持仓估值。',
   catalog: '中文名称用于阅读，英文 key 用于对照系统参数。',
+  tasks: '回测、参数扫描等耗时任务在后台执行，这里查看进度与结果。同一时刻只能运行一个任务。',
   settings: '记录与实盘能力相关的偏好，系统不会代为下单。',
   'admin-jobs': '查看数据采集与研究流水线的调度状态，并可手动触发一次执行。',
 }
@@ -305,7 +311,10 @@ watch(mobileNavOpen, (open) => {
 })
 
 onMounted(() => {
-  if (getToken()) void loadCatalog()
+  if (getToken()) {
+    void loadCatalog()
+    void refreshTasks()
+  }
   document.addEventListener('keydown', onGlobalKeydown)
 })
 
@@ -458,6 +467,19 @@ onBeforeUnmount(() => {
           <span class="inline-flex items-center gap-1.5"><span class="h-1.5 w-1.5 rounded-full bg-down" />日频研究模式</span>
         </div>
 
+        <router-link
+          :to="{ name: 'tasks' }"
+          class="icon-button relative shrink-0"
+          title="任务中心"
+          active-class="!bg-active !text-text-primary"
+        >
+          <ListChecks :size="17" />
+          <span
+            v-if="activeTasks.length"
+            class="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-accent px-0.5 text-[9px] font-semibold leading-none text-on-accent"
+          >{{ activeTasks.length }}</span>
+          <span class="sr-only">任务中心</span>
+        </router-link>
         <ThemeToggle />
         <span class="hidden max-w-24 truncate text-xs text-text-tertiary md:block">{{ username }}</span>
         <router-link
