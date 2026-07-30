@@ -114,6 +114,7 @@ def test_trading_day_runs_ingest(monkeypatch):
         db.commit()
 
     monkeypatch.setattr(scheduler, "SessionLocal", maker)
+    monkeypatch.setattr(scheduler.settings, "bulk_daily_bars", False)
     _no_baostock_login(monkeypatch)
     calls: list[str] = []
     monkeypatch.setattr(
@@ -142,6 +143,7 @@ def test_session_poison_isolated_failing_code_does_not_break_rest(monkeypatch):
         db.commit()
 
     monkeypatch.setattr(scheduler, "SessionLocal", maker)
+    monkeypatch.setattr(scheduler.settings, "bulk_daily_bars", False)
     monkeypatch.setattr(scheduler, "INGEST_BATCH_SIZE", 50)  # 全部挤进一个 Session
     _no_baostock_login(monkeypatch)
     monkeypatch.setattr(scheduler.ingest, "cleanup_snapshots", lambda *a: 0)

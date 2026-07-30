@@ -142,3 +142,37 @@ def test_top_scored_codes_reflects_config():
         codes = top_scored_codes(db, n=1, as_of=day)
 
     assert codes == ["sh.600001"]
+
+
+def test_run_selection_factor_codes_full_market():
+    """factor_codes 超集:池外股票也落因子行,但 picks 只来自池内。"""
+    with _db() as db:
+        seed_factor_defs(db)
+        seed_stock(db, "sh.600001")
+        seed_stock(db, "sz.300002")
+        day = date(2024, 6, 28)
+        start = day - timedelta(days=250)
+        _seed_bars(db, "sh.600001", start, day, trend="up")
+        _seed_bars(db, "sz.300002", start, day, trend="down")
+        seed_selection_config(db, overrides={
+            "score_weights": {"mom20": 1.0},
+            "vol_confirm": {"factor": "vol_ratio5", "cap": 3.0, "weight": 0.0},
+            "hard_filters": [{"type": "exclude_st"}],
+            "top_n": 30,
+        })
+        result = run_selection(
+            db, day=day,
+            codes=["sh.600001"],                      # 选股池只有 1 只
+            factor_codes=["sh.600001", "sz.300002"],  # 因子计算覆盖 2 只
+        )
+
+    # 池外股票也有因子行
+    outside = db.execute(select(FactorDaily).where(
+        FactorDaily.code == "sz.300002", FactorDaily.date == day,
+    )).scalar_one_or_none()
+    assert outside is not None and outside.values.get("mom20") is not None
+    # picks 只来自池内
+    picks = db.execute(select(Pick.code).where(Pick.date == day)).scalars().all()
+    assert picks == ["sh.600001"]
+    assert result["factor_scope"] == 2
+    assert result["pool"] == 1

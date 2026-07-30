@@ -482,6 +482,7 @@ def test_switch_on_uses_bulk_path(monkeypatch):
     _seed_calendar_and_pool(maker, DAY, ["sh.600519", "bj.920000"])
     monkeypatch.setattr(scheduler, "SessionLocal", maker)
     monkeypatch.setattr(scheduler.settings, "bulk_daily_bars", True)
+    monkeypatch.setattr(scheduler.settings, "full_market_daily", False)
     monkeypatch.setattr(scheduler.ingest, "cleanup_snapshots", lambda *a: 0)
     monkeypatch.setattr(
         scheduler.ingest, "ingest_daily",
@@ -502,4 +503,31 @@ def test_switch_on_uses_bulk_path(monkeypatch):
     assert captured["codes"] == {"sh.600519", "bj.920000"}
     assert result["succeeded"] == 1
     # bj.920000 不在批量结果中,但不计入 empty
+    assert result["empty"] == []
+
+
+def test_full_market_daily_passes_none_codes(monkeypatch):
+    """full_market_daily 开启:批量链路收到 codes=None(整包写入全市场)。"""
+    maker = _memory_sessionmaker()
+    _seed_calendar_and_pool(maker, DAY, ["sh.600519"])
+    monkeypatch.setattr(scheduler, "SessionLocal", maker)
+    monkeypatch.setattr(scheduler.settings, "bulk_daily_bars", True)
+    monkeypatch.setattr(scheduler.settings, "full_market_daily", True)
+    monkeypatch.setattr(scheduler.ingest, "cleanup_snapshots", lambda *a: 0)
+    monkeypatch.setattr(
+        scheduler.ingest, "ingest_daily",
+        lambda *a, **kw: (_ for _ in ()).throw(
+            AssertionError("批量模式不应走按 code 路径")))
+    captured: dict = {}
+
+    def fake_market_day(db, day, codes=None, backfill_start=None):
+        captured["codes"] = codes
+        return {"codes": 5200, "failed": [], "written_codes": ["sh.600519"]}
+
+    monkeypatch.setattr(scheduler.ingest, "ingest_market_day", fake_market_day)
+
+    result = scheduler.job_daily_bars(DAY)
+
+    assert captured["codes"] is None
+    assert result["succeeded"] == 5200
     assert result["empty"] == []

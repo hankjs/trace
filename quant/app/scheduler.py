@@ -37,7 +37,7 @@ from .data import calendar as trade_calendar
 from .data.clock import SHANGHAI_TZ, now_cst
 from .data.quality import refresh_data_quality_cache
 from .db import SessionLocal
-from .models import Pick, WatchlistItem
+from .models import DailyBar, Pick, WatchlistItem
 from .selection.pipeline import run_selection
 from .research_plan.pipeline import run_portfolio_plans
 from .research_plan.retention import prune_research_plans
@@ -122,23 +122,27 @@ def _ingest_batch(codes: list[str], watch_set: set[str],
 EMPTY_RATIO_ABORT = 0.5
 
 
-def _ingest_market_day(day: date, codes: list[str]) -> tuple[int, list[str], list[str]]:
+def _ingest_market_day(day: date, codes: list[str] | None) -> tuple[int, list[str], list[str]]:
     """按日批量采集(开关 bulk_daily_bars 开启时),返回 (成功数, 失败, 无当日数据)。
 
     一次 Session 即可:批量链路只有 2 次 baostock 调用 + 整行 upsert,
     不存在按 code 循环的 Session 中毒面。因子按日同步(P3)在
     ingest.ingest_market_day 内部完成(同一次批量因子请求,不重复调用)。
     北交所不在批量结果中,不计入 empty(它们走新浪源,见 ingest.sync_bj_market)。
+    codes=None 时写全市场(full_market_daily);此时 empty 恒为空——
+    全市场口径无法廉价地区分停牌与漏数,异常检测看日志里的写入只数。
     """
     with SessionLocal() as db:
         try:
             res = ingest.ingest_market_day(
-                db, day, codes=set(codes),
+                db, day, codes=set(codes) if codes is not None else None,
                 backfill_start=date.fromisoformat(settings.backfill_start))
         except Exception:  # noqa: BLE001
             db.rollback()
             logger.exception("盘后批量日线失败 %s", day)
-            return 0, sorted(codes), []
+            return 0, sorted(codes or []), []
+    if codes is None:
+        return res["codes"], res["failed"], []
     written = set(res["written_codes"])
     empty = [c for c in codes
              if c not in written and not ingest.is_bj_code(c)]
@@ -163,7 +167,9 @@ def job_daily_bars(day: date | None = None) -> dict:
     logger.info("盘后日线开始: 池内 %d 只,自选 %d 只,批量=%s",
                 len(pool), len(watch), settings.bulk_daily_bars)
     if settings.bulk_daily_bars:
-        succeeded, failed, empty = _ingest_market_day(day, codes)
+        # full_market_daily: 批量结果整包写入(全 A),不再裁到池内+自选
+        succeeded, failed, empty = _ingest_market_day(
+            day, None if settings.full_market_daily else codes)
     else:
         # 全程复用一次 baostock 登录(可重入),Session 则按批切分
         with baostock_client.login_session():
@@ -191,12 +197,25 @@ def job_daily_bars(day: date | None = None) -> dict:
 
 
 def job_factors_and_selection() -> dict | None:
-    """17:00 因子 + 选股"""
+    """17:00 因子 + 选股
+
+    full_market_daily 开启时,因子计算覆盖当日有行情的全体代码(全 A 落
+    quant_factor_daily),选股仍只在池内进行。代价:每日从库多读约
+    75 万行行情(几十 MB),写入仅 ~5 千行 JSON。
+    """
     if not _is_trading_day():
         return None
     with SessionLocal() as db:
         try:
-            result = run_selection(db)
+            factor_codes = None
+            if settings.full_market_daily:
+                factor_codes = list(db.execute(
+                    select(DailyBar.code)
+                    .where(DailyBar.date == _now().date())
+                    .distinct()
+                ).scalars())
+                logger.info("因子全市场计算: 当日行情 %d 只", len(factor_codes))
+            result = run_selection(db, factor_codes=factor_codes or None)
             logger.info("选股完成: %s", result)
             return result
         except Exception:  # noqa: BLE001

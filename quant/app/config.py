@@ -80,6 +80,9 @@ class Settings:
         # 盘后日 K 是否走 baostock 按日批量链路(P2)。默认关闭:
         # 换算口径待 P0 spike 验证(docs/baostock-bulk-ingest.md §3),验证前不开生产。
         self.bulk_daily_bars: bool = False
+        # 盘后任务是否覆盖全 A(日线批量写入 + 因子全市场计算);
+        # False 时维持旧口径:池内 + 自选股。
+        self.full_market_daily: bool = False
 
         # quant 自己的覆盖配置(可选)
         cfg_env: str | None = None
@@ -114,6 +117,8 @@ class Settings:
                 self.task_workers = int(local["task_workers"])
             if "bulk_daily_bars" in local:
                 self.bulk_daily_bars = bool(local["bulk_daily_bars"])
+            if "full_market_daily" in local:
+                self.full_market_daily = bool(local["full_market_daily"])
 
         # QUANT_ENV 优先于 config.toml,便于 systemd 注入而无需改配置文件
         self.env = normalize_env(os.environ.get("QUANT_ENV") or cfg_env)

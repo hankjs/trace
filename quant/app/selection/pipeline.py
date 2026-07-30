@@ -244,8 +244,14 @@ def _apply_hard_filters(
 
 def run_selection(db: Session, day: date | None = None,
                   top_n: int | None = None,
-                  codes: list[str] | None = None) -> dict:
-    """跑一天选股:过滤 -> 打分 -> Top N 落 quant_pick。返回汇总。"""
+                  codes: list[str] | None = None,
+                  factor_codes: list[str] | None = None) -> dict:
+    """跑一天选股:过滤 -> 打分 -> Top N 落 quant_pick。返回汇总。
+
+    factor_codes: 因子计算/落库范围,默认与选股池相同。盘后全市场任务
+    (full_market_daily)传入当日有行情的全体代码,使 quant_factor_daily
+    覆盖全 A;选股(过滤/打分/Top N)始终只在池内进行。
+    """
     config = load_selection_config(db)
     day = day or today_cst()
     effective_top_n = top_n if top_n is not None else config.top_n
@@ -257,7 +263,10 @@ def run_selection(db: Session, day: date | None = None,
         raise ValueError("股票池为空,请先同步成分股")
 
     names = dict(db.execute(select(Stock.code, Stock.name)).all())
-    rows = compute_factor_rows(db, codes, day)
+    rows = compute_factor_rows(db, factor_codes if factor_codes is not None else codes, day)
+    if factor_codes is not None:
+        pool_set = set(codes)
+        rows = [r for r in rows if r["code"] in pool_set]
 
     survivors, n_filtered = _apply_hard_filters(rows, config, names)
 
@@ -289,6 +298,7 @@ def run_selection(db: Session, day: date | None = None,
                 day, len(codes), len(rows), n_filtered, len(top))
     return {"date": str(day), "pool": len(codes), "valid": len(rows),
             "filtered": n_filtered, "picked": len(top),
+            "factor_scope": len(factor_codes) if factor_codes is not None else len(codes),
             "top": [{"code": r["code"], "score": r["score"], "rank": i + 1}
                     for i, r in enumerate(top[:10])]}
 
