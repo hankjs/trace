@@ -2,9 +2,9 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -67,12 +67,17 @@ class TrialBatchCreateIn(BaseModel):
 @router.get("")
 def api_list_experiments(
     include_archived: bool = False,
+    limit: Annotated[int, Query(ge=1, le=200)] = 200,
+    offset: Annotated[int, Query(ge=0)] = 0,
     db: Session = Depends(get_db),
     claims: dict = Depends(require_client),
 ):
     owner_id = user_id_from_claims(claims)
     items = list_experiments(
-        db, owner_id, include_archived=include_archived,
+        db, owner_id,
+        include_archived=include_archived,
+        limit=limit,
+        offset=offset,
     )
     return {"count": len(items), "items": items}
 

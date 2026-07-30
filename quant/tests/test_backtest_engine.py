@@ -26,6 +26,7 @@ from app.backtest.engine import (
     MIN_STAT_BARS,
     TRADING_DAYS,
     _batch_single,
+    _batch_single_fractional,
     _combo_metrics,
     _equity_statistics,
     _held_before,
@@ -168,6 +169,43 @@ def test_stamp_tax_in_simulation():
     # 平价一买一卖必亏(双边佣金+滑点+印花税),且胜率口径来自同一模拟
     assert taxed["X"]["metrics"]["total_return"] < 0
     assert taxed["X"]["metrics"]["win_rate"] == 0.0
+
+
+def test_batch_single_fractional_stamp_tax_only_affects_sell_fees():
+    """含档位路径的两趟 from_orders 一致:仅印花税改变卖出单 fee,订单规模不变。"""
+    start = date(2024, 1, 1)
+    df = _mk_df(start, [10.0] * 10)
+    # 0->0.5 加仓 -> 减仓 -> 清仓,产生买入与卖出单
+    pos = pd.Series(
+        [0.0, 0.5, 0.5, 0.5, 0.2, 0.2, 0.0, 0.0, 0.0, 0.0],
+        index=df["date"],
+    )
+    bt_start = df["date"].iloc[1]
+
+    result = _batch_single_fractional(
+        {"X": df}, {"X": pos}, DEFAULT_COSTS, bt_start,
+    )["X"]
+    details = result["trade_details"]
+    assert details
+
+    buy_fees = [d for d in details if d["side"] == "buy"]
+    sell_fees = [d for d in details if d["side"] == "sell"]
+    assert buy_fees
+    assert sell_fees
+    for d in buy_fees:
+        expected = DEFAULT_COSTS["commission"] * d["size"] * d["execution_price"]
+        assert d["fees"] == pytest.approx(expected, rel=1e-4)
+    for d in sell_fees:
+        rate = DEFAULT_COSTS["commission"] + DEFAULT_COSTS["stamp_tax"]
+        expected = rate * d["size"] * d["execution_price"]
+        assert d["fees"] == pytest.approx(expected, rel=1e-4)
+
+    # 无印花税时卖出单 fee 只含佣金,收益更高
+    free = _batch_single_fractional(
+        {"X": df}, {"X": pos},
+        {**DEFAULT_COSTS, "stamp_tax": 0.0}, bt_start,
+    )["X"]
+    assert free["metrics"]["total_return"] > result["metrics"]["total_return"]
 
 
 def test_initial_entry_cost_is_in_total_return_and_drawdown():
@@ -543,6 +581,46 @@ def test_entry_allowed_when_open_below_limit_up():
                         df["date"].iloc[1])["X"]
 
     assert res["metrics"]["trade_count"] == 1
+
+
+def test_blocked_buy_resets_on_rebalance_day():
+    """涨停/停牌导致买入失败后，调仓日应重置阻塞标记，目标持续为正时不被永久跳过。"""
+    start = date(2024, 1, 1)
+    # d1 收盘给出 A/B 买入信号 -> d2 执行; A d2 开盘涨停买不进。
+    # d2 收盘再次上调 A 目标 -> d3 调仓日执行,阻塞应被重置。
+    a_opens = [10.0, 10.0, 11.0, 10.5]
+    a_closes = [10.0, 10.0, 11.0, 10.5]
+    a = _mk_df_ohlc(start, a_opens, a_closes)
+    b = _mk_df(start, [10.0] * 4)
+    idx = pd.DatetimeIndex(a["date"])
+    weights = pd.DataFrame({
+        "A": [0.0, 0.5, 0.6, 0.6],
+        "B": [0.0, 0.5, 0.4, 0.4],
+    }, index=idx)
+    rebalance = pd.Series([True, False, False, True], index=idx)
+
+    sim = _portfolio_sim(weights, {"A": a, "B": b}, idx, DEFAULT_COSTS)
+    orders = sim["pf"].orders.records_readable
+    a_buys = orders[(orders["Column"] == "A") & (orders["Side"] == "Buy")]
+
+    # d2 涨停买不到 A; d3 调仓日重置阻塞后 A 必须成交。
+    assert idx[2] not in set(a_buys["Timestamp"])
+    assert idx[3] in set(a_buys["Timestamp"])
+
+
+def test_blocked_buy_stays_blocked_without_rebalance():
+    """无调仓日时，买入失败后目标持续为正应继续保持阻塞。"""
+    start = date(2024, 1, 1)
+    a_opens = [10.0, 10.0, 11.0, 10.5]
+    a_closes = [10.0, 10.0, 11.0, 10.5]
+    a = _mk_df_ohlc(start, a_opens, a_closes)
+    idx = pd.DatetimeIndex(a["date"])
+    weights = pd.DataFrame({"A": [0.0, 0.5, 0.5, 0.5]}, index=idx)
+
+    sim = _portfolio_sim(weights, {"A": a}, idx, DEFAULT_COSTS)
+    orders = sim["pf"].orders.records_readable
+
+    assert not (orders["Column"] == "A").any()
 
 
 def test_limit_pct_is_20_for_chinext_and_star_board():

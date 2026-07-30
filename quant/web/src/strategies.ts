@@ -52,6 +52,12 @@ export const loadStrategies = collection.load
 /** 策略增删改后调用,强制下次读取走网络 */
 export const invalidateStrategies = collection.invalidate
 
+/** 登出或需要完全清空缓存时调用 */
+export function resetStrategies() {
+  limits.value = DEFAULT_LIMITS
+  collection.reset()
+}
+
 export const strategyById = collection.byId
 
 /** 已保存的 strategy_id 是否仍然有效(策略可能已被删除) */
@@ -71,6 +77,7 @@ export function useStrategies() {
     ),
     load: loadStrategies,
     invalidate: invalidateStrategies,
+    reset: resetStrategies,
     strategyById,
     defaultStrategyId,
   }

@@ -124,6 +124,30 @@ def test_kline_response_has_stock_metadata():
         assert result["industry"] == "白酒"
 
 
+def test_kline_rejects_excessive_range():
+    with _session() as db:
+        _seed_stock_and_bar(db)
+        with pytest.raises(HTTPException) as caught:
+            get_kline(
+                code="sh.600519",
+                start=date(2000, 1, 1),
+                end=date(2026, 7, 30),
+                db=db,
+            )
+        assert caught.value.status_code == 400
+        assert "不能超过 5 年" in caught.value.detail
+
+
+def test_kline_defaults_to_recent_five_years():
+    with _session() as db:
+        _seed_stock_and_bar(db)
+        result = get_kline(
+            code="sh.600519", start=None, end=None, db=db,
+        )
+        assert result["count"] == 1
+        assert result["bars"][0]["date"] == "2026-07-24"
+
+
 def test_stock_search_supports_name_six_digits_and_full_code():
     with _session() as db:
         _seed_search_stocks(db)
@@ -204,6 +228,32 @@ def test_add_trade_rejects_unknown_stock_code():
             "股票代码 sh.999999 不存在，请先从股票搜索结果中选择"
         )
         assert list_trades(code=None, db=db, claims=CLAIMS) == {"count": 0, "items": []}
+
+
+def test_trade_in_qty_must_be_positive_integer():
+    with pytest.raises(Exception):  # pydantic ValidationError
+        TradeIn(
+            code="sh.600519", trade_date=date(2026, 7, 24),
+            side="buy", price=10.0, qty=0,
+        )
+
+    with pytest.raises(Exception):
+        TradeIn(
+            code="sh.600519", trade_date=date(2026, 7, 24),
+            side="buy", price=10.0, qty=-10,
+        )
+
+    with pytest.raises(Exception):
+        TradeIn(
+            code="sh.600519", trade_date=date(2026, 7, 24),
+            side="buy", price=10.0, qty=100.5,
+        )
+
+    body = TradeIn(
+        code="sh.600519", trade_date=date(2026, 7, 24),
+        side="buy", price=10.0, qty=100.0,
+    )
+    assert body.qty == 100
 
 
 def test_manual_trades_are_isolated_by_user():

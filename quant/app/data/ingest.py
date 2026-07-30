@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 import pandas as pd
 from sqlalchemy import delete, func, select
@@ -18,8 +19,26 @@ from .clock import naive_now_cst, today_cst
 
 logger = logging.getLogger(__name__)
 
+
 # 名称含以下子串即视为风险警示股(*ST/ST/退市整理期)
 ST_NAME_MARKERS = ("ST", "*ST", "退")
+
+
+def _to_decimal(value, default=None):
+    """把标量转成 Decimal,避免 Python float 直接入 DECIMAL 列引入二进制误差。
+
+    对 None/NaN 返回 default;其余通过 `str()` 走十进制,保持人能读的小数位。
+    """
+    if value is None:
+        return default
+    if isinstance(value, float) and pd.isna(value):
+        return default
+    try:
+        if pd.isna(value):
+            return default
+    except (TypeError, ValueError):
+        pass
+    return Decimal(str(value))
 
 
 def is_st_name(name: str | None) -> bool:
@@ -44,7 +63,6 @@ def upsert_stock(db: Session, code: str, name: str = "",
     if name:
         # 改名为 *ST 的股票必须同步刷新标记,否则 ST 过滤永远漏它
         stock.is_st = is_st_name(name)
-    db.commit()
     return stock
 
 
@@ -227,7 +245,8 @@ def backfill_list_dates(db: Session) -> dict:
 
 
 def upsert_valuations_from_daily_bulk(db: Session, day: date,
-                                      bars: pd.DataFrame) -> int:
+                                      bars: pd.DataFrame,
+                                      commit: bool = True) -> int:
     """把批量日 K 里的 peTTM/pb/psTTM 落入 quant_valuation_snapshot。
 
     source=baostock_k_daily,available_date=data_date=day(日频点时,无公告滞后)。
@@ -264,7 +283,8 @@ def upsert_valuations_from_daily_bulk(db: Session, day: date,
             "pb": None if pb is None else float(pb),
             "ps_ttm": None if ps is None else float(ps),
             "dividend_yield": None,
-            "total_market_cap": None,
+            "total_market_cap": _to_decimal(
+                getattr(r, "total_market_cap", None)),
         })
     if not rows:
         return 0
@@ -291,25 +311,30 @@ def upsert_valuations_from_daily_bulk(db: Session, day: date,
             )
         db.execute(stmt)
         n += len(chunk)
-    db.commit()
+    if commit:
+        db.commit()
     return n
 
 
-def upsert_bars(db: Session, code: str, df: pd.DataFrame) -> int:
+def upsert_bars(db: Session, code: str, df: pd.DataFrame,
+                commit: bool = True) -> int:
     """日线 upsert(code+date 唯一键)。df 可无 code 列(则用参数 code)。"""
     if df.empty:
         return 0
     work = df.copy()
     if "code" not in work.columns:
         work["code"] = code
-    return upsert_bars_frame(db, work)
+    return upsert_bars_frame(db, work, commit=commit)
 
 
-def upsert_bars_frame(db: Session, df: pd.DataFrame) -> int:
+def upsert_bars_frame(db: Session, df: pd.DataFrame,
+                      commit: bool = True) -> int:
     """多 code 日线批量 upsert(code+date 唯一键)。
 
     重锚修复依赖「同 code+date 的旧行被新尺度覆盖」;必须真正 upsert。
     按批提交,避免单次包过大;比按只循环快一个数量级。
+    价格/量额在入库前统一转 Decimal,避免 float 写入 DECIMAL 列引入
+    二进制浮点误差。
     """
     if df.empty:
         return 0
@@ -327,13 +352,13 @@ def upsert_bars_frame(db: Session, df: pd.DataFrame) -> int:
         rows.append({
             "code": r.code,
             "date": r.date,
-            "open": float(r.open),
-            "high": float(r.high),
-            "low": float(r.low),
-            "close": float(r.close),
-            "raw_close": None if raw is None or pd.isna(raw) else float(raw),
-            "volume": 0.0 if pd.isna(getattr(r, "volume", 0)) else float(r.volume),
-            "amount": 0.0 if pd.isna(getattr(r, "amount", 0)) else float(r.amount),
+            "open": _to_decimal(r.open),
+            "high": _to_decimal(r.high),
+            "low": _to_decimal(r.low),
+            "close": _to_decimal(r.close),
+            "raw_close": _to_decimal(raw),
+            "volume": _to_decimal(getattr(r, "volume", 0), default=Decimal("0")),
+            "amount": _to_decimal(getattr(r, "amount", 0), default=Decimal("0")),
             "is_st": (None if is_st is None or (isinstance(is_st, float) and pd.isna(is_st))
                       else bool(is_st)),
         })
@@ -356,12 +381,13 @@ def upsert_bars_frame(db: Session, df: pd.DataFrame) -> int:
             )
         db.execute(stmt)
         total += len(chunk)
-    db.commit()
+    if commit:
+        db.commit()
     return total
 
 
 def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame,
-                          source: str = "baostock") -> int:
+                          source: str = "baostock", commit: bool = True) -> int:
     """复权因子 upsert(code + divid_operate_date 主键)。
 
     因子是权威事实,理论上只增不改;但 baostock 偶有修订,故用 upsert
@@ -377,9 +403,8 @@ def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame,
         {
             "code": code,
             "divid_operate_date": r.divid_operate_date,
-            "fore_factor": float(r.fore_factor),
-            "back_factor": (None if pd.isna(r.back_factor)
-                            else float(r.back_factor)),
+            "fore_factor": _to_decimal(r.fore_factor),
+            "back_factor": _to_decimal(r.back_factor),
             "source": source,
         }
         for r in df.itertuples()
@@ -397,7 +422,8 @@ def upsert_adjust_factors(db: Session, code: str, df: pd.DataFrame,
             **{c: getattr(stmt.inserted, c) for c in updated_cols}
         )
     db.execute(stmt)
-    db.commit()
+    if commit:
+        db.commit()
     return len(rows)
 
 
@@ -405,24 +431,24 @@ def sync_adjust_factors(db: Session, codes: list[str] | None = None,
                         start: date | str = "2015-01-01",
                         end: date | str | None = None,
                         sleep_per_code: float = 0.0) -> dict:
-    """全市场复权因子采集。
+    """复权因子权威值采集。
 
-    因子按除权日稀疏返回(实测 sh.600519 的 2808 行日线只对应 17 个除权日),
-    所以整轮采集比日线回填轻得多。
+    - 全市场(codes 为 None)走 `query_daily_adjust_factor` 按日 bulk 接口,
+      1 次/日,替代原逐 code 循环(约 5000 次/轮,占日限额 10%)。
+    - 小批量/单 code 场景(codes 显式传入)保留逐 code 路径,供 admin 手动
+      触发或少量补录使用。
 
-    空响应视为「该股无分红送转」,不清空已有数据 —— 数据源抖动不该被当成
+    空响应视为「该股/该日无分红送转」,不清空已有数据 —— 数据源抖动不该被当成
     「因子被撤销」(同 sync_index_members 对空响应的处理)。
     """
     end = end or today_cst()
+    if isinstance(start, str):
+        start = date.fromisoformat(start)
+    if isinstance(end, str):
+        end = date.fromisoformat(end)
     if codes is None:
-        # 跳过北交所:baostock 完全不覆盖(bj. 前缀直接报 10004011),
-        # 不跳会白发 330 次注定失败的请求。它们的因子由 sync_bj_market
-        # 从 close/raw_close 自算并标 source='sina'(见 alembic 0008)。
-        codes = [
-            r[0] for r in db.execute(
-                select(Stock.code).where(Stock.code.not_like(f"{BJ_PREFIX}%"))
-            ).all()
-        ]
+        return _sync_adjust_factors_bulk_range(db, start, end)
+
     total = upserted = empty = failed = 0
     failed_codes: list[str] = []
     with baostock_client.login_session():
@@ -442,17 +468,66 @@ def sync_adjust_factors(db: Session, codes: list[str] | None = None,
                 upserted += upsert_adjust_factors(db, code, df)
             if sleep_per_code:
                 time.sleep(sleep_per_code)
-    logger.info("复权因子采集: %d 只,写入 %d 行,无分红 %d 只,失败 %d 只",
+    logger.info("复权因子采集(逐 code): %d 只,写入 %d 行,无分红 %d 只,失败 %d 只",
                 total, upserted, empty, failed)
     return {"total": total, "upserted": upserted, "empty": empty,
             "failed": failed, "failed_codes": failed_codes[:20]}
 
 
-def backfill(db: Session, code: str, start: date | str, end: date | str | None = None) -> int:
+def _sync_adjust_factors_bulk_range(db: Session, start: date,
+                                    end: date) -> dict:
+    """按交易日循环 `sync_adjust_factors_for_day`,1 次 baostock 请求/日。"""
+    # 先拿交易日历,避免在周末/节假日发无效请求
+    try:
+        cal = baostock_client.fetch_trade_dates(start, end)
+        days = cal[cal["is_open"]]["date"].tolist()
+    except Exception:  # noqa: BLE001
+        logger.warning("取交易日历失败,退化为日历日循环 %s ~ %s", start, end,
+                       exc_info=True)
+        days = []
+        d = start
+        while d <= end:
+            days.append(d)
+            d += timedelta(days=1)
+
+    upserted = empty = failed = 0
+    failed_codes: list[str] = []
+    all_codes: set[str] = set()
+    with baostock_client.login_session():
+        for day in days:
+            try:
+                res = sync_adjust_factors_for_day(db, day, commit=True)
+            except Exception:  # noqa: BLE001
+                logger.warning("批量复权因子 %s 失败", day, exc_info=True)
+                failed += 1
+                failed_codes.append(str(day))
+                db.rollback()
+                continue
+            upserted += res["upserted"]
+            if res["empty"]:
+                empty += 1
+            all_codes.update(res.get("changed", []))
+            # changed 列表仅返回因子较库内发生变化的 code,这里额外记所有写入的 code
+            # 作为尝试覆盖范围(与逐 code 路径的 total 语义接近)
+            # sync_adjust_factors_for_day 不返回写入 code 列表,不额外增加复杂度
+    logger.info("批量复权因子采集: %d 个交易日,写入 %d 行,空响应 %d 日,失败 %d 日",
+                len(days), upserted, empty, failed)
+    return {
+        "total": len(days),
+        "upserted": upserted,
+        "empty": empty,
+        "failed": failed,
+        "failed_codes": failed_codes[:20],
+        "days": len(days),
+    }
+
+
+def backfill(db: Session, code: str, start: date | str,
+             end: date | str | None = None, commit: bool = True) -> int:
     """历史回填:baostock 拉 [start, end] 全量日线并 upsert"""
     end = end or today_cst()
     df = baostock_client.fetch_daily_bars(code, start, end)
-    n = upsert_bars(db, code, df)
+    n = upsert_bars(db, code, df, commit=commit)
     logger.info("回填 %s [%s, %s]: %d 条", code, start, end, n)
     return n
 
@@ -764,7 +839,8 @@ def detect_reanchor(db: Session, code: str, df: pd.DataFrame) -> ReanchorVerdict
 
 
 def _upsert_with_reanchor_check(db: Session, code: str, df: pd.DataFrame,
-                                fallback_start: date, end: date) -> int:
+                                fallback_start: date, end: date,
+                                commit: bool = True) -> int:
     """upsert 前检测前复权重锚,必要时全量回填。
 
     baostock 前复权价在分红送转后会回溯调整全部历史,只增量更新最近几天
@@ -785,7 +861,7 @@ def _upsert_with_reanchor_check(db: Session, code: str, df: pd.DataFrame,
     audit = audit_scale_against_factors(db, code)
     verdict = audit if audit.reanchored else detect_reanchor(db, code, df)
     if not verdict.reanchored:
-        return upsert_bars(db, code, df)
+        return upsert_bars(db, code, df, commit=commit)
 
     history_min = db.execute(
         select(func.min(DailyBar.date)).where(DailyBar.code == code)
@@ -793,7 +869,7 @@ def _upsert_with_reanchor_check(db: Session, code: str, df: pd.DataFrame,
     start = min(history_min, fallback_start) if history_min else fallback_start
     logger.warning("前复权重锚 %s(%s): %s,强制全量回填自 %s",
                    code, verdict.reason, verdict.detail, start)
-    return backfill(db, code, start=start, end=end)
+    return backfill(db, code, start=start, end=end, commit=commit)
 
 
 # 公开别名:脚本与 admin API 用这个,别直接用下划线私有名
@@ -801,7 +877,8 @@ upsert_with_reanchor_check = _upsert_with_reanchor_check
 
 
 def safe_backfill(db: Session, code: str, start: date | str,
-                  end: date | str | None = None, force: bool = False) -> int:
+                  end: date | str | None = None, force: bool = False,
+                  commit: bool = True) -> int:
     """带重锚校验的回填。全市场回填与 admin 手动回填都必须走这里。
 
     - 库中无该 code 历史,或 `force=True` → 直接全量拉 [start, end];
@@ -818,10 +895,10 @@ def safe_backfill(db: Session, code: str, start: date | str,
         .where(DailyBar.__table__.c.code == code)
     ).scalar_one() > 0
     if force or not has_history:
-        return backfill(db, code, start_d, end_d)
+        return backfill(db, code, start_d, end_d, commit=commit)
     df = baostock_client.fetch_daily_bars(code, start_d, end_d)
     return upsert_with_reanchor_check(
-        db, code, df, fallback_start=start_d, end=end_d)
+        db, code, df, fallback_start=start_d, end=end_d, commit=commit)
 
 
 def ingest_daily(db: Session, code: str, day: date | None = None,
@@ -926,7 +1003,8 @@ def _detect_factor_changes(db: Session, df: pd.DataFrame) -> set[str]:
     return changed
 
 
-def sync_adjust_factors_for_day(db: Session, day: date | str) -> dict:
+def sync_adjust_factors_for_day(db: Session, day: date | str,
+                                commit: bool = True) -> dict:
     """按日批量同步全市场复权因子(query_daily_adjust_factor,1 次/日)。
 
     替代 sync_adjust_factors 的按 code 全表扫(旧函数保留,admin 手动
@@ -948,7 +1026,7 @@ def sync_adjust_factors_for_day(db: Session, day: date | str) -> dict:
     changed = _detect_factor_changes(db, df)
     upserted = 0
     for code, grp in df.groupby("code"):
-        upserted += upsert_adjust_factors(db, code, grp)
+        upserted += upsert_adjust_factors(db, code, grp, commit=commit)
     logger.info("批量复权因子 %s: %d 只,写入 %d 行,因子变化 %d 只",
                 day, df["code"].nunique(), upserted, len(changed))
     return {"day": day, "upserted": upserted, "empty": False,
@@ -984,8 +1062,13 @@ def ingest_market_day(db: Session, day: date | str,
        upsert 进 quant_adjust_factor(P3 一并完成,不重复请求);
     2. 用库内权威因子按 `raw_to_qfq` 换算前复权 OHLC,**无条件整行
        upsert** 当日行(§7 第 3 条,覆盖盘中可能残留的半根线);
+       缺因子(code 在因子表无记录)时**不得**按 factor=1.0 静默写入,
+       必须跳过并计数/告警,让问题可观测;
     3. 因子较库内记录发生变化的 code(分红除权/重锚嫌疑)走
        `safe_backfill` 单票全历史重拉,保住重锚防护语义。
+
+    当日日线+因子+估值在同一事务中提交;单只重锚失败通过 SAVEPOINT 隔离,
+    不影响其他 code,最终只提交成功部分。
 
     北交所不在批量结果中,自然跳过,仍走原有新浪路径。
     codes 为 None 时写入批量结果的全部 code(历史回填用);盘后增量传
@@ -998,17 +1081,21 @@ def ingest_market_day(db: Session, day: date | str,
 
     with baostock_client.login_session():
         bars = baostock_client.fetch_market_daily_bars(day)
-        factor_res = sync_adjust_factors_for_day(db, day)
+        factor_res = sync_adjust_factors_for_day(db, day, commit=False)
 
         result: dict = {
             "day": day, "bars": 0, "codes": 0, "written_codes": [],
             "factors_upserted": factor_res["upserted"],
             "factor_empty": factor_res["empty"],
             "factor_changed": [], "reanchored": [], "failed": [],
+            "missing_factor": [],
         }
         if bars.empty:
             logger.warning("批量日 K %s 返回空(非交易日或数据源异常),未写入", day)
             return result
+        if factor_res["empty"]:
+            raise RuntimeError(
+                f"批量复权因子 {day} 返回空,无法完成前复权换算,当日任务失败")
         if codes is not None:
             bars = bars[bars["code"].isin(codes)]
         if bars.empty:
@@ -1020,48 +1107,59 @@ def ingest_market_day(db: Session, day: date | str,
         result["factor_changed"] = sorted(changed)
 
         for code, grp in bars.groupby("code"):
-            if code in changed:
-                # 分红除权/重锚嫌疑:单票全历史重拉,重锚防护语义不丢
-                try:
-                    n = safe_backfill(db, code, start=backfill_start,
-                                      end=day, force=True)
-                    result["reanchored"].append(code)
-                    result["bars"] += n
-                    logger.info("因子变化 %s,已全历史重拉 %d 行", code, n)
-                except Exception:  # noqa: BLE001 - 单只失败不影响其他
-                    db.rollback()
-                    result["failed"].append(code)
-                    logger.exception("因子变化 %s 的全历史重拉失败", code)
-                if sleep_per_reanchor:
-                    time.sleep(sleep_per_reanchor)
-                continue
-            # 无因子记录 = 从未分红送转,因子为 1,前复权价即原始价
-            factor = factors.get(code, 1.0)
-            df = pd.DataFrame({
-                "date": grp["date"],
-                "open": grp["open"].map(lambda v: raw_to_qfq(v, factor)),
-                "high": grp["high"].map(lambda v: raw_to_qfq(v, factor)),
-                "low": grp["low"].map(lambda v: raw_to_qfq(v, factor)),
-                "close": grp["close"].map(lambda v: raw_to_qfq(v, factor)),
-                "raw_close": grp["close"],
-                "volume": grp["volume"],
-                "amount": grp["amount"],
-                "is_st": grp["is_st"],
-            })
-            result["bars"] += upsert_bars(db, code, df)
-        # 接口返回的 peTTM/pb/ps 一并入库,避免以后再扫估值源
+            try:
+                with db.begin_nested():
+                    if code in changed:
+                        # 分红除权/重锚嫌疑:单票全历史重拉,重锚防护语义不丢
+                        n = safe_backfill(db, code, start=backfill_start,
+                                          end=day, force=True, commit=False)
+                        result["reanchored"].append(code)
+                        result["bars"] += n
+                        logger.info("因子变化 %s,已全历史重拉 %d 行", code, n)
+                        if sleep_per_reanchor:
+                            time.sleep(sleep_per_reanchor)
+                        continue
+                    factor = factors.get(code)
+                    if factor is None:
+                        result["missing_factor"].append(code)
+                        logger.warning(
+                            "批量日 K %s: %s 无有效复权因子,跳过写入", day, code)
+                        continue
+                    df = pd.DataFrame({
+                        "date": grp["date"],
+                        "open": grp["open"].map(lambda v: raw_to_qfq(v, factor)),
+                        "high": grp["high"].map(lambda v: raw_to_qfq(v, factor)),
+                        "low": grp["low"].map(lambda v: raw_to_qfq(v, factor)),
+                        "close": grp["close"].map(lambda v: raw_to_qfq(v, factor)),
+                        "raw_close": grp["close"],
+                        "volume": grp["volume"],
+                        "amount": grp["amount"],
+                        "is_st": grp["is_st"],
+                    })
+                    result["bars"] += upsert_bars(db, code, df, commit=False)
+            except Exception:  # noqa: BLE001 - 单只失败不影响其他
+                result["failed"].append(code)
+                logger.exception("批量日 K %s 写入 %s 失败", day, code)
+
+        # 接口返回的 peTTM/pb/ps 一并入库,失败只回滚估值 SAVEPOINT
         try:
-            result["valuations"] = upsert_valuations_from_daily_bulk(db, day, bars)
+            with db.begin_nested():
+                result["valuations"] = upsert_valuations_from_daily_bulk(
+                    db, day, bars, commit=False)
         except Exception:  # noqa: BLE001
-            db.rollback()
             result["valuations"] = 0
             logger.exception("批量估值字段落库失败 %s", day)
+
         result["codes"] = len(bar_codes)
         result["written_codes"] = bar_codes
+
+    db.commit()
     logger.info(
-        "批量日 K %s: %d 只,写入 %d 行,估值 %d 行,因子变化重拉 %d 只,失败 %d 只",
+        "批量日 K %s: %d 只,写入 %d 行,估值 %d 行,因子变化重拉 %d 只,"
+        "缺因子跳过 %d 只,失败 %d 只",
         day, result["codes"], result["bars"], result.get("valuations", 0),
-        len(result["reanchored"]), len(result["failed"]))
+        len(result["reanchored"]), len(result["missing_factor"]),
+        len(result["failed"]))
     return result
 
 
@@ -1123,6 +1221,42 @@ def load_bars_df(db: Session, code: str, start: date | None = None,
     if extra_fields:
         df = attach_snapshot_fields(db, df, code, extra_fields)
     return df
+
+
+def load_bars_df_bulk(db: Session, codes: list[str],
+                      start: date | None = None, end: date | None = None,
+                      *, extra_fields: list[str] | None = None) -> dict[str, pd.DataFrame]:
+    """批量读取多只股票日线,返回 {code: DataFrame}。
+
+    全 A 选股时逐股 `load_bars_df` 会产生 5000+ 次往返;本函数一次性把
+    `[start, end]` 窗口内全部日线读入内存,再按 code 分组,最后按需附加
+    估值/财务快照字段。分组后各 DataFrame 的列与 `load_bars_df` 一致。
+    """
+    if not codes:
+        return {}
+    rows: list[DailyBar] = []
+    for chunk in _chunks(sorted(set(codes)), size=500):
+        q = select(DailyBar).where(DailyBar.code.in_(chunk))
+        if start:
+            q = q.where(DailyBar.date >= start)
+        if end:
+            q = q.where(DailyBar.date <= end)
+        rows.extend(db.execute(q).scalars().all())
+    if not rows:
+        return {}
+    frame = pd.DataFrame([
+        {"date": r.date, "code": r.code, "open": r.open, "high": r.high,
+         "low": r.low, "close": r.close, "raw_close": r.raw_close,
+         "volume": r.volume, "amount": r.amount, "is_st": r.is_st}
+        for r in rows
+    ])
+    result: dict[str, pd.DataFrame] = {}
+    for code, grp in frame.groupby("code"):
+        cdf = grp.drop(columns=["code"]).reset_index(drop=True)
+        if extra_fields:
+            cdf = attach_snapshot_fields(db, cdf, code, extra_fields)
+        result[code] = cdf
+    return result
 
 
 # load_bars_df 始终提供的日线列(去掉 date),capability 的 available_fields 基数

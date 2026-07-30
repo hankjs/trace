@@ -18,25 +18,36 @@ export function createCachedCollectionStore<T extends CollectionItem, Response>(
   const loaded = ref(false)
   const error = ref('')
   let inflight: Promise<T[]> | null = null
+  let inflightGeneration = 0
+  let generation = 0
 
   async function load(force = false): Promise<T[]> {
     if (loaded.value && !force) return items.value
-    if (inflight) return inflight
+    if (inflight && inflightGeneration === generation) return inflight
+
+    generation += 1
+    const requestGeneration = generation
     loading.value = true
     error.value = ''
+    inflightGeneration = requestGeneration
     inflight = (async () => {
       try {
         const response = await options.request()
+        if (requestGeneration !== generation) return items.value
         items.value = options.itemsFrom(response)
         options.onLoaded?.(response)
         loaded.value = true
         return items.value
       } catch (caught) {
-        error.value = (caught as Error).message
+        if (requestGeneration === generation) {
+          error.value = (caught as Error).message
+        }
         throw caught
       } finally {
-        loading.value = false
-        inflight = null
+        if (requestGeneration === generation) {
+          loading.value = false
+          inflight = null
+        }
       }
     })()
     return inflight
@@ -44,6 +55,16 @@ export function createCachedCollectionStore<T extends CollectionItem, Response>(
 
   function invalidate() {
     loaded.value = false
+    generation += 1
+  }
+
+  function reset() {
+    generation += 1
+    items.value = []
+    loading.value = false
+    loaded.value = false
+    error.value = ''
+    inflight = null
   }
 
   function byId(id: number | null | undefined): T | null {
@@ -62,6 +83,7 @@ export function createCachedCollectionStore<T extends CollectionItem, Response>(
     error: readonly(error),
     load,
     invalidate,
+    reset,
     byId,
     isKnownId,
   }

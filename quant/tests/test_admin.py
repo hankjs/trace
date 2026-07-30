@@ -62,7 +62,7 @@ def test_import_stocks_maps_provider_failure_to_502_and_closes_session(
         asyncio.run(admin.import_stocks())
 
     assert caught.value.status_code == 502
-    assert caught.value.detail == "股票列表导入失败: provider unavailable"
+    assert "股票列表导入失败" in caught.value.detail
     assert session.exited is True
 
 

@@ -77,6 +77,24 @@ describe('strategy collection store', () => {
     expect(request).toHaveBeenCalledTimes(2)
     expect(store.defaultStrategyId('portfolio')).toBe(3)
   })
+
+  it('reset clears cache and restores default limits', async () => {
+    const { api } = await import('./api')
+    const firstItems = [makeStrategy(1, false)]
+    const nextItems = [makeStrategy(2, true)]
+    const request = vi.spyOn(api, 'strategies')
+      .mockResolvedValueOnce({ items: firstItems, limits: { max_total: 100, max_enabled: 20 } })
+      .mockResolvedValueOnce({ items: nextItems, limits })
+    const store = await import('./strategies')
+
+    await store.loadStrategies()
+    store.resetStrategies()
+    const items = await store.loadStrategies()
+
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(items).toEqual(nextItems)
+    expect(store.defaultStrategyId()).toBe(2)
+  })
 })
 
 describe('pool collection store', () => {
@@ -117,5 +135,46 @@ describe('pool collection store', () => {
 
     expect(request).toHaveBeenCalledTimes(2)
     expect(store.defaultPoolId()).toBe(7)
+  })
+
+  it('reset clears cache and forces a new request', async () => {
+    const { api } = await import('./api')
+    const firstItems = [makePool(1, 'index')]
+    const nextItems = [makePool(2, 'all')]
+    const request = vi.spyOn(api, 'pools')
+      .mockResolvedValueOnce({ items: firstItems })
+      .mockResolvedValueOnce({ items: nextItems })
+    const store = await import('./pools')
+
+    await store.loadPools()
+    store.resetPools()
+    const items = await store.loadPools()
+
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(items).toEqual(nextItems)
+    expect(store.defaultPoolId()).toBe(2)
+  })
+
+  it('does not return stale inflight result after invalidation', async () => {
+    const { api } = await import('./api')
+    let resolveFirst!: (value: { items: Pool[] }) => void
+    const firstResponse = new Promise<{ items: Pool[] }>((resolve) => {
+      resolveFirst = resolve
+    })
+    const firstItems = [makePool(1, 'index')]
+    const nextItems = [makePool(2, 'all')]
+    const request = vi.spyOn(api, 'pools')
+      .mockReturnValueOnce(firstResponse)
+      .mockResolvedValueOnce({ items: nextItems })
+    const store = await import('./pools')
+
+    store.loadPools()
+    store.invalidatePools()
+    const second = store.loadPools()
+
+    resolveFirst({ items: firstItems })
+    await expect(second).resolves.toEqual(nextItems)
+    expect(request).toHaveBeenCalledTimes(2)
+    expect(store.defaultPoolId()).toBe(2)
   })
 })

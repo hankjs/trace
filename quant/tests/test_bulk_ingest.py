@@ -228,11 +228,12 @@ def test_ingest_market_day_converts_raw_to_qfq(db, monkeypatch):
         monkeypatch,
         bars=_bulk_bars([
             ("sh.600519", 100.0, 102.0, 99.0, 100.0, 1000, 100000, False),
-            # 无因子记录 -> 因子 1,前复权价即原始价
+            # 因子为 1:前复权价即原始价
             ("sz.000001", 10.0, 10.2, 9.9, 10.1, 2000, 20200, True),
         ]),
         factors=_bulk_factors([
-            ("sh.600519", date(2020, 6, 24), 0.5, 6.0)]),
+            ("sh.600519", date(2020, 6, 24), 0.5, 6.0),
+            ("sz.000001", date(2020, 6, 24), 1.0, 1.0)]),
     )
 
     res = ingest.ingest_market_day(db, DAY)
@@ -273,7 +274,8 @@ def test_ingest_market_day_is_idempotent(db, monkeypatch):
         monkeypatch,
         bars=_bulk_bars([
             ("sz.000001", 10.0, 10.2, 9.9, 10.1, 1, 1, False)]),
-        factors=_bulk_factors([]),
+        factors=_bulk_factors([
+            ("sz.000001", date(2020, 6, 24), 1.0, 1.0)]),
     )
     assert ingest.ingest_market_day(db, DAY)["bars"] == 1
     assert ingest.ingest_market_day(db, DAY)["bars"] == 1
@@ -292,7 +294,8 @@ def test_ingest_market_day_overwrites_existing_row_unconditionally(db, monkeypat
         monkeypatch,
         bars=_bulk_bars([
             ("sz.000001", 10.0, 10.2, 9.9, 10.1, 2000, 20200, False)]),
-        factors=_bulk_factors([]),
+        factors=_bulk_factors([
+            ("sz.000001", date(2020, 6, 24), 1.0, 1.0)]),
     )
 
     ingest.ingest_market_day(db, DAY)
@@ -313,11 +316,12 @@ def test_factor_changed_code_falls_back_to_safe_backfill(db, monkeypatch):
             ("sh.600519", 100.0, 100.0, 100.0, 100.0, 1, 1, False),
             ("sz.000001", 10.0, 10.0, 10.0, 10.0, 1, 1, False)]),
         factors=_bulk_factors([
-            ("sh.600519", date(2026, 7, 20), 0.9, 7.5)]),
+            ("sh.600519", date(2026, 7, 20), 0.9, 7.5),
+            ("sz.000001", date(2020, 6, 24), 1.0, 1.0)]),
     )
     calls: list[dict] = []
 
-    def fake_safe_backfill(db, code, start, end, force=False):
+    def fake_safe_backfill(db, code, start, end, force=False, commit=True):
         calls.append({"code": code, "start": start, "end": end,
                       "force": force})
         return 3
@@ -346,10 +350,11 @@ def test_safe_backfill_failure_isolated(db, monkeypatch):
             ("sh.600519", 100.0, 100.0, 100.0, 100.0, 1, 1, False),
             ("sz.000001", 10.0, 10.0, 10.0, 10.0, 1, 1, False)]),
         factors=_bulk_factors([
-            ("sh.600519", date(2026, 7, 20), 0.9, 7.5)]),
+            ("sh.600519", date(2026, 7, 20), 0.9, 7.5),
+            ("sz.000001", date(2020, 6, 24), 1.0, 1.0)]),
     )
 
-    def boom(db, code, start, end, force=False):
+    def boom(db, code, start, end, force=False, commit=True):
         raise RuntimeError("baostock 限速")
 
     monkeypatch.setattr(ingest, "safe_backfill", boom)
@@ -367,7 +372,8 @@ def test_ingest_market_day_codes_filter(db, monkeypatch):
         bars=_bulk_bars([
             ("sh.600519", 100.0, 100.0, 100.0, 100.0, 1, 1, False),
             ("sz.000001", 10.0, 10.0, 10.0, 10.0, 1, 1, False)]),
-        factors=_bulk_factors([]),
+        factors=_bulk_factors([
+            ("sh.600519", date(2020, 6, 24), 1.0, 1.0)]),
     )
 
     res = ingest.ingest_market_day(db, DAY, codes={"sh.600519"})
@@ -375,6 +381,40 @@ def test_ingest_market_day_codes_filter(db, monkeypatch):
     assert res["codes"] == 1
     assert db.get(DailyBar, ("sh.600519", DAY)) is not None
     assert db.get(DailyBar, ("sz.000001", DAY)) is None
+
+
+def test_ingest_market_day_skips_codes_with_missing_factor(db, monkeypatch):
+    """缺复权因子的 code 不得按 factor=1.0 静默写入,必须跳过并计数。"""
+    _mock_market(
+        monkeypatch,
+        bars=_bulk_bars([
+            ("sh.600519", 100.0, 100.0, 100.0, 100.0, 1, 1, False),
+            ("sz.000001", 10.0, 10.0, 10.0, 10.0, 1, 1, False)]),
+        factors=_bulk_factors([
+            # 只给了 600519 的因子,000001 缺因子
+            ("sh.600519", date(2020, 6, 24), 1.0, 1.0)]),
+    )
+
+    res = ingest.ingest_market_day(db, DAY)
+
+    assert res["missing_factor"] == ["sz.000001"]
+    assert db.get(DailyBar, ("sh.600519", DAY)) is not None
+    assert db.get(DailyBar, ("sz.000001", DAY)) is None
+
+
+def test_ingest_market_day_fails_when_factor_bulk_empty(db, monkeypatch):
+    """批量复权因子整体为空时,当日任务必须显式失败,不得静默按 factor=1 写入。"""
+    _mock_market(
+        monkeypatch,
+        bars=_bulk_bars([
+            ("sh.600519", 100.0, 100.0, 100.0, 100.0, 1, 1, False)]),
+        factors=_bulk_factors([]),
+    )
+
+    with pytest.raises(RuntimeError, match="批量复权因子.*返回空"):
+        ingest.ingest_market_day(db, DAY)
+
+    assert db.execute(select(func.count()).select_from(DailyBar)).scalar() == 0
 
 
 def test_ingest_market_day_empty_bulk_writes_nothing(db, monkeypatch):

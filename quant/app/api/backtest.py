@@ -4,10 +4,11 @@ from __future__ import annotations
 import logging
 from copy import deepcopy
 from datetime import date, datetime
+from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,7 +17,11 @@ from ..backtest.engine import (
 )
 from ..backtest.evaluate import leaderboard
 from ..backtest.jobs import execute_backtest_run, pending_payload
-from ..backtest.validation import evaluate_declared_sweep
+from ..backtest.validation import (
+    evaluate_declared_sweep,
+    validate_backtest_window,
+    validate_sweep_grid,
+)
 from ..auth import require_client, user_id_from_claims
 from ..api.pools import (get_pool_or_404, pool_ref_out,
                          resolve_pool_codes, resolve_pool_codes_during)
@@ -53,6 +58,11 @@ class BacktestIn(BaseModel):
     params: dict = Field(default_factory=dict)
     costs: dict = Field(default_factory=dict)  # 可选覆盖费用
 
+    @model_validator(mode="after")
+    def _check_window(self) -> "BacktestIn":
+        validate_backtest_window(self.start, self.end)
+        return self
+
 
 class SweepIn(BaseModel):
     strategy_id: int
@@ -63,6 +73,13 @@ class SweepIn(BaseModel):
     costs: dict = Field(default_factory=dict)
     # true 时忽略 param_grid,按规格 validation.parameter_scans 声明执行扫描
     declared: bool = False
+
+    @model_validator(mode="after")
+    def _check_window_and_grid(self) -> "SweepIn":
+        validate_backtest_window(self.start, self.end)
+        if self.param_grid:
+            validate_sweep_grid(self.param_grid)
+        return self
 
 
 class SensitivityIn(BaseModel):
@@ -77,6 +94,11 @@ class SensitivityIn(BaseModel):
     slippage_multipliers: list[float] = Field(
         default_factory=lambda: [0.5, 1.0, 2.0], min_length=1, max_length=8,
     )
+
+    @model_validator(mode="after")
+    def _check_window(self) -> "SensitivityIn":
+        validate_backtest_window(self.start, self.end)
+        return self
 
 
 def _decorate_result(result: dict, db: Session, pool: Pool | None = None) -> dict:
@@ -103,8 +125,6 @@ def sweep(body: SweepIn, db: Session = Depends(get_db),
     spec_hash(与回测结果同一关联键)与参数稳定性评估;扫描仍是探索性动作,
     不推进证据状态。
     """
-    if body.start >= body.end:
-        raise HTTPException(400, "start 必须早于 end")
     strategy = get_strategy_or_404(
         db, body.strategy_id, user_id_from_claims(claims))
     param_grid = body.param_grid
@@ -115,6 +135,7 @@ def sweep(body: SweepIn, db: Session = Depends(get_db),
             raise HTTPException(400, "该策略规格未声明 parameter_scans")
         param_grid = {scan.path: list(scan.values) for scan in scans}
     try:
+        validate_sweep_grid(param_grid)
         result = run_sweep(db, strategy, [c.lower() for c in body.codes],
                            body.start, body.end, param_grid, body.costs)
         result["strategy_spec_hash"] = strategy_spec_hash(spec)
@@ -139,14 +160,18 @@ def sweep(body: SweepIn, db: Session = Depends(get_db),
 
 
 @router.get("/leaderboard")
-def get_leaderboard(db: Session = Depends(get_db),
-                    claims: dict = Depends(require_client)):
+def get_leaderboard(
+    limit: Annotated[int, Query(ge=1, le=200)] = 200,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
     """策略排行:最近一轮批量评估(quant_strategy_eval)汇总。
 
     只出我可见的策略 —— 评估跑所有用户启用的策略,但别人的策略不该出现在
     我的排行榜里(过滤在 leaderboard() 内)。
     """
-    return leaderboard(db, user_id_from_claims(claims))
+    return leaderboard(db, user_id_from_claims(claims), limit=limit, offset=offset)
 
 
 @router.post("/sensitivity")
@@ -221,8 +246,6 @@ def _prepare_backtest(
     body: BacktestIn, db: Session, user_id: str,
 ) -> tuple[Strategy, object, list[str], bool, Pool | None]:
     """校验请求并冻结规格,返回 (strategy, execution_spec, codes, use_pool, pool)。"""
-    if body.start >= body.end:
-        raise HTTPException(400, "start 必须早于 end")
     strategy = get_strategy_or_404(db, body.strategy_id, user_id)
     # 请求一进入就冻结规格。后续解析股票池和加载行情时即使策略被原地修改，
     # 本次执行也只能使用这个不可变快照。

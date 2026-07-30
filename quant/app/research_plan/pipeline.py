@@ -4,14 +4,14 @@ from __future__ import annotations
 import logging
 from datetime import date, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..data.calendar import is_trading_day
 from ..data.ingest import load_bars_df, required_snapshot_fields
 from ..data.universe import (INDEX_NAMES, pool_eligibility_matrix,
                              resolve_pool, resolve_pool_during)
-from ..models import Pool, Strategy
+from ..models import DailyBar, Pool, Strategy
 from ..strategy.runtime import strategy_spec_for
 from ..strategy.store import enabled_strategies
 from .service import create_portfolio_plan
@@ -78,6 +78,17 @@ def run_portfolio_plans(
         min_list_days=pool.min_list_days)
     if not codes:
         raise ValueError(f"股票池「{pool.name}」在 {day} 没有可用成分")
+
+    # 确定统一数据日期截面:取目标日及之前、池内成分实际有 bar 的最新交易日。
+    # 避免逐股读行情时因盘后采集竞态导致不同代码用到不同截面,调仓权重不一致。
+    max_date = db.execute(
+        select(func.max(DailyBar.date)).where(
+            DailyBar.code.in_(codes),
+            DailyBar.date <= day,
+        )
+    ).scalar()
+    data_date = max_date or day
+
     pool_dfs = {}
     # 组合策略同样按规格的 data_requirements 供给估值/财务快照字段
     extra_fields = sorted({
@@ -86,7 +97,7 @@ def run_portfolio_plans(
         for field in _strategy_snapshot_fields(strategy)
     })
     for code in codes:
-        frame = load_bars_df(db, code, start=start, end=day,
+        frame = load_bars_df(db, code, start=start, end=data_date,
                              extra_fields=extra_fields)
         if not frame.empty:
             pool_dfs[code] = frame
@@ -103,7 +114,7 @@ def run_portfolio_plans(
     for strategy in targets:
         try:
             plan = create_portfolio_plan(
-                db, strategy, data_date=day, pool_id=pool.id,
+                db, strategy, data_date=data_date, pool_id=pool.id,
                 pool_name=pool.name, pool_dfs=pool_dfs,
                 eligibility=eligibility)
         except ValueError as exc:
@@ -114,7 +125,8 @@ def run_portfolio_plans(
         created.append({"plan_id": plan.id, "strategy_id": strategy.id,
                         "strategy_name": strategy.name})
     db.commit()
-    return {"date": str(day), "pool_id": pool.id, "pool_name": pool.name,
+    return {"date": str(day), "data_date": str(data_date),
+            "pool_id": pool.id, "pool_name": pool.name,
             "plans": created, "count": len(created)}
 
 

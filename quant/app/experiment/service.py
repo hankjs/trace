@@ -149,12 +149,19 @@ def create_experiment(
 
 
 def list_experiments(
-    db: Session, owner_id: str, *, include_archived: bool = False,
+    db: Session,
+    owner_id: str,
+    *,
+    include_archived: bool = False,
+    limit: int = 200,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     q = select(Experiment).where(Experiment.owner_id == owner_id)
     if not include_archived:
         q = q.where(Experiment.status != "archived")
-    rows = list(db.execute(q.order_by(Experiment.id.desc())).scalars().all())
+    rows = list(db.execute(
+        q.order_by(Experiment.id.desc()).offset(offset).limit(limit)
+    ).scalars().all())
     if not rows:
         return []
     counts = dict(

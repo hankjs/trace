@@ -130,21 +130,29 @@ def test_one_failing_code_does_not_break_the_rest(db, monkeypatch):
     assert db.get(AdjustFactor, ("sz.000001", date(2016, 6, 1))) is not None
 
 
-def test_sync_defaults_to_all_stocks(db, monkeypatch):
-    """不传 codes 时覆盖 quant_stock 全表。"""
-    seen: list[str] = []
+def test_sync_defaults_to_bulk_daily_path(db, monkeypatch):
+    """不传 codes 时走按日 bulk 路径,不再逐 code 调用 baostock。"""
+    days_seen: list[date] = []
 
-    def _fetch(code: str, start, end):
-        seen.append(code)
-        return _factors([])
+    def _fake_sync_day(db_sess, day, commit=True):
+        days_seen.append(day)
+        return {"day": day, "upserted": 1, "empty": False, "changed": []}
 
-    monkeypatch.setattr(ingest.baostock_client, "login_session",
-                        lambda: _nullcontext())
-    monkeypatch.setattr(ingest.baostock_client, "fetch_adjust_factors", _fetch)
+    monkeypatch.setattr(ingest.baostock_client, "fetch_trade_dates",
+                        lambda start, end: pd.DataFrame([
+                            {"date": date(2026, 7, 24), "is_open": True},
+                            {"date": date(2026, 7, 25), "is_open": False},
+                            {"date": date(2026, 7, 26), "is_open": True},
+                        ]))
+    monkeypatch.setattr(ingest, "sync_adjust_factors_for_day",
+                        _fake_sync_day)
 
-    ingest.sync_adjust_factors(db)
+    result = ingest.sync_adjust_factors(db)
 
-    assert sorted(seen) == ["sh.600519", "sz.000001"]
+    assert days_seen == [date(2026, 7, 24), date(2026, 7, 26)]
+    assert result["days"] == 2
+    assert result["upserted"] == 2
+    assert result["failed"] == 0
 
 
 class _nullcontext:
@@ -295,21 +303,32 @@ def test_source_column_distinguishes_authority_from_derived(db):
 
 
 def test_baostock_sync_skips_beijing_codes(db, monkeypatch):
-    """baostock 不覆盖北交所,默认采集必须跳过,不白发注定失败的请求。"""
+    """baostock 不覆盖北交所,默认全市场采集走按日 bulk,不再逐 code 请求。"""
     from app.models import Stock as _Stock
     db.add(_Stock(code="bj.920000"))
     db.commit()
-    seen: list[str] = []
+    per_code_calls: list[str] = []
+    days_seen: list[date] = []
 
     monkeypatch.setattr(ingest.baostock_client, "login_session",
                         lambda: _nullcontext())
     monkeypatch.setattr(ingest.baostock_client, "fetch_adjust_factors",
-                        lambda code, start, end: seen.append(code) or _factors([]))
+                        lambda code, start, end: per_code_calls.append(code)
+                                                    or _factors([]))
+    monkeypatch.setattr(ingest.baostock_client, "fetch_trade_dates",
+                        lambda start, end: pd.DataFrame([
+                            {"date": date(2026, 7, 24), "is_open": True}]))
+    monkeypatch.setattr(
+        ingest, "sync_adjust_factors_for_day",
+        lambda db_sess, day, commit=True: (
+            days_seen.append(day),
+            {"day": day, "upserted": 1, "empty": False, "changed": []}
+        )[1])
 
     ingest.sync_adjust_factors(db)
 
-    assert "bj.920000" not in seen
-    assert sorted(seen) == ["sh.600519", "sz.000001"]
+    assert not per_code_calls
+    assert days_seen == [date(2026, 7, 24)]
 
 
 def test_derive_factors_survives_low_price_rounding_noise(db):

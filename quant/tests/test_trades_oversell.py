@@ -144,3 +144,22 @@ def test_oversell_check_is_scoped_per_user(db):
         _sell(db, 100)  # USER 自己没有持仓
 
     assert trade_svc.list_trades(db, USER, CODE) == []
+
+
+def test_mysql_path_locks_existing_rows_before_replay(db, monkeypatch):
+    """MySQL 分支应在重放校验前对已有成交行加 FOR UPDATE。"""
+    _buy(db, 100)
+    calls: list[tuple[int, str]] = []
+
+    def fake_lock(session, user_id: int, code: str) -> None:
+        calls.append((user_id, code))
+
+    monkeypatch.setattr(trade_svc, "_lock_trades_for_update", fake_lock)
+    _sell(db, 50)
+    assert calls == [(USER, CODE)]
+
+    buy2 = _buy(db, 100, day=date(2024, 1, 4))
+    calls.clear()
+    monkeypatch.setattr(trade_svc, "_lock_trades_for_update", fake_lock)
+    trade_svc.delete_trade(db, USER, buy2.id)
+    assert calls == [(USER, CODE)]

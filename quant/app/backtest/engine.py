@@ -665,6 +665,10 @@ def _batch_single_fractional(
         init_cash=1.0, fees=commission_fees,
         slippage=costs["slippage"], freq="1D",
     )
+    # 先跑仅佣金 probe 得到订单列表,再按卖出单叠加印花税重新跑净值。
+    # 关键假设:size_type="targetpercent" 且 price/slippage 不变时,仅改变 fees
+    # 不会影响订单规模/方向/成交日;若该假设被破坏,两趟 from_orders 的订单会
+    # 不一致,必须改为同时传入买/卖双方向费率矩阵。
     fees = commission_fees.copy()
     pf = probe
     if costs["stamp_tax"]:
@@ -996,8 +1000,13 @@ def _portfolio_execution_schedule(
     planned_orders: pd.DataFrame,
     reason_map: dict[tuple[pd.Timestamp, str], list[dict]],
     synthetic_entries: pd.DataFrame,
+    rebalance_mask: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[tuple[pd.Timestamp, str], dict]]:
-    """组合订单可成交调度：买入失败丢弃，卖出失败保留并逐日重试。"""
+    """组合订单可成交调度：买入失败丢弃，卖出失败保留并逐日重试。
+
+    某个代码的目标权重再次发生变化(调仓日)时,重置因涨停/停牌导致的买入阻塞,
+    避免目标持续为正时被永久跳过;其它代码的权重变化不应借机补买。
+    """
     open_prices = _to_price_matrix(pool_dfs, "open", bt_idx)
     valid_open = open_prices.notna() & open_prices.gt(0)
     volume = _to_price_matrix(pool_dfs, "volume", bt_idx)
@@ -1009,12 +1018,19 @@ def _portfolio_execution_schedule(
     previous_targets = w_exec.shift().fillna(0.0)
     actual = pd.DataFrame(np.nan, index=bt_idx, columns=w_exec.columns)
     events: dict[tuple[pd.Timestamp, str], dict] = {}
+    rebalance = (
+        rebalance_mask.reindex(index=bt_idx, columns=w_exec.columns).fillna(False).astype(bool)
+        if rebalance_mask is not None
+        else pd.DataFrame(False, index=bt_idx, columns=w_exec.columns)
+    )
 
     for code in w_exec.columns:
         pending: dict | None = None
         synthetic_pending_target: float | None = None
         blocked_buy_until_reset = False
         for day in bt_idx:
+            if rebalance.at[day, code]:
+                blocked_buy_until_reset = False
             target = planned_orders.at[day, code]
             if pending is not None:
                 if bool(sell_tradable.at[day, code]):
@@ -1188,9 +1204,16 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
     if len(bt_idx) and (weights_full.index < bt_idx[0]).any():
         synthetic_entries.loc[bt_idx[0]] = w_exec.loc[bt_idx[0]].fillna(0.0).gt(0)
     reason_map = exit_reasons or {}
+    # T 日目标权重变化(调仓)时重置该代码的买入阻塞标记；用执行日 w_exec 与
+    # 上一执行日比较，排除首次建仓的 NaN 前值，避免无关代码借机补买。
+    rebalance = (
+        w_exec.ne(w_exec.shift()).fillna(False)
+        & w_exec.notna()
+        & w_exec.shift().notna()
+    )
     w_orders, exit_events = _portfolio_execution_schedule(
         weights_full, pool_dfs, bt_idx, w_exec, planned_orders, reason_map,
-        synthetic_entries,
+        synthetic_entries, rebalance_mask=rebalance,
     )
     w_orders, exit_events = _enforce_actual_portfolio_order_tradability(
         w_orders, close, open_, pool_dfs, bt_idx, costs, synthetic_entries,

@@ -18,6 +18,10 @@ from ..models import DailyBar, Stock, WatchlistItem
 
 router = APIRouter(prefix="/api/market", tags=["market"])
 
+_MAX_KLINE_YEARS = 5
+_MAX_KLINE_DAYS = 365 * _MAX_KLINE_YEARS + _MAX_KLINE_YEARS // 4
+
+
 _FULL_CODE_RE = re.compile(r"^(sh|sz|bj)\.(\d{6})$", re.IGNORECASE)
 _PARTIAL_CODE_RE = re.compile(r"^(sh|sz|bj)\.(\d{1,5})$", re.IGNORECASE)
 _DIGITS_RE = re.compile(r"^\d{1,6}$")
@@ -110,11 +114,37 @@ def get_data_quality(
     return data_quality_public_summary(db)
 
 
+def _clamp_kline_range(
+    start: date | None, end: date | None,
+) -> tuple[date, date]:
+    """限制 K 线查询区间:无参数时取最近 5 年,显式范围不超过 5 年。
+
+    未来 end 会被截断到当日;start 晚于 end 时报错。
+    """
+    from datetime import timedelta
+
+    today = date.today()
+    if end is None:
+        end = today
+    if end > today:
+        end = today
+    if start is None:
+        start = max(end - timedelta(days=_MAX_KLINE_DAYS), date.min)
+    if start > end:
+        raise HTTPException(400, "start 不能晚于 end")
+    if (end - start).days > _MAX_KLINE_DAYS:
+        raise HTTPException(
+            400, f"K线查询区间跨度不能超过 {_MAX_KLINE_YEARS} 年"
+        )
+    return start, end
+
+
 @router.get("/kline")
 def get_kline(code: str = Query(..., description="如 sh.600519"),
               start: date | None = None, end: date | None = None,
               db: Session = Depends(get_db)):
     """K线数据(前复权,raw_close 为不复权收盘)"""
+    start, end = _clamp_kline_range(start, end)
     q = (select(DailyBar).where(DailyBar.code == code)
          .order_by(DailyBar.date))
     if start:

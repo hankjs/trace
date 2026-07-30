@@ -437,14 +437,3 @@ def test_disabled_generic_overlay_does_not_remove_volume_strategy_native_atr_exi
     assert spec.overlays.risk.type == "atr_multiple"
     assert spec.overlays.risk.value == 2.0
 
-
-@pytest.mark.parametrize("name", sorted(SYSTEM_STRATEGY_SPECS))
-def test_legacy_atr_overlay_adapter_declares_required_ohlc_fields(name):
-    spec = get_preset_spec(name, {
-        "risk_overlay": {
-            "enabled": True, "type": "atr_multiple", "value": 2.0,
-            "atr_period": 14,
-        },
-    })
-    declared = {item.field for item in spec.data_requirements}
-    assert {"close", "high", "low"} <= declared

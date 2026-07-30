@@ -34,9 +34,11 @@ def test_filter_field_contract_reserves_fundamental_keys():
         "debt_ratio", "cashflow_ratio",
     }
     assert required <= set(FILTER_FIELDS)
+    # dividend_yield 刻意不可用:数据源未稳定提供 TTM 股息率,不维护、不回填
+    unavailable = {"dividend_yield"}
     for key in required:
         assert FILTER_FIELDS[key]["source"] == "fundamental"
-        assert FILTER_FIELDS[key]["available"] is True
+        assert FILTER_FIELDS[key]["available"] is (key not in unavailable)
         assert {
             "eq", "ne", "gt", "gte", "lt", "lte", "between",
             "is_null", "not_null",

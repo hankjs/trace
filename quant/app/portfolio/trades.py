@@ -34,6 +34,27 @@ def _assert_no_negative_position(trades: list[Trade]) -> None:
         running -= t.qty
 
 
+def _dialect_name(db: Session) -> str:
+    bind = db.get_bind()
+    return bind.dialect.name if bind is not None else "unknown"
+
+
+def _lock_trades_for_update(db: Session, user_id: int, code: str) -> None:
+    """MySQL 下对已有成交行加 SELECT ... FOR UPDATE,防并发同标超卖。
+
+    SQLite 等不支持行级锁的方言直接跳过:单连接/文件库的事务隔离已能
+    满足测试场景,生产互斥由 MySQL 的 next-key 锁保证。
+    """
+    if _dialect_name(db) != "mysql":
+        return
+    db.execute(
+        select(Trade.id)
+        .where(Trade.user_id == user_id, Trade.code == code)
+        .order_by(Trade.id)
+        .with_for_update()
+    ).all()
+
+
 def _trades_for_check(db: Session, user_id: int, code: str) -> list[Trade]:
     """取该用户该标的的全部成交,按 (日期, id) 升序——重放校验的口径。"""
     return list(db.execute(
@@ -57,7 +78,9 @@ def add_trade(db: Session, user_id: int, code: str, trade_date: date, side: str,
     # 在同一事务内 flush 后连同已有成交重放校验:超卖直接回滚拒绝。
     # 此前 positions.py 用 min(卖出量, 持仓量) 静默截断,库里留着 200 股的
     # 成交、盈亏只算 100 股,两边永久不一致;对零持仓的卖出更是凭空消失。
+    # MySQL 下先加 FOR UPDATE,用 next-key 锁把同账户同标的的并发写入串行化。
     try:
+        _lock_trades_for_update(db, user_id, code)
         db.flush()
         _assert_no_negative_position(_trades_for_check(db, user_id, code))
     except Exception:
@@ -86,6 +109,7 @@ def delete_trade(db: Session, user_id: int, trade_id: int) -> bool:
     db.delete(t)
     # 删掉一笔买入会让它之后的卖出失去支撑,同样要校验整条序列
     try:
+        _lock_trades_for_update(db, user_id, code)
         db.flush()
         _assert_no_negative_position(_trades_for_check(db, user_id, code))
     except Exception:

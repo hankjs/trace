@@ -547,6 +547,15 @@ def test_atr_overlay_and_nested_parameter_scan_values_are_validated(monkeypatch)
         validate_strategy_params("breakout", {
             "take_profit": {"type": "atr_multiple", "value": 80},
         })
+    # risk_overlay 与 take_profit 的 ATR 上限均与 StrategySpec 一致为 50
+    with pytest.raises(ValueError, match="ATR 倍数"):
+        validate_strategy_params("breakout", {
+            "risk_overlay": {"type": "atr_multiple", "value": 51},
+        })
+    valid_50 = validate_strategy_params("breakout", {
+        "risk_overlay": {"type": "atr_multiple", "value": 50},
+    })
+    assert valid_50["risk_overlay"]["value"] == 50.0
 
     df = _bars([10 + i * 0.05 for i in range(100)])
     monkeypatch.setattr("app.backtest.engine.load_bars_df", lambda *args, **kwargs: df)

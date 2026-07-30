@@ -28,6 +28,8 @@ class _FakeConnection:
         self.statements: list[str] = []
 
     def execute(self, statement, params=None):
+        if self.closed:
+            raise RuntimeError("连接已关闭")
         text = str(statement)
         self.statements.append(text)
         if self._fail:
@@ -57,6 +59,7 @@ class _FakeEngine:
 
 def _reset() -> None:
     scheduler_lock._lock_connection = None
+    scheduler_lock._job_lock_connections.clear()
 
 
 def _enable_prod_scheduler(monkeypatch) -> None:
@@ -164,3 +167,57 @@ def test_release_is_idempotent_and_closes_connection(monkeypatch):
 
     scheduler_lock.release_scheduler_slot()  # 第二次是 no-op,不应抛
     assert scheduler_lock._lock_connection is None
+
+
+def test_scheduler_slot_held_checks_used_lock_on_same_connection(monkeypatch):
+    """持有锁时 is_scheduler_slot_held 为 True;其它连接持有则为 False。"""
+    _reset()
+    conn = _FakeConnection(lock_result=1)
+    _enable_prod_scheduler(monkeypatch)
+    monkeypatch.setattr(scheduler_lock, "engine", _FakeEngine("mysql", conn))
+
+    assert scheduler_lock.acquire_scheduler_slot() is True
+    assert scheduler_lock.is_scheduler_slot_held() is True
+    assert any("IS_USED_LOCK" in s for s in conn.statements)
+
+    # 模拟连接断开
+    conn.closed = True
+    assert scheduler_lock.is_scheduler_slot_held() is False
+
+
+def test_acquire_job_lock_uses_mysql_get_lock(monkeypatch):
+    """手动触发任务使用 per-job GET_LOCK 跨 worker 互斥。"""
+    _reset()
+    conn = _FakeConnection(lock_result=1)
+    _enable_prod_scheduler(monkeypatch)
+    monkeypatch.setattr(scheduler_lock, "engine", _FakeEngine("mysql", conn))
+
+    acquired = scheduler_lock.acquire_job_lock("sync_stock_list")
+    assert acquired is conn
+    assert "sync_stock_list" in scheduler_lock._job_lock_connections
+    assert any("GET_LOCK" in s for s in conn.statements)
+
+    scheduler_lock.release_job_lock("sync_stock_list")
+    assert conn.closed is True
+    assert "sync_stock_list" not in scheduler_lock._job_lock_connections
+
+
+def test_acquire_job_lock_returns_none_when_already_held(monkeypatch):
+    """同任务锁被其它实例持有时返回 None。"""
+    _reset()
+    conn = _FakeConnection(lock_result=0)
+    _enable_prod_scheduler(monkeypatch)
+    monkeypatch.setattr(scheduler_lock, "engine", _FakeEngine("mysql", conn))
+
+    assert scheduler_lock.acquire_job_lock("sync_stock_list") is None
+    assert conn.closed is True
+
+
+def test_acquire_job_lock_noop_on_non_mysql(monkeypatch):
+    """SQLite 等方言无 advisory lock,返回 True 由调用方做进程内互斥。"""
+    _reset()
+    _enable_prod_scheduler(monkeypatch)
+    monkeypatch.setattr(scheduler_lock, "engine", _FakeEngine("sqlite"))
+
+    assert scheduler_lock.acquire_job_lock("sync_stock_list") is True
+    assert scheduler_lock.release_job_lock("sync_stock_list") is None

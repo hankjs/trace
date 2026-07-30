@@ -34,6 +34,9 @@ export const loadPools = collection.load
 /** 池增删改后调用,强制下次读取走网络 */
 export const invalidatePools = collection.invalidate
 
+/** 登出或需要完全清空缓存时调用 */
+export const resetPools = collection.reset
+
 export const poolById = collection.byId
 
 /** 已保存的 pool_id 是否仍然有效(池可能已被删除) */
@@ -49,6 +52,7 @@ export function usePools() {
     presetPools: computed(() => pools.value.filter((pool) => pool.kind !== 'static')),
     load: loadPools,
     invalidate: invalidatePools,
+    reset: resetPools,
     poolById,
     defaultPoolId,
     hasSurvivorshipBias,

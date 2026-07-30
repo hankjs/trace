@@ -14,7 +14,7 @@ import pandas as pd
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
-from ..data.ingest import load_bars_df
+from ..data.ingest import load_bars_df, load_bars_df_bulk
 from ..data.universe import current_pool, pool_at
 from ..factors import FACTOR_COLUMNS, MIN_BARS, factor_frame
 from ..models import DailyBar, FactorDaily, Pick, Stock
@@ -104,8 +104,9 @@ def compute_factor_rows(db: Session, codes: list[str],
     """
     start = day - timedelta(days=LOOKBACK_DAYS)
     rows = []
-    for code in codes:
-        df = load_bars_df(db, code, start=start, end=day)
+    # 批量加载全窗口日线后在内存分组,避免全 A 选股时 5000+ 次单股查询往返。
+    bars_by_code = load_bars_df_bulk(db, codes, start=start, end=day)
+    for code, df in bars_by_code.items():
         if len(df) < MIN_BARS or df["date"].iat[-1] != day:
             continue  # 当日无数据(停牌/非交易日/未更新)
         ff = factor_frame(df)
@@ -123,7 +124,7 @@ def compute_factor_rows(db: Session, codes: list[str],
             **{k: (None if v != v else float(v)) for k, v in last.items()},
         })
 
-    # upsert quant_factor_daily
+    # upsert quant_factor_daily(与 run_selection 共用同一事务,外层统一 commit)
     if rows:
         db.execute(delete(FactorDaily).where(
             FactorDaily.date == day,
@@ -134,7 +135,6 @@ def compute_factor_rows(db: Session, codes: list[str],
             [{"code": r["code"], "date": r["date"],
               **{k: r[k] for k in FACTOR_COLUMNS}} for r in rows],
         )
-        db.commit()
     return rows
 
 

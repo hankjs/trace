@@ -26,7 +26,7 @@ import {
   X,
 } from 'lucide-vue-next'
 import { clearAuth, currentUsername, getToken, isAdmin } from './api'
-import { loadCatalog } from './catalog'
+import { loadCatalog, resetCatalog } from './catalog'
 import CoDialog from './components/CoDialog.vue'
 import OnboardingGuide from './components/OnboardingGuide.vue'
 import QuTour from './components/QuTour.vue'
@@ -34,6 +34,8 @@ import ResearchAssistant from './components/ResearchAssistant.vue'
 import StockSearchInput from './components/StockSearchInput.vue'
 import ThemeToggle from './components/ThemeToggle.vue'
 import type { ResearchGuide } from './guides'
+import { resetPools } from './pools'
+import { resetStrategies } from './strategies'
 
 const route = useRoute()
 const router = useRouter()
@@ -46,6 +48,9 @@ const stockSearch = ref<{ focus: () => void } | null>(null)
 
 function logout() {
   clearAuth()
+  resetStrategies()
+  resetPools()
+  resetCatalog()
   router.push('/login')
 }
 

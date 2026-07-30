@@ -147,7 +147,7 @@ describe('saved StrategySpec backtest workflow', () => {
     await wrapper.get('form').trigger('submit')
     await flushPromises()
 
-    expect(run).toHaveBeenCalledWith({
+    expect(run.mock.calls[0][0]).toEqual({
       strategy_id: 7,
       codes: ['sh.600519'],
       start: '2024-01-01',
@@ -155,6 +155,7 @@ describe('saved StrategySpec backtest workflow', () => {
       costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
     })
     expect(run.mock.calls[0][0]).not.toHaveProperty('params')
+    expect(run.mock.calls[0][1]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
     expect(wrapper.text()).toContain('不可变执行证据')
     expect(wrapper.text()).toContain('与当前策略一致')
     expect(wrapper.text()).toContain('strategy-compiler-v1')
@@ -207,7 +208,7 @@ describe('saved StrategySpec backtest workflow', () => {
     await wrapper.get('form').trigger('submit')
     await flushPromises()
 
-    expect(run).toHaveBeenCalledWith({
+    expect(run.mock.calls[0][0]).toEqual({
       strategy_id: 7,
       codes: [],
       start: '2024-01-01',
@@ -215,6 +216,7 @@ describe('saved StrategySpec backtest workflow', () => {
       pool_id: 2,
       costs: { commission: 0.00025, stamp_tax: 0.0005, slippage: 0.0001 },
     })
+    expect(run.mock.calls[0][1]).toEqual(expect.objectContaining({ signal: expect.any(AbortSignal) }))
   })
 
   it('blocks a strategy with capability failures', async () => {

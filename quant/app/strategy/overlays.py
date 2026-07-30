@@ -41,7 +41,8 @@ DEFAULT_OVERLAYS: dict[str, dict[str, Any]] = {
 _VALUE_LIMITS = {
     "risk_overlay": {
         "fixed_pct": (0.001, 1.0),
-        "atr_multiple": (0.1, 20.0),
+        # 与 StrategySpec 的 OverlayRuleSpec 上限保持一致(50)
+        "atr_multiple": (0.1, 50.0),
     },
     "take_profit": {
         "fixed_pct": (0.001, 1.0),

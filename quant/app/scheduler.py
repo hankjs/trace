@@ -19,13 +19,17 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from datetime import date, datetime, time as dtime
+from functools import wraps
+from typing import TypeVar
 
 from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from . import scheduler_lock
 from .backtest.evaluate import run_evaluation
 from .config import settings
 from .data import baostock_client, fundamentals, ingest, universe
@@ -39,6 +43,8 @@ from .research_plan.pipeline import run_portfolio_plans
 from .strategy.engine import run_signals
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 
@@ -384,58 +390,77 @@ def job_def(job_id: str) -> dict | None:
 # 详细失败仍要看日志。
 def _record_system_run(event) -> None:
     from . import job_log  # 延迟导入,避免 scheduler<->job_log 循环依赖
+    started_at = (
+        event.scheduled_run_time.replace(tzinfo=None)
+        if getattr(event, "scheduled_run_time", None) is not None
+        else now_cst().replace(tzinfo=None)
+    )
     job_log.record_run(
         event.job_id, job_log.TRIGGER_SYSTEM,
         job_log.STATUS_FAILED if event.exception else job_log.STATUS_FINISHED,
-        started_at=now_cst().replace(tzinfo=None),
+        started_at=started_at,
         finished_at=now_cst().replace(tzinfo=None),
         result=getattr(event, "retval", None),
         error=str(event.exception) if event.exception else None,
     )
 
 
+def _run_with_lock_check(func: Callable[[], T]) -> Callable[[], T | None]:
+    """调度任务执行前校验本实例是否仍持有互斥锁;失锁则停止调度。"""
+    @wraps(func)
+    def wrapper() -> T | None:
+        if not scheduler_lock.is_scheduler_slot_held():
+            logger.error("调度器互斥锁已丢失,停止本实例调度")
+            stop_scheduler()
+            return None
+        return func()
+    return wrapper
+
+
 def start_scheduler() -> BackgroundScheduler:
     scheduler.add_listener(
         _record_system_run, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
     scheduler.add_job(
-        job_evening_pipeline, "cron",
+        _run_with_lock_check(job_evening_pipeline), "cron",
         day_of_week="mon-fri", hour=16, minute=30,
         id="evening_pipeline", replace_existing=True,
         max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
-        job_sync_index_members, "cron",
+        _run_with_lock_check(job_sync_index_members), "cron",
         day=1, hour=9, minute=0,
         id="sync_index_members", replace_existing=True,
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
-        job_sync_trade_calendar, "cron",
+        _run_with_lock_check(job_sync_trade_calendar), "cron",
         day=1, hour=8, minute=30,
         id="sync_trade_calendar", replace_existing=True,
-        max_instances=1, coalesce=True,
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
-        job_sync_stock_list, "cron",
+        _run_with_lock_check(job_sync_stock_list), "cron",
         day_of_week="sat", hour=8, minute=0,
         id="sync_stock_list", replace_existing=True,
-        max_instances=1, coalesce=True,
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
-        job_sync_valuations, "cron",
+        _run_with_lock_check(job_sync_valuations), "cron",
         day_of_week="mon-fri", hour=18, minute=30,
         id="sync_valuations", replace_existing=True,
-        max_instances=1, coalesce=True,
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
-        job_sync_fundamentals, "cron",
+        _run_with_lock_check(job_sync_fundamentals), "cron",
         day_of_week="sat", hour=9, minute=0,
         id="sync_fundamentals", replace_existing=True,
-        max_instances=1, coalesce=True,
+        max_instances=1, coalesce=True, misfire_grace_time=3600,
     )
     scheduler.add_job(
-        job_intraday_snapshot, "cron",
+        _run_with_lock_check(job_intraday_snapshot), "cron",
         day_of_week="mon-fri", minute="*/30",
         id="intraday_snapshot", replace_existing=True,
+        max_instances=1, coalesce=True, misfire_grace_time=600,
     )
     scheduler.start()
     logger.info("scheduler 已启动: 16:30 盘后流水线(日线->因子+选股->信号,"

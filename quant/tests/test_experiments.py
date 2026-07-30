@@ -131,6 +131,35 @@ def test_experiment_trial_ledger_keeps_failures():
         assert archived["status"] == "archived"
 
 
+def test_list_experiments_honors_limit_and_offset():
+    with _session() as db:
+        strategy = _seed(db)
+        for i in range(4):
+            api_create_experiment(
+                ExperimentCreateIn(
+                    title=f"实验 {i}",
+                    hypothesis="分页测试",
+                    permanent_candidate_id=f"CAN-PAG-{i:03d}",
+                    spec=strategy.spec,
+                    strategy_id=strategy.id,
+                ),
+                db=db, claims=CLAIMS,
+            )
+
+        page1 = api_list_experiments(
+            limit=2, offset=0, db=db, claims=CLAIMS,
+        )
+        page2 = api_list_experiments(
+            limit=2, offset=2, db=db, claims=CLAIMS,
+        )
+
+        assert len(page1["items"]) == 2
+        assert len(page2["items"]) == 2
+        ids1 = {item["id"] for item in page1["items"]}
+        ids2 = {item["id"] for item in page2["items"]}
+        assert not ids1 & ids2
+
+
 def test_batch_trials_persist_mixed_success_and_failure():
     """B5: 批量创建含失败项全部落库。"""
     with _session() as db:

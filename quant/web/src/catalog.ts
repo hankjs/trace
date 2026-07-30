@@ -310,6 +310,13 @@ export async function loadCatalog(): Promise<CatalogPayload> {
   return catalog.value
 }
 
+export function resetCatalog() {
+  catalog.value = fallbackCatalog
+  loading.value = false
+  loaded.value = false
+  usingFallback.value = true
+}
+
 export function catalogEntry(section: CatalogSection, key: string): CatalogEntry | undefined {
   return catalog.value[section].find((entry) => entry.key === key)
 }
@@ -375,5 +382,6 @@ export function useCatalog() {
     loaded: readonly(loaded),
     usingFallback: readonly(usingFallback),
     load: loadCatalog,
+    reset: resetCatalog,
   }
 }

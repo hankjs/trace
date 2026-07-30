@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { FolderOpen, Plus, Save, Search, Trash2 } from 'lucide-vue-next'
 import {
   api,
+  currentUsername,
   type CatalogEntry,
   type FilterLogic,
   type ScreenerCondition,
@@ -37,6 +38,10 @@ interface SavedScheme {
  */
 const STORAGE_KEY = 'quant_screener_schemes_v2'
 const LEGACY_STORAGE_KEY = 'quant_screener_schemes_v1'
+
+function schemesKey(): string {
+  return `${STORAGE_KEY}_${currentUsername() || 'guest'}`
+}
 const { catalog, load: loadCatalog } = useCatalog()
 const groups = ref<ScreenerGroup[]>([])
 const rootLogic = ref<FilterLogic>('and')
@@ -300,7 +305,7 @@ function applyPreset(preset: typeof presets[number]) {
 
 function readSchemes(): SavedScheme[] {
   try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]')
+    const parsed = JSON.parse(localStorage.getItem(schemesKey()) ?? '[]')
     if (!Array.isArray(parsed)) return []
     // 只接受 pool_id 为数字或 null 的方案,防御手工改坏的 localStorage
     return parsed.filter((scheme): scheme is SavedScheme =>
@@ -341,7 +346,7 @@ function saveScheme() {
   const index = savedSchemes.value.findIndex((item) => item.name === name)
   if (index >= 0) savedSchemes.value.splice(index, 1, scheme)
   else savedSchemes.value.push(scheme)
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedSchemes.value))
+  localStorage.setItem(schemesKey(), JSON.stringify(savedSchemes.value))
   selectedScheme.value = name
   error.value = ''
 }
@@ -362,7 +367,7 @@ function loadScheme() {
 function deleteScheme() {
   if (!selectedScheme.value) return
   savedSchemes.value = savedSchemes.value.filter((item) => item.name !== selectedScheme.value)
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(savedSchemes.value))
+  localStorage.setItem(schemesKey(), JSON.stringify(savedSchemes.value))
   selectedScheme.value = ''
   schemeName.value = ''
 }

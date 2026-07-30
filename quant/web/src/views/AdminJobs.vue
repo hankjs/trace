@@ -128,7 +128,8 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="space-y-4">
-    <InlineFeedback :error="error" :notice="notice" />
+    <InlineFeedback v-if="error" tone="error">{{ error }}</InlineFeedback>
+    <InlineFeedback v-else-if="notice">{{ notice }}</InlineFeedback>
 
     <section class="rounded border border-border bg-surface-raised">
       <div class="flex items-center gap-2 border-b border-border px-3 py-2.5">

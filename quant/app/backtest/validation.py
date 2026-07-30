@@ -30,6 +30,35 @@ from ..strategy.spec import StrategySpec
 
 OOS_FRACTION = 0.2  # 锁定样本外占回测窗口交易日数的比例(文档未定,定为最后 20%)
 MIN_OOS_BARS = 5    # OOS 段少于此长度的指标不可靠,如实标记不可用
+MAX_BACKTEST_YEARS = 10   # 回测窗口最大跨度(年)
+MAX_BACKTEST_DAYS = 365 * MAX_BACKTEST_YEARS + MAX_BACKTEST_YEARS // 4  # 含闰日余量
+MAX_SWEEP_COMBINATIONS = 500  # 参数扫描笛卡尔积上限
+
+
+def validate_backtest_window(start: date, end: date) -> None:
+    """校验回测窗口:start 早于 end、不含未来日期、跨度不超 10 年。"""
+    if start >= end:
+        raise ValueError("start 必须早于 end")
+    today = date.today()
+    if start > today:
+        raise ValueError("start 不能是未来日期")
+    if end > today:
+        raise ValueError("end 不能是未来日期")
+    if (end - start).days > MAX_BACKTEST_DAYS:
+        raise ValueError(f"回测区间跨度不能超过 {MAX_BACKTEST_YEARS} 年")
+
+
+def validate_sweep_grid(param_grid: dict[str, Any]) -> None:
+    """校验参数扫描网格笛卡尔积不超过上限。"""
+    total = 1
+    for key, values in param_grid.items():
+        if not isinstance(values, list):
+            raise ValueError(f"参数 {key} 的候选值必须是列表")
+        total *= len(values)
+    if total > MAX_SWEEP_COMBINATIONS:
+        raise ValueError(
+            f"参数扫描组合数 {total} 超过上限 {MAX_SWEEP_COMBINATIONS}"
+        )
 
 BASELINE_NAMES = {
     "buy_and_hold": "买入持有(等权)",
@@ -79,6 +108,8 @@ def baseline_equity(
     if baseline_id == "buy_and_hold":
         # 每只标的以窗口内首个有效收盘归一,等权平均;窗口内新上市的标的自其
         # 首个有效值起计入(skipna 平均,与引擎等权合成口径一致)。
+        # 注意:起点不同则 buy_and_hold 的归一化价格不同,不能跨回测窗口直接
+        # 比较绝对净值,只能比较同一窗口内的相对超额收益。
         first = close.apply(lambda s: s.dropna().iloc[0] if s.notna().any() else np.nan)
         normed = close / first
         equity = normed.ffill().mean(axis=1, skipna=True)
@@ -475,7 +506,9 @@ def evaluate_validation(
 
 
 __all__ = [
-    "BASELINE_NAMES", "MIN_OOS_BARS", "OOS_FRACTION", "baseline_equity",
-    "build_oos_report", "evaluate_declared_sweep", "evaluate_rejection",
-    "evaluate_validation", "segment_metrics", "split_oos",
+    "BASELINE_NAMES", "MIN_OOS_BARS", "OOS_FRACTION",
+    "MAX_BACKTEST_YEARS", "MAX_SWEEP_COMBINATIONS",
+    "baseline_equity", "build_oos_report", "evaluate_declared_sweep",
+    "evaluate_rejection", "evaluate_validation", "segment_metrics",
+    "split_oos", "validate_backtest_window", "validate_sweep_grid",
 ]

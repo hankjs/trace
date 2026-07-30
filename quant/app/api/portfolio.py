@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 
 from ..catalog import manual_trade_side_name
@@ -23,9 +23,18 @@ class TradeIn(BaseModel):
     trade_date: date
     side: str = Field(..., pattern="^(buy|sell)$")
     price: float = Field(..., gt=0)
-    qty: float = Field(..., gt=0)
+    qty: int = Field(..., gt=0)
     fee: float = Field(0.0, ge=0)
     note: str = ""
+
+    @field_validator("qty", mode="before")
+    @classmethod
+    def _qty_must_be_positive_integer(cls, value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("qty 必须是正整数")
+        if isinstance(value, float) and not value.is_integer():
+            raise ValueError("qty 必须是正整数")
+        return int(value)
 
 
 def _trade_out(t, stock: Stock | None = None) -> dict:

@@ -26,11 +26,15 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.add_column(
-        "quant_stock",
-        sa.Column(
-            "is_watch", sa.Boolean(), nullable=False, server_default=sa.false(),
-        ),
+    column = sa.Column(
+        "is_watch", sa.Boolean(), nullable=False, server_default=sa.false(),
     )
-    # server_default 只服务迁移;业务默认由应用层负责,去掉 DB 默认以免残留语义
-    op.alter_column("quant_stock", "is_watch", server_default=None)
+    # SQLite 不支持 ALTER COLUMN DROP DEFAULT,使用 batch 重建表。
+    if op.get_bind().dialect.name == "sqlite":
+        with op.batch_alter_table("quant_stock") as batch_op:
+            batch_op.add_column(column)
+            batch_op.alter_column("is_watch", server_default=None)
+    else:
+        op.add_column("quant_stock", column)
+        # server_default 只服务迁移;业务默认由应用层负责,去掉 DB 默认以免残留语义
+        op.alter_column("quant_stock", "is_watch", server_default=None)

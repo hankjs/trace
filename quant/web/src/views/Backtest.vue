@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onActivated, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { AlertTriangle, CheckCircle2, ChevronRight, Code2, Fingerprint, Plus, TriangleAlert } from 'lucide-vue-next'
 import type { EChartsCoreOption } from 'echarts/core'
@@ -43,6 +43,7 @@ const result = ref<BacktestResult | null>(null)
 const running = ref(false)
 const error = ref('')
 const runIdInput = ref('')
+let backtestAbort: AbortController | null = null
 /** 股票池:组合策略的研究范围;单标的策略在「按股票池」模式下使用 */
 const poolId = ref<number | null>(null)
 /** 单标的策略的选股方式:手动选股 / 按股票池(与 codes 互斥) */
@@ -456,7 +457,7 @@ const exactHashMatch = computed<boolean | null>(() => {
 // ---- 规格验证报告(基线对比 / OOS 分段 / 否决判定) ----
 
 const resultValidation = computed<BacktestValidation | null>(
-  () => result.value?.validation ?? result.value?.metrics.validation ?? null,
+  () => result.value?.validation ?? result.value?.metrics?.validation ?? null,
 )
 const validationOos = computed(() => {
   const oos = resultValidation.value?.oos
@@ -579,6 +580,7 @@ async function run() {
     return
   }
   running.value = true
+  backtestAbort = new AbortController()
   try {
     result.value = await api.runBacktest({
       strategy_id: strategyId.value,
@@ -589,12 +591,15 @@ async function run() {
       // 单标的「按股票池」模式同样留空 codes 并下发 pool_id
       ...(usePool && !codes.length ? { pool_id: poolId.value! } : {}),
       costs: runCosts(),
-    })
+    }, { signal: backtestAbort.signal })
     markEventDone('run_backtest')
   } catch (e) {
-    error.value = (e as Error).message
+    if ((e as Error).message !== '回测已取消') {
+      error.value = (e as Error).message
+    }
   } finally {
     running.value = false
+    backtestAbort = null
   }
 }
 
@@ -614,6 +619,10 @@ async function loadRun() {
     running.value = false
   }
 }
+
+onUnmounted(() => {
+  backtestAbort?.abort()
+})
 
 /** 从路由同步策略预选。KeepAlive 下需 watch / onActivated,不能只在 onMounted 读一次。 */
 function syncStrategyFromRoute() {

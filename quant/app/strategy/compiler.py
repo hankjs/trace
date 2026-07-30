@@ -367,7 +367,7 @@ def _compile_single_native(
         if blocked_until_reset:
             if not entry_now:
                 reset_bars += 1
-                if reset_bars > parsed.holding.cooldown_days:
+                if reset_bars >= parsed.holding.cooldown_days:
                     blocked_until_reset = False
                     reset_bars = 0
             if blocked_until_reset:

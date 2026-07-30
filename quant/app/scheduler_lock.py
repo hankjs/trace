@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from sqlalchemy import text
 
@@ -34,6 +35,13 @@ LOCK_NAME = "quant_scheduler"
 
 # 持有锁的连接。必须保持引用:GET_LOCK 是会话级的,连接一还池/关闭锁就没了。
 _lock_connection = None
+
+# 手动触发任务的 per-job 锁连接(同 scheduler_lock 的 MySQL 会话锁语义)。
+_job_lock_connections: dict[str, Any] = {}
+
+
+def _dialect_name() -> str:
+    return engine.dialect.name
 
 
 def acquire_scheduler_slot() -> bool:
@@ -52,7 +60,7 @@ def acquire_scheduler_slot() -> bool:
         logger.info("scheduler_enabled=false,本实例不参与调度")
         return False
 
-    if engine.dialect.name != "mysql":
+    if _dialect_name() != "mysql":
         # sqlite/其他:无 advisory lock,单进程场景直接放行
         logger.info("非 MySQL 方言(%s),跳过跨进程互斥", engine.dialect.name)
         return True
@@ -77,6 +85,37 @@ def acquire_scheduler_slot() -> bool:
     return True
 
 
+def is_scheduler_slot_held() -> bool:
+    """校验本实例是否仍持有调度器互斥锁(连接断开后锁会自动释放)。"""
+    if _dialect_name() != "mysql":
+        return True
+    if _lock_connection is None:
+        return False
+    try:
+        holder = _lock_connection.execute(
+            text("SELECT IS_USED_LOCK(:name)"), {"name": LOCK_NAME},
+        ).scalar()
+        me = _lock_connection.execute(text("SELECT CONNECTION_ID()")).scalar()
+    except Exception:  # noqa: BLE001 - 连接已断开即视为失锁
+        return False
+    return holder is not None and holder == me
+
+
+def ping_scheduler_lock() -> bool:
+    """对持有锁的连接做一次心跳探测;失锁时返回 False 并清空引用。"""
+    global _lock_connection
+    if _dialect_name() != "mysql":
+        return True
+    if _lock_connection is None:
+        return False
+    try:
+        _lock_connection.execute(text("SELECT 1"))
+    except Exception:  # noqa: BLE001
+        _lock_connection = None
+        return False
+    return is_scheduler_slot_held()
+
+
 def release_scheduler_slot() -> None:
     """释放锁(优雅关闭时调用;进程崩溃时由连接断开自动释放)。"""
     global _lock_connection
@@ -89,5 +128,54 @@ def release_scheduler_slot() -> None:
         logger.info("已释放调度器互斥锁 %s", LOCK_NAME)
     except Exception:  # noqa: BLE001 - 关闭路径不抛
         logger.exception("释放调度器互斥锁失败")
+    finally:
+        connection.close()
+
+
+def _job_lock_name(job_id: str) -> str:
+    return f"quant_job_{job_id}"
+
+
+def acquire_job_lock(job_id: str, *, blocking: bool = False) -> Any:
+    """为手动触发任务获取 MySQL 会话级互斥锁。
+
+    非 MySQL 方言返回 True(由调用方自行决定进程内互斥方案);
+    获取成功返回连接对象,失败返回 None。注意返回的连接对象必须被
+    `release_job_lock` 释放,否则锁会持续到连接断开。
+    """
+    if _dialect_name() != "mysql":
+        return True
+    connection = engine.connect()
+    timeout = -1 if blocking else 0
+    try:
+        acquired = connection.execute(
+            text("SELECT GET_LOCK(:name, :timeout)"),
+            {"name": _job_lock_name(job_id), "timeout": timeout},
+        ).scalar()
+    except Exception:  # noqa: BLE001
+        connection.close()
+        logger.exception("获取任务 %s 互斥锁失败", job_id)
+        return None
+    if acquired == 1:
+        _job_lock_connections[job_id] = connection
+        return connection
+    connection.close()
+    return None
+
+
+def release_job_lock(job_id: str) -> None:
+    """释放手动触发任务的 MySQL 会话锁。"""
+    if _dialect_name() != "mysql":
+        return
+    connection = _job_lock_connections.pop(job_id, None)
+    if connection is None:
+        return
+    try:
+        connection.execute(
+            text("SELECT RELEASE_LOCK(:name)"),
+            {"name": _job_lock_name(job_id)},
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("释放任务 %s 互斥锁失败", job_id)
     finally:
         connection.close()

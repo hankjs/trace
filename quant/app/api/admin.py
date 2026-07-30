@@ -5,6 +5,7 @@ baostock / akshare 均为同步阻塞调用,统一在线程中执行以免卡住
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections.abc import Callable
 from datetime import date, datetime
@@ -13,7 +14,7 @@ from typing import TypeVar
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from .. import job_log
+from .. import job_log, scheduler_lock
 from ..auth import require_admin
 from ..config import settings
 from ..backtest.evaluate import run_evaluation
@@ -30,6 +31,8 @@ from ..selection.pipeline import run_selection
 from ..strategy.engine import run_signals
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -70,7 +73,8 @@ async def backfill(code: str = Query(..., description="如 sh.600519"),
 
         n = await run_db_job(_job)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"回填失败: {e}")
+        logger.exception("手动回填失败")
+        raise HTTPException(502, "回填失败，请查看服务日志") from e
     return {"code": code.lower(), "start": str(start),
             "end": str(end or date.today()), "bars": n}
 
@@ -81,7 +85,8 @@ async def run_signals_now(date_: date | None = Query(None, alias="date")):
     try:
         return await run_db_job(lambda db: run_signals(db, day=date_))
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"信号计算失败: {e}")
+        logger.exception("手动信号计算失败")
+        raise HTTPException(500, "信号计算失败，请查看服务日志") from e
 
 
 @router.post("/snapshot")
@@ -90,7 +95,8 @@ async def snapshot_now():
     try:
         n = await run_db_job(ingest.ingest_snapshot)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"快照抓取失败: {e}")
+        logger.exception("手动快照抓取失败")
+        raise HTTPException(502, "快照抓取失败，请查看服务日志") from e
     return {"snapshots": n}
 
 
@@ -100,7 +106,8 @@ async def import_stocks():
     try:
         return await run_db_job(ingest.import_stock_list)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"股票列表导入失败: {e}")
+        logger.exception("手动股票列表导入失败")
+        raise HTTPException(502, "股票列表导入失败，请查看服务日志") from e
 
 
 @router.post("/sync-trade-calendar")
@@ -116,7 +123,8 @@ async def sync_trade_calendar_now(
     except ValueError as e:
         raise HTTPException(422, str(e)) from e
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"交易日历同步失败: {e}")
+        logger.exception("手动交易日历同步失败")
+        raise HTTPException(502, "交易日历同步失败，请查看服务日志") from e
 
 
 @router.post("/backfill-list-dates")
@@ -125,7 +133,8 @@ async def backfill_list_dates_now():
     try:
         return await run_db_job(ingest.backfill_list_dates)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"list_date 回填失败: {e}")
+        logger.exception("手动 list_date 回填失败")
+        raise HTTPException(502, "list_date 回填失败，请查看服务日志") from e
 
 
 @router.post("/sync-adjust-factors")
@@ -154,8 +163,9 @@ async def sync_adjust_factors_now(
             return result
 
         return await run_db_job(_job)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"复权因子采集失败: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("手动复权因子采集失败")
+        raise HTTPException(502, "复权因子采集失败，请查看服务日志") from exc
 
 
 @router.post("/sync-fundamentals")
@@ -199,7 +209,8 @@ async def sync_fundamentals_now(
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, f"基本面同步失败: {exc}") from exc
+        logger.exception("手动基本面同步失败")
+        raise HTTPException(500, "基本面同步失败，请查看服务日志") from exc
 
 
 @router.post("/sync-index-members")
@@ -208,18 +219,20 @@ async def sync_index_members():
     try:
         return await run_db_job(universe.sync_all_indices)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"成分股同步失败: {e}")
+        logger.exception("手动成分股同步失败")
+        raise HTTPException(502, "成分股同步失败，请查看服务日志") from e
 
 
 @router.post("/run-selection")
 async def run_selection_now(date_: date | None = Query(None, alias="date"),
-                            top_n: int = 30):
+                            top_n: int = Query(30, ge=1, le=200)):
     """手动触发指定日期的因子计算 + 选股(默认今天;该日无数据则空结果)"""
     try:
         return await run_db_job(
             lambda db: run_selection(db, day=date_, top_n=top_n))
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"选股失败: {e}")
+        logger.exception("手动选股失败")
+        raise HTTPException(500, "选股失败，请查看服务日志") from e
 
 
 @router.post("/run-eval")
@@ -231,7 +244,8 @@ async def run_eval_now(date_: date | None = Query(None, alias="date"),
             lambda db: run_evaluation(
                 db, day=date_, period_days=period_days))
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"批量评估失败: {e}")
+        logger.exception("手动批量评估失败")
+        raise HTTPException(500, "批量评估失败，请查看服务日志") from e
 
 
 @router.get("/data-quality")
@@ -261,7 +275,7 @@ _manual_locks: dict[str, threading.Lock] = {
     j["id"]: threading.Lock() for j in JOB_DEFS}
 
 
-def _run_job_thread(job: dict, run_id: int | None) -> None:
+def _run_job_thread(job: dict, run_id: int | None, db_lock) -> None:
     try:
         result = job["func"]()
         job_log.finish_run(run_id, job_log.STATUS_FINISHED,
@@ -270,6 +284,7 @@ def _run_job_thread(job: dict, run_id: int | None) -> None:
         job_log.finish_run(run_id, job_log.STATUS_FAILED,
                            datetime.now(), error=str(e))
     finally:
+        scheduler_lock.release_job_lock(job["id"])
         _manual_locks[job["id"]].release()
 
 
@@ -326,6 +341,12 @@ async def run_job(job_id: str, claims: dict = Depends(require_admin)):
     if not lock.acquire(blocking=False):
         raise HTTPException(409, "该任务已有手动执行进行中")
     try:
+        # 多 worker 环境下用 MySQL 会话级锁保证同任务不并发;SQLite 测试环境退化为
+        # 进程内 threading.Lock。
+        db_lock = scheduler_lock.acquire_job_lock(job_id)
+        if db_lock is None:
+            lock.release()
+            raise HTTPException(409, "该任务已有其它实例执行中")
         job_log.fail_stale_running(job_id)
         run_id = job_log.record_run(
             job_id, job_log.TRIGGER_MANUAL, job_log.STATUS_RUNNING,
@@ -333,8 +354,11 @@ async def run_job(job_id: str, claims: dict = Depends(require_admin)):
             operator=str(claims.get("username") or "") or None,
         )
         threading.Thread(
-            target=_run_job_thread, args=(job, run_id), daemon=True).start()
+            target=_run_job_thread, args=(job, run_id, db_lock), daemon=True).start()
+    except HTTPException:
+        raise
     except Exception:
         lock.release()
+        scheduler_lock.release_job_lock(job_id)
         raise
     return {"status": "started", "job_id": job_id}

@@ -1664,18 +1664,26 @@ export const api = {
     return request<{ deleted: number }>(`/api/pools/${id}/members/${code}`, { method: 'DELETE' })
   },
 
-  async runBacktest(body: {
-    strategy_id: number
-    codes: string[]
-    start: string
-    end: string
-    pool_id?: number
-    costs?: BacktestCostSnapshot
-  }) {
+  async runBacktest(
+    body: {
+      strategy_id: number
+      codes: string[]
+      start: string
+      end: string
+      pool_id?: number
+      costs?: BacktestCostSnapshot
+    },
+    opts?: { signal?: AbortSignal }
+  ) {
+    const signal = opts?.signal
+    if (signal?.aborted) throw new Error('回测已取消')
+
     const initial = await request<BacktestResult>('/api/backtests', {
       method: 'POST',
       body: JSON.stringify(body),
+      signal,
     })
+    if (signal?.aborted) throw new Error('回测已取消')
     // 同步路径直接 done;异步路径 202 pending 后轮询直到完成
     if (!initial.status || initial.status === 'done' || initial.status === 'failed') {
       if (initial.status === 'failed') {
@@ -1686,8 +1694,21 @@ export const api = {
     const runId = initial.run_id
     const deadline = Date.now() + 10 * 60 * 1000
     while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 1200))
-      const current = await request<BacktestResult>(`/api/backtests/${runId}`)
+      if (signal?.aborted) throw new Error('回测已取消')
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 1200)
+        if (!signal) return
+        const onAbort = () => {
+          clearTimeout(timer)
+          reject(new Error('回测已取消'))
+        }
+        if (signal.aborted) {
+          onAbort()
+          return
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+      })
+      const current = await request<BacktestResult>(`/api/backtests/${runId}`, { signal })
       if (current.status === 'done' || current.status === 'failed' || !current.status) {
         if (current.status === 'failed') {
           throw new Error(current.error || '回测失败')

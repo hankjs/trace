@@ -237,7 +237,9 @@ async function loadAll() {
       const last = bars.value[bars.value.length - 1]
       if (lastPct.value === null && bars.value.length > 1) {
         const prev = bars.value[bars.value.length - 2]
-        lastPct.value = ((last.close - prev.close) / prev.close) * 100
+        if (prev.close !== 0) {
+          lastPct.value = ((last.close - prev.close) / prev.close) * 100
+        }
       }
     }
     setRange(0)

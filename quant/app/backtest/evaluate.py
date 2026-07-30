@@ -171,7 +171,8 @@ def run_evaluation(db: Session, day: date | None = None,
             "evaluated": saved}
 
 
-def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
+def leaderboard(db: Session, user_id: str, limit: int = 200,
+                offset: int = 0) -> dict:
     """最近一轮评估结果,按年化中位数/组合年化排序。
 
     按 batch_id 整批取,不用 run_at 精确相等:同一轮里各行的 run_at 相差数
@@ -181,13 +182,13 @@ def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
     我自己的 —— 否则别人的策略名和参数会出现在我的页面上。
     """
     if limit <= 0:
-        return {"run_at": None, "batch_id": None, "items": []}
+        return {"run_at": None, "batch_id": None, "count": 0, "items": []}
     latest = db.execute(
         select(StrategyEval.batch_id, StrategyEval.run_at)
         .order_by(StrategyEval.run_at.desc()).limit(1)
     ).first()
     if latest is None:
-        return {"run_at": None, "batch_id": None, "items": []}
+        return {"run_at": None, "batch_id": None, "count": 0, "items": []}
     batch_id, latest_run = latest
     rows = db.execute(
         select(StrategyEval, Strategy)
@@ -222,6 +223,8 @@ def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
         v = m.get("annual_return_median", m.get("annual_return"))
         return v if isinstance(v, (int, float)) else -9
 
+    sorted_rows = sorted(rows, key=sort_key, reverse=True)
+    total = len(sorted_rows)
     items = [
         {
             "strategy_id": r.strategy_id,
@@ -237,7 +240,7 @@ def leaderboard(db: Session, user_id: str, limit: int = 50) -> dict:
             "run_at": r.run_at.isoformat(sep=" "),
             "batch_id": r.batch_id,
         }
-        for r, s in sorted(rows, key=sort_key, reverse=True)[:limit]
+        for r, s in sorted_rows[offset:offset + limit]
     ]
     return {"run_at": latest_run.isoformat(sep=" "), "batch_id": batch_id,
-            "items": items}
+            "count": total, "items": items}
