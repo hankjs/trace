@@ -158,6 +158,9 @@ class AdjustFactor(Base):
         _ADJ_FACTOR, nullable=True)
     # 'baostock' = query_adjust_factor 的权威值;
     # 'sina' = 北交所自算(baostock 不覆盖北交所,见 alembic 0008)。
+    # 'verified_none' = 单票验证「从未除权」后写入的 1.0 哨兵(见
+    # ingest.verify_missing_factor_codes);该股日后首次除权时,真实因子
+    # 日期更晚自动接管。
     # 自算值精度受 close/raw_close 的 DECIMAL(12,4) 限制,约 4~5 位有效,
     # 故审计时它的可信度低于权威值 —— 用 source 区分,不要混为一谈。
     source: Mapped[str] = mapped_column(String(16), default="baostock")

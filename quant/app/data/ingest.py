@@ -1050,6 +1050,72 @@ def _effective_fore_factors(db: Session, codes: list[str],
     return effective
 
 
+def verify_missing_factor_codes(db: Session, codes: list[str],
+                                *, sleep_per_code: float = 0.3,
+                                max_codes: int = 50) -> dict:
+    """缺因子 code 的单票验证:区分「从未除权」与「因子数据缺口」。
+
+    批量日 K 需要库内复权因子做原始价→前复权换算。code 无因子记录有两
+    种含义:从未分红送转(因子恒为 1.0,按 1.0 写是正确的),或因子数
+    据缺口(按 1.0 写会把原始价混进前复权序列)。不验证就按 1.0 写,
+    后一种情况会静默污染数据 —— 所以批量链路默认跳过,本函数负责把
+    「不知道」变成「已验证」:
+
+    - baostock 单票全历史查询返回 0 行 → 从未除权,写哨兵记录
+      (fore_factor=1.0, divid_operate_date=上市日, source='verified_none'),
+      之后 _effective_fore_factors 自然命中,走与其他股票相同的路径;
+      该股日后首次分红时,真实因子日期更晚自动接管,并触发重锚。
+    - 返回有行 → 因子数据缺口,顺手 upsert 真实因子修复。
+
+    幂等:已有任何因子行(含哨兵)的 code 直接跳过。max_codes 限制单次
+    验证规模,超出的留给下一轮(批量日 K 每天会再试)。
+
+    返回 {"verified_none", "synced", "failed", "remaining"} 四个 code 列表。
+    """
+    verified_none: list[str] = []
+    synced: list[str] = []
+    failed: list[str] = []
+    remaining: list[str] = []
+    # 已有任何因子行的 code 不重复验证
+    existing = set(db.execute(
+        select(AdjustFactor.code).where(AdjustFactor.code.in_(codes)).distinct()
+    ).scalars()) if codes else set()
+    todo = [c for c in codes if c not in existing]
+    list_dates = dict(db.execute(
+        select(Stock.code, Stock.list_date).where(Stock.code.in_(todo))
+    ).all()) if todo else {}
+
+    for code in todo[:max_codes]:
+        try:
+            df = baostock_client.fetch_adjust_factors(code)
+        except Exception:  # noqa: BLE001 - 单票接口失败不拖垮整个验证
+            failed.append(code)
+            logger.exception("复权因子验证 %s 查询失败,维持跳过", code)
+            continue
+        if df.empty:
+            db.merge(AdjustFactor(
+                code=code,
+                divid_operate_date=list_dates.get(code) or date(1990, 1, 1),
+                fore_factor=1.0, back_factor=1.0,
+                source="verified_none",
+            ))
+            verified_none.append(code)
+            logger.info("复权因子验证 %s: 从未除权,写入 1.0 哨兵", code)
+        else:
+            upsert_adjust_factors(db, code, df, commit=False)
+            synced.append(code)
+            logger.info("复权因子验证 %s: 数据缺口,已补 %d 行真实因子",
+                        code, len(df))
+        if sleep_per_code:
+            time.sleep(sleep_per_code)
+    remaining = todo[max_codes:]
+    if remaining:
+        logger.warning("复权因子验证超上限 %d,剩余 %d 只留待下轮: %s",
+                       max_codes, len(remaining), remaining[:10])
+    return {"verified_none": verified_none, "synced": synced,
+            "failed": failed, "remaining": remaining}
+
+
 def ingest_market_day(db: Session, day: date | str,
                       codes: set[str] | None = None,
                       backfill_start: date | str = "2015-01-01",
@@ -1088,7 +1154,8 @@ def ingest_market_day(db: Session, day: date | str,
             "factors_upserted": factor_res["upserted"],
             "factor_empty": factor_res["empty"],
             "factor_changed": [], "reanchored": [], "failed": [],
-            "missing_factor": [],
+            "missing_factor": [], "factor_verified_none": [],
+            "factor_synced": [],
         }
         if bars.empty:
             logger.warning("批量日 K %s 返回空(非交易日或数据源异常),未写入", day)
@@ -1105,6 +1172,17 @@ def ingest_market_day(db: Session, day: date | str,
         factors = _effective_fore_factors(db, bar_codes, day)
         changed = set(factor_res["changed"])
         result["factor_changed"] = sorted(changed)
+
+        # 缺因子 code 先单票验证(从未除权→1.0 哨兵;数据缺口→补真实因子),
+        # 验证通过的与正常股票同路径写入,不再整只跳过
+        missing = [c for c in bar_codes if c not in factors and c not in changed]
+        if missing:
+            verify_res = verify_missing_factor_codes(db, missing)
+            result["factor_verified_none"] = verify_res["verified_none"]
+            result["factor_synced"] = verify_res["synced"]
+            if verify_res["verified_none"] or verify_res["synced"]:
+                factors.update(_effective_fore_factors(
+                    db, verify_res["verified_none"] + verify_res["synced"], day))
 
         for code, grp in bars.groupby("code"):
             try:
@@ -1156,9 +1234,10 @@ def ingest_market_day(db: Session, day: date | str,
     db.commit()
     logger.info(
         "批量日 K %s: %d 只,写入 %d 行,估值 %d 行,因子变化重拉 %d 只,"
-        "缺因子跳过 %d 只,失败 %d 只",
+        "缺因子跳过 %d 只(验证: 从未除权 %d, 补缺口 %d),失败 %d 只",
         day, result["codes"], result["bars"], result.get("valuations", 0),
         len(result["reanchored"]), len(result["missing_factor"]),
+        len(result["factor_verified_none"]), len(result["factor_synced"]),
         len(result["failed"]))
     return result
 

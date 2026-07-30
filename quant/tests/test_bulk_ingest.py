@@ -383,8 +383,9 @@ def test_ingest_market_day_codes_filter(db, monkeypatch):
     assert db.get(DailyBar, ("sz.000001", DAY)) is None
 
 
-def test_ingest_market_day_skips_codes_with_missing_factor(db, monkeypatch):
-    """缺复权因子的 code 不得按 factor=1.0 静默写入,必须跳过并计数。"""
+def test_ingest_market_day_verifies_missing_factor_and_writes_sentinel(
+        db, monkeypatch):
+    """缺因子 code 经单票验证「从未除权」后写 1.0 哨兵,当日正常写入。"""
     _mock_market(
         monkeypatch,
         bars=_bulk_bars([
@@ -394,6 +395,39 @@ def test_ingest_market_day_skips_codes_with_missing_factor(db, monkeypatch):
             # 只给了 600519 的因子,000001 缺因子
             ("sh.600519", date(2020, 6, 24), 1.0, 1.0)]),
     )
+    monkeypatch.setattr(
+        ingest.baostock_client, "fetch_adjust_factors",
+        lambda code: pd.DataFrame(
+            columns=["code", "divid_operate_date", "fore_factor", "back_factor"]))
+
+    res = ingest.ingest_market_day(db, DAY)
+
+    assert res["missing_factor"] == []
+    assert res["factor_verified_none"] == ["sz.000001"]
+    bar = db.get(DailyBar, ("sz.000001", DAY))
+    assert bar is not None and bar.close == 10.0  # 因子 1.0,原始价即前复权价
+    from app.models import AdjustFactor
+    sentinel = db.get(AdjustFactor, ("sz.000001", date(1990, 1, 1)))
+    assert sentinel is not None and sentinel.fore_factor == 1.0
+    assert sentinel.source == "verified_none"
+
+
+def test_ingest_market_day_skips_when_factor_verify_fails(db, monkeypatch):
+    """验证查询失败时维持旧保护语义:跳过并计数,绝不按 1.0 静默写入。"""
+    _mock_market(
+        monkeypatch,
+        bars=_bulk_bars([
+            ("sh.600519", 100.0, 100.0, 100.0, 100.0, 1, 1, False),
+            ("sz.000001", 10.0, 10.0, 10.0, 10.0, 1, 1, False)]),
+        factors=_bulk_factors([
+            ("sh.600519", date(2020, 6, 24), 1.0, 1.0)]),
+    )
+
+    def _boom(code):
+        raise RuntimeError("baostock 超时")
+
+    monkeypatch.setattr(
+        ingest.baostock_client, "fetch_adjust_factors", _boom)
 
     res = ingest.ingest_market_day(db, DAY)
 
