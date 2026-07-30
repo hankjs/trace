@@ -1,6 +1,6 @@
 # quant 系统介绍（Slidev）
 
-面向**金融小白**的 quant 系统讲解稿：产品边界、术语（指标 / 因子 / 策略 / 回测指标）、业务架构与日常研究流程。
+面向**金融小白**的 quant 系统讲解稿：产品边界、术语（指标 / 因子 / 策略 / 回测指标）、业务架构与日常研究流程。配**线上界面实拍**，图文对照。
 
 ## 启动
 
@@ -21,19 +21,20 @@ pnpm preview      # 允许局域网访问
 make quant-slidev          # 同上 pnpm dev
 make quant-slidev-build    # 同上 pnpm build
 make deploy-quant-slidev   # 部署到 wananyun (nginx :3030 → /opt/hank-quant-slidev)
-# SSH_HOST=其他主机 make deploy-quant-slidev
 ```
+
+界面截图在 `public/screenshots/`（构建时打进静态站）。
 
 ## 内容结构
 
 | 章节 | 内容 |
 |---|---|
-| 一 | 定位与产品边界（研究 vs 交易） |
-| 二 | 零基础术语：日线、指标、因子、基本面、回测指标 |
-| 三 | 策略 Spec、六套预置、信号含义 |
-| 四 | 业务分层、数据生命周期、选股与晚间流水线、证据状态机 |
-| 五 | 前端工作区与一日研究闭环 |
-| 六 | 误区与原则 |
-| 附录 | 速查卡、代码目录、启动命令 |
+| 一 | 定位与登录页边界 |
+| 二 | **界面导览**（总览 / 选股 / 信号 / 策略 / 回测 / 词典…） |
+| 三 | 术语：指标、因子、估值、回测指标 |
+| 四 | 策略 Spec、预置、信号含义 |
+| 五 | 业务分层、流水线、证据状态机 |
+| 六 | 一日研究闭环与误区 |
+| 附录 | 速查与命令 |
 
-主文件：`slides.md`。细节与口径以仓库 `README.md`、`PRODUCT.md`、`DATA-ARCHITECTURE.md`、`app/catalog.py` 为准。
+主文件：`slides.md`。口径以仓库 `README.md`、`PRODUCT.md`、`DATA-ARCHITECTURE.md`、`app/catalog.py` 为准。
