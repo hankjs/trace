@@ -607,32 +607,7 @@ async fn run_short(
 ) -> Result<ToolOutput> {
     let msg = A2aClient::data_message(skill, payload, metadata);
     match client.send_message(msg).await? {
-        SendResult::Task(task) => {
-            // 优先取 artifacts 中的 data part
-            if let Some(artifacts) = task.artifacts {
-                for art in artifacts {
-                    if let Some(data) = extract_data_part(&art.parts) {
-                        return Ok(ToolOutput {
-                            content: data.to_string(),
-                            is_error: false,
-                        });
-                    }
-                }
-            }
-            // 其次取 status.message 中的 data part
-            if let Some(message) = task.status.message {
-                if let Some(data) = extract_data_part(&message.parts) {
-                    return Ok(ToolOutput {
-                        content: data.to_string(),
-                        is_error: false,
-                    });
-                }
-            }
-            Ok(ToolOutput {
-                content: json!({ "status": task.status.state }).to_string(),
-                is_error: false,
-            })
-        }
+        SendResult::Task(task) => Ok(short_task_output(&task)),
         SendResult::Message(message) => {
             if let Some(data) = extract_data_part(&message.parts) {
                 Ok(ToolOutput {
@@ -704,23 +679,67 @@ async fn run_streaming(
         }
     }
 
+    Ok(streaming_output(terminal_state, last_artifact, terminal_message))
+}
+
+/// 短任务 Task → ToolOutput。终态非 completed（failed/canceled/rejected）时标为错误，
+/// 避免任务失败被模型读成成功结果。
+fn short_task_output(task: &hank_a2a_client::Task) -> ToolOutput {
+    let failed = task.status.state.is_terminal() && task.status.state != TaskState::Completed;
+    // 优先取 artifacts 中的 data part
+    if let Some(ref artifacts) = task.artifacts {
+        for art in artifacts {
+            if let Some(data) = extract_data_part(&art.parts) {
+                return ToolOutput {
+                    content: data.to_string(),
+                    is_error: failed,
+                };
+            }
+        }
+    }
+    // 其次取 status.message 中的 data part
+    if let Some(ref message) = task.status.message {
+        if let Some(data) = extract_data_part(&message.parts) {
+            return ToolOutput {
+                content: data.to_string(),
+                is_error: failed,
+            };
+        }
+    }
+    ToolOutput {
+        content: json!({ "status": task.status.state }).to_string(),
+        is_error: failed,
+    }
+}
+
+/// 流式长任务收尾：终态/最后 artifact/终态消息 → ToolOutput（纯函数，便于测试）。
+///
+/// - `Completed`：优先具名 artifact，其次终态消息，都没有才算错误；
+/// - 其它终态（failed/canceled/rejected）：错误；
+/// - `None`（流结束但没收到终态事件，如断连/服务端崩溃）：错误，
+///   不得把已缓存的半截 artifact 当成功结果返回。
+fn streaming_output(
+    terminal_state: Option<TaskState>,
+    last_artifact: Option<Value>,
+    terminal_message: Option<String>,
+) -> ToolOutput {
     match terminal_state {
-        Some(TaskState::Completed) | None => {
+        Some(TaskState::Completed) => {
             if let Some(data) = last_artifact {
-                Ok(ToolOutput {
+                ToolOutput {
                     content: data.to_string(),
                     is_error: false,
-                })
+                }
             } else if let Some(msg) = terminal_message {
-                Ok(ToolOutput {
+                ToolOutput {
                     content: msg,
                     is_error: false,
-                })
+                }
             } else {
-                Ok(ToolOutput {
+                ToolOutput {
                     content: "长任务结束但未返回 artifact".to_string(),
                     is_error: true,
-                })
+                }
             }
         }
         Some(state) => {
@@ -730,11 +749,18 @@ async fn run_streaming(
             if let Some(msg) = terminal_message {
                 err["message"] = msg.into();
             }
-            Ok(ToolOutput {
+            ToolOutput {
                 content: err.to_string(),
                 is_error: true,
-            })
+            }
         }
+        None => ToolOutput {
+            content: "SSE 流结束但未收到终态事件，任务状态未知（可能断连或服务端重启）。\
+                      请用 quant_get_experiment / quant_get_backtest 恢复终态，不得盲目重发；\
+                      确需重发必须复用同一 client_request_id。"
+                .to_string(),
+            is_error: true,
+        },
     }
 }
 
@@ -875,5 +901,86 @@ mod tests {
         ];
         let data = extract_data_part(&parts).unwrap();
         assert_eq!(data["skill"], "x");
+    }
+
+    #[test]
+    fn test_streaming_output_completed_uses_artifact() {
+        let out = streaming_output(
+            Some(TaskState::Completed),
+            Some(json!({ "sharpe": 1.2 })),
+            None,
+        );
+        assert!(!out.is_error);
+        assert!(out.content.contains("sharpe"));
+    }
+
+    #[test]
+    fn test_streaming_output_no_terminal_is_error() {
+        // 断连/服务端崩溃：即使缓存了半截 artifact 也不得返回成功
+        let out = streaming_output(None, Some(json!({ "partial": true })), None);
+        assert!(out.is_error);
+        assert!(out.content.contains("未收到终态事件"));
+
+        let out = streaming_output(None, None, Some("partial msg".to_string()));
+        assert!(out.is_error);
+    }
+
+    #[test]
+    fn test_streaming_output_failed_terminal_is_error() {
+        let out = streaming_output(
+            Some(TaskState::Failed),
+            Some(json!({ "partial": true })),
+            Some("boom".to_string()),
+        );
+        assert!(out.is_error);
+        assert!(out.content.contains("Failed"));
+        assert!(out.content.contains("boom"));
+    }
+
+    fn make_task(state: TaskState, with_artifact: bool) -> hank_a2a_client::Task {
+        let artifacts = with_artifact.then(|| {
+            vec![hank_a2a_client::Artifact {
+                artifact_id: "a1".to_string(),
+                name: Some("result".to_string()),
+                description: None,
+                parts: vec![Part::Data {
+                    data: serde_json::from_value(json!({ "ok": true })).unwrap(),
+                }],
+                metadata: None,
+                append: None,
+                last_chunk: None,
+            }]
+        });
+        hank_a2a_client::Task {
+            id: "t1".to_string(),
+            context_id: None,
+            status: hank_a2a_client::TaskStatus {
+                state,
+                message: None,
+                timestamp: None,
+            },
+            artifacts,
+            history: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn test_short_task_output_failed_terminal_is_error() {
+        // 有 artifact 但任务失败：结果必须标错误
+        let out = short_task_output(&make_task(TaskState::Failed, true));
+        assert!(out.is_error);
+
+        // 无 artifact 的失败任务：status JSON 也必须标错误
+        let out = short_task_output(&make_task(TaskState::Canceled, false));
+        assert!(out.is_error);
+        assert!(out.content.contains("canceled") || out.content.contains("Canceled"));
+    }
+
+    #[test]
+    fn test_short_task_output_completed_is_success() {
+        let out = short_task_output(&make_task(TaskState::Completed, true));
+        assert!(!out.is_error);
+        assert!(out.content.contains("ok"));
     }
 }

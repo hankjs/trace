@@ -13,6 +13,11 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantA2aConfig {
+    /// 是否在所有已登录会话注册 quant_* 工具（默认 false）。
+    /// 开启后每个会话都会挂载 19 个工具 schema 并注入 quant-research skill 全文，
+    /// 需显式 opt-in。
+    #[serde(default)]
+    pub enabled: bool,
     #[serde(default = "default_quant_a2a_base_url")]
     pub base_url: String,
 }

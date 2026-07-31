@@ -31,6 +31,32 @@ const MAX_CONTINUATIONS: u32 = 3;
 /// 递减回报判停：续写增量低于该 token 数视为无进展（【AF 08】<500）
 const CONTINUATION_MIN_GAIN_TOKENS: u32 = 500;
 
+/// quant 高成本确认闸门的提问文案与选项。
+///
+/// 选项只放真实可点的按钮；批量授权只能在文字回复中输入（如「确认5次」），
+/// 不把「确认N次」这种字面模板放进 options——用户一点就会被解析层当成拒绝。
+/// 微信入口无批量授权、5 分钟超时，话术单独一份。
+fn quant_confirm_prompt(summary: &str, source: &str) -> (String, Vec<String>) {
+    if source == "weixin" {
+        (
+            format!(
+                "{summary}\n\n确认执行该高成本量化操作？可回复：确认 / 否。\
+                 （微信入口每次单独确认，5 分钟内有效）"
+            ),
+            vec!["确认".to_string(), "否".to_string()],
+        )
+    } else {
+        (
+            format!(
+                "{summary}\n\n确认执行该高成本量化操作？可回复：确认 / 否；\
+                 回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作。\
+                 授权与日高成本配额共用，本会话内有效。"
+            ),
+            vec!["确认".to_string(), "否".to_string()],
+        )
+    }
+}
+
 /// Agent execution mode
 pub enum AgentMode {
     /// Simple flat loop (backward compatible, for simple queries)
@@ -788,18 +814,11 @@ impl AgentSession {
                         // 模型自填的 confirmed 由工具 execute 再次剥离。
                         if let Some(tool) = self.tools.iter().find(|t| t.name() == name) {
                             if let Some(req) = tool.needs_confirmation(input) {
-                                let question = format!(
-                                    "{}\n\n确认执行该高成本量化操作？可回复：确认 / 确认N次（本会话批量，N≤50）/ 否。授权与日高成本配额共用，本会话内有效。",
-                                    req.summary
-                                );
+                                let (question, options) = quant_confirm_prompt(&req.summary, &req.source);
                                 let _ = event_tx
                                     .send(AgentEvent::AskUser {
                                         question,
-                                        options: vec![
-                                            "确认".to_string(),
-                                            "确认N次".to_string(),
-                                            "否".to_string(),
-                                        ],
+                                        options,
                                         tool_use_id: id.clone(),
                                         kind: Some(format!("quant_confirm:{}", req.source)),
                                     })
@@ -1066,5 +1085,32 @@ impl AgentSession {
         }
 
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::quant_confirm_prompt;
+
+    #[test]
+    fn test_quant_confirm_prompt_no_literal_batch_button() {
+        // 「确认N次」是文字模板，不得作为可点按钮出现（点击会被解析层当成拒绝）
+        for source in ["trace_chat", "weixin", "admin"] {
+            let (_, options) = quant_confirm_prompt("回测策略 42", source);
+            assert!(!options.iter().any(|o| o.contains('N')), "source={source}");
+            assert!(options.contains(&"确认".to_string()));
+            assert!(options.contains(&"否".to_string()));
+        }
+    }
+
+    #[test]
+    fn test_quant_confirm_prompt_weixin_no_batch_wording() {
+        let (question, _) = quant_confirm_prompt("回测策略 42", "weixin");
+        assert!(!question.contains("确认N次"));
+        assert!(question.contains("5 分钟"));
+
+        let (question, _) = quant_confirm_prompt("回测策略 42", "trace_chat");
+        assert!(question.contains("确认N次"));
+        assert!(question.contains("确认5次"));
     }
 }

@@ -41,8 +41,14 @@ const QUANT_RESEARCH_SKILL_MD: &str = include_str!("../skills/quant-research/SKI
 const QUANT_RESEARCH_SKILL_NAME: &str = "quant-research";
 const QUANT_RESEARCH_SKILL_DESC: &str = "Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experiment/trial/backtest/factor 工具链上执行可检验假设，遵守停止条件与 findings 强制落表，不输出交易指令。";
 const QUANT_RESEARCH_SKILL_PATH: &str = "skills/quant-research";
-/// quant 高成本工具待确认单 TTL：5 分钟（设计 §5.4.4）。
+/// 微信入口待确认单 TTL：5 分钟（设计 §5.4.4）。
+/// 注意：该 TTL 只在 handle_quant_confirmation 对 weixin 来源生效；
+/// web 会话的待确认单不设业务 TTL（进程重启即失效），避免用户稍后回复
+/// 「确认」被静默当成新消息。
 const QUANT_CONFIRM_TTL_MS: i64 = 5 * 60 * 1000;
+/// 待确认单 map 的兜底 GC 周期（纯内存卫生，防止永不回复的会话条目无限堆积），
+/// 远大于任何业务 TTL，不影响确认流程语义。
+const QUANT_CONFIRM_GC_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// 构造 quant-research skill 索引与 project segment；仅在有 quant 工具的会话注入。
 fn quant_research_prompt_inputs(
@@ -317,9 +323,9 @@ pub async fn run_chat_turn(
             )));
         }
 
-        // 注册 quant_* 工具：需配置 quant_a2a.base_url、用户已登录（有 JWT）、且会话来源明确
+        // 注册 quant_* 工具：需 quant_a2a.enabled 显式开启、用户已登录（有 JWT）、且会话来源明确
         if let Some(ref quant_cfg) = state.config.quant_a2a {
-            if !token.is_empty() {
+            if quant_cfg.enabled && !token.is_empty() {
                 let source = session_record
                     .as_ref()
                     .and_then(|s| s.metadata.as_deref())
@@ -969,8 +975,10 @@ pub async fn stop_handler(
 
 /// 解析并获取待确认的 ask_user 状态。
 ///
-/// 设计 §5.4.4：quant_confirm 类待确认单优先从进程内 map 读取，读取时顺手清理过期项；
+/// 设计 §5.4.4：quant_confirm 类待确认单优先从进程内 map 读取；
 /// map 未命中时回退 DB（兼容旧代码遗留或进程重启前的待确认单）。
+/// 这里只做 24h 内存卫生 GC；业务 TTL（微信 5 分钟）在
+/// handle_quant_confirmation 判定，以便给用户明确的超时反馈而不是静默丢失。
 async fn resolve_pending_ask_user(
     state: &Arc<AppState>,
     session_id: &str,
@@ -978,7 +986,7 @@ async fn resolve_pending_ask_user(
 ) -> Option<String> {
     state
         .quant_pending_confirms
-        .cleanup_expired(QUANT_CONFIRM_TTL_MS);
+        .cleanup_expired(QUANT_CONFIRM_GC_TTL_MS);
 
     // 1. DB pending 是 quant_confirm 时，优先读进程内 map；map 未命中则回退 DB。
     if let Some(ref pending_json) = db_pending {
@@ -1018,6 +1026,12 @@ async fn resolve_pending_ask_user(
     None
 }
 
+/// 微信入口待确认单是否已超 5 分钟 TTL（纯函数便于测试）。
+/// 其它来源不设业务 TTL：进程内 map 重启即失效，无需额外过期。
+fn quant_confirm_expired(source: &str, created_at_ms: i64, now_ms: i64) -> bool {
+    source == "weixin" && now_ms.saturating_sub(created_at_ms) > QUANT_CONFIRM_TTL_MS
+}
+
 /// 处理 quant 高成本工具的恢复确认：解析用户回复，授予授权，并返回给模型的 ToolResult 文案。
 async fn handle_quant_confirmation(
     state: &Arc<AppState>,
@@ -1027,13 +1041,11 @@ async fn handle_quant_confirmation(
     text: &str,
 ) -> String {
     // 微信入口 5 分钟超时作废
-    if source == "weixin" {
-        let created = pending["created_at_ms"].as_i64().unwrap_or(0);
-        let now = chrono::Utc::now().timestamp_millis();
-        if now.saturating_sub(created) > 5 * 60 * 1000 {
-            return "待确认单已超时（5 分钟），未执行高成本量化操作。如需执行请重新发起工具调用。"
-                .to_string();
-        }
+    let created = pending["created_at_ms"].as_i64().unwrap_or(0);
+    let now = chrono::Utc::now().timestamp_millis();
+    if quant_confirm_expired(source, created, now) {
+        return "待确认单已超时（5 分钟），未执行高成本量化操作。如需执行请重新发起工具调用。"
+            .to_string();
     }
 
     let (grant, summary) = parse_quant_confirmation(text, source);
@@ -1305,5 +1317,20 @@ mod tests {
         for phrase in ["已下单", "建议买入", "建议卖出"] {
             assert!(!msg.contains(phrase), "timeout message contains forbidden phrase '{}'", phrase);
         }
+    }
+
+    #[test]
+    fn test_quant_confirm_expired_only_weixin() {
+        let now = 1_000_000_000i64;
+        let fresh = now - 60 * 1000; // 1 分钟前
+        let stale = now - 10 * 60 * 1000; // 10 分钟前
+
+        // 微信：5 分钟 TTL
+        assert!(!quant_confirm_expired("weixin", fresh, now));
+        assert!(quant_confirm_expired("weixin", stale, now));
+
+        // web 会话：同样的时间差不设业务 TTL（进程重启才失效），
+        // 用户 10 分钟后回「确认」仍然有效
+        assert!(!quant_confirm_expired("trace_chat", stale, now));
     }
 }
