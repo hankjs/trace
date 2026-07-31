@@ -51,7 +51,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
-  build-essential ca-certificates curl git libssl-dev nginx npm pkg-config \
+  build-essential ca-certificates curl git libssl-dev nginx pkg-config \
   python3 rsync sudo util-linux
 
 if ! getent group hank-workspace >/dev/null 2>&1; then
