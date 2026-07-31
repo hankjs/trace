@@ -140,7 +140,7 @@ pub async fn prepare_repository_workspace(
     }
     .await;
     if let Err(e) = setup_result {
-        cleanup_failed_session_workspace(&repo, &worktree, &branch).await;
+        cleanup_failed_session_workspace(&repo, &worktree, &branch, &cfg.execution_user).await;
         return Err(e).context("初始化话题 worktree");
     }
     Ok(worktree_str)
@@ -183,14 +183,23 @@ pub async fn prepare_general_workspace(
     Ok(workspace_str)
 }
 
-async fn cleanup_failed_session_workspace(repo: &Path, worktree: &Path, branch: &str) {
-    let _ = Command::new("git")
-        .arg("-C")
-        .arg(repo)
+async fn cleanup_failed_session_workspace(
+    repo: &Path,
+    worktree: &Path,
+    branch: &str,
+    execution_user: &str,
+) {
+    let _ = git_command_as_user(execution_user)
+        .args(["-C", &repo.to_string_lossy()])
         .args(["worktree", "remove", "--force"])
         .arg(worktree)
         .output()
         .await;
+    // worktree remove 可能在 checkout 半途失败时只清掉 Git metadata；这个路径是
+    // 刚为当前 session 创建的，确认仍为空/残留后才删除，避免遗留脏 worktree。
+    if worktree.exists() {
+        let _ = tokio::fs::remove_dir_all(worktree).await;
+    }
     let branch_ref = format!("refs/heads/{branch}");
     let _ = Command::new("git")
         .arg("-C")
