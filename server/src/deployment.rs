@@ -94,6 +94,9 @@ pub async fn prepare_repository_workspace(
     if !repo.join(".git").exists() {
         bail!("{} 不是 Git 工作区", repo.display());
     }
+    ensure_worktree_git_namespaces(&repo)
+        .await
+        .context("准备话题 Git 命名空间")?;
 
     let worktrees_root = PathBuf::from(&cfg.worktrees_root);
     tokio::fs::create_dir_all(&worktrees_root).await?;
@@ -207,6 +210,26 @@ async fn cleanup_failed_session_workspace(
         .args(["update-ref", "-d", &branch_ref])
         .output()
         .await;
+}
+
+async fn ensure_worktree_git_namespaces(repo: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    for path in [
+        repo.join(".git/worktrees"),
+        repo.join(".git/refs/heads/feishu"),
+        repo.join(".git/logs/refs/heads/feishu"),
+    ] {
+        tokio::fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("创建 {}", path.display()))?;
+        let mut permissions = tokio::fs::metadata(&path).await?.permissions();
+        permissions.set_mode(0o2770);
+        tokio::fs::set_permissions(&path, permissions)
+            .await
+            .with_context(|| format!("设置 {} 权限", path.display()))?;
+    }
+    Ok(())
 }
 
 /// 把当前 worktree 固化为 commit，识别部署目标并创建待审批任务。
@@ -1040,6 +1063,10 @@ fn command_as_user(user: &str, program: &str) -> Command {
         "env",
         &home,
         &path,
+        "sh",
+        "-c",
+        "umask 0007; exec \"$@\"",
+        "sh",
         program,
     ]);
     command

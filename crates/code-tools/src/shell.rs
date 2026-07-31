@@ -61,6 +61,14 @@ impl ShellTool {
             .any(|b| lower.contains(&b.to_lowercase()))
     }
 
+    fn command_with_shared_umask(&self, command: &str) -> String {
+        if self.run_as_user.is_some() {
+            format!("umask 0007\n{command}")
+        } else {
+            command.to_string()
+        }
+    }
+
     fn truncate_output(output: &str) -> String {
         if output.len() <= MAX_OUTPUT_BYTES {
             return output.to_string();
@@ -142,7 +150,7 @@ impl Tool for ShellTool {
 
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), {
             let mut cmd = self.shell_command();
-            cmd.arg("-c").arg(&command);
+            cmd.arg("-c").arg(self.command_with_shared_umask(&command));
             if let Some(ref dir) = self.work_dir {
                 cmd.current_dir(dir);
             }
@@ -205,7 +213,7 @@ impl Tool for ShellTool {
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
         let mut cmd = self.shell_command();
-        cmd.arg("-c").arg(&command);
+        cmd.arg("-c").arg(self.command_with_shared_umask(&command));
         if let Some(ref dir) = self.work_dir {
             cmd.current_dir(dir);
         }

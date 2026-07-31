@@ -238,6 +238,10 @@ impl Tool for TestRunnerTool {
                 "env",
                 &home,
                 &path,
+                "sh",
+                "-c",
+                "umask 0007; exec \"$@\"",
+                "sh",
                 &cmd_name,
             ]);
             command
