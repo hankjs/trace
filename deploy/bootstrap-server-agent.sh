@@ -185,6 +185,7 @@ runuser --user hank -- git -C /opt/hank-src config --unset-all core.hooksPath ||
 runuser --user hank-build -- env HOME=/home/hank-build \
   git config --global --replace-all safe.directory '/opt/hank-worktrees/*'
 
+install -d -o root -g root -m 755 /usr/local/libexec
 install -o root -g root -m 755 "$STAGE/hank-deploy" /usr/local/libexec/hank-deploy
 cat > /etc/sudoers.d/hank-deploy <<'EOF'
 hank ALL=(root) NOPASSWD: /usr/local/libexec/hank-deploy *
