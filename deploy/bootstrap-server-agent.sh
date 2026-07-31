@@ -52,7 +52,7 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
   build-essential ca-certificates curl git libssl-dev nginx pkg-config \
-  python3 rsync sudo util-linux
+  python3 rsync sudo util-linux xz-utils
 
 if ! getent group hank-workspace >/dev/null 2>&1; then
   groupadd --system hank-workspace
@@ -66,14 +66,24 @@ fi
 usermod -a -G hank-workspace hank
 usermod -a -G hank-workspace hank-build
 
-node_major="$(node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || true)"
-if [[ -z "$node_major" || "$node_major" -lt 20 ]]; then
-  curl -fsSL https://deb.nodesource.com/setup_22.x -o /tmp/hank-nodesource.sh
-  bash /tmp/hank-nodesource.sh
-  rm -f /tmp/hank-nodesource.sh
-  apt-get install -y -qq nodejs
+if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a > 20 || (a === 20 && b >= 19) ? 0 : 1)' >/dev/null 2>&1; then
+  # Ubuntu 18.04 的 glibc 2.27 无法运行 NodeSource 新包；使用 Node 官方
+  # unofficial-builds 的 glibc-217 兼容构建，并校验发布方 SHA-256 清单。
+  NODE_VERSION="20.19.4"
+  NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64-glibc-217.tar.xz"
+  NODE_URL="https://unofficial-builds.nodejs.org/download/release/v${NODE_VERSION}"
+  NODE_STAGE="$(mktemp -d /tmp/hank-node.XXXXXX)"
+  curl -fsSL "$NODE_URL/$NODE_ARCHIVE" -o "$NODE_STAGE/$NODE_ARCHIVE"
+  curl -fsSL "$NODE_URL/SHASUMS256.txt" -o "$NODE_STAGE/SHASUMS256.txt"
+  (cd "$NODE_STAGE" && grep "  $NODE_ARCHIVE\$" SHASUMS256.txt | sha256sum -c -)
+  install -d -o root -g root -m 755 "/opt/node-v${NODE_VERSION}"
+  tar -xJf "$NODE_STAGE/$NODE_ARCHIVE" --strip-components=1 -C "/opt/node-v${NODE_VERSION}"
+  ln -sfn "/opt/node-v${NODE_VERSION}/bin/node" /usr/local/bin/node
+  ln -sfn "/opt/node-v${NODE_VERSION}/bin/npm" /usr/local/bin/npm
+  ln -sfn "/opt/node-v${NODE_VERSION}/bin/npx" /usr/local/bin/npx
+  rm -rf -- "$NODE_STAGE"
 fi
-npm install --global pnpm@10.26.2
+npm install --global --prefix /usr/local pnpm@10.26.2
 
 if [[ ! -x /home/hank-build/.cargo/bin/cargo ]]; then
   runuser --user hank-build -- env HOME=/home/hank-build bash -c \
