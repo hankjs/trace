@@ -29,6 +29,7 @@ from .migrations import check_schema_version
 from .scheduler import start_scheduler, stop_scheduler
 from .scheduler_lock import acquire_scheduler_slot, release_scheduler_slot
 from .tasks import recover_tasks, shutdown_tasks
+from .a2a import mount_a2a_routes
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,9 +37,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_a2a_handler = None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _a2a_handler
     check_schema_version(engine)
     logger.info(
         "quant 启动: env=%s scheduler_enabled=%s",
@@ -53,6 +57,8 @@ async def lifespan(app: FastAPI):
     recover_tasks()
     yield
     shutdown_tasks()
+    if _a2a_handler is not None:
+        await _a2a_handler.aclose()
     if owns_scheduler:
         stop_scheduler()
         release_scheduler_slot()
@@ -88,6 +94,9 @@ app.include_router(selection.router, dependencies=_auth)
 app.include_router(factors.router, dependencies=_auth)
 app.include_router(tasks.router, dependencies=_auth)
 app.include_router(admin.router, dependencies=[Depends(require_admin)])
+
+# A2A 路由：Card 公开，/a2a JSON-RPC 由 context builder 做 JWT 鉴权
+_a2a_handler = mount_a2a_routes(app)
 
 
 @app.get("/api/health")
