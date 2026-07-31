@@ -89,8 +89,12 @@ fi
 npm install --global --prefix /usr/local pnpm@10.26.2
 
 if [[ ! -x /home/hank-build/.cargo/bin/cargo ]]; then
-  runuser --user hank-build -- env HOME=/home/hank-build bash -c \
-    'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/hank-rustup.sh && sh /tmp/hank-rustup.sh -y --default-toolchain stable --profile minimal && rm -f /tmp/hank-rustup.sh'
+  runuser --user hank-build -- env \
+    HOME=/home/hank-build \
+    RUSTUP_DIST_SERVER=https://rsproxy.cn \
+    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
+    bash -c \
+    'curl --proto "=https" --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh -o /tmp/hank-rustup.sh && sh /tmp/hank-rustup.sh -y --default-toolchain stable --profile minimal && rm -f /tmp/hank-rustup.sh'
 fi
 install -d -o hank-build -g hank-build -m 755 /home/hank-build/.cargo
 if [[ ! -f /home/hank-build/.cargo/config.toml ]]; then
