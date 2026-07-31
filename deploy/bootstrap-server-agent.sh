@@ -127,6 +127,7 @@ install -d -o root -g root -m 755 \
   /opt/hank-docs /opt/hank-docs/releases
 install -d -o hank -g hank -m 2700 /opt/hank/deploy-jobs
 install -d -o hank -g hank -m 755 /opt/hank/logs
+install -d -o hank -g hank-workspace -m 2750 /opt/hank-src
 install -d -o hank -g hank-workspace -m 2770 /opt/hank-worktrees
 
 if [[ ! -d /opt/hank-src/.git ]]; then
