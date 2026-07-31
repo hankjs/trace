@@ -51,7 +51,7 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
-  build-essential ca-certificates curl git libssl-dev nginx pkg-config \
+  aria2 build-essential ca-certificates curl git libssl-dev nginx pkg-config \
   python3 rsync sudo util-linux xz-utils
 
 if ! getent group hank-workspace >/dev/null 2>&1; then
@@ -73,7 +73,10 @@ if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.
   NODE_ARCHIVE="node-v${NODE_VERSION}-linux-x64-glibc-217.tar.xz"
   NODE_URL="https://unofficial-builds.nodejs.org/download/release/v${NODE_VERSION}"
   NODE_STAGE="$(mktemp -d /tmp/hank-node.XXXXXX)"
-  curl -fsSL "$NODE_URL/$NODE_ARCHIVE" -o "$NODE_STAGE/$NODE_ARCHIVE"
+  aria2c --allow-overwrite=true --auto-file-renaming=false \
+    --console-log-level=warn --summary-interval=0 \
+    --max-connection-per-server=8 --split=8 --min-split-size=1M \
+    --dir="$NODE_STAGE" --out="$NODE_ARCHIVE" "$NODE_URL/$NODE_ARCHIVE"
   curl -fsSL "$NODE_URL/SHASUMS256.txt" -o "$NODE_STAGE/SHASUMS256.txt"
   (cd "$NODE_STAGE" && grep "  $NODE_ARCHIVE\$" SHASUMS256.txt | sha256sum -c -)
   install -d -o root -g root -m 755 "/opt/node-v${NODE_VERSION}"
