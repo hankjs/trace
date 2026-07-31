@@ -67,9 +67,12 @@ usermod -a -G hank-workspace hank
 usermod -a -G hank-workspace hank-build
 
 # wananyun 到 GitHub 的 HTTP/2 链路偶发长时间无响应，两个 Git 执行账号统一使用 HTTP/1.1。
-runuser --user hank -- git config --global http.version HTTP/1.1
-runuser --user hank-build -- env HOME=/home/hank-build \
-  git config --global http.version HTTP/1.1
+(
+  cd /
+  runuser --user hank -- git config --global http.version HTTP/1.1
+  runuser --user hank-build -- env HOME=/home/hank-build \
+    git config --global http.version HTTP/1.1
+)
 
 if ! node -e 'const [a,b]=process.versions.node.split(".").map(Number); process.exit(a > 20 || (a === 20 && b >= 19) ? 0 : 1)' >/dev/null 2>&1; then
   # Ubuntu 18.04 的 glibc 2.27 无法运行 NodeSource 新包；使用 Node 官方
