@@ -141,6 +141,42 @@ pub async fn delete_binding_admin(
     }
 }
 
+#[derive(Deserialize)]
+pub struct SendMessageRequest {
+    pub binding_id: String,
+    pub text: String,
+}
+
+/// POST /api/admin/feishu/send — 主动给已绑定用户发飞书单聊消息。
+/// quant 巡检/任务完成等主动推送场景也走这个通道（open_id 来自绑定记录）。
+pub async fn send_message(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<SendMessageRequest>,
+) -> impl IntoResponse {
+    let text = body.text.trim();
+    if text.is_empty() {
+        return R::bad_request("text is empty");
+    }
+    let binding = match state.db.get_feishu_binding_by_id(&body.binding_id).await {
+        Ok(Some(b)) => b,
+        Ok(None) => return R::not_found("binding not found"),
+        Err(e) => return R::internal_error(e),
+    };
+    let account = match state.db.get_feishu_account(&binding.account_id).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return R::not_found("account not found"),
+        Err(e) => return R::internal_error(e),
+    };
+    if !account.enabled {
+        return R::bad_request("该应用已停用");
+    }
+    let api = FeishuApi::new(&account);
+    match api.send_text("open_id", &binding.open_id, text).await {
+        Ok(_) => R::no_content(),
+        Err(e) => R::internal_error(e),
+    }
+}
+
 // ─── Client ────────────────────────────────────────────────────────
 
 /// 绑定码有效期（10 分钟）

@@ -475,6 +475,7 @@ async fn main() -> Result<()> {
             "/api/admin/feishu/bindings/{id}",
             delete(feishu::routes::delete_binding_admin),
         )
+        .route("/api/admin/feishu/send", post(feishu::routes::send_message))
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
         .route(

@@ -199,6 +199,39 @@ impl FeishuApi {
         }
         Ok(())
     }
+
+    /// 主动发送文本消息（非回复）：receive_id_type = open_id（单聊）| chat_id（群）。
+    /// 主动推送（巡检结果、任务完成通知等）走这里。
+    pub async fn send_text(
+        &self,
+        receive_id_type: &str,
+        receive_id: &str,
+        text: &str,
+    ) -> Result<String> {
+        let token = self.tenant_token().await?;
+        let resp = self
+            .http
+            .post(format!(
+                "{}/open-apis/im/v1/messages?receive_id_type={}",
+                self.base, receive_id_type
+            ))
+            .bearer_auth(&token)
+            .json(&json!({
+                "receive_id": receive_id,
+                "msg_type": "text",
+                "content": json!({ "text": text }).to_string(),
+            }))
+            .send()
+            .await?
+            .json::<ApiResp>()
+            .await?;
+        if resp.code != 0 {
+            bail!("飞书主动发消息失败 code={} msg={}", resp.code, resp.msg);
+        }
+        resp.data
+            .and_then(|d| d["message_id"].as_str().map(|s| s.to_string()))
+            .ok_or_else(|| anyhow!("飞书发送响应缺少 message_id"))
+    }
 }
 
 #[cfg(test)]

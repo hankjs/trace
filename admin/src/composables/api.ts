@@ -404,6 +404,13 @@ export const api = {
     return request<void>(`/api/admin/feishu/bindings/${id}`, { method: 'DELETE' })
   },
 
+  feishuSend(bindingId: string, text: string) {
+    return request<void>('/api/admin/feishu/send', {
+      method: 'POST',
+      body: JSON.stringify({ binding_id: bindingId, text }),
+    })
+  },
+
   chatGenerate(prompt: string, context?: string) {
     return fetch('/api/admin/chat/generate', {
       method: 'POST',
