@@ -21,6 +21,7 @@ const router = createRouter({
     { path: '/image-providers', component: () => import('./views/ImageProviders.vue') },
     { path: '/weixin', component: () => import('./views/WeixinBot.vue') },
     { path: '/feishu', component: () => import('./views/FeishuBot.vue') },
+    { path: '/chat-records', component: () => import('./views/ChatRecords.vue') },
     { path: '/jobs', component: () => import('./views/Jobs.vue') },
     { path: '/terminals', component: () => import('./views/Terminals.vue') },
     { path: '/notifications', component: () => import('./views/Notifications.vue') },

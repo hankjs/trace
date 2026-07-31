@@ -26,6 +26,14 @@ pub struct FeishuApi {
     app_id: String,
     app_secret: Arc<str>,
     token: Arc<RwLock<Option<CachedToken>>>,
+    archive: Option<ArchiveContext>,
+}
+
+#[derive(Clone)]
+struct ArchiveContext {
+    db: hank_db::Database,
+    account_id: String,
+    account_name: String,
 }
 
 #[derive(Deserialize)]
@@ -54,7 +62,23 @@ impl FeishuApi {
             app_id: account.app_id.clone(),
             app_secret: account.app_secret.as_str().into(),
             token: Arc::new(RwLock::new(None)),
+            archive: None,
         }
+    }
+
+    /// 创建带消息留档能力的 API 客户端。留档失败只记日志，不影响飞书发送结果。
+    pub fn new_archived(account: &hank_db::FeishuAccount, db: hank_db::Database) -> Self {
+        let mut api = Self::new(account);
+        api.archive = Some(ArchiveContext {
+            db,
+            account_id: account.id.clone(),
+            account_name: if account.name.trim().is_empty() {
+                account.app_id.clone()
+            } else {
+                account.name.clone()
+            },
+        });
+        api
     }
 
     /// 用 app_id/app_secret 直接验证凭证有效性（admin 创建账号时调用）。
@@ -174,9 +198,29 @@ impl FeishuApi {
         if resp.code != 0 {
             bail!("飞书回复消息失败 code={} msg={}", resp.code, resp.msg);
         }
-        resp.data
+        let sent_message_id = resp
+            .data
             .and_then(|d| d["message_id"].as_str().map(|s| s.to_string()))
-            .ok_or_else(|| anyhow!("飞书回复响应缺少 message_id"))
+            .ok_or_else(|| anyhow!("飞书回复响应缺少 message_id"))?;
+        if let Some(archive) = &self.archive {
+            let content_text = archive_display_content(msg_type, &content);
+            if let Err(e) = archive
+                .db
+                .insert_channel_reply(
+                    "feishu",
+                    &archive.account_id,
+                    message_id,
+                    &sent_message_id,
+                    msg_type,
+                    &content_text,
+                    chrono::Utc::now(),
+                )
+                .await
+            {
+                tracing::warn!(message_id, "feishu: archive reply failed: {e:#}");
+            }
+        }
+        Ok(sent_message_id)
     }
 
     /// 原地更新卡片消息（进度刷新走这里）。
@@ -196,6 +240,22 @@ impl FeishuApi {
             .await?;
         if resp.code != 0 {
             bail!("飞书更新卡片失败 code={} msg={}", resp.code, resp.msg);
+        }
+        if let Some(archive) = &self.archive {
+            let content_text = archive_display_content("interactive", card);
+            if let Err(e) = archive
+                .db
+                .update_channel_message_content(
+                    "feishu",
+                    &archive.account_id,
+                    message_id,
+                    "interactive",
+                    &content_text,
+                )
+                .await
+            {
+                tracing::warn!(message_id, "feishu: archive card update failed: {e:#}");
+            }
         }
         Ok(())
     }
@@ -228,16 +288,130 @@ impl FeishuApi {
         if resp.code != 0 {
             bail!("飞书主动发消息失败 code={} msg={}", resp.code, resp.msg);
         }
-        resp.data
-            .and_then(|d| d["message_id"].as_str().map(|s| s.to_string()))
-            .ok_or_else(|| anyhow!("飞书发送响应缺少 message_id"))
+        let data = resp.data.unwrap_or_default();
+        let sent_message_id = data["message_id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("飞书发送响应缺少 message_id"))?;
+        if let Some(archive) = &self.archive {
+            let conversation_id = data["chat_id"].as_str().unwrap_or(receive_id);
+            let (user_id, session_id) = if receive_id_type == "open_id" {
+                match archive.db.get_feishu_binding(&archive.account_id, receive_id).await {
+                    Ok(Some(binding)) => {
+                        let session = archive
+                            .db
+                            .get_feishu_chat(&archive.account_id, conversation_id, "main")
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|chat| chat.session_id);
+                        (Some(binding.user_id), session)
+                    }
+                    _ => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+            let content_text = archive_display_content("text", &json!({ "text": text }));
+            if let Err(e) = archive
+                .db
+                .insert_channel_outbound(
+                    "feishu",
+                    &archive.account_id,
+                    &archive.account_name,
+                    conversation_id,
+                    "main",
+                    &sent_message_id,
+                    "text",
+                    &content_text,
+                    (receive_id_type == "open_id").then_some(receive_id),
+                    user_id.as_deref(),
+                    session_id.as_deref(),
+                    chrono::Utc::now(),
+                )
+                .await
+            {
+                tracing::warn!(message_id = %sent_message_id, "feishu: archive proactive message failed: {e:#}");
+            }
+        }
+        Ok(sent_message_id)
+    }
+}
+
+fn archive_display_content(message_type: &str, content: &Value) -> String {
+    if message_type == "text" {
+        return content["text"].as_str().unwrap_or_default().to_string();
+    }
+    let mut values = Vec::new();
+    if let Some(header) = content.get("header") {
+        collect_card_text(header, &mut values);
+    }
+    if let Value::Object(map) = content {
+        for (key, child) in map {
+            if key != "header" {
+                collect_card_text(child, &mut values);
+            }
+        }
+    } else {
+        collect_card_text(content, &mut values);
+    }
+    values.dedup();
+    if values.is_empty() {
+        format!("[{message_type}]")
+    } else {
+        values.join("\n")
+    }
+}
+
+fn collect_card_text(value: &Value, values: &mut Vec<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map {
+                if matches!(key.as_str(), "text" | "content" | "title") {
+                    if let Some(text) = child.as_str() {
+                        let text = text.trim();
+                        if !text.is_empty() && !values.iter().any(|item| item == text) {
+                            values.push(text.to_string());
+                        }
+                    }
+                }
+                collect_card_text(child, values);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_card_text(item, values);
+            }
+        }
+        _ => {}
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     #[test]
     fn base_url_is_feishu() {
         assert!(super::FEISHU_BASE_URL.contains("feishu"));
+    }
+
+    #[test]
+    fn archive_content_extracts_text_from_cards() {
+        let card = json!({
+            "header": { "title": { "content": "Agent 任务" } },
+            "elements": [
+                { "tag": "markdown", "content": "执行完成" },
+                { "tag": "note", "elements": [{ "tag": "plain_text", "content": "耗时 2s" }] }
+            ]
+        });
+        assert_eq!(
+            super::archive_display_content("interactive", &card),
+            "Agent 任务\n执行完成\n耗时 2s"
+        );
+        assert_eq!(
+            super::archive_display_content("text", &json!({ "text": "你好" })),
+            "你好"
+        );
     }
 }

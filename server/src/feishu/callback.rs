@@ -74,7 +74,7 @@ pub async fn handle_card_action(
     let topic_id = value["topic_id"].as_str().unwrap_or("").to_string();
     let card_message_id = ev.context.and_then(|c| c.open_message_id);
 
-    let api = FeishuApi::new(&account);
+    let api = FeishuApi::new_archived(&account, state.db.clone());
 
     // 操作者必须是已绑定用户
     let binding = state
@@ -110,13 +110,48 @@ pub async fn handle_card_action(
     let in_thread = topic_id != "main";
     let msg = IncomingMessage {
         message_id: card_message_id.clone().unwrap_or_else(|| chat_id.clone()),
-        chat_id,
+        chat_id: chat_id.clone(),
         message_type: "text".to_string(),
         text: choice.clone(),
         root_id: String::new(),
         thread_id: if in_thread { topic_id } else { String::new() },
         sender_open_id: operator_open_id,
     };
+    let card_external_id = format!(
+        "card-action:{}:{}",
+        card_message_id.as_deref().unwrap_or(&chat_id),
+        choice
+    );
+    let card_external_id: String = card_external_id.chars().take(240).collect();
+    let account_name = if account.name.trim().is_empty() {
+        account.app_id.clone()
+    } else {
+        account.name.clone()
+    };
+    let inserted = state
+        .db
+        .insert_channel_message(
+            "feishu",
+            &account.id,
+            &account_name,
+            &msg.chat_id,
+            &msg.topic_id(),
+            &card_external_id,
+            card_message_id.as_deref(),
+            "inbound",
+            "text",
+            &choice,
+            Some(&msg.sender_open_id),
+            Some(&user_id),
+            (!session_id.is_empty()).then_some(session_id.as_str()),
+            chrono::Utc::now(),
+        )
+        .await?;
+    if !inserted {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "这个操作已经提交过了" }
+        }));
+    }
     let state2 = state.clone();
     let api2 = api.clone();
     let choice_for_dispatch = choice.clone();

@@ -141,6 +141,47 @@ pub struct FeishuBindingWithUsername {
     pub created_at: DateTime<Utc>,
 }
 
+/// 渠道消息留档。该表不依赖渠道账号或用户外键，确保解绑/删除账号后历史仍可追溯。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChannelMessage {
+    pub id: String,
+    pub channel: String,
+    pub account_id: String,
+    pub account_name: String,
+    pub conversation_id: String,
+    pub topic_id: String,
+    pub external_message_id: String,
+    pub reply_to_external_id: Option<String>,
+    pub direction: String,
+    pub message_type: String,
+    pub content: String,
+    pub peer_id: Option<String>,
+    pub user_id: Option<String>,
+    pub username: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 渠道会话列表项，由渠道消息按账号/聊天/话题聚合得到。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ChannelConversation {
+    pub channel: String,
+    pub account_id: String,
+    pub account_name: String,
+    pub conversation_id: String,
+    pub topic_id: String,
+    pub peer_id: Option<String>,
+    pub user_id: Option<String>,
+    pub username: Option<String>,
+    pub session_id: Option<String>,
+    pub message_count: i64,
+    pub first_message_at: DateTime<Utc>,
+    pub last_message_at: DateTime<Utc>,
+    pub last_direction: String,
+    pub last_message_type: String,
+    pub last_content: String,
+}
+
 /// 定时任务执行记录（job_runs 表，镜像 quant_job_run 模型）
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct JobRun {
@@ -940,6 +981,34 @@ impl Database {
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (account_id) REFERENCES feishu_accounts(id) ON DELETE CASCADE,
                 UNIQUE KEY uk_feishu_chat_topic (account_id, chat_id, topic_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // 渠道聊天记录留档（当前接入飞书，后续微信等渠道复用）。不建立账号/用户外键，
+        // 保留应用删除、解绑后的审计快照；external_message_id 唯一键也用于入站去重。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS channel_messages (
+                id VARCHAR(36) PRIMARY KEY,
+                channel VARCHAR(32) NOT NULL,
+                account_id VARCHAR(36) NOT NULL,
+                account_name VARCHAR(128) NOT NULL DEFAULT '',
+                conversation_id VARCHAR(128) NOT NULL,
+                topic_id VARCHAR(128) NOT NULL DEFAULT 'main',
+                external_message_id VARCHAR(256) NOT NULL,
+                reply_to_external_id VARCHAR(256) DEFAULT NULL,
+                direction VARCHAR(16) NOT NULL,
+                message_type VARCHAR(32) NOT NULL DEFAULT 'text',
+                content MEDIUMTEXT NOT NULL,
+                peer_id VARCHAR(128) DEFAULT NULL,
+                user_id VARCHAR(36) DEFAULT NULL,
+                username VARCHAR(128) DEFAULT NULL,
+                session_id VARCHAR(36) DEFAULT NULL,
+                created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
+                UNIQUE KEY uk_channel_external_message (channel, account_id, external_message_id),
+                INDEX idx_channel_conversation (channel, account_id, conversation_id, topic_id, created_at),
+                INDEX idx_channel_created (channel, created_at)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -3127,6 +3196,302 @@ impl Database {
                 .execute(&self.pool)
         )?;
         Ok(())
+    }
+
+    // 渠道消息留档
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_channel_message(
+        &self,
+        channel: &str,
+        account_id: &str,
+        account_name: &str,
+        conversation_id: &str,
+        topic_id: &str,
+        external_message_id: &str,
+        reply_to_external_id: Option<&str>,
+        direction: &str,
+        message_type: &str,
+        content: &str,
+        peer_id: Option<&str>,
+        user_id: Option<&str>,
+        session_id: Option<&str>,
+        created_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let id = Uuid::new_v4().to_string();
+        let result = db_retry!(
+            sqlx::query(
+                "INSERT IGNORE INTO channel_messages
+                 (id, channel, account_id, account_name, conversation_id, topic_id,
+                  external_message_id, reply_to_external_id, direction, message_type,
+                  content, peer_id, user_id, username, session_id, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    (SELECT username FROM users WHERE id = ? LIMIT 1), ?, ?)"
+            )
+            .bind(&id)
+            .bind(channel)
+            .bind(account_id)
+            .bind(account_name)
+            .bind(conversation_id)
+            .bind(topic_id)
+            .bind(external_message_id)
+            .bind(reply_to_external_id)
+            .bind(direction)
+            .bind(message_type)
+            .bind(content)
+            .bind(peer_id)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(session_id)
+            .bind(created_at)
+            .execute(&self.pool)
+        )?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// 归档回复消息，并从被回复消息继承聊天、用户和会话上下文。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_channel_reply(
+        &self,
+        channel: &str,
+        account_id: &str,
+        reply_to_external_id: &str,
+        external_message_id: &str,
+        message_type: &str,
+        content: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let id = Uuid::new_v4().to_string();
+        let result = db_retry!(
+            sqlx::query(
+                "INSERT IGNORE INTO channel_messages
+                 (id, channel, account_id, account_name, conversation_id, topic_id,
+                  external_message_id, reply_to_external_id, direction, message_type,
+                  content, peer_id, user_id, username, session_id, created_at)
+                 SELECT ?, channel, account_id, account_name, conversation_id, topic_id,
+                    ?, ?, 'outbound', ?, ?, peer_id, user_id, username, session_id, ?
+                 FROM channel_messages
+                 WHERE channel = ? AND account_id = ? AND external_message_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT 1"
+            )
+            .bind(&id)
+            .bind(external_message_id)
+            .bind(reply_to_external_id)
+            .bind(message_type)
+            .bind(content)
+            .bind(created_at)
+            .bind(channel)
+            .bind(account_id)
+            .bind(reply_to_external_id)
+            .execute(&self.pool)
+        )?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// 主动推送成功后补充其会话上下文；无对应入站消息时仍可作为独立会话展示。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_channel_outbound(
+        &self,
+        channel: &str,
+        account_id: &str,
+        account_name: &str,
+        conversation_id: &str,
+        topic_id: &str,
+        external_message_id: &str,
+        message_type: &str,
+        content: &str,
+        peer_id: Option<&str>,
+        user_id: Option<&str>,
+        session_id: Option<&str>,
+        created_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        self.insert_channel_message(
+            channel,
+            account_id,
+            account_name,
+            conversation_id,
+            topic_id,
+            external_message_id,
+            None,
+            "outbound",
+            message_type,
+            content,
+            peer_id,
+            user_id,
+            session_id,
+            created_at,
+        )
+        .await
+    }
+
+    pub async fn update_channel_message_content(
+        &self,
+        channel: &str,
+        account_id: &str,
+        external_message_id: &str,
+        message_type: &str,
+        content: &str,
+    ) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "UPDATE channel_messages SET message_type = ?, content = ?
+                 WHERE channel = ? AND account_id = ? AND external_message_id = ?"
+            )
+            .bind(message_type)
+            .bind(content)
+            .bind(channel)
+            .bind(account_id)
+            .bind(external_message_id)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// Agent 会话确定后，为当前渠道消息补上 session 关联。
+    pub async fn link_channel_message_session(
+        &self,
+        channel: &str,
+        account_id: &str,
+        external_message_id: &str,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "UPDATE channel_messages
+                 SET session_id = ?, user_id = COALESCE(user_id, ?),
+                     username = COALESCE(username, (SELECT username FROM users WHERE id = ? LIMIT 1))
+                 WHERE channel = ? AND account_id = ? AND external_message_id = ?"
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(channel)
+            .bind(account_id)
+            .bind(external_message_id)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn count_channel_conversations(&self, channel: &str, search: &str) -> Result<u64> {
+        let pattern = format!("%{search}%");
+        let (count,): (i64,) = db_retry!(
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM (
+                    SELECT account_id, conversation_id, topic_id
+                    FROM channel_messages
+                    WHERE channel = ? AND (
+                        ? = '' OR account_name LIKE ? OR conversation_id LIKE ? OR topic_id LIKE ?
+                        OR peer_id LIKE ? OR username LIKE ? OR content LIKE ?
+                    )
+                    GROUP BY account_id, conversation_id, topic_id
+                ) conversations"
+            )
+            .bind(channel)
+            .bind(search)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .fetch_one(&self.pool)
+        )?;
+        Ok(count.max(0) as u64)
+    }
+
+    pub async fn list_channel_conversations(
+        &self,
+        channel: &str,
+        search: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<Vec<ChannelConversation>> {
+        let pattern = format!("%{search}%");
+        let offset = ((page.saturating_sub(1)) * per_page) as i64;
+        let limit = per_page as i64;
+        let rows = db_retry!(
+            sqlx::query_as::<_, ChannelConversation>(
+                "SELECT g.channel, g.account_id,
+                    (SELECT m.account_name FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS account_name,
+                    g.conversation_id, g.topic_id,
+                    (SELECT m.peer_id FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS peer_id,
+                    (SELECT m.user_id FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS user_id,
+                    (SELECT m.username FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS username,
+                    (SELECT m.session_id FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id AND m.session_id IS NOT NULL ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS session_id,
+                    g.message_count, g.first_message_at, g.last_message_at,
+                    (SELECT m.direction FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_direction,
+                    (SELECT m.message_type FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_message_type,
+                    (SELECT m.content FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_content
+                 FROM (
+                    SELECT channel, account_id, conversation_id, topic_id,
+                        COUNT(*) AS message_count, MIN(created_at) AS first_message_at, MAX(created_at) AS last_message_at
+                    FROM channel_messages
+                    WHERE channel = ? AND (
+                        ? = '' OR account_name LIKE ? OR conversation_id LIKE ? OR topic_id LIKE ?
+                        OR peer_id LIKE ? OR username LIKE ? OR content LIKE ?
+                    )
+                    GROUP BY channel, account_id, conversation_id, topic_id
+                 ) g
+                 ORDER BY g.last_message_at DESC
+                 LIMIT ? OFFSET ?"
+            )
+            .bind(channel)
+            .bind(search)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(&pattern)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    pub async fn list_channel_messages(
+        &self,
+        channel: &str,
+        account_id: &str,
+        conversation_id: &str,
+        topic_id: &str,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<ChannelMessage>, u64)> {
+        let (count,): (i64,) = db_retry!(
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM channel_messages
+                 WHERE channel = ? AND account_id = ? AND conversation_id = ? AND topic_id = ?"
+            )
+            .bind(channel)
+            .bind(account_id)
+            .bind(conversation_id)
+            .bind(topic_id)
+            .fetch_one(&self.pool)
+        )?;
+        let offset = ((page.saturating_sub(1)) * per_page) as i64;
+        let rows = db_retry!(
+            sqlx::query_as::<_, ChannelMessage>(
+                "SELECT id, channel, account_id, account_name, conversation_id, topic_id,
+                    external_message_id, reply_to_external_id, direction, message_type,
+                    content, peer_id, user_id, username, session_id, created_at
+                 FROM channel_messages
+                 WHERE channel = ? AND account_id = ? AND conversation_id = ? AND topic_id = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+            )
+            .bind(channel)
+            .bind(account_id)
+            .bind(conversation_id)
+            .bind(topic_id)
+            .bind(per_page as i64)
+            .bind(offset)
+            .fetch_all(&self.pool)
+        )?;
+        let mut ordered = rows;
+        ordered.reverse();
+        Ok((ordered, count.max(0) as u64))
     }
 
     // Job runs（定时任务执行日志）

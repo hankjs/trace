@@ -4,6 +4,7 @@ mod auth;
 mod changes;
 mod chat;
 mod checkpoints;
+mod channel_records;
 mod config;
 mod image_gen;
 mod llm;
@@ -491,6 +492,15 @@ async fn main() -> Result<()> {
             delete(feishu::routes::delete_binding_admin),
         )
         .route("/api/admin/feishu/send", post(feishu::routes::send_message))
+        // Channel chat records（目前开放飞书，后续渠道复用）
+        .route(
+            "/api/admin/chat-records/conversations",
+            get(channel_records::list_conversations),
+        )
+        .route(
+            "/api/admin/chat-records/messages",
+            get(channel_records::list_messages),
+        )
         // Scheduler admin routes（定时任务管理）
         .route("/api/admin/jobs", get(scheduler::routes::list_jobs))
         .route(

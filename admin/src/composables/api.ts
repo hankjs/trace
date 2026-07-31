@@ -170,6 +170,43 @@ export interface FeishuBindCode {
   expires_at: number
 }
 
+export interface ChannelConversation {
+  channel: string
+  account_id: string
+  account_name: string
+  conversation_id: string
+  topic_id: string
+  peer_id: string | null
+  user_id: string | null
+  username: string | null
+  session_id: string | null
+  message_count: number
+  first_message_at: string
+  last_message_at: string
+  last_direction: 'inbound' | 'outbound'
+  last_message_type: string
+  last_content: string
+}
+
+export interface ChannelMessage {
+  id: string
+  channel: string
+  account_id: string
+  account_name: string
+  conversation_id: string
+  topic_id: string
+  external_message_id: string
+  reply_to_external_id: string | null
+  direction: 'inbound' | 'outbound'
+  message_type: string
+  content: string
+  peer_id: string | null
+  user_id: string | null
+  username: string | null
+  session_id: string | null
+  created_at: string
+}
+
 export interface JobRun {
   id: number
   job_id: string
@@ -444,6 +481,37 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ binding_id: bindingId, text }),
     })
+  },
+
+  chatRecordConversations(page = 1, perPage = 30, search = '', channel = 'feishu') {
+    const params = new URLSearchParams({
+      channel,
+      page: String(page),
+      per_page: String(perPage),
+    })
+    if (search) params.set('search', search)
+    return request<PaginatedResponse<ChannelConversation>>(
+      `/api/admin/chat-records/conversations?${params}`,
+    )
+  },
+
+  chatRecordMessages(
+    conversation: Pick<ChannelConversation, 'account_id' | 'conversation_id' | 'topic_id'>,
+    page = 1,
+    perPage = 100,
+    channel = 'feishu',
+  ) {
+    const params = new URLSearchParams({
+      channel,
+      account_id: conversation.account_id,
+      conversation_id: conversation.conversation_id,
+      topic_id: conversation.topic_id,
+      page: String(page),
+      per_page: String(perPage),
+    })
+    return request<PaginatedResponse<ChannelMessage>>(
+      `/api/admin/chat-records/messages?${params}`,
+    )
   },
 
   // Scheduler job management

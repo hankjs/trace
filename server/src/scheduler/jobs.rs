@@ -107,7 +107,7 @@ async fn push_user_brief(
     if !account.enabled {
         bail!("飞书账号已停用: {}", account.app_id);
     }
-    let api = FeishuApi::new(&account);
+    let api = FeishuApi::new_archived(&account, state.db.clone());
     api.send_text("open_id", &binding.open_id, &format_brief(today, &signals.items))
         .await?;
     Ok(true)

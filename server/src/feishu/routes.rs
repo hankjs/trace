@@ -191,7 +191,7 @@ pub async fn send_message(
     if !account.enabled {
         return R::bad_request("该应用已停用");
     }
-    let api = FeishuApi::new(&account);
+    let api = FeishuApi::new_archived(&account, state.db.clone());
     match api.send_text("open_id", &binding.open_id, text).await {
         Ok(_) => R::no_content(),
         Err(e) => R::internal_error(e),

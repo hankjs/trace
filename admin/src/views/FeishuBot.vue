@@ -76,7 +76,7 @@ async function toggleEnabled(a: FeishuAccount) {
 }
 
 async function remove(id: string) {
-  if (!confirm('确定删除该飞书应用？绑定与话题会话映射会一并删除。')) return
+  if (!confirm('确定删除该飞书应用？绑定与话题会话映射会一并删除，已留档的聊天记录将继续保留。')) return
   await api.deleteFeishuAccount(id)
   await load()
   await loadBindings()

@@ -226,16 +226,17 @@ async fn handle_message(state: Arc<AppState>, account: FeishuAccount, data: Even
             .unwrap_or_default(),
     };
 
+    let log_text = archive_inbound_content(&msg);
     tracing::info!(
         account_id = %account.id,
         chat = %msg.chat_id,
         topic = %msg.topic_id(),
         sender = %msg.sender_open_id,
         "feishu: 收到消息: {}",
-        &msg.text.chars().take(80).collect::<String>()
+        &log_text.chars().take(80).collect::<String>()
     );
 
-    let api = FeishuApi::new(&account);
+    let api = FeishuApi::new_archived(&account, state.db.clone());
 
     // 绑定检查：未绑定走 bind code 流程
     let binding = state
@@ -243,8 +244,31 @@ async fn handle_message(state: Arc<AppState>, account: FeishuAccount, data: Even
         .get_feishu_binding(&account.id, &msg.sender_open_id)
         .await
         .unwrap_or(None);
+    let inserted = state
+        .db
+        .insert_channel_message(
+            "feishu",
+            &account.id,
+            archive_account_name(&account),
+            &msg.chat_id,
+            &msg.topic_id(),
+            &msg.message_id,
+            None,
+            "inbound",
+            &msg.message_type,
+            &archive_inbound_content(&msg),
+            Some(&msg.sender_open_id),
+            binding.as_ref().map(|binding| binding.user_id.as_str()),
+            None,
+            chrono::Utc::now(),
+        )
+        .await?;
+    if !inserted {
+        tracing::info!(message_id = %msg.message_id, "feishu: duplicate inbound message ignored");
+        return Ok(());
+    }
     let binding = match binding {
-        Some(b) => b,
+        Some(binding) => binding,
         None => {
             handle_unbound(&state, &api, &account, &msg).await;
             return Ok(());
@@ -443,6 +467,20 @@ pub async fn dispatch_task(
         },
     };
 
+    if let Err(e) = state
+        .db
+        .link_channel_message_session(
+            "feishu",
+            &account.id,
+            &msg.message_id,
+            &session_id,
+            user_id,
+        )
+        .await
+    {
+        tracing::warn!(session_id = %session_id, "feishu: link archived messages to session failed: {e:#}");
+    }
+
     // 并发控制：同 session 同时只跑一个 turn
     if state.active_tasks.read().await.contains_key(&session_id) {
         api.reply_text(&msg.message_id, "正在执行中，/stop 可取消", msg.in_thread())
@@ -500,6 +538,30 @@ pub async fn dispatch_task(
         }
     }
     Ok(())
+}
+
+fn archive_account_name(account: &FeishuAccount) -> &str {
+    if account.name.trim().is_empty() {
+        &account.app_id
+    } else {
+        &account.name
+    }
+}
+
+fn archive_inbound_content(msg: &IncomingMessage) -> String {
+    let text = msg.text.trim();
+    if text
+        .strip_prefix("bind")
+        .map(str::trim)
+        .is_some_and(|code| code.len() == 6 && code.chars().all(|c| c.is_ascii_digit()))
+    {
+        return "bind ******".to_string();
+    }
+    if text.is_empty() {
+        format!("[{} message]", msg.message_type)
+    } else {
+        text.to_string()
+    }
 }
 
 async fn create_feishu_session(state: &Arc<AppState>, user_id: &str) -> Result<hank_db::Session> {
@@ -612,5 +674,21 @@ mod tests {
         assert!(msg("omt_1", "").in_thread());
         assert!(msg("", "om_9").in_thread());
         assert!(!msg("", "").in_thread());
+    }
+
+    #[test]
+    fn archive_content_redacts_bind_code_and_labels_media() {
+        let message = |message_type: &str, text: &str| IncomingMessage {
+            message_id: "om_1".into(),
+            chat_id: "oc_1".into(),
+            message_type: message_type.into(),
+            text: text.into(),
+            root_id: String::new(),
+            thread_id: String::new(),
+            sender_open_id: "ou_1".into(),
+        };
+        assert_eq!(archive_inbound_content(&message("text", "bind 123456")), "bind ******");
+        assert_eq!(archive_inbound_content(&message("text", "绑定需求")), "绑定需求");
+        assert_eq!(archive_inbound_content(&message("image", "")), "[image message]");
     }
 }
