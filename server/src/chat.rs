@@ -532,7 +532,10 @@ pub async fn run_chat_turn(
     let fwd_span = tracing::info_span!("chat_fwd", session_id = %session_id);
     tokio::spawn(
         async move {
-            let mut seq: u64 = 0;
+            let mut seq = db_fwd
+                .get_last_agent_event_seq(&sid_fwd2)
+                .await
+                .unwrap_or(0);
             while let Some(event) = event_rx.recv().await {
                 seq += 1;
 
@@ -630,7 +633,7 @@ pub async fn run_chat_turn(
                 }
                 let mut buffers = state_fwd.event_buffers.write().await;
                 if let Some(buf) = buffers.get_mut(&sid_fwd) {
-                    buf.push(event);
+                    buf.push(event_for_stream(&event));
                 }
             }
         }
@@ -1276,6 +1279,9 @@ fn extract_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::ExploreComplete { .. } => "explore_complete",
         AgentEvent::GenerateComplete { .. } => "generate_complete",
         AgentEvent::LlmRequest { .. } => "llm_request",
+        AgentEvent::LlmResponse { .. } => "llm_response",
+        AgentEvent::LlmRetry { .. } => "llm_retry",
+        AgentEvent::LlmFailed { .. } => "llm_failed",
         AgentEvent::ToolOutputDelta { .. } => "tool_output_delta",
         AgentEvent::RunStarted { .. } => "run_started",
         AgentEvent::RunCompleted { .. } => "run_completed",
@@ -1291,6 +1297,37 @@ fn extract_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::VerificationStarted { .. } => "verification_started",
         AgentEvent::VerificationCompleted { .. } => "verification_completed",
     }
+}
+
+/// 审计表保留完整 LLM 请求/响应；实时 SSE 只发送轻量摘要，避免每轮重复传输
+/// 完整上下文和工具 schema，拖慢桌面端与断线恢复缓冲。
+pub(crate) fn event_for_stream(event: &AgentEvent) -> AgentEvent {
+    let mut stream_event = event.clone();
+    match &mut stream_event {
+        AgentEvent::LlmRequest {
+            system,
+            messages,
+            tool_definitions,
+            ..
+        } => {
+            *system = system.as_deref().map(|text| preview_chars(text, 500));
+            messages.clear();
+            tool_definitions.clear();
+        }
+        AgentEvent::LlmResponse { content, .. } => content.clear(),
+        AgentEvent::ToolResult { content, .. } => {
+            *content = preview_chars(content, 12_000);
+        }
+        _ => {}
+    }
+    stream_event
+}
+
+fn preview_chars(text: &str, max_chars: usize) -> String {
+    let Some((end, _)) = text.char_indices().nth(max_chars) else {
+        return text.to_string();
+    };
+    format!("{}\n...[实时流已截断，完整内容见调用链记录]", &text[..end])
 }
 
 #[cfg(test)]

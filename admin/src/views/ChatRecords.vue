@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
-import { api, type ChannelConversation, type ChannelMessage } from '../composables/api'
+import AgentTracePanel from '../components/AgentTracePanel.vue'
+import { api, type AgentEventRecord, type ChannelConversation, type ChannelMessage } from '../composables/api'
 
 const conversations = ref<ChannelConversation[]>([])
 const selected = ref<ChannelConversation | null>(null)
@@ -13,6 +14,10 @@ const searchInput = ref('')
 const appliedSearch = ref('')
 const conversationsLoading = ref(true)
 const messagesLoading = ref(false)
+const traceEvents = ref<AgentEventRecord[]>([])
+const traceLoading = ref(false)
+const traceError = ref('')
+const detailMode = ref<'messages' | 'trace'>('messages')
 const error = ref('')
 
 const conversationPerPage = 30
@@ -83,9 +88,27 @@ async function loadConversations() {
 async function selectConversation(item: ChannelConversation) {
   selected.value = item
   messages.value = []
+  traceEvents.value = []
+  traceError.value = ''
   totalMessages.value = 0
   messagePage.value = 0
-  await loadMessages(1, true)
+  detailMode.value = item.session_id ? 'trace' : 'messages'
+  await Promise.all([
+    loadMessages(1, true),
+    item.session_id ? loadTrace(item.session_id) : Promise.resolve(),
+  ])
+}
+
+async function loadTrace(sessionId: string) {
+  traceLoading.value = true
+  traceError.value = ''
+  try {
+    traceEvents.value = await api.sessionEvents(sessionId)
+  } catch (e: any) {
+    traceError.value = e?.message || '调用链加载失败'
+  } finally {
+    traceLoading.value = false
+  }
 }
 
 async function loadMessages(page: number, replace = false) {
@@ -214,14 +237,33 @@ onMounted(loadConversations)
                 <h2 class="truncate text-[13px] font-semibold text-text-primary">{{ conversationLabel(selected) }}</h2>
                 <p class="mt-1 truncate font-mono text-[11px] text-text-tertiary">{{ selected.conversation_id }} · {{ topicLabel(selected) }}</p>
               </div>
-              <RouterLink
-                v-if="selected.session_id"
-                :to="`/sessions/${selected.session_id}`"
-                class="shrink-0 text-[11px] text-accent hover:text-accent-hover"
-              >查看 Session ↗</RouterLink>
+              <div class="flex shrink-0 items-center gap-2">
+                <div class="flex h-7 items-center rounded border border-border-subtle bg-surface" role="tablist" aria-label="记录视图">
+                  <button
+                    class="h-full px-2.5 text-[11px] transition-colors"
+                    :class="detailMode === 'messages' ? 'bg-active font-medium text-text-primary' : 'text-text-tertiary hover:text-text-secondary'"
+                    role="tab"
+                    :aria-selected="detailMode === 'messages'"
+                    @click="detailMode = 'messages'"
+                  >消息</button>
+                  <button
+                    v-if="selected.session_id"
+                    class="h-full border-l border-border-subtle px-2.5 text-[11px] transition-colors"
+                    :class="detailMode === 'trace' ? 'bg-active font-medium text-text-primary' : 'text-text-tertiary hover:text-text-secondary'"
+                    role="tab"
+                    :aria-selected="detailMode === 'trace'"
+                    @click="detailMode = 'trace'"
+                  >调用链</button>
+                </div>
+                <RouterLink
+                  v-if="selected.session_id"
+                  :to="`/sessions/${selected.session_id}`"
+                  class="text-[11px] text-accent hover:text-accent-hover"
+                >Session ↗</RouterLink>
+              </div>
             </div>
           </header>
-          <div class="min-h-0 flex-1 overflow-y-auto">
+          <div v-if="detailMode === 'messages'" class="min-h-0 flex-1 overflow-y-auto" role="tabpanel">
             <div v-if="hasOlderMessages" class="border-b border-border-subtle px-4 py-2 text-center">
               <button class="text-[11px] text-accent hover:text-accent-hover disabled:opacity-40" :disabled="messagesLoading" @click="loadMessages(messagePage + 1)">
                 {{ messagesLoading ? '加载中...' : '加载更早记录' }}
@@ -247,6 +289,9 @@ onMounted(loadConversations)
                 </div>
               </article>
             </div>
+          </div>
+          <div v-else class="min-h-0 flex-1 overflow-y-auto" role="tabpanel">
+            <AgentTracePanel :events="traceEvents" :loading="traceLoading" :error="traceError" />
           </div>
         </template>
         <div v-else class="flex flex-1 items-center justify-center px-6 text-xs text-text-tertiary">选择一个会话查看记录</div>

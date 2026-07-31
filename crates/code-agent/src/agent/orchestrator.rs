@@ -5,7 +5,10 @@ use crate::agent::LoopDetector;
 use crate::agent::loop_detector::LoopLevel;
 use crate::context::summary::{estimate_tokens, truncate_tool_result_default};
 use crate::context::{BudgetStatus, ContextManager};
-use crate::retry::{consume_stream_with_retry, stream_with_retry};
+use crate::retry::{
+    consume_stream_with_retry, emit_llm_request, emit_llm_response, stream_with_retry,
+    LlmTraceContext,
+};
 use crate::runtime::{
     build_run_summary_from, classify_tool_error, now_ts, RunState, ToolCallContext, ToolGate,
     ToolRuntime,
@@ -34,8 +37,6 @@ const MAX_CONTINUATIONS: u32 = 3;
 /// 递减回报判停：续写增量低于该 token 数视为无进展（【AF 08】<500）
 const CONTINUATION_MIN_GAIN_TOKENS: u32 = 500;
 const MAX_REVISIONS: usize = 2;
-/// LlmRequest 事件中 system prompt 最大字符数，防止 SSE 流量过大
-const LLM_REQUEST_SYSTEM_PREVIEW_CHARS: usize = 500;
 
 #[derive(Clone)]
 pub(crate) struct OrchestratorRuntime {
@@ -156,16 +157,6 @@ impl OrchestratorAgent {
             }
         }
         self.deferred_tool_names = names;
-    }
-
-    /// LlmRequest 事件中截断 system prompt，防止 SSE 流量过大
-    fn preview_system(system: &Option<String>) -> Option<String> {
-        system.as_deref().map(|s| {
-            match s.char_indices().nth(LLM_REQUEST_SYSTEM_PREVIEW_CHARS) {
-                Some((i, _)) => format!("{}...", &s[..i]),
-                None => s.to_string(),
-            }
-        })
     }
 
     /// Run the orchestrator loop with Think/Act/Observe phases.
@@ -391,30 +382,38 @@ impl OrchestratorAgent {
             max_tokens: 2048,
         };
 
-        let _ = event_tx
-            .send(AgentEvent::LlmRequest {
-                model: req.model.clone(),
-                system: Self::preview_system(&req.system),
-                tools: req.tools.iter().map(|t| t.name.clone()).collect(),
-                max_tokens: req.max_tokens,
-                message_count: req.messages.len(),
-                phase: "think".to_string(),
-            })
-            .await;
+        let llm_trace = LlmTraceContext {
+            call_id: uuid::Uuid::new_v4().to_string(),
+            run_id: Some(runtime.run_id.clone()),
+            turn_id: Some(turn_id.clone()),
+            model: req.model.clone(),
+            provider: self.provider.name().to_string(),
+            phase: "think".to_string(),
+        };
+        emit_llm_request(event_tx, &llm_trace, &req).await;
 
         debug!("Orchestrator THINK phase");
         let llm_start = Instant::now();
-        let mut stream = stream_with_retry(&self.provider, req).await?;
+        let mut stream = stream_with_retry(&self.provider, req, event_tx, &llm_trace).await?;
         let mut think_text = String::new();
         let mut total_input_tokens = 0u32;
         let mut total_output_tokens = 0u32;
+        let mut cache_read_tokens = 0u32;
+        let mut cache_write_tokens = 0u32;
+        let mut stop_reason = StopReason::EndTurn;
+        let mut cancelled = false;
+        let mut timed_out = false;
 
         loop {
             let event = tokio::select! {
                 event = stream.next() => event,
-                _ = cancel.cancelled() => { None }
+                _ = cancel.cancelled() => {
+                    cancelled = true;
+                    None
+                }
                 _ = tokio::time::sleep(Duration::from_secs(LLM_STREAM_TIMEOUT_SECS)) => {
                     warn!("Think phase LLM stream timeout after {}s", LLM_STREAM_TIMEOUT_SECS);
+                    timed_out = true;
                     None
                 }
             };
@@ -424,14 +423,20 @@ impl OrchestratorAgent {
                     think_text.push_str(&text);
                     let _ = event_tx.send(AgentEvent::Thinking { text }).await;
                 }
-                Ok(StreamEvent::MessageEnd { .. }) => break,
+                Ok(StreamEvent::MessageEnd { stop_reason: sr }) => {
+                    stop_reason = sr;
+                    break;
+                }
                 Ok(StreamEvent::Usage {
                     input_tokens,
                     output_tokens,
-                    ..
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
                 }) => {
                     total_input_tokens += input_tokens;
                     total_output_tokens += output_tokens;
+                    cache_read_tokens += cache_read;
+                    cache_write_tokens += cache_write;
                 }
                 Ok(StreamEvent::Error(msg)) => {
                     let _ = event_tx.send(AgentEvent::Error { message: msg }).await;
@@ -445,6 +450,24 @@ impl OrchestratorAgent {
             }
         }
 
+        let latency_ms = llm_start.elapsed().as_millis() as u64;
+        emit_llm_response(
+            event_tx,
+            &llm_trace,
+            vec![ContentBlock::Text {
+                text: think_text.clone(),
+            }],
+            stop_reason,
+            total_input_tokens,
+            total_output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            latency_ms,
+            cancelled,
+            timed_out,
+        )
+        .await;
+
         // Add think output to messages as assistant turn
         if !think_text.is_empty() {
             let think_msg = Message {
@@ -456,7 +479,6 @@ impl OrchestratorAgent {
             self.messages.push(think_msg);
         }
 
-        let latency_ms = llm_start.elapsed().as_millis() as u64;
         let _ = event_tx
             .send(AgentEvent::Metrics {
                 input_tokens: total_input_tokens,
@@ -515,16 +537,15 @@ impl OrchestratorAgent {
             },
         };
 
-        let _ = event_tx
-            .send(AgentEvent::LlmRequest {
-                model: req.model.clone(),
-                system: Self::preview_system(&req.system),
-                tools: req.tools.iter().map(|t| t.name.clone()).collect(),
-                max_tokens: req.max_tokens,
-                message_count: req.messages.len(),
-                phase: "act".to_string(),
-            })
-            .await;
+        let call_id = uuid::Uuid::new_v4().to_string();
+        let llm_trace = LlmTraceContext {
+            call_id: call_id.clone(),
+            run_id: Some(runtime.run_id.clone()),
+            turn_id: Some(turn_id.clone()),
+            model: req.model.clone(),
+            provider: self.provider.name().to_string(),
+            phase: "act".to_string(),
+        };
 
         debug!("Orchestrator ACT phase");
         let llm_start = Instant::now();
@@ -535,6 +556,7 @@ impl OrchestratorAgent {
             event_tx,
             cancel,
             runtime.stream_timeout,
+            &llm_trace,
         )
         .await?;
         let assistant_content = outcome.assistant_content;
@@ -681,6 +703,7 @@ impl OrchestratorAgent {
                 let summary = build_run_summary_from(run_state);
                 let result = verifier
                     .verify(
+                        &runtime.run_id,
                         &runtime.original_request,
                         &summary,
                         event_tx.clone(),
@@ -894,6 +917,7 @@ impl OrchestratorAgent {
                         run_state,
                         runtime,
                         &turn_id,
+                        &call_id,
                     )
                     .await;
                 // 回填结果指纹（【SA 03】：结果不同属正常探索，不计 streak）
@@ -913,7 +937,14 @@ impl OrchestratorAgent {
                     }
                     let result = self
                         .execute_single_tool(
-                            id, name, input, &event_tx, run_state, runtime, &turn_id,
+                            id,
+                            name,
+                            input,
+                            &event_tx,
+                            run_state,
+                            runtime,
+                            &turn_id,
+                            &call_id,
                         )
                         .await;
                     // 回填结果指纹
@@ -928,6 +959,20 @@ impl OrchestratorAgent {
         // Execute delegate tasks — parallel if no affected_paths conflicts, sequential otherwise
         if !delegate_tasks.is_empty() {
             had_worker = true;
+            for (id, input) in &delegate_tasks {
+                let _ = event_tx
+                    .send(AgentEvent::ToolStart {
+                        id: (*id).to_string(),
+                        name: DELEGATE_TASK_TOOL.to_string(),
+                        input: serde_json::to_string(input).unwrap_or_default(),
+                        run_id: Some(runtime.run_id.clone()),
+                        turn_id: Some(turn_id.clone()),
+                        call_id: Some(call_id.clone()),
+                        risk: Some("Delegation".to_string()),
+                        timeout_ms: None,
+                    })
+                    .await;
+            }
 
             // Detect write conflicts: tasks sharing any affected_path must run sequentially
             let tasks_parsed: Vec<(String, DelegatedTask)> = delegate_tasks
@@ -1048,20 +1093,47 @@ impl OrchestratorAgent {
                             if result.status != TaskStatus::Success {
                                 worker_success = false;
                             }
+                            let content = format!(
+                                "Task {} completed with status {:?}.\nSummary: {}",
+                                result.task_id, result.status, result.summary
+                            );
+                            let is_error = result.status == TaskStatus::Failed;
+                            let _ = event_tx
+                                .send(AgentEvent::ToolResult {
+                                    id: id.clone(),
+                                    name: Some(DELEGATE_TASK_TOOL.to_string()),
+                                    content: content.clone(),
+                                    is_error,
+                                    run_id: Some(runtime.run_id.clone()),
+                                    turn_id: Some(turn_id.clone()),
+                                    call_id: Some(call_id.clone()),
+                                    duration_ms: None,
+                                })
+                                .await;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id,
-                                content: format!(
-                                    "Task {} completed with status {:?}.\nSummary: {}",
-                                    result.task_id, result.status, result.summary
-                                ),
-                                is_error: result.status == TaskStatus::Failed,
+                                content,
+                                is_error,
                             });
                         }
                         Err(e) => {
                             worker_success = false;
+                            let content = format!("Worker error: {e}");
+                            let _ = event_tx
+                                .send(AgentEvent::ToolResult {
+                                    id: id.clone(),
+                                    name: Some(DELEGATE_TASK_TOOL.to_string()),
+                                    content: content.clone(),
+                                    is_error: true,
+                                    run_id: Some(runtime.run_id.clone()),
+                                    turn_id: Some(turn_id.clone()),
+                                    call_id: Some(call_id.clone()),
+                                    duration_ms: None,
+                                })
+                                .await;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id,
-                                content: format!("Worker error: {e}"),
+                                content,
                                 is_error: true,
                             });
                         }
@@ -1112,20 +1184,47 @@ impl OrchestratorAgent {
                             if result.status != TaskStatus::Success {
                                 worker_success = false;
                             }
+                            let content = format!(
+                                "Task {} completed with status {:?}.\nSummary: {}",
+                                result.task_id, result.status, result.summary
+                            );
+                            let is_error = result.status == TaskStatus::Failed;
+                            let _ = event_tx
+                                .send(AgentEvent::ToolResult {
+                                    id: id.clone(),
+                                    name: Some(DELEGATE_TASK_TOOL.to_string()),
+                                    content: content.clone(),
+                                    is_error,
+                                    run_id: Some(runtime.run_id.clone()),
+                                    turn_id: Some(turn_id.clone()),
+                                    call_id: Some(call_id.clone()),
+                                    duration_ms: None,
+                                })
+                                .await;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id,
-                                content: format!(
-                                    "Task {} completed with status {:?}.\nSummary: {}",
-                                    result.task_id, result.status, result.summary
-                                ),
-                                is_error: result.status == TaskStatus::Failed,
+                                content,
+                                is_error,
                             });
                         }
                         Err(e) => {
                             worker_success = false;
+                            let content = format!("Worker error: {e}");
+                            let _ = event_tx
+                                .send(AgentEvent::ToolResult {
+                                    id: id.clone(),
+                                    name: Some(DELEGATE_TASK_TOOL.to_string()),
+                                    content: content.clone(),
+                                    is_error: true,
+                                    run_id: Some(runtime.run_id.clone()),
+                                    turn_id: Some(turn_id.clone()),
+                                    call_id: Some(call_id.clone()),
+                                    duration_ms: None,
+                                })
+                                .await;
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id,
-                                content: format!("Worker error: {e}"),
+                                content,
                                 is_error: true,
                             });
                         }
@@ -1208,6 +1307,7 @@ impl OrchestratorAgent {
         run_state: &mut RunState,
         runtime: &OrchestratorRuntime,
         turn_id: &str,
+        call_id: &str,
     ) -> ContentBlock {
         let tool_runtime = ToolRuntime::new(
             runtime.permission.clone(),
@@ -1222,6 +1322,7 @@ impl OrchestratorAgent {
                     input,
                     run_id: &runtime.run_id,
                     turn_id,
+                    call_id: Some(call_id),
                 },
                 event_tx,
                 run_state,
@@ -1238,6 +1339,7 @@ impl OrchestratorAgent {
         run_state: &mut RunState,
         runtime: &OrchestratorRuntime,
         turn_id: &str,
+        call_id: &str,
     ) -> Vec<ContentBlock> {
         use futures::future::join_all;
 
@@ -1257,6 +1359,7 @@ impl OrchestratorAgent {
                         input: *input,
                         run_id: &runtime.run_id,
                         turn_id,
+                        call_id: Some(call_id),
                     },
                     event_tx,
                     run_state,
@@ -1265,11 +1368,24 @@ impl OrchestratorAgent {
             {
                 ToolGate::Proceed => allowed.push((*id, *name, *input)),
                 ToolGate::Denied(reason) => {
+                    let content = format!(
+                        "Permission denied: {reason}. This action was not executed. If needed, the user can perform it manually."
+                    );
+                    let _ = event_tx
+                        .send(AgentEvent::ToolResult {
+                            id: (*id).to_string(),
+                            name: Some((*name).to_string()),
+                            content: content.clone(),
+                            is_error: true,
+                            run_id: Some(runtime.run_id.clone()),
+                            turn_id: Some(turn_id.to_string()),
+                            call_id: Some(call_id.to_string()),
+                            duration_ms: Some(0),
+                        })
+                        .await;
                     content_blocks.push(ContentBlock::ToolResult {
                         tool_use_id: (*id).to_string(),
-                        content: format!(
-                            "Permission denied: {reason}. This action was not executed. If needed, the user can perform it manually."
-                        ),
+                        content,
                         is_error: true,
                     });
                 }
@@ -1284,6 +1400,14 @@ impl OrchestratorAgent {
                     id: id.to_string(),
                     name: name.to_string(),
                     input: input_str,
+                    run_id: Some(runtime.run_id.clone()),
+                    turn_id: Some(turn_id.to_string()),
+                    call_id: Some(call_id.to_string()),
+                    risk: Some(format!(
+                        "{:?}",
+                        ToolRuntime::tool_risk_for(&self.tools, name)
+                    )),
+                    timeout_ms: Some(tool_runtime.timeout_for(name).as_millis() as u64),
                 })
                 .await;
         }
@@ -1326,8 +1450,13 @@ impl OrchestratorAgent {
             let _ = event_tx
                 .send(AgentEvent::ToolResult {
                     id: id.clone(),
+                    name: Some(name.clone()),
                     content: output.content.clone(),
                     is_error: output.is_error,
+                    run_id: Some(runtime.run_id.clone()),
+                    turn_id: Some(turn_id.to_string()),
+                    call_id: Some(call_id.to_string()),
+                    duration_ms: Some(duration_ms),
                 })
                 .await;
             let _ = event_tx

@@ -26,6 +26,7 @@ pub(crate) struct ToolCallContext<'a> {
     pub(crate) input: &'a Value,
     pub(crate) run_id: &'a str,
     pub(crate) turn_id: &'a str,
+    pub(crate) call_id: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -238,11 +239,24 @@ impl ToolRuntime {
         match self.gate_tool(&call, event_tx, run_state).await {
             ToolGate::Proceed => {}
             ToolGate::Denied(reason) => {
+                let content = format!(
+                    "Permission denied: {reason}. This action was not executed. If needed, the user can perform it manually."
+                );
+                let _ = event_tx
+                    .send(AgentEvent::ToolResult {
+                        id: call.id.to_string(),
+                        name: Some(call.name.to_string()),
+                        content: content.clone(),
+                        is_error: true,
+                        run_id: Some(call.run_id.to_string()),
+                        turn_id: Some(call.turn_id.to_string()),
+                        call_id: call.call_id.map(str::to_string),
+                        duration_ms: Some(0),
+                    })
+                    .await;
                 return ContentBlock::ToolResult {
                     tool_use_id: call.id.to_string(),
-                    content: format!(
-                        "Permission denied: {reason}. This action was not executed. If needed, the user can perform it manually."
-                    ),
+                    content,
                     is_error: true,
                 };
             }
@@ -257,16 +271,21 @@ impl ToolRuntime {
         };
 
         let input_str = serde_json::to_string(call.input).unwrap_or_default();
+        let timeout = self.timeout_for(call.name);
         debug!("Executing tool: name={}, id={}", call.name, call.id);
         let _ = event_tx
             .send(AgentEvent::ToolStart {
                 id: call.id.to_string(),
                 name: call.name.to_string(),
                 input: input_str,
+                run_id: Some(call.run_id.to_string()),
+                turn_id: Some(call.turn_id.to_string()),
+                call_id: call.call_id.map(str::to_string),
+                risk: Some(format!("{:?}", Self::tool_risk_for(&self.tools, call.name))),
+                timeout_ms: Some(timeout.as_millis() as u64),
             })
             .await;
 
-        let timeout = self.timeout_for(call.name);
         let tool_start = Instant::now();
         let output = match tokio::time::timeout(
             timeout,
@@ -289,8 +308,13 @@ impl ToolRuntime {
         let _ = event_tx
             .send(AgentEvent::ToolResult {
                 id: call.id.to_string(),
+                name: Some(call.name.to_string()),
                 content: output.content.clone(),
                 is_error: output.is_error,
+                run_id: Some(call.run_id.to_string()),
+                turn_id: Some(call.turn_id.to_string()),
+                call_id: call.call_id.map(str::to_string),
+                duration_ms: Some(tool_duration_ms),
             })
             .await;
         let _ = event_tx

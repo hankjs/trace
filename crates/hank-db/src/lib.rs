@@ -606,7 +606,7 @@ impl Database {
                 id VARCHAR(36) PRIMARY KEY,
                 session_id VARCHAR(36) NOT NULL,
                 event_type VARCHAR(32) NOT NULL,
-                payload MEDIUMTEXT NOT NULL,
+                payload LONGTEXT NOT NULL,
                 seq BIGINT UNSIGNED NOT NULL DEFAULT 0,
                 created_at DATETIME(6) NOT NULL DEFAULT NOW(6),
                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
@@ -615,6 +615,12 @@ impl Database {
         )
         .execute(&pool)
         .await?;
+
+        // 完整 LLM 请求会包含 system、messages、工具 schema，图片消息还可能带 base64。
+        // 旧库从 MEDIUMTEXT 升为 LONGTEXT，确保审计事件不会因 16MB 上限静默丢失。
+        let _ = sqlx::query("ALTER TABLE agent_events MODIFY COLUMN payload LONGTEXT NOT NULL")
+            .execute(&pool)
+            .await;
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS prompt_templates (
@@ -1609,6 +1615,15 @@ impl Database {
             .fetch_all(&self.pool)
         )?;
         Ok(rows)
+    }
+
+    pub async fn get_last_agent_event_seq(&self, session_id: &str) -> Result<u64> {
+        let row: (Option<u64>,) = db_retry!(
+            sqlx::query_as("SELECT MAX(seq) FROM agent_events WHERE session_id = ?")
+                .bind(session_id)
+                .fetch_one(&self.pool)
+        )?;
+        Ok(row.0.unwrap_or(0))
     }
 
     // Prompt Templates

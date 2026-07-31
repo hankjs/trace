@@ -247,6 +247,39 @@ async fn test_run_turn_lifecycle_text_only() {
         "missing run.completed"
     );
 
+    let (call_id, turn_id) = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::LlmRequest {
+                call_id,
+                turn_id,
+                system,
+                messages,
+                tool_definitions,
+                ..
+            } => {
+                assert_eq!(system.as_deref(), Some("sys"));
+                assert_eq!(messages.len(), 1);
+                assert!(tool_definitions.is_empty());
+                Some((call_id.clone(), turn_id.clone()))
+            }
+            _ => None,
+        })
+        .expect("missing llm.request");
+    assert!(turn_id.is_some());
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::LlmResponse {
+            call_id: response_call_id,
+            content,
+            stop_reason: StopReason::EndTurn,
+            input_tokens: 120,
+            output_tokens: 10,
+            ..
+        } if response_call_id == &call_id
+            && matches!(content.as_slice(), [hank_provider::ContentBlock::Text { text }] if text == "done")
+    )));
+
     // RunStarted 应在最前，TurnComplete 应在最后
     assert!(matches!(
         events.first().unwrap(),
@@ -531,7 +564,32 @@ async fn test_streaming_tool_output_delta_is_forwarded() {
             id,
             content,
             is_error: false,
+            ..
         } if id == "t1" && content == "stream complete"
+    )));
+    let start_call_id = events.iter().find_map(|event| match event {
+        AgentEvent::ToolStart {
+            id,
+            call_id,
+            run_id,
+            turn_id,
+            ..
+        } if id == "t1" => {
+            assert!(run_id.is_some());
+            assert!(turn_id.is_some());
+            call_id.clone()
+        }
+        _ => None,
+    }).expect("tool_start missing call_id");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolResult {
+            id,
+            name: Some(name),
+            call_id: Some(result_call_id),
+            duration_ms: Some(_),
+            ..
+        } if id == "t1" && name == "streaming_echo" && result_call_id == &start_call_id
     )));
 }
 

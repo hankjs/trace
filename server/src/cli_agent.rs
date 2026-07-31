@@ -640,6 +640,11 @@ async fn handle_codex_event(
                         id: item["id"].as_str().unwrap_or("codex-tool").to_string(),
                         name: item["type"].as_str().unwrap_or("codex_tool").to_string(),
                         input: redact_secrets(item["command"].as_str().unwrap_or_default(), auth),
+                        run_id: None,
+                        turn_id: None,
+                        call_id: None,
+                        risk: None,
+                        timeout_ms: None,
                     },
                 )
                 .await;
@@ -660,6 +665,7 @@ async fn handle_codex_event(
                         session_id,
                         AgentEvent::ToolResult {
                             id: item["id"].as_str().unwrap_or("codex-tool").to_string(),
+                            name: item["type"].as_str().map(ToOwned::to_owned),
                             content: truncate(
                                 &redact_secrets(
                                     item["aggregated_output"].as_str().unwrap_or_default(),
@@ -670,6 +676,10 @@ async fn handle_codex_event(
                             is_error: item["status"]
                                 .as_str()
                                 .is_some_and(|status| status == "failed"),
+                            run_id: None,
+                            turn_id: None,
+                            call_id: None,
+                            duration_ms: None,
                         },
                     )
                     .await;
@@ -725,6 +735,11 @@ async fn handle_claude_event(
                                     &redact_secrets(&block["input"].to_string(), auth),
                                     2000,
                                 ),
+                                run_id: None,
+                                turn_id: None,
+                                call_id: None,
+                                risk: None,
+                                timeout_ms: None,
                             },
                         )
                         .await;
@@ -750,8 +765,13 @@ async fn handle_claude_event(
                                 .as_str()
                                 .unwrap_or("claude-tool")
                                 .to_string(),
+                            name: None,
                             content: truncate(&redact_secrets(&content, auth), 4000),
                             is_error: block["is_error"].as_bool().unwrap_or(false),
+                            run_id: None,
+                            turn_id: None,
+                            call_id: None,
+                            duration_ms: None,
                         },
                     )
                     .await;

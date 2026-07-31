@@ -73,6 +73,7 @@ async fn test_verifier_ignores_leading_usage_event() {
     let (tx, _rx) = mpsc::channel(64);
     let result = verifier
         .verify(
+            "test-run",
             "original request",
             "task summary",
             tx,

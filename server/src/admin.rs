@@ -157,6 +157,7 @@ pub async fn session_events(
             "session_id": e.session_id,
             "event_type": e.event_type,
             "payload": e.payload,
+            "seq": e.seq,
             "source": "remote",
             "created_at": e.created_at,
         }));
@@ -315,7 +316,7 @@ pub async fn replay_with_prompt(
     // Stream results as SSE
     let stream = async_stream::stream! {
         while let Some(event) = event_rx.recv().await {
-            let json = serde_json::to_string(&event).unwrap_or_default();
+            let json = serde_json::to_string(&crate::chat::event_for_stream(&event)).unwrap_or_default();
             yield Ok::<_, Infallible>(Event::default().data(json));
         }
     };

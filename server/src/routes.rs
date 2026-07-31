@@ -482,6 +482,7 @@ pub async fn get_session_events(
             "session_id": e.session_id,
             "event_type": e.event_type,
             "payload": e.payload,
+            "seq": e.seq,
             "source": "remote",
             "created_at": e.created_at,
         }));

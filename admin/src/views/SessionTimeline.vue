@@ -24,6 +24,10 @@ const EVENT_COLORS: Record<string, string> = {
   text_delta: 'bg-purple-400',
   turn_complete: 'bg-gray-600',
   provider_fallback: 'bg-yellow-500',
+  llm_request: 'bg-blue-500',
+  llm_response: 'bg-green-500',
+  llm_retry: 'bg-yellow-500',
+  llm_failed: 'bg-red-500',
 }
 
 const EVENT_LABELS: Record<string, string> = {
@@ -39,6 +43,10 @@ const EVENT_LABELS: Record<string, string> = {
   text_delta: 'Text Output',
   turn_complete: 'Turn Complete',
   provider_fallback: 'Fallback',
+  llm_request: 'LLM Request',
+  llm_response: 'LLM Response',
+  llm_retry: 'LLM Retry',
+  llm_failed: 'LLM Failed',
 }
 
 // PLACEHOLDER_TIMELINE_LOGIC
@@ -122,6 +130,10 @@ function getPayloadPreview(item: { event_type: string; events: AgentEventRecord[
     if (p.description) return p.description.slice(0, 120)
     if (p.task_id) return `task: ${p.task_id}`
     if (p.tool_name) return `${p.tool_name} (${p.duration_ms}ms)`
+    if (item.event_type === 'llm_request') return `${p.phase} · ${p.provider || ''}/${p.model} · ${p.message_count} messages · ${p.tools?.length || 0} tools`
+    if (item.event_type === 'llm_response') return `${p.phase} · ${p.stop_reason} · in:${p.input_tokens} out:${p.output_tokens} · ${p.latency_ms}ms`
+    if (item.event_type === 'llm_retry') return `${p.stage} · #${p.failed_attempt} → #${p.next_attempt} · ${p.error}`
+    if (item.event_type === 'llm_failed') return `${p.stage} · #${p.attempt} · ${p.error}`
     if (p.input_tokens !== undefined) return `in:${p.input_tokens} out:${p.output_tokens} ${p.latency_ms}ms`
     return JSON.stringify(p).slice(0, 100)
   } catch { return '' }
@@ -201,6 +213,10 @@ onMounted(async () => {
                 'text-red-400 bg-red-500/10': item.event_type === 'error',
                 'text-purple-400 bg-purple-500/10': item.event_type === 'text_delta',
                 'text-yellow-400 bg-yellow-500/10': item.event_type === 'provider_fallback',
+                'text-blue-500 bg-blue-500/10': item.event_type === 'llm_request',
+                'text-green-600 bg-green-500/10': item.event_type === 'llm_response',
+                'text-yellow-600 bg-yellow-500/10': item.event_type === 'llm_retry',
+                'text-red-500 bg-red-500/10': item.event_type === 'llm_failed',
               }"
             >{{ EVENT_LABELS[item.event_type] || item.event_type }}</span>
             <span v-if="item.event_type === 'text_delta' && item.events.length > 1" class="text-[10px] text-text-tertiary">({{ item.events.length }} chunks)</span>

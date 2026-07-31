@@ -66,7 +66,11 @@ function handleGenerate() {
     </aside>
     <main
       class="flex-1 min-w-0 px-10 py-8"
-      :class="route.path === '/terminals' ? 'flex flex-col h-screen overflow-hidden' : 'max-w-4xl'"
+      :class="route.path === '/terminals'
+        ? 'flex flex-col h-screen overflow-hidden'
+        : route.path === '/chat-records'
+          ? 'w-full max-w-[1400px]'
+          : 'max-w-4xl'"
     >
       <RouterView />
     </main>

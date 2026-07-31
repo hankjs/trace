@@ -3,7 +3,7 @@ use anyhow::Result;
 use hank_provider::{CompletionRequest, ContentBlock, LlmProvider, StopReason, StreamEvent};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
@@ -20,6 +20,124 @@ const MAX_RETRIES: u32 = 3;
 const BASE_DELAY_MS: u64 = 1000;
 /// 最大退避时间（毫秒）
 const MAX_DELAY_MS: u64 = 30_000;
+
+/// 贯穿一次 LLM 请求、重试与响应的关联信息。
+#[derive(Debug, Clone)]
+pub(crate) struct LlmTraceContext {
+    pub(crate) call_id: String,
+    pub(crate) run_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) model: String,
+    pub(crate) provider: String,
+    pub(crate) phase: String,
+}
+
+pub(crate) async fn emit_llm_request(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    trace: &LlmTraceContext,
+    req: &CompletionRequest,
+) {
+    let _ = event_tx
+        .send(AgentEvent::LlmRequest {
+            call_id: trace.call_id.clone(),
+            run_id: trace.run_id.clone(),
+            turn_id: trace.turn_id.clone(),
+            model: req.model.clone(),
+            provider: trace.provider.clone(),
+            system: req.system.clone(),
+            messages: req.messages.clone(),
+            tools: req.tools.iter().map(|tool| tool.name.clone()).collect(),
+            tool_definitions: req.tools.clone(),
+            max_tokens: req.max_tokens,
+            message_count: req.messages.len(),
+            phase: trace.phase.clone(),
+        })
+        .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn emit_llm_response(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    trace: &LlmTraceContext,
+    content: Vec<ContentBlock>,
+    stop_reason: StopReason,
+    input_tokens: u32,
+    output_tokens: u32,
+    cache_read_tokens: u32,
+    cache_write_tokens: u32,
+    latency_ms: u64,
+    cancelled: bool,
+    timed_out: bool,
+) {
+    let _ = event_tx
+        .send(AgentEvent::LlmResponse {
+            call_id: trace.call_id.clone(),
+            run_id: trace.run_id.clone(),
+            turn_id: trace.turn_id.clone(),
+            model: trace.model.clone(),
+            provider: trace.provider.clone(),
+            phase: trace.phase.clone(),
+            content,
+            stop_reason,
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            latency_ms,
+            cancelled,
+            timed_out,
+        })
+        .await;
+}
+
+async fn emit_retry(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    trace: &LlmTraceContext,
+    stage: &str,
+    failed_attempt: u32,
+    delay: Duration,
+    error: &anyhow::Error,
+) {
+    let _ = event_tx
+        .send(AgentEvent::LlmRetry {
+            call_id: trace.call_id.clone(),
+            run_id: trace.run_id.clone(),
+            turn_id: trace.turn_id.clone(),
+            model: trace.model.clone(),
+            provider: trace.provider.clone(),
+            phase: trace.phase.clone(),
+            stage: stage.to_string(),
+            failed_attempt,
+            next_attempt: failed_attempt + 1,
+            delay_ms: delay.as_millis() as u64,
+            error: error.to_string(),
+        })
+        .await;
+}
+
+async fn emit_failed(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    trace: &LlmTraceContext,
+    stage: &str,
+    attempt: u32,
+    retryable: bool,
+    error: &anyhow::Error,
+) {
+    let _ = event_tx
+        .send(AgentEvent::LlmFailed {
+            call_id: trace.call_id.clone(),
+            run_id: trace.run_id.clone(),
+            turn_id: trace.turn_id.clone(),
+            model: trace.model.clone(),
+            provider: trace.provider.clone(),
+            phase: trace.phase.clone(),
+            stage: stage.to_string(),
+            attempt,
+            retryable,
+            error: error.to_string(),
+        })
+        .await;
+}
 
 /// 判断错误是否可重试（瞬态错误）
 fn is_retryable(error: &anyhow::Error) -> bool {
@@ -111,9 +229,11 @@ fn rand_jitter() -> f64 {
 
 /// 带重试的 LLM stream 调用。
 /// 对瞬态错误（429、5xx、网络错误）自动重试，指数退避 + 抖动。
-pub async fn stream_with_retry(
+pub(crate) async fn stream_with_retry(
     provider: &Arc<dyn LlmProvider>,
     req: CompletionRequest,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    trace: &LlmTraceContext,
 ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
     let mut last_error = None;
 
@@ -133,6 +253,7 @@ pub async fn stream_with_retry(
                         e,
                         delay
                     );
+                    emit_retry(event_tx, trace, "request", attempt + 1, delay, &e).await;
                     tokio::time::sleep(delay).await;
                     last_error = Some(e);
                     continue;
@@ -145,6 +266,15 @@ pub async fn stream_with_retry(
                         e
                     );
                 }
+                emit_failed(
+                    event_tx,
+                    trace,
+                    "request",
+                    attempt + 1,
+                    is_retryable(&e),
+                    &e,
+                )
+                .await;
                 return Err(e);
             }
         }
@@ -159,6 +289,8 @@ pub(crate) struct StreamOutcome {
     pub stop_reason: StopReason,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
     /// 消费期间收到取消信号
     pub cancelled: bool,
     /// 流超时——非正常结束，调用方必须按失败/告警处理，
@@ -175,11 +307,14 @@ pub(crate) async fn consume_stream_with_retry(
     event_tx: &mpsc::Sender<AgentEvent>,
     cancel: &CancellationToken,
     timeout: Duration,
+    trace: &LlmTraceContext,
 ) -> Result<StreamOutcome> {
     let mut attempt = 0u32;
+    let started_at = Instant::now();
+    emit_llm_request(event_tx, trace, &req).await;
 
     'step: loop {
-        let mut stream = stream_with_retry(provider, req.clone()).await?;
+        let mut stream = stream_with_retry(provider, req.clone(), event_tx, trace).await?;
 
         let mut assistant_content: Vec<ContentBlock> = Vec::new();
         let mut current_text = String::new();
@@ -192,6 +327,8 @@ pub(crate) async fn consume_stream_with_retry(
         let mut timed_out = false;
         let mut input_tokens = 0u32;
         let mut output_tokens = 0u32;
+        let mut cache_read_tokens = 0u32;
+        let mut cache_write_tokens = 0u32;
 
         loop {
             let event = tokio::select! {
@@ -246,10 +383,13 @@ pub(crate) async fn consume_stream_with_retry(
                 Ok(StreamEvent::Usage {
                     input_tokens: i,
                     output_tokens: o,
-                    ..
+                    cache_read_tokens: cache_read,
+                    cache_write_tokens: cache_write,
                 }) => {
                     input_tokens += i;
                     output_tokens += o;
+                    cache_read_tokens += cache_read;
+                    cache_write_tokens += cache_write;
                 }
                 Ok(StreamEvent::Error(msg)) => {
                     let _ = event_tx.send(AgentEvent::Error { message: msg }).await;
@@ -267,11 +407,21 @@ pub(crate) async fn consume_stream_with_retry(
                             e,
                             delay
                         );
+                        emit_retry(event_tx, trace, "stream", attempt + 1, delay, &e).await;
                         tokio::time::sleep(delay).await;
                         attempt += 1;
                         continue 'step;
                     }
                     // 不可重试或已达最大重试次数
+                    emit_failed(
+                        event_tx,
+                        trace,
+                        "stream",
+                        attempt + 1,
+                        is_retryable(&e),
+                        &e,
+                    )
+                    .await;
                     return Err(e);
                 }
             }
@@ -282,14 +432,31 @@ pub(crate) async fn consume_stream_with_retry(
             assistant_content.push(ContentBlock::Text { text: current_text });
         }
 
-        return Ok(StreamOutcome {
+        let outcome = StreamOutcome {
             assistant_content,
             stop_reason,
             input_tokens,
             output_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
             cancelled,
             timed_out,
-        });
+        };
+        emit_llm_response(
+            event_tx,
+            trace,
+            outcome.assistant_content.clone(),
+            outcome.stop_reason,
+            outcome.input_tokens,
+            outcome.output_tokens,
+            outcome.cache_read_tokens,
+            outcome.cache_write_tokens,
+            started_at.elapsed().as_millis() as u64,
+            outcome.cancelled,
+            outcome.timed_out,
+        )
+        .await;
+        return Ok(outcome);
     }
 }
 

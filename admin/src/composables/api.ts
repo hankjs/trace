@@ -235,7 +235,9 @@ export interface AgentEventRecord {
   session_id: string
   event_type: string
   payload: string
-  seq: number
+  seq?: number
+  source?: string
+  agent_type?: string
   created_at: string
 }
 

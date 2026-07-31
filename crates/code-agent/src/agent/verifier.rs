@@ -1,6 +1,7 @@
 use crate::agent::{Verdict, VerificationResult};
 use crate::context::summary::truncate_tool_result_default;
-use crate::retry::stream_with_retry;
+use crate::retry::{emit_llm_request, emit_llm_response, stream_with_retry, LlmTraceContext};
+use crate::runtime::now_ts;
 use crate::AgentEvent;
 use anyhow::Result;
 use hank_provider::{
@@ -9,6 +10,7 @@ use hank_provider::{
 };
 use code_tools::{Tool, ToolOutput};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -47,9 +49,10 @@ impl VerifierAgent {
     /// Verify a task result against the original request.
     pub async fn verify(
         &self,
+        run_id: &str,
         original_request: &str,
         task_summary: &str,
-        _event_tx: mpsc::Sender<AgentEvent>,
+        event_tx: mpsc::Sender<AgentEvent>,
         cancel: CancellationToken,
     ) -> Result<VerificationResult> {
         let system_prompt = "You are a verification agent. Your job is to check whether \
@@ -75,6 +78,17 @@ impl VerifierAgent {
                 break;
             }
 
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let _ = event_tx
+                .send(AgentEvent::TurnStarted {
+                    run_id: run_id.to_string(),
+                    turn_id: turn_id.clone(),
+                    timestamp: now_ts(),
+                    phase: "verify".to_string(),
+                    message_count: messages.len(),
+                })
+                .await;
+
             let req = CompletionRequest {
                 model: self.model.clone(),
                 system: Some(system_prompt.to_string()),
@@ -82,9 +96,19 @@ impl VerifierAgent {
                 tools: self.tool_definitions.clone(),
                 max_tokens: 2048,
             };
+            let llm_trace = LlmTraceContext {
+                call_id: uuid::Uuid::new_v4().to_string(),
+                run_id: Some(run_id.to_string()),
+                turn_id: Some(turn_id.clone()),
+                model: req.model.clone(),
+                provider: self.provider.name().to_string(),
+                phase: "verify".to_string(),
+            };
 
             debug!("Verifier iteration {iteration}");
-            let mut stream = stream_with_retry(&self.provider, req).await?;
+            emit_llm_request(&event_tx, &llm_trace, &req).await;
+            let llm_start = Instant::now();
+            let mut stream = stream_with_retry(&self.provider, req, &event_tx, &llm_trace).await?;
 
             let mut assistant_content: Vec<ContentBlock> = Vec::new();
             let mut current_text = String::new();
@@ -93,11 +117,19 @@ impl VerifierAgent {
             let mut current_tool_input = String::new();
             let mut stop_reason = StopReason::EndTurn;
             let mut in_tool_block = false;
+            let mut input_tokens = 0u32;
+            let mut output_tokens = 0u32;
+            let mut cache_read_tokens = 0u32;
+            let mut cache_write_tokens = 0u32;
+            let mut cancelled = false;
 
             loop {
                 let event = tokio::select! {
                     event = stream.next() => event,
-                    _ = cancel.cancelled() => { None }
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        None
+                    }
                 };
                 let Some(event) = event else { break };
                 match event {
@@ -133,8 +165,17 @@ impl VerifierAgent {
                     Ok(StreamEvent::MessageEnd { stop_reason: sr }) => {
                         stop_reason = sr;
                     }
-                    // 忽略未匹配的事件（如 Usage）——Anthropic 在 message_start
-                    // 阶段就会先发自 Usage，不能当作流结束
+                    Ok(StreamEvent::Usage {
+                        input_tokens: input,
+                        output_tokens: output,
+                        cache_read_tokens: cache_read,
+                        cache_write_tokens: cache_write,
+                    }) => {
+                        input_tokens += input;
+                        output_tokens += output;
+                        cache_read_tokens += cache_read;
+                        cache_write_tokens += cache_write;
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         warn!("Verifier stream error: {e}");
@@ -150,6 +191,21 @@ impl VerifierAgent {
                 });
             }
 
+            emit_llm_response(
+                &event_tx,
+                &llm_trace,
+                assistant_content.clone(),
+                stop_reason,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+                llm_start.elapsed().as_millis() as u64,
+                cancelled,
+                false,
+            )
+            .await;
+
             messages.push(Message {
                 role: Role::Assistant,
                 content: assistant_content.clone(),
@@ -160,7 +216,40 @@ impl VerifierAgent {
                 for block in &assistant_content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
                         if cancel.is_cancelled() { break; }
+                        let _ = event_tx
+                            .send(AgentEvent::ToolStart {
+                                id: id.clone(),
+                                name: name.clone(),
+                                input: serde_json::to_string(input).unwrap_or_default(),
+                                run_id: Some(run_id.to_string()),
+                                turn_id: Some(turn_id.clone()),
+                                call_id: Some(llm_trace.call_id.clone()),
+                                risk: Some("Safe".to_string()),
+                                timeout_ms: Some(VERIFIER_TOOL_TIMEOUT_SECS * 1000),
+                            })
+                            .await;
+                        let tool_start = Instant::now();
                         let output = self.execute_tool(name, input.clone()).await;
+                        let duration_ms = tool_start.elapsed().as_millis() as u64;
+                        let _ = event_tx
+                            .send(AgentEvent::ToolResult {
+                                id: id.clone(),
+                                name: Some(name.clone()),
+                                content: output.content.clone(),
+                                is_error: output.is_error,
+                                run_id: Some(run_id.to_string()),
+                                turn_id: Some(turn_id.clone()),
+                                call_id: Some(llm_trace.call_id.clone()),
+                                duration_ms: Some(duration_ms),
+                            })
+                            .await;
+                        let _ = event_tx
+                            .send(AgentEvent::ToolMetrics {
+                                tool_name: name.clone(),
+                                duration_ms,
+                                is_error: output.is_error,
+                            })
+                            .await;
                         let content = truncate_tool_result_default(&output.content);
                         tool_results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
@@ -173,7 +262,17 @@ impl VerifierAgent {
                     role: Role::User,
                     content: tool_results,
                 });
-            } else {
+            }
+
+            let _ = event_tx
+                .send(AgentEvent::TurnCompleted {
+                    run_id: run_id.to_string(),
+                    turn_id,
+                    timestamp: now_ts(),
+                })
+                .await;
+
+            if stop_reason != StopReason::ToolUse {
                 break;
             }
         }

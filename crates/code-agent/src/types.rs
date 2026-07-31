@@ -1,4 +1,5 @@
 use crate::agent::{TaskStatus, Verdict};
+use hank_provider::{ContentBlock, Message, StopReason, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
 /// 文件变更类型
@@ -37,11 +38,32 @@ pub enum AgentEvent {
         id: String,
         name: String,
         input: String,
+        /// 关联到完整 run / turn / LLM 调用，旧的外部执行事件可为空。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        risk: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timeout_ms: Option<u64>,
     },
     ToolResult {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         content: String,
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
     TurnComplete,
     Error {
@@ -146,12 +168,73 @@ pub enum AgentEvent {
     },
     /// 每次 LLM 调用前 emit，记录请求参数
     LlmRequest {
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
         model: String,
+        provider: String,
         system: Option<String>,
+        /// 实际发送给 provider 的完整上下文，不是摘要或预览。
+        messages: Vec<Message>,
         tools: Vec<String>,
+        /// 完整工具描述与 JSON Schema，便于复现模型当时看到的工具面。
+        tool_definitions: Vec<ToolDefinition>,
         max_tokens: u32,
         message_count: usize,
         phase: String,
+    },
+    /// 每次 LLM 流完成后 emit，和 LlmRequest.call_id 一一对应。
+    LlmResponse {
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        model: String,
+        provider: String,
+        phase: String,
+        content: Vec<ContentBlock>,
+        stop_reason: StopReason,
+        input_tokens: u32,
+        output_tokens: u32,
+        cache_read_tokens: u32,
+        cache_write_tokens: u32,
+        latency_ms: u64,
+        cancelled: bool,
+        timed_out: bool,
+    },
+    /// LLM 请求建立或流消费阶段的可重试失败。
+    LlmRetry {
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        model: String,
+        provider: String,
+        phase: String,
+        stage: String,
+        failed_attempt: u32,
+        next_attempt: u32,
+        delay_ms: u64,
+        error: String,
+    },
+    /// 一次 LLM 调用在所有重试后仍失败。
+    LlmFailed {
+        call_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn_id: Option<String>,
+        model: String,
+        provider: String,
+        phase: String,
+        stage: String,
+        attempt: u32,
+        retryable: bool,
+        error: String,
     },
     /// Streaming tool output delta (实时输出)
     ToolOutputDelta {

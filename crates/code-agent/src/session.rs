@@ -3,7 +3,7 @@ use crate::agent::verifier::VerifierAgent;
 use crate::agent::{LoopDetector, LoopLevel, ThinkStrategy, Verdict};
 use crate::context::summary::estimate_tokens;
 use crate::context::ContextManager;
-use crate::retry::consume_stream_with_retry;
+use crate::retry::{consume_stream_with_retry, LlmTraceContext};
 use crate::runtime::{
     build_run_summary_from as runtime_build_run_summary_from, emit_run_terminal, now_ts, RunState,
     ToolCallContext, ToolRuntime,
@@ -430,7 +430,7 @@ impl AgentSession {
         let verifier =
             VerifierAgent::new(self.provider.clone(), readonly_tools, self.model.clone());
         let result = verifier
-            .verify(&self.original_request, summary, event_tx.clone(), cancel)
+            .verify(run_id, &self.original_request, summary, event_tx.clone(), cancel)
             .await
             .unwrap_or_else(|e| {
                 warn!("VerifierAgent error: {e}");
@@ -560,6 +560,15 @@ impl AgentSession {
                 req.messages.len()
             );
 
+            let call_id = uuid::Uuid::new_v4().to_string();
+            let llm_trace = LlmTraceContext {
+                call_id: call_id.clone(),
+                run_id: Some(run_id.clone()),
+                turn_id: Some(turn_id.clone()),
+                model: req.model.clone(),
+                provider: self.provider.name().to_string(),
+                phase: "simple".to_string(),
+            };
             let llm_start = Instant::now();
             // 步骤级重试：发请求 + 消费流作为一个可重试单元（【SA 03】）
             let outcome = match consume_stream_with_retry(
@@ -568,6 +577,7 @@ impl AgentSession {
                 &event_tx,
                 &cancel,
                 self.stream_timeout,
+                &llm_trace,
             )
             .await
             {
@@ -897,6 +907,7 @@ impl AgentSession {
                                     input,
                                     run_id: &run_id,
                                     turn_id: &turn_id,
+                                    call_id: Some(&call_id),
                                 },
                                 &event_tx,
                                 run_state,

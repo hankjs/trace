@@ -1,7 +1,7 @@
 use crate::agent::{DelegatedTask, LoopDetector, LoopLevel, TaskResult, TaskStatus};
 use crate::context::summary::estimate_tokens;
 use crate::context::{BudgetStatus, ContextManager};
-use crate::retry::consume_stream_with_retry;
+use crate::retry::{consume_stream_with_retry, LlmTraceContext};
 use crate::runtime::{RunState, ToolCallContext, ToolRuntime};
 use crate::AgentEvent;
 use anyhow::Result;
@@ -160,15 +160,16 @@ impl WorkerAgent {
             };
 
             debug!("Worker iteration {iteration} for task {}", task.id);
-
-            let _ = event_tx.send(AgentEvent::LlmRequest {
+            let turn_id = format!("{}:{iteration}", task.id);
+            let call_id = uuid::Uuid::new_v4().to_string();
+            let llm_trace = LlmTraceContext {
+                call_id: call_id.clone(),
+                run_id: Some(task.id.clone()),
+                turn_id: Some(turn_id.clone()),
                 model: req.model.clone(),
-                system: req.system.clone(),
-                tools: req.tools.iter().map(|t| t.name.clone()).collect(),
-                max_tokens: req.max_tokens,
-                message_count: req.messages.len(),
+                provider: self.provider.name().to_string(),
                 phase: "worker".to_string(),
-            }).await;
+            };
 
             // 步骤级重试：发请求 + 消费流作为一个可重试单元（【SA 03】）
             let outcome = match consume_stream_with_retry(
@@ -177,6 +178,7 @@ impl WorkerAgent {
                 &event_tx,
                 &cancel,
                 Duration::from_secs(LLM_STREAM_TIMEOUT_SECS),
+                &llm_trace,
             )
             .await
             {
@@ -373,7 +375,8 @@ impl WorkerAgent {
                                     name: name.as_str(),
                                     input,
                                     run_id: &task.id,
-                                    turn_id: &task.id,
+                                    turn_id: &turn_id,
+                                    call_id: Some(&call_id),
                                 },
                                 &event_tx,
                                 &mut run_state,
