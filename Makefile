@@ -1,4 +1,4 @@
-.PHONY: default help server-dev client-dev admin-dev quant quant-web quant-slidev quant-slidev-build bootstrap-server-agent sync-server-agent deploy deploy-cli deploy-quant deploy-quant-slidev app cli-dev cli
+.PHONY: default help server-dev client-dev admin-dev quant quant-web quant-slidev quant-slidev-build bootstrap-server-agent install-agent-clis sync-agent-cli-config sync-server-agent deploy deploy-cli deploy-quant deploy-quant-slidev app cli-dev cli
 
 # 默认目标：仅提示可用命令，不执行任何操作
 default: help
@@ -22,6 +22,8 @@ help:
 	@echo ""
 	@echo "  部署:"
 	@echo "    make bootstrap-server-agent 首次初始化 wananyun 飞书开发环境"
+	@echo "    make install-agent-clis  本机下载校验并离线安装 Claude Code / Codex"
+	@echo "    make sync-agent-cli-config 同步本机 Claude Code / Codex 第三方 API 配置"
 	@echo "    make sync-server-agent  拉回 wananyun 本地 Git 分支（不合并、不 push）"
 	@echo "    make deploy              部署 server + admin (可 SKIP_DEPS=--skip-deps)"
 	@echo "    make deploy-cli          部署 hank-cli"
@@ -71,6 +73,12 @@ deploy:
 # 只执行一次：创建 hank 用户、生产 Git 基线、部署 helper 与服务权限。
 bootstrap-server-agent:
 	./deploy/bootstrap-server-agent.sh
+
+install-agent-clis:
+	./deploy/install-agent-clis.sh
+
+sync-agent-cli-config:
+	./deploy/sync-agent-cli-config.sh
 
 # 拉回 wananyun 的生产基线与飞书话题分支，只更新 refs/remotes/wananyun/*。
 sync-server-agent:

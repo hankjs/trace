@@ -24,6 +24,11 @@ base_ref = "trace-production"
 deploy_jobs_dir = "/opt/hank/deploy-jobs"
 deploy_helper = "/usr/local/libexec/hank-deploy"
 execution_user = "hank-build"
+agent_cli_root = "/opt/hank-agent-cli"
+agent_state_root = "/opt/hank-agent-state"
+agent_timeout_secs = 1800
+agent_output_limit_bytes = 2097152
+agent_sandbox_bin = "/usr/bin/bwrap"
 deploy_use_sudo = true
 approval_ttl_secs = 600
 

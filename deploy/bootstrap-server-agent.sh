@@ -75,7 +75,7 @@ cd /
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq \
-  aria2 build-essential ca-certificates curl git libssl-dev nginx pkg-config \
+  aria2 bubblewrap build-essential ca-certificates curl git libssl-dev nginx pkg-config \
   python3 rsync sudo util-linux xz-utils
 
 if ! getent group hank-workspace >/dev/null 2>&1; then
@@ -141,6 +141,12 @@ git-fetch-with-cli = true
 EOF
   chown hank-build:hank-build /home/hank-build/.cargo/config.toml
 fi
+if [[ ! -x /home/hank-build/.cargo/bin/rg ]]; then
+  runuser --user hank-build -- env HOME=/home/hank-build \
+    PATH=/home/hank-build/.cargo/bin:/usr/local/bin:/usr/bin:/bin \
+    /home/hank-build/.cargo/bin/cargo install ripgrep --locked
+fi
+ln -sfn /home/hank-build/.cargo/bin/rg /usr/local/bin/rg
 
 if [[ ! -x /home/hank-build/.local/bin/uv ]]; then
   runuser --user hank-build -- env HOME=/home/hank-build bash -c \
@@ -163,6 +169,8 @@ chown -R hank:hank /opt/hank/logs
 install -d -o hank -g hank-workspace -m 2750 /opt/hank-src
 install -d -o hank -g hank-workspace -m 2770 /opt/hank-worktrees
 install -d -o hank-build -g hank-workspace -m 2770 /opt/hank-workspaces
+install -d -o hank -g hank-workspace -m 2770 /opt/hank-agent-state
+install -d -o root -g root -m 755 /workspace /agent-home /git-common
 
 BUNDLE_FILE="$(mktemp /tmp/hank-bootstrap-repository.XXXXXX.bundle)"
 install -o hank -g hank -m 600 "$STAGE/repository.bundle" "$BUNDLE_FILE"
@@ -227,7 +235,7 @@ install -d -o root -g root -m 755 /usr/local/libexec
 install -o root -g root -m 755 "$STAGE/hank-deploy" /usr/local/libexec/hank-deploy
 cat > /etc/sudoers.d/hank-deploy <<'EOF'
 hank ALL=(root) NOPASSWD: /usr/local/libexec/hank-deploy *
-hank ALL=(hank-build) NOPASSWD: ALL
+hank ALL=(hank-build) NOPASSWD:SETENV: ALL
 EOF
 chmod 440 /etc/sudoers.d/hank-deploy
 visudo -cf /etc/sudoers.d/hank-deploy
@@ -257,6 +265,11 @@ base_ref = "trace-production"
 deploy_jobs_dir = "/opt/hank/deploy-jobs"
 deploy_helper = "/usr/local/libexec/hank-deploy"
 execution_user = "hank-build"
+agent_cli_root = "/opt/hank-agent-cli"
+agent_state_root = "/opt/hank-agent-state"
+agent_timeout_secs = 1800
+agent_output_limit_bytes = 2097152
+agent_sandbox_bin = "/usr/bin/bwrap"
 deploy_use_sudo = true
 approval_ttl_secs = 600
 EOF
@@ -276,6 +289,11 @@ desired = {
     "deploy_jobs_dir": 'deploy_jobs_dir = "/opt/hank/deploy-jobs"\n',
     "deploy_helper": 'deploy_helper = "/usr/local/libexec/hank-deploy"\n',
     "execution_user": 'execution_user = "hank-build"\n',
+    "agent_cli_root": 'agent_cli_root = "/opt/hank-agent-cli"\n',
+    "agent_state_root": 'agent_state_root = "/opt/hank-agent-state"\n',
+    "agent_timeout_secs": "agent_timeout_secs = 1800\n",
+    "agent_output_limit_bytes": "agent_output_limit_bytes = 2097152\n",
+    "agent_sandbox_bin": 'agent_sandbox_bin = "/usr/bin/bwrap"\n',
     "deploy_use_sudo": "deploy_use_sudo = true\n",
 }
 start = next(i for i, line in enumerate(lines) if line.strip() == "[server_agent]")

@@ -4,6 +4,7 @@ mod auth;
 mod changes;
 mod chat;
 mod checkpoints;
+mod cli_agent;
 mod channel_records;
 mod config;
 mod deployment;

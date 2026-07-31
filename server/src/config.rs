@@ -35,6 +35,21 @@ pub struct ServerAgentConfig {
     /// 执行仓库 shell、测试和构建的低权限用户，不具备部署 sudoers。
     #[serde(default = "default_execution_user")]
     pub execution_user: String,
+    /// Claude Code / Codex 的离线安装目录。
+    #[serde(default = "default_agent_cli_root")]
+    pub agent_cli_root: String,
+    /// 每个飞书话题独占的 CLI HOME 与上下文目录。
+    #[serde(default = "default_agent_state_root")]
+    pub agent_state_root: String,
+    /// 外部 Agent 单轮最长运行时间。
+    #[serde(default = "default_agent_timeout_secs")]
+    pub agent_timeout_secs: u64,
+    /// 外部 Agent stdout/stderr 各自允许保留的最大字节数。
+    #[serde(default = "default_agent_output_limit_bytes")]
+    pub agent_output_limit_bytes: usize,
+    /// 外部 Agent 必须通过该程序进入文件系统沙箱；缺失时拒绝启动。
+    #[serde(default = "default_agent_sandbox_bin")]
+    pub agent_sandbox_bin: String,
     /// 生产环境以非 root 用户运行 server 时，通过 sudo 调用唯一允许的部署 helper。
     #[serde(default)]
     pub deploy_use_sudo: bool,
@@ -53,6 +68,11 @@ impl Default for ServerAgentConfig {
             deploy_jobs_dir: default_deploy_jobs_dir(),
             deploy_helper: default_deploy_helper(),
             execution_user: default_execution_user(),
+            agent_cli_root: default_agent_cli_root(),
+            agent_state_root: default_agent_state_root(),
+            agent_timeout_secs: default_agent_timeout_secs(),
+            agent_output_limit_bytes: default_agent_output_limit_bytes(),
+            agent_sandbox_bin: default_agent_sandbox_bin(),
             deploy_use_sudo: false,
             approval_ttl_secs: default_deploy_approval_ttl_secs(),
         }
@@ -85,6 +105,26 @@ fn default_deploy_helper() -> String {
 
 fn default_execution_user() -> String {
     "hank-build".to_string()
+}
+
+fn default_agent_cli_root() -> String {
+    "/opt/hank-agent-cli".to_string()
+}
+
+fn default_agent_state_root() -> String {
+    "/opt/hank-agent-state".to_string()
+}
+
+fn default_agent_timeout_secs() -> u64 {
+    30 * 60
+}
+
+fn default_agent_output_limit_bytes() -> usize {
+    2 * 1024 * 1024
+}
+
+fn default_agent_sandbox_bin() -> String {
+    "/usr/bin/bwrap".to_string()
 }
 
 fn default_deploy_approval_ttl_secs() -> u64 {

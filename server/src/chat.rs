@@ -149,6 +149,8 @@ pub struct ChatTurnHandle {
 pub enum ChatTurnError {
     #[error("No enabled providers available")]
     NoProviders,
+    #[error("{0}")]
+    ExternalAgent(String),
 }
 
 /// Extract the plain text of a content-block list (used for checkpoint
@@ -176,6 +178,27 @@ pub async fn run_chat_turn(
 ) -> Result<ChatTurnHandle, ChatTurnError> {
     let session_id = session_id.to_string();
 
+    let session_record = state.db.get_session(&session_id).await.ok().flatten();
+    let session_metadata_value = session_record
+        .as_ref()
+        .and_then(|session| session.metadata.as_deref())
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok());
+    let agent_backend = session_metadata_value
+        .as_ref()
+        .and_then(|metadata| metadata["agent_backend"].as_str())
+        .unwrap_or("native");
+    if matches!(agent_backend, "codex" | "claude") {
+        return crate::cli_agent::run_cli_turn(
+            state,
+            &session_id,
+            session_record,
+            content,
+            agent_backend,
+        )
+        .await
+        .map_err(|error| ChatTurnError::ExternalAgent(format!("{error:#}")));
+    }
+
     // Resolve providers with fallback from DB
     let fallback_list = match opts.provider.as_deref() {
         Some(name) => provider_registry::resolve_with_fallback(&state.db, name).await,
@@ -201,7 +224,6 @@ pub async fn run_chat_turn(
         None => provider_registry::resolve_default_model(first_record),
     };
 
-    let session_record = state.db.get_session(&session_id).await.ok().flatten();
     let work_dir = session_record.as_ref().and_then(|s| s.work_dir.clone());
     let work_dir_for_checkpoint = work_dir.clone();
     let work_dir_for_agent = work_dir.clone();
@@ -216,8 +238,6 @@ pub async fn run_chat_turn(
         .and_then(|s| s.exec_client_id.clone());
     let session_user_id = session_record.as_ref().and_then(|s| s.user_id.clone());
     let session_metadata = session_record.as_ref().and_then(|s| s.metadata.as_deref());
-    let session_metadata_value =
-        session_metadata.and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok());
     let server_agent_session = session_metadata_value
         .as_ref()
         .and_then(|metadata| metadata["server_agent"].as_bool())

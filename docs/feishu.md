@@ -1,6 +1,6 @@
 # 飞书渠道接入指南
 
-飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。实现参考 `docs/book/agent-os` 课程文档，但用纯 Rust 复刻（`server/src/feishu/`），执行引擎复用 server 自己的 agent（`chat::run_chat_turn`），不是 headless Claude Code。
+飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。入口和生命周期由 Rust server 统一管理（`server/src/feishu/`）；纯对话使用无工具的 native Agent，代码与文件任务可派发到离线安装的 Codex 或 Claude Code。
 
 ## 架构
 
@@ -9,7 +9,7 @@
         │ im.message.receive_v1 / card.action.trigger
         ▼
 feishu/router.rs（消息解析、话题=会话、/命令、派发）
-        │ run_chat_turn（session metadata.source = "feishu"）
+        │ run_chat_turn（读取 session metadata.agent_backend）
         ▼
 feishu/pusher.rs（事件流 → 任务卡片 2s 节流刷新）
         │ AskUser → 确认卡片（按钮）
@@ -21,7 +21,7 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
 - **确认闸门升级**：微信是文本白名单（回复"确认"），飞书是按钮卡片；回调文本化后走同一套 `handle_quant_confirmation`，code-agent 零改动
-- **执行模式**：默认仍可绑定在线桌面 client；开启 `[server_agent]` 后，新话题按任务意图选择 Trace/quant Git worktree 或普通隔离目录，完全不依赖 `client/`
+- **执行模式**：开启 `[server_agent]` 后，新话题同时确定 Agent 类型和执行后端；Trace/quant 使用 Git worktree，普通文件任务使用隔离目录，纯对话不建目录，完全不依赖 `client/`
 - **管理员边界**：server Agent 只接受绑定到 `can_login_admin = true` 用户的飞书消息
 
 ## 一、飞书开放平台配置
@@ -138,6 +138,11 @@ base_ref = "trace-production"
 deploy_jobs_dir = "/opt/hank/deploy-jobs"
 deploy_helper = "/usr/local/libexec/hank-deploy"
 execution_user = "hank-build"
+agent_cli_root = "/opt/hank-agent-cli"
+agent_state_root = "/opt/hank-agent-state"
+agent_timeout_secs = 1800
+agent_output_limit_bytes = 2097152
+agent_sandbox_bin = "/usr/bin/bwrap"
 deploy_use_sudo = true
 approval_ttl_secs = 600
 ```
@@ -146,8 +151,32 @@ approval_ttl_secs = 600
 
 - `/help`、`help`、`?help`、`？help`、`帮助` 等命令不创建会话工作区。
 - 同一飞书话题已有 `feishu_chats` 映射时，始终复用原 session 和原工作区，不重新分类。
-- 新话题会先由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。`trace_code`/`quant_code` 从 `trace-production` 创建 Git worktree，`general_task` 创建普通隔离目录，`conversation` 不创建目录；同一话题后续固定复用该路由结果。
+- 新话题会先由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex` 或 `claude` 后端，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。`conversation` 被强制归一为 `native`；其他任务若错误返回 `native` 会归一为当前有可用凭据的 CLI 后端（优先 Codex，否则 Claude）。用户明确点名后端时保留其选择。
+- `trace_code`/`quant_code` 从 `trace-production` 创建 Git worktree，`general_task` 创建普通隔离目录，`conversation` 不创建目录。同一飞书话题后续固定复用 backend、workspace 和 `agent_thread_id`，不会重新分类或重复创建 worktree。
 - 只有 Git worktree 会注入 Trace/quant/同步协议，并支持 `/diff`、`/test`、`/deploy`、`/rollback`；普通隔离目录不能部署。
+- 外部 CLI 以 `hank-build` 运行，每个话题有独立 HOME，并由 bubblewrap 只挂载当前 `/workspace`；`client/` 叠加为只读，`/opt/hank/config.toml`、其他 worktree 和其他话题状态目录不可见。bubblewrap 缺失时外部后端拒绝启动，不做无沙箱降级。
+- Codex/Claude 的 stdout 按 JSONL 解析，线程 ID 写回 metadata；server 统一处理 30 分钟超时、2 MiB 输出上限、`/stop` 取消、进程组清理和飞书终态卡片。
+
+### 离线安装 Codex 与 Claude Code
+
+在可访问 npm registry 的本机执行：
+
+```bash
+make install-agent-clis
+```
+
+脚本固定下载 `@openai/codex` 与 `@anthropic-ai/claude-code-linux-x64` 的 Linux x64 原生制品，先校验 npm 发布元数据中的 SHA-1，再生成 SHA-256 清单连同制品传到 wananyun；远端复验后安装到 `/opt/hank-agent-cli` 并原子更新 `current` 链接。wananyun 不访问 GitHub，也不在线下载 CLI。
+
+凭据优先从 wananyun 的 `/opt/hank/agent-cli.env` 读取（`root:hank 0640`），可配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN` 或 `CLAUDE_CODE_OAUTH_TOKEN`。Claude 可复用 server 中已启用的 Anthropic provider；Codex 只自动复用官方 `api.openai.com` provider，因为 Codex 0.146 只支持 Responses API，普通 Chat Completions 兼容网关不能直接复用。第三方 Responses 兼容端点必须在环境文件中显式配置 key 和 base URL。环境文件不回传、不进 Git，凭据不写入命令行、session metadata 或日志。修改环境文件后需重启 `hank-server` 让 systemd 重新载入。
+
+本机 CC Switch 不安装到无 GUI 的 wananyun。需要复用本机已经生效的 Claude Code / Codex 第三方 API 配置时执行：
+
+```bash
+make sync-agent-cli-config
+```
+
+文件范围、远端路径、权限和共同维护规则统一见
+[`Server Agent 双向 Git 同步协议`](src/operations/server-agent-sync.md#claude-code--codex-配置同步)。
 
 ### 日常流程
 
@@ -174,7 +203,7 @@ approval_ttl_secs = 600
 | 文档做法 | 本项目实现 | 原因 |
 |---------|-----------|------|
 | Node.js + `@larksuiteoapi/node-sdk` | 纯 Rust 手写 pbbp2 帧（prost）+ REST | 社区 SDK（open-lark 0.14）不转发 `card` 类型帧，确认按钮回调收不到 |
-| headless `claude -p` 做执行引擎 | 复用 server 自己的 agent | server 已有完整 agent（quant 工具链/确认闸门/远程执行），第二引擎接不进去 |
+| headless `claude -p` 做唯一执行引擎 | native / Codex / Claude Code 按话题固定路由 | 对话禁用工具；代码任务可复用 CLI 原生上下文，并由 server 统一管理工作区、取消和终态 |
 | 会话存 `data/sessions.json` | `feishu_chats` 表 + server 会话本就在 DB | 天然解决持久化与重启恢复 |
 | 文本回复确认 | 卡片按钮确认 | 文档后期审批篇的形态，提前落地 |
 

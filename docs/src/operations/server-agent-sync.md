@@ -1,6 +1,6 @@
 # Server Agent 双向 Git 同步协议
 
-> 协议版本：2
+> 协议版本：3
 >
 > 本文件是本机、wananyun 和飞书 server Agent 共同维护的唯一同步流程。
 > `AGENTS.md`、飞书指南和脚本只引用本文件，不复制另一套流程。
@@ -41,8 +41,9 @@ Trace/quant 飞书话题 worktree 从 `trace-production` 创建，因此会得�
 
 1. 命令、帮助、问候和尚未形成具体事项的消息路由到 conversation Agent，只创建无工作目录的 session，不创建工作区。
 2. `feishu_chats` 已有映射时，历史话题始终复用原 session/workspace，不重新分类。
-3. 新消息由路由 Agent 标记为 `conversation`、`trace_code`、`quant_code` 或 `general_task`，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。两类代码 Agent 使用 Git worktree，通用任务使用普通隔离目录；判断失败默认普通隔离目录，避免误触生产仓库。
-4. 只有 repository workspace 可以运行 `/diff`、`/test`、`/deploy`、`/rollback`，普通 workspace 只能进行该话题范围内的通用工作。
+3. 新消息由路由 Agent 标记为 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex` 或 `claude`，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。两类代码 Agent 使用 Git worktree，通用任务使用普通隔离目录；判断失败默认 `general_task + 当前有凭据的 CLI`，避免误触生产仓库。Codex 只自动复用官方 OpenAI Responses provider，第三方 Responses 兼容端点通过 `make sync-agent-cli-config` 从本机生效配置同步。
+4. 同一飞书话题始终复用首次确定的 backend、workspace 和 `agent_thread_id`。只有 `/new` 或新话题会重新路由；不得因后续消息再次创建 worktree。
+5. 只有 repository workspace 可以运行 `/diff`、`/test`、`/deploy`、`/rollback`，普通 workspace 只能进行该话题范围内的通用工作。
 
 ## 数据流
 
@@ -66,7 +67,7 @@ wananyun Git 对象库 ──→ trace-production ──→ 新建 feishu/*
 
 ## 飞书侧标准流程
 
-1. 在新话题描述需求，server 按工作区路由规则创建 Git worktree 或普通隔离目录。
+1. 在新话题描述需求，server 先固定 Agent 后端与任务类型，再按工作区路由规则创建 Git worktree、普通隔离目录或不创建目录。
 2. Agent 开始工作前读取 `AGENTS.md` 和本协议；修改 quant 时还必须读取 `quant/AGENTS.md`。
 3. Agent 只修改允许的项目目录，不修改 `client/`、生产配置或部署基础设施。
 4. 在同一话题迭代，用 `/diff` 检查范围，用 `/test` 运行固定测试矩阵。
@@ -143,6 +144,18 @@ git log --left-right --graph --oneline \
 
 `bootstrap-server-agent` 和手工部署脚本通过本机生成的 Git bundle 交付 commit；
 GitHub `origin` 在 wananyun 只保留为 break-glass 元数据。禁止把 GitHub token、SSH 私钥或其他 push 凭据部署到 wananyun。
+
+## Claude Code / Codex 配置同步
+
+wananyun 没有 GUI，不安装 CC Switch。需要复用本机已经生效的第三方 API 配置时，在仓库根目录执行：
+
+```bash
+make sync-agent-cli-config
+```
+
+脚本只同步 `~/.claude/settings.json`、`~/.codex/auth.json` 和 `~/.codex/config.toml`，不传历史会话、缓存或插件。完整源文件安装到 `/home/hank` 的标准配置目录，并在 `/opt/hank-agent-config/current` 保存一份 `root:hank` 受限副本；飞书 Agent 只使用结构化提取到 `/opt/hank/agent-cli.env` 的认证、端点和模型白名单。Codex 当前 Provider 必须使用 Responses API。
+
+配置文件和本地/远端临时目录均不得进入 Git。同步脚本不输出凭据，远端文件权限必须保持 `root:hank 0640` 或 `hank:hank 0600`；脚本完成后重启 `hank-server`，使 systemd 重新加载环境文件。
 
 ## 强制边界
 

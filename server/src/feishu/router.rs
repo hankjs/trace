@@ -193,16 +193,16 @@ impl WorkspaceKind {
     }
 }
 
-#[derive(Debug, Deserialize, PartialEq, Eq)]
-#[serde(tag = "agent_kind", rename_all = "snake_case")]
-enum NewTopicDecision {
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentKind {
     Conversation,
     TraceCode,
     QuantCode,
     GeneralTask,
 }
 
-impl NewTopicDecision {
+impl AgentKind {
     fn agent_kind(&self) -> &'static str {
         match self {
             Self::Conversation => "conversation",
@@ -218,6 +218,66 @@ impl NewTopicDecision {
             Self::TraceCode | Self::QuantCode => WorkspaceKind::Repository,
             Self::GeneralTask => WorkspaceKind::General,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentBackend {
+    Native,
+    Codex,
+    Claude,
+}
+
+impl AgentBackend {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+
+    fn preferred(value: &str) -> Self {
+        if value == "claude" {
+            Self::Claude
+        } else {
+            Self::Codex
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct NewTopicDecision {
+    agent_kind: AgentKind,
+    agent_backend: AgentBackend,
+}
+
+impl NewTopicDecision {
+    fn fallback(default_backend: AgentBackend) -> Self {
+        Self {
+            agent_kind: AgentKind::GeneralTask,
+            agent_backend: default_backend,
+        }
+    }
+
+    fn agent_kind(&self) -> &'static str {
+        self.agent_kind.agent_kind()
+    }
+
+    fn workspace_kind(&self) -> WorkspaceKind {
+        self.agent_kind.workspace_kind()
+    }
+
+    fn normalized(mut self, default_backend: AgentBackend) -> Self {
+        match self.agent_kind {
+            AgentKind::Conversation => self.agent_backend = AgentBackend::Native,
+            _ if self.agent_backend == AgentBackend::Native => {
+                self.agent_backend = default_backend
+            }
+            _ => {}
+        }
+        self
     }
 }
 
@@ -744,35 +804,47 @@ async fn handle_command(
 /// 新话题先判断是否真的需要工作区，以及工作区是否属于 Trace monorepo。
 /// 分类失败时降级到普通隔离目录，绝不误创建仓库 worktree。
 async fn decide_new_topic(state: &AppState, text: &str) -> NewTopicDecision {
-    match try_decide_new_topic(state, text).await {
+    let default_backend =
+        AgentBackend::preferred(crate::cli_agent::preferred_backend(state).await);
+    match try_decide_new_topic(state, text, default_backend).await {
         Ok(decision) => {
+            let decision = decision.normalized(default_backend);
             tracing::info!(?decision, "feishu: new topic workspace decision");
             decision
         }
         Err(e) => {
             tracing::warn!("feishu: workspace decision failed, fallback to general: {e:#}");
-            NewTopicDecision::GeneralTask
+            NewTopicDecision::fallback(default_backend)
         }
     }
 }
 
-async fn try_decide_new_topic(state: &AppState, text: &str) -> Result<NewTopicDecision> {
+async fn try_decide_new_topic(
+    state: &AppState,
+    text: &str,
+    default_backend: AgentBackend,
+) -> Result<NewTopicDecision> {
     let (record, provider) = provider_registry::resolve_default(&state.db)
         .await
         .ok_or_else(|| anyhow!("没有可用的 LLM provider"))?;
-    let system = "你是飞书任务的路由 Agent。只输出一个 JSON 对象，不要输出 markdown 或其他文字。\n\
-        可选结果：\n\
-        - {\"agent_kind\":\"trace_code\"}：需要读取、修改、测试或部署 Trace/Hank monorepo 的 server、\
+    let system = format!("你是飞书任务的路由 Agent。只输出一个 JSON 对象，不要输出 markdown 或其他文字。\n\
+        输出字段 agent_kind 可选值：\n\
+        - trace_code：需要读取、修改、测试或部署 Trace/Hank monorepo 的 server、\
           crates、admin、cli、docs、飞书/微信渠道或同步流程；不包括 client 和 quant。\n\
-        - {\"agent_kind\":\"quant_code\"}：需要读取、修改或测试 monorepo 的 quant 项目代码、策略、看板或文档。\n\
-        - {\"agent_kind\":\"general_task\"}：具体任务与 Trace/quant 无关，但需要文件、代码、命令、下载、分析产物或持续迭代工作区。\n\
-        - {\"agent_kind\":\"conversation\"}：用户在问候、讨论、咨询、分析问题，或者尚未给出需要文件和命令的事项。\
+        - quant_code：需要读取、修改或测试 monorepo 的 quant 项目代码、策略、看板或文档。\n\
+        - general_task：具体任务与 Trace/quant 无关，但需要文件、代码、命令、下载、分析产物或持续迭代工作区。\n\
+        - conversation：用户在问候、讨论、咨询、分析问题，或者尚未给出需要文件和命令的事项。\
           后续对话 Agent 会负责正式回答；路由器不要回答用户问题。\n\
+        输出字段 agent_backend 可选值：native、codex、claude。conversation 必须选 native；\
+        其他任务默认选 {default_backend}；用户明确要求 Codex 时选 codex，明确要求 Claude/Claude Code，或任务明确是 Claude Code 配置与插件维护时选 claude。\n\
+        示例：{{\"agent_kind\":\"trace_code\",\"agent_backend\":\"{default_backend}\"}}。\n\
         判断 Agent 必须看语义，不只看是否出现项目名。拿不准是否属于 Trace/quant 时选择 general_task；\
-        拿不准是否需要文件或命令时选择 conversation。";
+        拿不准是否需要文件或命令时选择 conversation。",
+        default_backend = default_backend.as_str()
+    );
     let request = CompletionRequest {
         model: provider_registry::resolve_default_model(&record),
-        system: Some(system.to_string()),
+        system: Some(system),
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text {
@@ -780,7 +852,7 @@ async fn try_decide_new_topic(state: &AppState, text: &str) -> Result<NewTopicDe
             }],
         }],
         tools: vec![],
-        max_tokens: 256,
+        max_tokens: 320,
     };
     let mut stream = provider.stream(request).await?;
     let mut output = String::new();
@@ -987,12 +1059,13 @@ async fn create_and_map_feishu_session(
     let decision = if state.config.server_agent.enabled {
         decide_new_topic(state, &classification_text(content)).await
     } else {
-        NewTopicDecision::GeneralTask
+        NewTopicDecision::fallback(AgentBackend::Codex)
     };
     let session = create_feishu_session(
         state,
         user_id,
         decision.agent_kind(),
+        decision.agent_backend.as_str(),
         decision.workspace_kind(),
     )
     .await?;
@@ -1034,6 +1107,7 @@ async fn create_feishu_session(
     state: &Arc<AppState>,
     user_id: &str,
     agent_kind: &str,
+    agent_backend: &str,
     workspace_kind: WorkspaceKind,
 ) -> Result<hank_db::Session> {
     if state.config.server_agent.enabled {
@@ -1041,7 +1115,7 @@ async fn create_feishu_session(
         let metadata = serde_json::json!({
             "source": "feishu",
             "server_agent": true,
-            "agent_backend": "native",
+            "agent_backend": agent_backend,
             "agent_kind": agent_kind,
             "workspace_kind": workspace_kind.as_str(),
             "client_excluded": true,
@@ -1207,25 +1281,60 @@ mod tests {
     #[test]
     fn parses_new_topic_workspace_decisions() {
         assert_eq!(
-            parse_new_topic_decision(r#"{"agent_kind":"trace_code"}"#).unwrap(),
-            NewTopicDecision::TraceCode
+            parse_new_topic_decision(
+                r#"{"agent_kind":"trace_code","agent_backend":"codex"}"#
+            )
+            .unwrap(),
+            NewTopicDecision {
+                agent_kind: AgentKind::TraceCode,
+                agent_backend: AgentBackend::Codex,
+            }
         );
         assert_eq!(
-            parse_new_topic_decision("```json\n{\"agent_kind\":\"quant_code\"}\n```")
-                .unwrap(),
-            NewTopicDecision::QuantCode
+            parse_new_topic_decision(
+                "```json\n{\"agent_kind\":\"quant_code\",\"agent_backend\":\"claude\"}\n```"
+            )
+            .unwrap(),
+            NewTopicDecision {
+                agent_kind: AgentKind::QuantCode,
+                agent_backend: AgentBackend::Claude,
+            }
         );
         assert_eq!(
-            parse_new_topic_decision(r#"{"agent_kind":"conversation"}"#).unwrap(),
-            NewTopicDecision::Conversation
+            parse_new_topic_decision(
+                r#"{"agent_kind":"conversation","agent_backend":"native"}"#
+            )
+            .unwrap(),
+            NewTopicDecision {
+                agent_kind: AgentKind::Conversation,
+                agent_backend: AgentBackend::Native,
+            }
         );
         assert_eq!(
-            NewTopicDecision::GeneralTask.workspace_kind(),
+            NewTopicDecision::fallback(AgentBackend::Codex).workspace_kind(),
             WorkspaceKind::General
         );
         assert_eq!(
-            NewTopicDecision::QuantCode.workspace_kind(),
+            AgentKind::QuantCode.workspace_kind(),
             WorkspaceKind::Repository
+        );
+        assert_eq!(
+            NewTopicDecision {
+                agent_kind: AgentKind::Conversation,
+                agent_backend: AgentBackend::Codex,
+            }
+            .normalized(AgentBackend::Claude)
+            .agent_backend,
+            AgentBackend::Native
+        );
+        assert_eq!(
+            NewTopicDecision {
+                agent_kind: AgentKind::TraceCode,
+                agent_backend: AgentBackend::Native,
+            }
+            .normalized(AgentBackend::Claude)
+            .agent_backend,
+            AgentBackend::Claude
         );
     }
 
