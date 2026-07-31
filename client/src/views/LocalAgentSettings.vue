@@ -4,6 +4,7 @@ import { useRouter } from "vue-router";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { createBindCode, getBinding, unbind, type WeixinBinding } from "../api/weixin";
+import { createFeishuBindCode, getFeishuBinding, unbindFeishu, type FeishuBinding } from "../api/feishu";
 import { useRemoteExec } from "../composables/useRemoteExec";
 
 const remoteExec = useRemoteExec();
@@ -176,6 +177,93 @@ function formatTime(iso: string) {
   return isNaN(d.getTime()) ? iso : d.toLocaleString();
 }
 
+// ---------- 飞书绑定 ----------
+
+const fsBinding = ref<FeishuBinding | null>(null);
+const fsBindCode = ref("");
+const fsBindExpiresAt = ref(0);
+const fsNow = ref(Date.now());
+const fsGeneratingCode = ref(false);
+const fsUnbinding = ref(false);
+let fsCountdownTimer: ReturnType<typeof setInterval> | undefined;
+let fsPollTimer: ReturnType<typeof setInterval> | undefined;
+
+const fsCodeExpired = computed(() => !fsBindCode.value || fsNow.value >= fsBindExpiresAt.value);
+const fsCountdownText = computed(() => {
+  const remain = Math.max(0, fsBindExpiresAt.value - fsNow.value);
+  const m = Math.floor(remain / 60000);
+  const s = Math.floor((remain % 60000) / 1000);
+  return `${m}:${String(s).padStart(2, "0")}`;
+});
+
+async function loadFsBinding() {
+  const result = await getFeishuBinding();
+  if (result.ok) fsBinding.value = result.data ?? null;
+}
+
+function stopFsPolling() {
+  clearInterval(fsPollTimer);
+  fsPollTimer = undefined;
+}
+
+function startFsPolling() {
+  stopFsPolling();
+  fsPollTimer = setInterval(async () => {
+    const result = await getFeishuBinding();
+    if (result.ok && result.data) fsBinding.value = result.data;
+  }, 5000);
+}
+
+watch(
+  fsBinding,
+  (value) => {
+    if (value) stopFsPolling();
+    else startFsPolling();
+  },
+  { immediate: true }
+);
+
+function startFsCountdown() {
+  clearInterval(fsCountdownTimer);
+  fsNow.value = Date.now();
+  fsCountdownTimer = setInterval(() => {
+    fsNow.value = Date.now();
+    if (fsNow.value >= fsBindExpiresAt.value) clearInterval(fsCountdownTimer);
+  }, 1000);
+}
+
+async function generateFsCode() {
+  fsGeneratingCode.value = true;
+  try {
+    const result = await createFeishuBindCode();
+    if (result.ok && result.data) {
+      fsBindCode.value = result.data.code;
+      fsBindExpiresAt.value = result.data.expires_at;
+      startFsCountdown();
+    }
+  } finally {
+    fsGeneratingCode.value = false;
+  }
+}
+
+async function confirmFsUnbind() {
+  if (!confirm("确定解绑飞书？解绑后将无法通过飞书机器人驱动会话。")) return;
+  fsUnbinding.value = true;
+  try {
+    const result = await unbindFeishu();
+    if (result.ok) {
+      fsBinding.value = null;
+      fsBindCode.value = "";
+    }
+  } finally {
+    fsUnbinding.value = false;
+  }
+}
+
+onMounted(() => {
+  loadFsBinding();
+});
+
 // ---------- 远程执行 ----------
 
 const remoteAccept = ref(remoteExec.acceptRemote.value);
@@ -206,6 +294,8 @@ async function saveRemoteWorkDir() {
 onUnmounted(() => {
   clearInterval(countdownTimer);
   stopPolling();
+  clearInterval(fsCountdownTimer);
+  stopFsPolling();
 });
 </script>
 
@@ -301,6 +391,38 @@ onUnmounted(() => {
           </template>
           <button class="btn-primary" :disabled="generatingCode" @click="generateCode">
             {{ generatingCode ? "生成中..." : bindCode ? "重新生成绑定码" : "生成绑定码" }}
+          </button>
+        </div>
+      </div>
+
+      <h3 class="section-title weixin-title">飞书绑定</h3>
+      <div class="weixin-section">
+        <p class="weixin-desc">绑定后可在飞书话题群中 @机器人 派发任务、审批确认。</p>
+
+        <!-- 已绑定 -->
+        <div v-if="fsBinding" class="weixin-bound">
+          <div class="weixin-bound-info">
+            <span class="weixin-label">飞书用户</span>
+            <span class="weixin-value">{{ fsBinding.open_id }}</span>
+          </div>
+          <div class="weixin-bound-info">
+            <span class="weixin-label">绑定时间</span>
+            <span class="weixin-value">{{ formatTime(fsBinding.created_at) }}</span>
+          </div>
+          <button class="btn-sm btn-danger" :disabled="fsUnbinding" @click="confirmFsUnbind">
+            {{ fsUnbinding ? "解绑中..." : "解绑" }}
+          </button>
+        </div>
+
+        <!-- 未绑定 -->
+        <div v-else class="weixin-unbound">
+          <template v-if="fsBindCode && !fsCodeExpired">
+            <div class="bind-code">{{ fsBindCode }}</div>
+            <p class="weixin-hint">有效期剩余 {{ fsCountdownText }}</p>
+            <p class="weixin-hint">打开飞书，向机器人发送：<code>bind {{ fsBindCode }}</code></p>
+          </template>
+          <button class="btn-primary" :disabled="fsGeneratingCode" @click="generateFsCode">
+            {{ fsGeneratingCode ? "生成中..." : fsBindCode ? "重新生成绑定码" : "生成绑定码" }}
           </button>
         </div>
       </div>

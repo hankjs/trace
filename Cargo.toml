@@ -41,3 +41,6 @@ fontdb = "0.23"
 unicode-width = "0.2"
 # 网页截图(需求 B):headless Chrome DevTools 协议
 chromiumoxide = "0.7"
+# 飞书渠道:WS 长连接(pbbp2 protobuf 帧)+ REST API(手写,对齐 weixin 模块风格)
+tokio-tungstenite = "0.24"
+prost = "0.13"

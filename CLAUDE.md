@@ -18,7 +18,9 @@
 ├── server/src/          # Rust 后端
 │   ├── main.rs          # 入口，启动 Axum 服务 (0.0.0.0:3000)
 │   ├── routes.rs        # 路由定义
-│   ├── chat.rs          # WebSocket 聊天处理
+│   ├── chat.rs          # SSE 聊天处理（run_chat_turn 与传输层解耦，各渠道复用）
+│   ├── weixin/          # 微信渠道（ilink 长轮询 monitor/router/pusher）
+│   ├── feishu/          # 飞书渠道（pbbp2 WS 长连接 + 任务卡片 + 按钮确认，见 docs/feishu.md）
 │   ├── changes.rs       # 变更管理 API
 │   ├── specs.rs         # Spec 管理 API
 │   ├── admin.rs         # 管理端点

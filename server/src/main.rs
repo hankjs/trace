@@ -18,6 +18,7 @@ mod snap_tools;
 mod specs;
 mod termshot;
 mod websnap;
+mod feishu;
 mod weixin;
 
 use anyhow::Result;
@@ -53,6 +54,8 @@ pub struct AppState {
     pub weixin_logins: weixin::login::LoginStates,
     /// 微信账号 monitor 任务（account_id → 停止令牌）
     pub weixin_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
+    /// 飞书账号 WS 长连接（account_id → 停止令牌）
+    pub feishu_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
     /// 微信渠道 agent 的短期对话记忆（binding_id → 最近若干轮问答）
     pub weixin_channel_history:
         RwLock<HashMap<String, std::collections::VecDeque<weixin::channel::ChannelTurn>>>,
@@ -167,6 +170,7 @@ async fn main() -> Result<()> {
         event_buffers: RwLock::new(HashMap::new()),
         weixin_logins: RwLock::new(HashMap::new()),
         weixin_monitors: RwLock::new(HashMap::new()),
+        feishu_monitors: RwLock::new(HashMap::new()),
         weixin_channel_history: RwLock::new(HashMap::new()),
         client_hubs: RwLock::new(HashMap::new()),
         quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
@@ -177,6 +181,9 @@ async fn main() -> Result<()> {
 
     // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）
     weixin::monitor::start_monitors(state.clone());
+
+    // 启动飞书 WS 长连接（为每个 enabled 账号起一个 monitor task）
+    feishu::monitor::start_monitors(state.clone());
 
     // 启动 kimi 托管通知消费循环（client 通知 → 微信推送）
     tokio::spawn(weixin::kimi::run_notification_consumer(state.clone()));
@@ -315,6 +322,16 @@ async fn main() -> Result<()> {
             "/api/weixin/binding",
             delete(weixin::routes::delete_binding),
         )
+        // Feishu routes (client)
+        .route(
+            "/api/feishu/bind-code",
+            post(feishu::routes::create_bind_code),
+        )
+        .route("/api/feishu/binding", get(feishu::routes::get_binding))
+        .route(
+            "/api/feishu/binding",
+            delete(feishu::routes::delete_binding),
+        )
         // Remote execution: desktop client long-poll channel
         .route(
             "/api/client/registration",
@@ -433,6 +450,31 @@ async fn main() -> Result<()> {
             delete(weixin::routes::delete_binding_admin),
         )
         .route("/api/admin/weixin/send", post(weixin::routes::send_message))
+        // Feishu admin routes（应用账号 + 绑定管理）
+        .route(
+            "/api/admin/feishu/accounts",
+            get(feishu::routes::list_accounts),
+        )
+        .route(
+            "/api/admin/feishu/accounts",
+            post(feishu::routes::create_account),
+        )
+        .route(
+            "/api/admin/feishu/accounts/{id}",
+            patch(feishu::routes::update_account),
+        )
+        .route(
+            "/api/admin/feishu/accounts/{id}",
+            delete(feishu::routes::delete_account),
+        )
+        .route(
+            "/api/admin/feishu/bindings",
+            get(feishu::routes::list_bindings),
+        )
+        .route(
+            "/api/admin/feishu/bindings/{id}",
+            delete(feishu::routes::delete_binding_admin),
+        )
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
         .route(

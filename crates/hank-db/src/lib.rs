@@ -95,6 +95,52 @@ pub struct Setting {
     pub value: String,
 }
 
+/// 飞书话题=会话映射（feishu_chats 表）
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FeishuChat {
+    pub id: String,
+    pub account_id: String,
+    pub chat_id: String,
+    pub topic_id: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 飞书自建应用账号（feishu_accounts 表，凭证由 admin REST 管理）
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FeishuAccount {
+    pub id: String,
+    pub name: String,
+    pub app_id: String,
+    #[serde(skip_serializing)]
+    pub app_secret: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 飞书用户 ↔ trace 用户绑定（feishu_bindings 表）
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FeishuBinding {
+    pub id: String,
+    pub account_id: String,
+    pub open_id: String,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FeishuBindingWithUsername {
+    pub id: String,
+    pub account_id: String,
+    pub open_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AgentMetric {
     pub id: String,
@@ -813,6 +859,69 @@ impl Database {
                 created_at DATETIME NOT NULL DEFAULT NOW(),
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (binding_id) REFERENCES weixin_bindings(id) ON DELETE CASCADE
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Feishu accounts table（自建应用凭证，admin REST 管理，与 weixin_accounts 同模式）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS feishu_accounts (
+                id VARCHAR(36) PRIMARY KEY,
+                name VARCHAR(128) NOT NULL DEFAULT '',
+                app_id VARCHAR(64) NOT NULL,
+                app_secret VARCHAR(128) NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                UNIQUE KEY uk_feishu_app_id (app_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Feishu bindings table（飞书 open_id ↔ trace user，bind code 流程建立）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS feishu_bindings (
+                id VARCHAR(36) PRIMARY KEY,
+                account_id VARCHAR(36) NOT NULL,
+                open_id VARCHAR(64) NOT NULL,
+                user_id VARCHAR(36) NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                FOREIGN KEY (account_id) REFERENCES feishu_accounts(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY uk_feishu_binding (account_id, open_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Feishu bind codes table（一次性绑定码，与 weixin_bind_codes 同模式）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS feishu_bind_codes (
+                code VARCHAR(8) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL,
+                expires_at BIGINT NOT NULL,
+                used_at BIGINT DEFAULT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Feishu chats table（话题=会话映射：account_id+chat_id+topic_id → session_id）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS feishu_chats (
+                id VARCHAR(36) PRIMARY KEY,
+                account_id VARCHAR(36) NOT NULL,
+                chat_id VARCHAR(64) NOT NULL,
+                topic_id VARCHAR(64) NOT NULL,
+                session_id VARCHAR(36) NOT NULL,
+                user_id VARCHAR(36) NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                FOREIGN KEY (account_id) REFERENCES feishu_accounts(id) ON DELETE CASCADE,
+                UNIQUE KEY uk_feishu_chat_topic (account_id, chat_id, topic_id)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -2727,6 +2836,246 @@ impl Database {
             .bind(session_id)
             .bind(now)
             .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    // Feishu accounts
+    pub async fn create_feishu_account(&self, name: &str, app_id: &str, app_secret: &str) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO feishu_accounts (id, name, app_id, app_secret, enabled, created_at, updated_at) VALUES (?, ?, ?, ?, TRUE, ?, ?)"
+            )
+            .bind(&id)
+            .bind(name)
+            .bind(app_id)
+            .bind(app_secret)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(id)
+    }
+
+    pub async fn list_feishu_accounts(&self) -> Result<Vec<FeishuAccount>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, FeishuAccount>(
+                "SELECT id, name, app_id, app_secret, enabled, created_at, updated_at FROM feishu_accounts ORDER BY created_at ASC"
+            )
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    pub async fn get_feishu_account(&self, id: &str) -> Result<Option<FeishuAccount>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, FeishuAccount>(
+                "SELECT id, name, app_id, app_secret, enabled, created_at, updated_at FROM feishu_accounts WHERE id = ?"
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn set_feishu_account_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE feishu_accounts SET enabled = ?, updated_at = NOW() WHERE id = ?")
+                .bind(enabled)
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn update_feishu_account(&self, id: &str, name: &str, app_secret: Option<&str>) -> Result<()> {
+        match app_secret {
+            Some(secret) => {
+                db_retry!(
+                    sqlx::query("UPDATE feishu_accounts SET name = ?, app_secret = ?, updated_at = NOW() WHERE id = ?")
+                        .bind(name)
+                        .bind(secret)
+                        .bind(id)
+                        .execute(&self.pool)
+                )?;
+            }
+            None => {
+                db_retry!(
+                    sqlx::query("UPDATE feishu_accounts SET name = ?, updated_at = NOW() WHERE id = ?")
+                        .bind(name)
+                        .bind(id)
+                        .execute(&self.pool)
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn delete_feishu_account(&self, id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("DELETE FROM feishu_accounts WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    // Feishu bindings
+    pub async fn create_feishu_binding(&self, account_id: &str, open_id: &str, user_id: &str) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO feishu_bindings (id, account_id, open_id, user_id, created_at) VALUES (?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE user_id = VALUES(user_id)"
+            )
+            .bind(&id)
+            .bind(account_id)
+            .bind(open_id)
+            .bind(user_id)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(id)
+    }
+
+    pub async fn get_feishu_binding(&self, account_id: &str, open_id: &str) -> Result<Option<FeishuBinding>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, FeishuBinding>(
+                "SELECT id, account_id, open_id, user_id, created_at FROM feishu_bindings WHERE account_id = ? AND open_id = ?"
+            )
+            .bind(account_id)
+            .bind(open_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn get_feishu_binding_by_id(&self, id: &str) -> Result<Option<FeishuBinding>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, FeishuBinding>(
+                "SELECT id, account_id, open_id, user_id, created_at FROM feishu_bindings WHERE id = ?"
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn get_feishu_binding_by_user(&self, user_id: &str) -> Result<Option<FeishuBinding>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, FeishuBinding>(
+                "SELECT id, account_id, open_id, user_id, created_at FROM feishu_bindings WHERE user_id = ? ORDER BY created_at DESC LIMIT 1"
+            )
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn list_feishu_bindings(&self) -> Result<Vec<FeishuBindingWithUsername>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, FeishuBindingWithUsername>(
+                "SELECT b.id, b.account_id, b.open_id, b.user_id, u.username, b.created_at FROM feishu_bindings b JOIN users u ON u.id = b.user_id ORDER BY b.created_at DESC"
+            )
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    pub async fn delete_feishu_binding(&self, id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("DELETE FROM feishu_bindings WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    // Feishu bind codes
+    pub async fn create_feishu_bind_code(&self, code: &str, user_id: &str, expires_at: i64) -> Result<()> {
+        db_retry!(
+            sqlx::query("INSERT INTO feishu_bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)")
+                .bind(code)
+                .bind(user_id)
+                .bind(expires_at)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 消费绑定码：存在、未用、未过期则标记已用并返回 user_id
+    pub async fn consume_feishu_bind_code(&self, code: &str) -> Result<Option<String>> {
+        let now = Utc::now().timestamp_millis();
+        let res = db_retry!(
+            sqlx::query("UPDATE feishu_bind_codes SET used_at = ? WHERE code = ? AND used_at IS NULL AND expires_at > ?")
+                .bind(now)
+                .bind(code)
+                .bind(now)
+                .execute(&self.pool)
+        )?;
+        if res.rows_affected() == 0 {
+            return Ok(None);
+        }
+        let row: Option<(String,)> = db_retry!(
+            sqlx::query_as("SELECT user_id FROM feishu_bind_codes WHERE code = ?")
+                .bind(code)
+                .fetch_optional(&self.pool)
+        )?;
+        Ok(row.map(|r| r.0))
+    }
+
+    // Feishu chats（话题=会话映射，账号维度）
+    pub async fn get_feishu_chat(&self, account_id: &str, chat_id: &str, topic_id: &str) -> Result<Option<FeishuChat>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, FeishuChat>(
+                "SELECT id, account_id, chat_id, topic_id, session_id, user_id, created_at, updated_at FROM feishu_chats WHERE account_id = ? AND chat_id = ? AND topic_id = ?"
+            )
+            .bind(account_id)
+            .bind(chat_id)
+            .bind(topic_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn set_feishu_chat(
+        &self,
+        account_id: &str,
+        chat_id: &str,
+        topic_id: &str,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO feishu_chats (id, account_id, chat_id, topic_id, session_id, user_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), user_id = VALUES(user_id), updated_at = VALUES(updated_at)"
+            )
+            .bind(&id)
+            .bind(account_id)
+            .bind(chat_id)
+            .bind(topic_id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn delete_feishu_chat(&self, account_id: &str, chat_id: &str, topic_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("DELETE FROM feishu_chats WHERE account_id = ? AND chat_id = ? AND topic_id = ?")
+                .bind(account_id)
+                .bind(chat_id)
+                .bind(topic_id)
+                .execute(&self.pool)
         )?;
         Ok(())
     }
