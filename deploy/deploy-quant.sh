@@ -68,8 +68,14 @@ rsync -az --delete -e ssh \
   --exclude '.venv' \
   --exclude '__pycache__' \
   --exclude '*.pyc' \
+  --exclude '.pytest_cache' \
+  --exclude 'data/baostock_raw' \
+  --exclude 'docs/research' \
+  --exclude 'logs' \
   --exclude 'web/node_modules' \
   --exclude 'web/dist' \
+  --exclude 'slidev/node_modules' \
+  --exclude 'slidev/dist' \
   --exclude 'config.toml' \
   "$PROJECT_ROOT/quant/" "$SSH_HOST:$REMOTE_RELEASE/"
 # 前端产物单独同步(上面排除了, 避免 --delete 误删后又全量重传)
