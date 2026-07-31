@@ -3702,12 +3702,14 @@ def _fields():
 
 def _portfolio_fields(fields):
     dates = pd.date_range("2025-01-06", periods=120, freq="B")
+    rising = np.linspace(1.0, 1.2, len(dates))
+    declining = np.linspace(1.0, 0.8, len(dates))
     return {
         name: pd.DataFrame(
             {
                 "sh.600000": pd.Series(s.to_numpy(), index=dates),
-                "sz.000001": pd.Series((s.to_numpy() * 1.1), index=dates),
-                "sh.601318": pd.Series((s.to_numpy() * 0.9), index=dates),
+                "sz.000001": pd.Series(s.to_numpy() * rising, index=dates),
+                "sh.601318": pd.Series(s.to_numpy() * declining, index=dates),
             }
         )
         for name, s in fields.items()
@@ -3774,4 +3776,13 @@ def test_corpus_evaluation(name):
     actual = evaluate_expression(
         expr, _portfolio_fields(fields) if name in PORTFOLIO_OPS else fields,
     )
-    _assert_value(actual, CORPUS_EVAL[name], name)
+    expected = CORPUS_EVAL[name]
+    if name in PORTFOLIO_OPS:
+        # 横截面输入使用明确的相反趋势，避免常数倍序列把 1e-16 浮点噪声当成排名语义。
+        row = [2.0, 1.0, 3.0] if name == "rank" else [True, True, False]
+        initial = [None, None, None] if name == "rank" else [False, False, False]
+        expected = {
+            "columns": ["sh.600000", "sz.000001", "sh.601318"],
+            "data": [initial for _ in range(20)] + [row for _ in range(100)],
+        }
+    _assert_value(actual, expected, name)
