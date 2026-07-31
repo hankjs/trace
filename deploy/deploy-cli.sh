@@ -72,7 +72,10 @@ set -euo pipefail
 release="$1"
 app="$2"
 release_id="$3"
-previous="$(readlink -f "$app/current" 2>/dev/null || true)"
+previous=""
+if [[ -L "$app/current" ]]; then
+  previous="$(readlink -f "$app/current" 2>/dev/null || true)"
+fi
 [[ -z "$previous" ]] || ln -sfn "$previous" "$app/previous"
 ln -s "$release" "$app/current.tmp.$release_id"
 mv -Tf "$app/current.tmp.$release_id" "$app/current"

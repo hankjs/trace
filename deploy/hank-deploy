@@ -233,16 +233,22 @@ if [[ "$ACTION" == "deploy" ]]; then
   reject_symlinks "$BUILD_SOURCE"
 fi
 
-PREV_CORE="$(readlink -f "$CORE_ROOT/current" 2>/dev/null || true)"
-PREV_CLI="$(readlink -f "$CLI_ROOT/current" 2>/dev/null || true)"
-PREV_QUANT="$(readlink -f "$QUANT_ROOT/current" 2>/dev/null || true)"
-PREV_SLIDEV="$(readlink -f "$SLIDEV_ROOT/current" 2>/dev/null || true)"
-PREV_DOCS="$(readlink -f "$DOCS_ROOT/current" 2>/dev/null || true)"
-ROLLBACK_CORE="$(readlink -f "$CORE_ROOT/previous" 2>/dev/null || true)"
-ROLLBACK_CLI="$(readlink -f "$CLI_ROOT/previous" 2>/dev/null || true)"
-ROLLBACK_QUANT="$(readlink -f "$QUANT_ROOT/previous" 2>/dev/null || true)"
-ROLLBACK_SLIDEV="$(readlink -f "$SLIDEV_ROOT/previous" 2>/dev/null || true)"
-ROLLBACK_DOCS="$(readlink -f "$DOCS_ROOT/previous" 2>/dev/null || true)"
+resolve_link() {
+  local link="$1"
+  [[ -L "$link" ]] || return 0
+  readlink -f "$link" 2>/dev/null || true
+}
+
+PREV_CORE="$(resolve_link "$CORE_ROOT/current")"
+PREV_CLI="$(resolve_link "$CLI_ROOT/current")"
+PREV_QUANT="$(resolve_link "$QUANT_ROOT/current")"
+PREV_SLIDEV="$(resolve_link "$SLIDEV_ROOT/current")"
+PREV_DOCS="$(resolve_link "$DOCS_ROOT/current")"
+ROLLBACK_CORE="$(resolve_link "$CORE_ROOT/previous")"
+ROLLBACK_CLI="$(resolve_link "$CLI_ROOT/previous")"
+ROLLBACK_QUANT="$(resolve_link "$QUANT_ROOT/previous")"
+ROLLBACK_SLIDEV="$(resolve_link "$SLIDEV_ROOT/previous")"
+ROLLBACK_DOCS="$(resolve_link "$DOCS_ROOT/previous")"
 SWITCHED_TARGETS=()
 REF_SWITCHED=0
 
