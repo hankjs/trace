@@ -7,6 +7,18 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+    #[serde(default)]
+    pub quant_a2a: Option<QuantA2aConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuantA2aConfig {
+    #[serde(default = "default_quant_a2a_base_url")]
+    pub base_url: String,
+}
+
+fn default_quant_a2a_base_url() -> String {
+    "http://127.0.0.1:8100".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -5,6 +5,8 @@ pub mod generate_tools;
 pub mod git;
 pub mod list_directory;
 pub mod permission;
+pub mod quant_grant;
+pub mod quant_tools;
 pub mod read_file;
 pub mod search;
 pub mod shell;
@@ -29,6 +31,14 @@ pub use permission::ToolRisk;
 pub use permission::{
     PermissionConfig, PermissionDecision, PermissionGuard, PermissionMode, DEFAULT_BLOCKED_COMMANDS,
 };
+
+#[derive(Debug, Clone)]
+pub struct ConfirmationRequest {
+    /// 给用户看的待确认摘要。
+    pub summary: String,
+    /// 会话来源，用于恢复时区分 web 对话与微信入口。
+    pub source: String,
+}
 
 #[async_trait]
 pub trait Tool: Send + Sync {
@@ -55,6 +65,12 @@ pub trait Tool: Send + Sync {
     /// Whether this tool supports streaming output.
     fn supports_streaming(&self) -> bool {
         false
+    }
+
+    /// 高成本工具可在此返回确认请求；agent 循环会暂停并询问用户。
+    /// 返回 None 表示无需确认。
+    fn needs_confirmation(&self, _input: &Value) -> Option<ConfirmationRequest> {
+        None
     }
 
     /// Execute with streaming output. Default falls back to regular execute.

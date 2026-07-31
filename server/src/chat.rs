@@ -1,5 +1,5 @@
-use crate::AppState;
 use crate::provider_registry;
+use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -8,7 +8,6 @@ use axum::{
         IntoResponse,
     },
 };
-use futures::stream::Stream;
 use code_agent::{AgentEvent, AgentSession};
 use code_tools::{
     ask_user::AskUserTool,
@@ -16,20 +15,54 @@ use code_tools::{
     file_checksum::new_checksum_store,
     generate_tools::GenerateArtifactsTool,
     git::GitTool,
-    read_file::ReadFileTool, search::SearchTool, shell::ShellTool,
+    list_directory::ListDirectoryTool,
+    quant_grant::QuantPendingConfirm,
+    quant_tools::quant_tools,
+    read_file::ReadFileTool,
+    search::SearchTool,
+    shell::ShellTool,
     spec_tools::{UpdateArtifactTool, UpdateSpecTool, UpdateTaskStatusTool},
     str_replace::StrReplaceTool,
-    list_directory::ListDirectoryTool,
     test_runner::TestRunnerTool,
     web_fetch::WebFetchTool,
-    write_file::WriteFileTool, Tool,
+    write_file::WriteFileTool,
+    Tool,
 };
+use futures::stream::Stream;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, Instrument};
+
+// --- quant-research skill 内建文档（仅在有 quant 工具的会话注入） ---
+const QUANT_RESEARCH_SKILL_MD: &str = include_str!("../skills/quant-research/SKILL.md");
+const QUANT_RESEARCH_SKILL_NAME: &str = "quant-research";
+const QUANT_RESEARCH_SKILL_DESC: &str = "Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experiment/trial/backtest/factor 工具链上执行可检验假设，遵守停止条件与 findings 强制落表，不输出交易指令。";
+const QUANT_RESEARCH_SKILL_PATH: &str = "skills/quant-research";
+/// quant 高成本工具待确认单 TTL：5 分钟（设计 §5.4.4）。
+const QUANT_CONFIRM_TTL_MS: i64 = 5 * 60 * 1000;
+
+/// 构造 quant-research skill 索引与 project segment；仅在有 quant 工具的会话注入。
+fn quant_research_prompt_inputs(
+    quant_tools_added: bool,
+) -> (Vec<code_agent::SkillInfo>, Vec<code_agent::PromptSegment>) {
+    let skills = if quant_tools_added {
+        vec![code_agent::SkillInfo {
+            name: QUANT_RESEARCH_SKILL_NAME.to_string(),
+            description: QUANT_RESEARCH_SKILL_DESC.to_string(),
+            path: QUANT_RESEARCH_SKILL_PATH.to_string(),
+        }]
+    } else {
+        vec![]
+    };
+    let mut segments = Vec::new();
+    if quant_tools_added {
+        segments.push(code_agent::PromptSegment::Static(QUANT_RESEARCH_SKILL_MD));
+    }
+    (skills, segments)
+}
 
 // --- Event Buffer types ---
 
@@ -167,19 +200,34 @@ pub async fn run_chat_turn(
     let work_dir_for_checkpoint = work_dir.clone();
     let work_dir_for_agent = work_dir.clone();
     let session_change_id = session_record.as_ref().and_then(|s| s.change_id.clone());
-    let session_type = session_record.as_ref().map(|s| s.session_type.clone()).unwrap_or_else(|| "chat".to_string());
+    let session_type = session_record
+        .as_ref()
+        .map(|s| s.session_type.clone())
+        .unwrap_or_else(|| "chat".to_string());
     // 远程执行：会话绑定的桌面 client（None = server 本地执行）
-    let exec_client_id = session_record.as_ref().and_then(|s| s.exec_client_id.clone());
+    let exec_client_id = session_record
+        .as_ref()
+        .and_then(|s| s.exec_client_id.clone());
     let session_user_id = session_record.as_ref().and_then(|s| s.user_id.clone());
 
-    // Check if this session has a pending ask_user state
-    let pending_ask_user = session_record.as_ref().and_then(|s| s.pending_ask_user.clone());
+    // Check if this session has a pending ask_user state.
+    // quant_confirm 类待确认单优先从进程内 map 读取（设计 §5.4.4），未命中再回退 DB。
+    let db_pending_ask_user = session_record
+        .as_ref()
+        .and_then(|s| s.pending_ask_user.clone());
+    let pending_ask_user =
+        resolve_pending_ask_user(state, &session_id, db_pending_ask_user.clone()).await;
 
     let parent_id_for_new_msg = match opts.parent_id.as_deref() {
         Some("root") => None,
         Some(id) => Some(id.to_string()),
-        None => session_record.as_ref().and_then(|s| s.active_leaf_id.clone()),
+        None => session_record
+            .as_ref()
+            .and_then(|s| s.active_leaf_id.clone()),
     };
+
+    // 标记本会话是否注册了 quant_* 工具，用于后续决定是否注入 quant-research skill 全文。
+    let mut quant_tools_added = false;
 
     let tools: Vec<Arc<dyn Tool>> = {
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
@@ -200,9 +248,18 @@ pub async fn run_chat_turn(
             }
             _ => vec![
                 Arc::new(ShellTool::new(work_dir.clone())),
-                Arc::new(ReadFileTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
-                Arc::new(WriteFileTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
-                Arc::new(StrReplaceTool::with_checksum_store(work_dir.clone(), checksum_store.clone())),
+                Arc::new(ReadFileTool::with_checksum_store(
+                    work_dir.clone(),
+                    checksum_store.clone(),
+                )),
+                Arc::new(WriteFileTool::with_checksum_store(
+                    work_dir.clone(),
+                    checksum_store.clone(),
+                )),
+                Arc::new(StrReplaceTool::with_checksum_store(
+                    work_dir.clone(),
+                    checksum_store.clone(),
+                )),
                 Arc::new(ListDirectoryTool::new(work_dir.clone())),
                 Arc::new(SearchTool::new(work_dir.clone())),
                 Arc::new(GitTool::new(work_dir.clone())),
@@ -210,9 +267,21 @@ pub async fn run_chat_turn(
                 Arc::new(TestRunnerTool::new(work_dir.clone())),
             ],
         };
-        t.push(Arc::new(UpdateSpecTool::new(base_url.clone(), token.clone(), session_id.clone())));
-        t.push(Arc::new(UpdateTaskStatusTool::new(base_url.clone(), token.clone(), session_id.clone())));
-        t.push(Arc::new(UpdateArtifactTool::new(base_url.clone(), token.clone(), session_id.clone())));
+        t.push(Arc::new(UpdateSpecTool::new(
+            base_url.clone(),
+            token.clone(),
+            session_id.clone(),
+        )));
+        t.push(Arc::new(UpdateTaskStatusTool::new(
+            base_url.clone(),
+            token.clone(),
+            session_id.clone(),
+        )));
+        t.push(Arc::new(UpdateArtifactTool::new(
+            base_url.clone(),
+            token.clone(),
+            session_id.clone(),
+        )));
         t.push(Arc::new(AskUserTool::new()));
         // 截图类工具永远 server 本地执行：网页快照用 server 本机 Chrome，
         // 终端截图由 server 拉 client 快照后本地渲染（无 user_id 的会话无法定位 client，不注册）
@@ -227,12 +296,48 @@ pub async fn run_chat_turn(
         }
         // Add explore/generate tools if session is bound to a change or is explore type
         if let Some(ref cid) = session_change_id {
-            t.push(Arc::new(FinalizeExploreTool::new(base_url.clone(), token.clone(), cid.clone(), session_id.clone())));
-            t.push(Arc::new(GenerateArtifactsTool::new(base_url.clone(), token.clone(), cid.clone())));
+            t.push(Arc::new(FinalizeExploreTool::new(
+                base_url.clone(),
+                token.clone(),
+                cid.clone(),
+                session_id.clone(),
+            )));
+            t.push(Arc::new(GenerateArtifactsTool::new(
+                base_url.clone(),
+                token.clone(),
+                cid.clone(),
+            )));
         } else if session_type == "explore" {
             // Explore session without a change yet — finalize_explore will create the change
-            t.push(Arc::new(FinalizeExploreTool::new(base_url.clone(), token.clone(), String::new(), session_id.clone())));
+            t.push(Arc::new(FinalizeExploreTool::new(
+                base_url.clone(),
+                token.clone(),
+                String::new(),
+                session_id.clone(),
+            )));
         }
+
+        // 注册 quant_* 工具：需配置 quant_a2a.base_url、用户已登录（有 JWT）、且会话来源明确
+        if let Some(ref quant_cfg) = state.config.quant_a2a {
+            if !token.is_empty() {
+                let source = session_record
+                    .as_ref()
+                    .and_then(|s| s.metadata.as_deref())
+                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+                    .and_then(|v| v["source"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "trace_chat".to_string());
+                let mut quant = quant_tools(
+                    quant_cfg.base_url.clone(),
+                    token.clone(),
+                    session_id.clone(),
+                    source,
+                    state.quant_grant_store.clone(),
+                );
+                t.append(&mut quant);
+                quant_tools_added = true;
+            }
+        }
+
         t
     };
 
@@ -256,15 +361,34 @@ pub async fn run_chat_turn(
     let apply_change_id = opts.apply_change_id.clone();
 
     // If pending_ask_user, the user's reply becomes a tool_result
-    let user_content: Vec<hank_provider::ContentBlock> = if let Some(ref pending_json) = pending_ask_user {
+    let user_content: Vec<hank_provider::ContentBlock> = if let Some(ref pending_json) =
+        pending_ask_user
+    {
         // Parse pending state to get tool_use_id
         let pending: serde_json::Value = serde_json::from_str(pending_json).unwrap_or_default();
-        let tool_use_id = pending["tool_use_id"].as_str().unwrap_or_default().to_string();
-        // Clear pending state
-        let _ = state.db.clear_session_pending_ask_user(&session_id).await;
+        let tool_use_id = pending["tool_use_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        // 若 pending 来自 DB（包括旧代码遗留的 quant_confirm），清除 DB 状态；
+        // 纯进程内 map 的 quant_confirm 不写 DB，无需清除。
+        if db_pending_ask_user.is_some() {
+            let _ = state.db.clear_session_pending_ask_user(&session_id).await;
+        }
+
+        let content = if let Some(kind) = pending["kind"].as_str() {
+            if let Some(source) = kind.strip_prefix("quant_confirm:") {
+                handle_quant_confirmation(state, &session_id, source, &pending, &content_text).await
+            } else {
+                content_text.clone()
+            }
+        } else {
+            content_text.clone()
+        };
+
         vec![hank_provider::ContentBlock::ToolResult {
             tool_use_id,
-            content: content_text.clone(),
+            content,
             is_error: false,
         }]
     } else {
@@ -272,7 +396,11 @@ pub async fn run_chat_turn(
     };
     let is_first_message = {
         let msgs = if let Some(ref leaf) = parent_id_for_new_msg {
-            state.db.get_branch_messages(&session_id, leaf).await.unwrap_or_default()
+            state
+                .db
+                .get_branch_messages(&session_id, leaf)
+                .await
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -282,14 +410,17 @@ pub async fn run_chat_turn(
 
     // Build history for the session
     let history: Vec<hank_provider::Message> = if let Some(ref leaf) = parent_id_for_new_msg {
-        state.db.get_branch_messages(&session_id, leaf).await.unwrap_or_default()
+        state
+            .db
+            .get_branch_messages(&session_id, leaf)
+            .await
+            .unwrap_or_default()
     } else {
         Vec::new()
     }
     .iter()
     .filter_map(|m| {
-        let content: Vec<hank_provider::ContentBlock> =
-            serde_json::from_str(&m.content).ok()?;
+        let content: Vec<hank_provider::ContentBlock> = serde_json::from_str(&m.content).ok()?;
         let role = match m.role.as_str() {
             "user" => hank_provider::Role::User,
             "assistant" => hank_provider::Role::Assistant,
@@ -309,8 +440,14 @@ pub async fn run_chat_turn(
         let cp_label: String = content_text.chars().take(40).collect();
         tokio::spawn(async move {
             if let Err(e) = crate::checkpoints::create_checkpoint_for_turn(
-                &cp_state, &cp_session_id, &cp_message_id, &cp_work_dir, &cp_label,
-            ).await {
+                &cp_state,
+                &cp_session_id,
+                &cp_message_id,
+                &cp_work_dir,
+                &cp_label,
+            )
+            .await
+            {
                 tracing::warn!(session_id = %cp_session_id, "checkpoint creation failed: {e:#}");
             }
         });
@@ -330,46 +467,112 @@ pub async fn run_chat_turn(
     let db_fwd = state.db.clone();
     let sid_fwd2 = session_id.clone();
     let fwd_span = tracing::info_span!("chat_fwd", session_id = %session_id);
-    tokio::spawn(async move {
-        let mut seq: u64 = 0;
-        while let Some(event) = event_rx.recv().await {
-            seq += 1;
+    tokio::spawn(
+        async move {
+            let mut seq: u64 = 0;
+            while let Some(event) = event_rx.recv().await {
+                seq += 1;
 
-            // Persist event to agent_events table
-            let event_type = extract_event_type(&event);
-            if let Ok(payload) = serde_json::to_string(&event) {
-                let _ = db_fwd.save_agent_event(&sid_fwd2, event_type, &payload, seq).await;
-            }
+                // Persist event to agent_events table
+                let event_type = extract_event_type(&event);
+                if let Ok(payload) = serde_json::to_string(&event) {
+                    let _ = db_fwd
+                        .save_agent_event(&sid_fwd2, event_type, &payload, seq)
+                        .await;
+                }
 
-            // Keep existing metric/tool persistence for backward compatibility
-            match &event {
-                AgentEvent::Metrics { input_tokens, output_tokens, latency_ms, model, provider, phase: _ } => {
-                    let _ = db_fwd.save_agent_metric(
-                        &sid_fwd2, None, *input_tokens, *output_tokens, *latency_ms, model, provider,
-                    ).await;
+                // Keep existing metric/tool persistence for backward compatibility
+                match &event {
+                    AgentEvent::Metrics {
+                        input_tokens,
+                        output_tokens,
+                        latency_ms,
+                        model,
+                        provider,
+                        phase: _,
+                    } => {
+                        let _ = db_fwd
+                            .save_agent_metric(
+                                &sid_fwd2,
+                                None,
+                                *input_tokens,
+                                *output_tokens,
+                                *latency_ms,
+                                model,
+                                provider,
+                            )
+                            .await;
+                    }
+                    AgentEvent::ToolMetrics {
+                        tool_name,
+                        duration_ms,
+                        is_error,
+                    } => {
+                        let _ = db_fwd
+                            .save_tool_execution(
+                                &sid_fwd2,
+                                None,
+                                tool_name,
+                                *duration_ms,
+                                *is_error,
+                            )
+                            .await;
+                    }
+                    AgentEvent::AskUser {
+                        question,
+                        options,
+                        tool_use_id,
+                        kind,
+                    } => {
+                        let is_quant_confirm = kind
+                            .as_ref()
+                            .map(|k| k.starts_with("quant_confirm:"))
+                            .unwrap_or(false);
+                        if is_quant_confirm {
+                            // quant_confirm 待确认单写进程内 map，5 分钟 TTL，不落表
+                            // （设计 §5.4.4）。事件仍入 buffer，用户可在当前通道看到确认文案。
+                            let source = kind
+                                .as_ref()
+                                .unwrap()
+                                .strip_prefix("quant_confirm:")
+                                .unwrap_or("")
+                                .to_string();
+                            let summary = question.lines().next().unwrap_or(&question).to_string();
+                            state_fwd.quant_pending_confirms.insert(
+                                &sid_fwd2,
+                                QuantPendingConfirm {
+                                    tool_use_id: tool_use_id.clone(),
+                                    summary,
+                                    question: question.clone(),
+                                    options: options.clone(),
+                                    created_at_ms: chrono::Utc::now().timestamp_millis(),
+                                    source,
+                                },
+                            );
+                        } else {
+                            // 其他 ask_user 仍走 DB，支持跨进程恢复
+                            let pending = serde_json::json!({
+                                "tool_use_id": tool_use_id,
+                                "question": question,
+                                "options": options,
+                                "kind": kind,
+                                "created_at_ms": chrono::Utc::now().timestamp_millis(),
+                            });
+                            let _ = db_fwd
+                                .set_session_pending_ask_user(&sid_fwd2, &pending.to_string())
+                                .await;
+                        }
+                    }
+                    _ => {}
                 }
-                AgentEvent::ToolMetrics { tool_name, duration_ms, is_error } => {
-                    let _ = db_fwd.save_tool_execution(
-                        &sid_fwd2, None, tool_name, *duration_ms, *is_error,
-                    ).await;
+                let mut buffers = state_fwd.event_buffers.write().await;
+                if let Some(buf) = buffers.get_mut(&sid_fwd) {
+                    buf.push(event);
                 }
-                AgentEvent::AskUser { question, options, tool_use_id } => {
-                    // Persist pending ask_user state to session
-                    let pending = serde_json::json!({
-                        "tool_use_id": tool_use_id,
-                        "question": question,
-                        "options": options,
-                    });
-                    let _ = db_fwd.set_session_pending_ask_user(&sid_fwd2, &pending.to_string()).await;
-                }
-                _ => {}
-            }
-            let mut buffers = state_fwd.event_buffers.write().await;
-            if let Some(buf) = buffers.get_mut(&sid_fwd) {
-                buf.push(event);
             }
         }
-    }.instrument(fwd_span));
+        .instrument(fwd_span),
+    );
 
     // Agent task with fallback loop
     let state_for_buffer2 = state.clone();
@@ -422,6 +625,8 @@ pub async fn run_chat_turn(
             // 分层注入运行时 + 环境上下文（FR-CTX-1/2）。
             // base 沿用客户端组装的 system_prompt（业务提示词由客户端负责）。
             {
+                // 仅在有 quant 工具的会话暴露 skill 索引与完整 skill 文档，避免污染其它会话。
+                let (quant_skills, mut quant_segments) = quant_research_prompt_inputs(quant_tools_added);
                 let runtime = code_agent::RuntimeContext {
                     permission_mode: "workspace-write".to_string(),
                     approval_policy: "auto".to_string(),
@@ -435,7 +640,7 @@ pub async fn run_chat_turn(
                             risk: format!("{:?}", t.risk_level()),
                         })
                         .collect(),
-                    skills: vec![],
+                    skills: quant_skills,
                 };
                 let env = code_agent::EnvironmentContext {
                     cwd: work_dir_for_agent.clone(),
@@ -455,6 +660,7 @@ pub async fn run_chat_turn(
                             .to_string(),
                     ));
                 }
+                project_segments.append(&mut quant_segments);
                 let (_assembled, named) = code_agent::build_layered_prompt(
                     Some(&system_prompt),
                     Some(&runtime),
@@ -549,7 +755,8 @@ pub async fn chat_handler(
     axum::Json(body): axum::Json<ChatRequest>,
 ) -> impl IntoResponse {
     // spec 类工具回调 server 自身时使用请求携带的 JWT
-    let auth_token = headers.get("authorization")
+    let auth_token = headers
+        .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or_default()
@@ -758,6 +965,139 @@ pub async fn stop_handler(
     }
 }
 
+// --- Quant confirmation helpers ---
+
+/// 解析并获取待确认的 ask_user 状态。
+///
+/// 设计 §5.4.4：quant_confirm 类待确认单优先从进程内 map 读取，读取时顺手清理过期项；
+/// map 未命中时回退 DB（兼容旧代码遗留或进程重启前的待确认单）。
+async fn resolve_pending_ask_user(
+    state: &Arc<AppState>,
+    session_id: &str,
+    db_pending: Option<String>,
+) -> Option<String> {
+    state
+        .quant_pending_confirms
+        .cleanup_expired(QUANT_CONFIRM_TTL_MS);
+
+    // 1. DB pending 是 quant_confirm 时，优先读进程内 map；map 未命中则回退 DB。
+    if let Some(ref pending_json) = db_pending {
+        let pending: serde_json::Value = serde_json::from_str(pending_json).unwrap_or_default();
+        if pending["kind"]
+            .as_str()
+            .map(|k| k.starts_with("quant_confirm:"))
+            .unwrap_or(false)
+        {
+            if let Some(p) = state.quant_pending_confirms.take(session_id) {
+                return Some(
+                    serde_json::json!({
+                        "tool_use_id": p.tool_use_id,
+                        "kind": format!("quant_confirm:{}", p.source),
+                        "created_at_ms": p.created_at_ms,
+                    })
+                    .to_string(),
+                );
+            }
+            return db_pending;
+        }
+        return db_pending;
+    }
+
+    // 2. 无 DB pending 时，仍检查进程内 map（新代码 quant_confirm 不写 DB）。
+    if let Some(p) = state.quant_pending_confirms.take(session_id) {
+        return Some(
+            serde_json::json!({
+                "tool_use_id": p.tool_use_id,
+                "kind": format!("quant_confirm:{}", p.source),
+                "created_at_ms": p.created_at_ms,
+            })
+            .to_string(),
+        );
+    }
+
+    None
+}
+
+/// 处理 quant 高成本工具的恢复确认：解析用户回复，授予授权，并返回给模型的 ToolResult 文案。
+async fn handle_quant_confirmation(
+    state: &Arc<AppState>,
+    session_id: &str,
+    source: &str,
+    pending: &serde_json::Value,
+    text: &str,
+) -> String {
+    // 微信入口 5 分钟超时作废
+    if source == "weixin" {
+        let created = pending["created_at_ms"].as_i64().unwrap_or(0);
+        let now = chrono::Utc::now().timestamp_millis();
+        if now.saturating_sub(created) > 5 * 60 * 1000 {
+            return "待确认单已超时（5 分钟），未执行高成本量化操作。如需执行请重新发起工具调用。"
+                .to_string();
+        }
+    }
+
+    let (grant, summary) = parse_quant_confirmation(text, source);
+    if grant == 0 {
+        return "用户未确认，停止高成本量化操作。".to_string();
+    }
+
+    let remaining = state.quant_grant_store.grant(session_id, grant);
+    format!(
+        "{}。本会话剩余授权 {} 次，请重新发起工具调用。",
+        summary, remaining
+    )
+}
+
+/// 解析 quant 确认回复。返回 (授权次数, 可读摘要)。
+fn parse_quant_confirmation(text: &str, source: &str) -> (u32, String) {
+    let normalized = normalize_quant_confirm(text);
+
+    let whitelist = ["确认", "好的", "是", "ok", "同意"];
+    if whitelist.iter().any(|w| normalized == *w) {
+        return (1, "用户已确认，本次高成本量化操作已授权".to_string());
+    }
+
+    // 微信入口无批量授权
+    if source != "weixin" {
+        for prefix in ["确认", "允许"] {
+            if let Some(rest) = normalized.strip_prefix(prefix) {
+                if let Some(num_part) = rest.strip_suffix("次") {
+                    if let Ok(n) = num_part.parse::<u32>() {
+                        let n = n.clamp(1, 50);
+                        return (n, format!("用户已确认批量授权 {} 次高成本量化操作", n));
+                    }
+                }
+            }
+        }
+    }
+
+    (0, "用户未确认".to_string())
+}
+
+/// 归一化确认文本：去首尾空白、去内部空白、全半角转换、小写。
+fn normalize_quant_confirm(text: &str) -> String {
+    text.trim()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| match c {
+            '０' => '0',
+            '１' => '1',
+            '２' => '2',
+            '３' => '3',
+            '４' => '4',
+            '５' => '5',
+            '６' => '6',
+            '７' => '7',
+            '８' => '8',
+            '９' => '9',
+            'Ａ'..='Ｚ' => ((c as u32 - 'Ａ' as u32) + 'a' as u32) as u8 as char,
+            'ａ'..='ｚ' => ((c as u32 - 'ａ' as u32) + 'a' as u32) as u8 as char,
+            _ => c,
+        })
+        .collect::<String>()
+        .to_lowercase()
+}
+
 fn extract_event_type(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::TextDelta { .. } => "text_delta",
@@ -796,5 +1136,174 @@ fn extract_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::PlanUpdated { .. } => "plan_updated",
         AgentEvent::VerificationStarted { .. } => "verification_started",
         AgentEvent::VerificationCompleted { .. } => "verification_completed",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_quant_confirm() {
+        assert_eq!(normalize_quant_confirm("  确认  "), "确认");
+        assert_eq!(normalize_quant_confirm("确　认"), "确认");
+        assert_eq!(normalize_quant_confirm("ＯＫ"), "ok");
+        assert_eq!(normalize_quant_confirm("确认３次"), "确认3次");
+    }
+
+    #[test]
+    fn test_parse_quant_confirmation_whitelist() {
+        for text in [
+            "确认",
+            "  确认  ",
+            "好的",
+            "是",
+            "OK",
+            "ok",
+            "同意",
+            "　同意　",
+        ] {
+            let (n, summary) = parse_quant_confirmation(text, "trace_chat");
+            assert_eq!(n, 1, "failed for: {}", text);
+            assert!(summary.contains("已确认"), "failed for: {}", text);
+        }
+    }
+
+    #[test]
+    fn test_parse_quant_confirmation_batch() {
+        let (n, summary) = parse_quant_confirmation("确认5次", "trace_chat");
+        assert_eq!(n, 5);
+        assert!(summary.contains("5 次"));
+
+        let (n, _) = parse_quant_confirmation("允许10次", "trace_chat");
+        assert_eq!(n, 10);
+
+        let (n, _) = parse_quant_confirmation("确认100次", "trace_chat");
+        assert_eq!(n, 50);
+
+        let (n, _) = parse_quant_confirmation("确认0次", "trace_chat");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_parse_quant_confirmation_weixin_no_batch() {
+        let (n, _) = parse_quant_confirmation("确认5次", "weixin");
+        assert_eq!(n, 0);
+
+        let (n, _) = parse_quant_confirmation("确认", "weixin");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn test_parse_quant_confirmation_reject() {
+        let (n, _) = parse_quant_confirmation("不要", "trace_chat");
+        assert_eq!(n, 0);
+
+        let (n, _) = parse_quant_confirmation("再想想", "weixin");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_quant_research_prompt_injected_when_quant_enabled() {
+        let (skills, segments) = quant_research_prompt_inputs(true);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "quant-research");
+
+        let runtime = code_agent::RuntimeContext {
+            permission_mode: "workspace-write".to_string(),
+            approval_policy: "auto".to_string(),
+            writable_roots: vec![],
+            network_policy: "restricted".to_string(),
+            tools: vec![],
+            skills,
+        };
+        let (prompt, named) = code_agent::build_layered_prompt(
+            Some("base prompt"),
+            Some(&runtime),
+            None,
+            &segments,
+        );
+        // project segment 存在，且 runtime 技能索引包含 quant-research
+        assert!(
+            named.iter().any(|s| s.name == "project"),
+            "project segment should exist"
+        );
+        assert!(prompt.contains("quant-research"), "prompt should reference quant-research");
+        assert!(
+            prompt.contains("S1 | 用户停止 / 会话结束"),
+            "prompt should contain stop condition S1"
+        );
+    }
+
+    #[test]
+    fn test_quant_research_prompt_not_injected_when_quant_disabled() {
+        let (skills, segments) = quant_research_prompt_inputs(false);
+        assert!(skills.is_empty());
+        assert!(segments.is_empty());
+
+        let runtime = code_agent::RuntimeContext {
+            permission_mode: "workspace-write".to_string(),
+            approval_policy: "auto".to_string(),
+            writable_roots: vec![],
+            network_policy: "restricted".to_string(),
+            tools: vec![],
+            skills,
+        };
+        let (prompt, named) = code_agent::build_layered_prompt(
+            Some("base prompt"),
+            Some(&runtime),
+            None,
+            &segments,
+        );
+        assert!(!named.iter().any(|s| s.name == "project"));
+        assert!(!prompt.contains("quant-research"));
+        assert!(!prompt.contains("S1 | 用户停止 / 会话结束"));
+    }
+
+    #[test]
+    fn test_parse_quant_confirmation_summary_is_non_trading() {
+        // 验收 #5：确认/授权文案本身不得含交易指令类措辞。
+        let forbidden = ["已下单", "建议买入", "买入建议", "建议卖出", "卖出建议"];
+        for text in ["确认", "确认5次", "允许10次"] {
+            for source in ["trace_chat", "weixin"] {
+                let (_, summary) = parse_quant_confirmation(text, source);
+                for phrase in forbidden {
+                    assert!(
+                        !summary.contains(phrase),
+                        "summary '{}' contains forbidden phrase '{}' for source={} text={}",
+                        summary,
+                        phrase,
+                        source,
+                        text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_quant_research_skill_forbids_trading_wording() {
+        // 验收 #5：SKILL.md 必须包含文案禁忌与投资/交易免责声明。
+        assert!(
+            QUANT_RESEARCH_SKILL_MD.contains("不输出交易指令"),
+            "SKILL.md should forbid trading instructions"
+        );
+        assert!(
+            QUANT_RESEARCH_SKILL_MD.contains("非投资建议"),
+            "SKILL.md should disclaim investment advice"
+        );
+        assert!(
+            QUANT_RESEARCH_SKILL_MD.contains("文案禁忌"),
+            "SKILL.md should list wording taboos"
+        );
+    }
+
+    #[test]
+    fn test_quant_confirm_timeout_message_is_safe() {
+        // 微信入口 5 分钟超时文案不应包含交易指令类措辞。
+        let msg = "待确认单已超时（5 分钟），未执行高成本量化操作。如需执行请重新发起工具调用。";
+        for phrase in ["已下单", "建议买入", "建议卖出"] {
+            assert!(!msg.contains(phrase), "timeout message contains forbidden phrase '{}'", phrase);
+        }
     }
 }

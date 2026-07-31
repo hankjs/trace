@@ -441,10 +441,12 @@ impl AgentSession {
                 if Some(id.as_str()) == skip_id {
                     continue;
                 }
-                let has_result = tool_results.iter().any(|r| matches!(
-                    r,
-                    ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
-                ));
+                let has_result = tool_results.iter().any(|r| {
+                    matches!(
+                        r,
+                        ContentBlock::ToolResult { tool_use_id, .. } if tool_use_id == id
+                    )
+                });
                 if !has_result {
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
@@ -568,9 +570,11 @@ impl AgentSession {
                     self.stream_timeout.as_secs()
                 );
                 warn!("{message}");
-                let _ = event_tx.send(AgentEvent::Error {
-                    message: message.clone(),
-                }).await;
+                let _ = event_tx
+                    .send(AgentEvent::Error {
+                        message: message.clone(),
+                    })
+                    .await;
                 return Err(anyhow::anyhow!(message));
             }
 
@@ -702,7 +706,9 @@ impl AgentSession {
                     || (continuation_count >= MAX_CONTINUATIONS && small_output_streak >= 2)
                 {
                     // ③ 认栽：发事件告知输出被截断
-                    warn!("MaxTokens recovery exhausted at iteration {iteration}, output truncated");
+                    warn!(
+                        "MaxTokens recovery exhausted at iteration {iteration}, output truncated"
+                    );
                     let _ = event_tx
                         .send(AgentEvent::Error {
                             message: "Output truncated: the response hit the output token limit repeatedly and could not be completed. The partial output above is kept as-is.".to_string(),
@@ -770,10 +776,38 @@ impl AgentSession {
                             // 构造参数：本次盲猜调用不执行，返回错误结果让模型重试
                             tool_results.push(ContentBlock::ToolResult {
                                 tool_use_id: id.clone(),
-                                content: "Tool schema now loaded, please retry with correct parameters".to_string(),
+                                content:
+                                    "Tool schema now loaded, please retry with correct parameters"
+                                        .to_string(),
                                 is_error: true,
                             });
                             continue;
+                        }
+
+                        // 高成本 quant 工具确认闸门：在用户真实确认前不执行，
+                        // 模型自填的 confirmed 由工具 execute 再次剥离。
+                        if let Some(tool) = self.tools.iter().find(|t| t.name() == name) {
+                            if let Some(req) = tool.needs_confirmation(input) {
+                                let question = format!(
+                                    "{}\n\n确认执行该高成本量化操作？可回复：确认 / 确认N次（本会话批量，N≤50）/ 否。授权与日高成本配额共用，本会话内有效。",
+                                    req.summary
+                                );
+                                let _ = event_tx
+                                    .send(AgentEvent::AskUser {
+                                        question,
+                                        options: vec![
+                                            "确认".to_string(),
+                                            "确认N次".to_string(),
+                                            "否".to_string(),
+                                        ],
+                                        tool_use_id: id.clone(),
+                                        kind: Some(format!("quant_confirm:{}", req.source)),
+                                    })
+                                    .await;
+                                ask_user_triggered = true;
+                                ask_user_tool_id = Some(id.clone());
+                                break;
+                            }
                         }
 
                         // Detect ask_user tool — emit event and break
@@ -793,6 +827,7 @@ impl AgentSession {
                                     question,
                                     options,
                                     tool_use_id: id.clone(),
+                                    kind: None,
                                 })
                                 .await;
                             ask_user_triggered = true;

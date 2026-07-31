@@ -30,25 +30,61 @@ pub enum RunStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
-    TextDelta { text: String },
-    ToolStart { id: String, name: String, input: String },
-    ToolResult { id: String, content: String, is_error: bool },
+    TextDelta {
+        text: String,
+    },
+    ToolStart {
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: bool,
+    },
     TurnComplete,
-    Error { message: String },
+    Error {
+        message: String,
+    },
     /// Orchestrator Think phase output
-    Thinking { text: String },
+    Thinking {
+        text: String,
+    },
     /// A worker agent was spawned
-    WorkerSpawned { task_id: String, description: String },
+    WorkerSpawned {
+        task_id: String,
+        description: String,
+    },
     /// A worker agent completed
-    WorkerCompleted { task_id: String, status: TaskStatus, summary: String },
+    WorkerCompleted {
+        task_id: String,
+        status: TaskStatus,
+        summary: String,
+    },
     /// Verification result from the Verifier
-    Verification { verdict: Verdict, issues: Vec<String> },
+    Verification {
+        verdict: Verdict,
+        issues: Vec<String>,
+    },
     /// Loop detected in agent execution
-    LoopDetected { pattern: String, window_size: usize },
+    LoopDetected {
+        pattern: String,
+        window_size: usize,
+    },
     /// Token budget warning
-    TokenWarning { used_tokens: usize, total_budget: usize, percent: u8, action: String },
+    TokenWarning {
+        used_tokens: usize,
+        total_budget: usize,
+        percent: u8,
+        action: String,
+    },
     /// Compression triggered
-    CompressionTriggered { before_tokens: usize, after_tokens: usize, strategy: String },
+    CompressionTriggered {
+        before_tokens: usize,
+        after_tokens: usize,
+        strategy: String,
+    },
     /// LLM call metrics (token usage + latency)
     Metrics {
         input_tokens: u32,
@@ -94,6 +130,9 @@ pub enum AgentEvent {
         question: String,
         options: Vec<String>,
         tool_use_id: String,
+        /// 可选标记，用于区分普通 ask_user 与 quant 高成本确认等场景。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
     },
     /// Explore phase completed for a change
     ExploreComplete {
@@ -115,7 +154,10 @@ pub enum AgentEvent {
         phase: String,
     },
     /// Streaming tool output delta (实时输出)
-    ToolOutputDelta { id: String, chunk: String },
+    ToolOutputDelta {
+        id: String,
+        chunk: String,
+    },
 
     // ─── Run / Turn 生命周期事件 (FR-EVT-2/3, FR-LOOP-7) ───
     /// 一次完整运行开始

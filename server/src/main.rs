@@ -10,8 +10,8 @@ mod llm;
 pub mod provider_registry;
 pub mod remote_exec;
 pub mod remote_tools;
-pub mod response;
 mod requirement_docs;
+pub mod response;
 mod routes;
 mod skills;
 mod snap_tools;
@@ -31,8 +31,8 @@ use axum::{
 };
 use config::Config;
 use hank_db::Database;
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
@@ -54,9 +54,14 @@ pub struct AppState {
     /// 微信账号 monitor 任务（account_id → 停止令牌）
     pub weixin_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
     /// 微信渠道 agent 的短期对话记忆（binding_id → 最近若干轮问答）
-    pub weixin_channel_history: RwLock<HashMap<String, std::collections::VecDeque<weixin::channel::ChannelTurn>>>,
+    pub weixin_channel_history:
+        RwLock<HashMap<String, std::collections::VecDeque<weixin::channel::ChannelTurn>>>,
     /// 桌面 client 远程执行通道（user_id → 长轮询/派发状态）
     pub client_hubs: RwLock<HashMap<String, remote_exec::UserHub>>,
+    /// quant 高成本 skill 会话级授权存储（进程内，重启失效）
+    pub quant_grant_store: Arc<code_tools::quant_grant::QuantGrantStore>,
+    /// quant 高成本工具待确认单（进程内 map，5 分钟 TTL，重启作废；设计 §5.4.4）
+    pub quant_pending_confirms: Arc<code_tools::quant_grant::QuantPendingConfirmStore>,
 }
 
 async fn auth_middleware(
@@ -89,10 +94,7 @@ async fn auth_middleware(
 }
 
 /// 在 auth_middleware 之后运行，要求 claims.can_admin == true
-async fn admin_required(
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
+async fn admin_required(request: Request<axum::body::Body>, next: Next) -> Response {
     match request.extensions().get::<auth::Claims>() {
         Some(claims) if claims.can_admin => next.run(request).await,
         _ => {
@@ -107,10 +109,10 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
     use axum::http::{header, HeaderValue, Method};
 
     let mut origins: Vec<HeaderValue> = [
-        "tauri://localhost",       // Tauri webview (macOS/Linux)
-        "http://tauri.localhost",  // Tauri webview (Windows)
-        "http://localhost:1420",   // client dev server
-        "http://localhost:5173",   // admin dev server
+        "tauri://localhost",      // Tauri webview (macOS/Linux)
+        "http://tauri.localhost", // Tauri webview (Windows)
+        "http://localhost:1420",  // client dev server
+        "http://localhost:5173",  // admin dev server
     ]
     .iter()
     .filter_map(|s| s.parse().ok())
@@ -157,7 +159,6 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     let db = Database::new(&config.server.database_url).await?;
 
-
     let state = Arc::new(AppState {
         db,
         jwt_secret: config.server.jwt_secret.clone(),
@@ -168,6 +169,10 @@ async fn main() -> Result<()> {
         weixin_monitors: RwLock::new(HashMap::new()),
         weixin_channel_history: RwLock::new(HashMap::new()),
         client_hubs: RwLock::new(HashMap::new()),
+        quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
+        quant_pending_confirms: Arc::new(
+            code_tools::quant_grant::QuantPendingConfirmStore::new(),
+        ),
     });
 
     // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）
@@ -190,12 +195,24 @@ async fn main() -> Result<()> {
         .route("/api/sessions/{id}", put(routes::update_session))
         .route("/api/sessions/{id}/messages", get(routes::get_messages))
         .route("/api/sessions/{id}/messages", post(routes::post_message))
-        .route("/api/sessions/{id}/messages/truncate", post(routes::truncate_messages))
+        .route(
+            "/api/sessions/{id}/messages/truncate",
+            post(routes::truncate_messages),
+        )
         .route("/api/sessions/{id}/tree", get(routes::get_message_tree))
-        .route("/api/sessions/{id}/active-leaf", put(routes::update_active_leaf))
-        .route("/api/sessions/{id}/local-events", post(routes::post_local_events))
+        .route(
+            "/api/sessions/{id}/active-leaf",
+            put(routes::update_active_leaf),
+        )
+        .route(
+            "/api/sessions/{id}/local-events",
+            post(routes::post_local_events),
+        )
         .route("/api/sessions/{id}/events", get(routes::get_session_events))
-        .route("/api/sessions/{id}/transcript", get(routes::get_session_transcript))
+        .route(
+            "/api/sessions/{id}/transcript",
+            get(routes::get_session_transcript),
+        )
         .route("/api/settings", put(routes::update_settings))
         .route("/api/providers", get(routes::list_providers))
         // Image providers (public list for client)
@@ -205,7 +222,10 @@ async fn main() -> Result<()> {
         .route("/api/image/edit", post(image_gen::edit_image))
         .route("/api/sessions/{id}/chat", post(chat::chat_handler))
         .route("/api/sessions/{id}/stop", post(chat::stop_handler))
-        .route("/api/sessions/{id}/events/resume", get(chat::resume_handler))
+        .route(
+            "/api/sessions/{id}/events/resume",
+            get(chat::resume_handler),
+        )
         .route("/api/llm/completion", post(llm::completion_handler))
         .route("/api/llm/tool-exec", post(llm::tool_exec_handler))
         .route("/api/fs/list", get(routes::list_directory))
@@ -226,59 +246,126 @@ async fn main() -> Result<()> {
         .route("/api/changes/{id}", delete(changes::delete_change))
         .route("/api/changes/{id}/explore", post(changes::start_explore))
         .route("/api/changes/{id}/generate", post(changes::start_generate))
-        .route("/api/changes/{id}/artifacts/confirm", post(changes::confirm_artifacts))
+        .route(
+            "/api/changes/{id}/artifacts/confirm",
+            post(changes::confirm_artifacts),
+        )
         .route("/api/changes/{id}/archive", post(changes::archive_change))
         // Artifacts routes
         .route("/api/changes/{id}/artifacts", get(changes::list_artifacts))
-        .route("/api/changes/{id}/artifacts", post(changes::create_artifact))
-        .route("/api/changes/{id}/artifacts/{aid}", get(changes::get_artifact))
-        .route("/api/changes/{id}/artifacts/{aid}", put(changes::update_artifact))
-        .route("/api/changes/{id}/artifacts/{aid}", delete(changes::delete_artifact))
+        .route(
+            "/api/changes/{id}/artifacts",
+            post(changes::create_artifact),
+        )
+        .route(
+            "/api/changes/{id}/artifacts/{aid}",
+            get(changes::get_artifact),
+        )
+        .route(
+            "/api/changes/{id}/artifacts/{aid}",
+            put(changes::update_artifact),
+        )
+        .route(
+            "/api/changes/{id}/artifacts/{aid}",
+            delete(changes::delete_artifact),
+        )
         // Tasks routes
         .route("/api/changes/{id}/tasks", get(changes::list_tasks))
         .route("/api/changes/{id}/tasks", post(changes::batch_create_tasks))
         .route("/api/changes/{id}/tasks/{tid}", put(changes::update_task))
-        .route("/api/changes/{id}/tasks/{tid}", delete(changes::delete_task))
+        .route(
+            "/api/changes/{id}/tasks/{tid}",
+            delete(changes::delete_task),
+        )
         // Context route
-        .route("/api/changes/{id}/context", get(changes::get_change_context))
+        .route(
+            "/api/changes/{id}/context",
+            get(changes::get_change_context),
+        )
         // Checkpoints routes
-        .route("/api/sessions/{id}/checkpoints", get(checkpoints::list_checkpoints_handler))
-        .route("/api/sessions/{id}/rewind/{cpid}", post(checkpoints::rewind_handler))
+        .route(
+            "/api/sessions/{id}/checkpoints",
+            get(checkpoints::list_checkpoints_handler),
+        )
+        .route(
+            "/api/sessions/{id}/rewind/{cpid}",
+            post(checkpoints::rewind_handler),
+        )
         // Skills routes
         .route("/api/skills", get(skills::list_skills))
         .route("/api/skills/install", post(skills::install_skill))
         .route("/api/skills/{name}", delete(skills::uninstall_skill))
         // Requirement docs routes (client)
         .route("/api/requirement-docs", post(requirement_docs::create_doc))
-        .route("/api/requirement-docs/{id}", put(requirement_docs::update_doc))
-        .route("/api/requirement-docs/by-change/{changeId}", get(requirement_docs::get_doc_by_change))
+        .route(
+            "/api/requirement-docs/{id}",
+            put(requirement_docs::update_doc),
+        )
+        .route(
+            "/api/requirement-docs/by-change/{changeId}",
+            get(requirement_docs::get_doc_by_change),
+        )
         // Weixin routes (client)
-        .route("/api/weixin/bind-code", post(weixin::routes::create_bind_code))
+        .route(
+            "/api/weixin/bind-code",
+            post(weixin::routes::create_bind_code),
+        )
         .route("/api/weixin/binding", get(weixin::routes::get_binding))
-        .route("/api/weixin/binding", delete(weixin::routes::delete_binding))
+        .route(
+            "/api/weixin/binding",
+            delete(weixin::routes::delete_binding),
+        )
         // Remote execution: desktop client long-poll channel
-        .route("/api/client/registration", put(remote_exec::register_client))
+        .route(
+            "/api/client/registration",
+            put(remote_exec::register_client),
+        )
         .route("/api/client/notify", post(remote_exec::post_notification))
         .route("/api/client/poll", get(remote_exec::poll_requests))
         // tool-result 可能携带媒体文件 base64 回传（20MB 文件约 27MB），放宽 body 上限
         .route(
             "/api/client/tool-result",
-            post(remote_exec::post_tool_result).route_layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
+            post(remote_exec::post_tool_result)
+                .route_layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
         )
         .route("/api/client/online", get(remote_exec::list_online))
-        .route("/api/sessions/{id}/exec-client", put(remote_exec::set_session_exec_client))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .route(
+            "/api/sessions/{id}/exec-client",
+            put(remote_exec::set_session_exec_client),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // Admin API routes (also protected)
     let admin_api = Router::new()
         .route("/api/admin/sessions", get(admin::list_sessions))
-        .route("/api/admin/sessions/{id}/replay", get(admin::session_replay))
-        .route("/api/admin/sessions/{id}/events", get(admin::session_events))
+        .route(
+            "/api/admin/sessions/{id}/replay",
+            get(admin::session_replay),
+        )
+        .route(
+            "/api/admin/sessions/{id}/events",
+            get(admin::session_events),
+        )
         .route("/api/admin/metrics/overview", get(admin::metrics_overview))
-        .route("/api/admin/metrics/by-session/{id}", get(admin::metrics_by_session))
-        .route("/api/admin/prompt-templates", post(admin::create_prompt_template))
-        .route("/api/admin/prompt-templates", get(admin::list_prompt_templates))
-        .route("/api/admin/prompt-templates/{id}", delete(admin::delete_prompt_template))
+        .route(
+            "/api/admin/metrics/by-session/{id}",
+            get(admin::metrics_by_session),
+        )
+        .route(
+            "/api/admin/prompt-templates",
+            post(admin::create_prompt_template),
+        )
+        .route(
+            "/api/admin/prompt-templates",
+            get(admin::list_prompt_templates),
+        )
+        .route(
+            "/api/admin/prompt-templates/{id}",
+            delete(admin::delete_prompt_template),
+        )
         .route("/api/admin/chat/generate", post(admin::chat_generate))
         .route("/api/admin/replay", post(admin::replay_with_prompt))
         .route("/api/admin/users", get(admin::list_users))
@@ -290,36 +377,90 @@ async fn main() -> Result<()> {
         .route("/api/admin/providers/{id}", put(admin::update_provider))
         .route("/api/admin/providers/{id}", delete(admin::delete_provider))
         // Image providers admin
-        .route("/api/admin/image-providers", get(admin::list_image_providers))
-        .route("/api/admin/image-providers", post(admin::create_image_provider))
-        .route("/api/admin/image-providers/{id}", put(admin::update_image_provider))
-        .route("/api/admin/image-providers/{id}", delete(admin::delete_image_provider))
+        .route(
+            "/api/admin/image-providers",
+            get(admin::list_image_providers),
+        )
+        .route(
+            "/api/admin/image-providers",
+            post(admin::create_image_provider),
+        )
+        .route(
+            "/api/admin/image-providers/{id}",
+            put(admin::update_image_provider),
+        )
+        .route(
+            "/api/admin/image-providers/{id}",
+            delete(admin::delete_image_provider),
+        )
         // Admin requirement docs & tasks
-        .route("/api/admin/requirement-docs", get(requirement_docs::admin_list_docs))
-        .route("/api/admin/requirement-docs/{id}", get(requirement_docs::admin_get_doc))
+        .route(
+            "/api/admin/requirement-docs",
+            get(requirement_docs::admin_list_docs),
+        )
+        .route(
+            "/api/admin/requirement-docs/{id}",
+            get(requirement_docs::admin_get_doc),
+        )
         .route("/api/admin/tasks", get(requirement_docs::admin_list_tasks))
         // Weixin bot admin
-        .route("/api/admin/weixin/login", post(weixin::routes::create_login))
-        .route("/api/admin/weixin/login/{login_id}", get(weixin::routes::get_login))
-        .route("/api/admin/weixin/accounts", get(weixin::routes::list_accounts))
-        .route("/api/admin/weixin/accounts/{id}", patch(weixin::routes::update_account))
-        .route("/api/admin/weixin/accounts/{id}", delete(weixin::routes::delete_account))
-        .route("/api/admin/weixin/bindings", get(weixin::routes::list_bindings))
-        .route("/api/admin/weixin/bindings/{id}", delete(weixin::routes::delete_binding_admin))
+        .route(
+            "/api/admin/weixin/login",
+            post(weixin::routes::create_login),
+        )
+        .route(
+            "/api/admin/weixin/login/{login_id}",
+            get(weixin::routes::get_login),
+        )
+        .route(
+            "/api/admin/weixin/accounts",
+            get(weixin::routes::list_accounts),
+        )
+        .route(
+            "/api/admin/weixin/accounts/{id}",
+            patch(weixin::routes::update_account),
+        )
+        .route(
+            "/api/admin/weixin/accounts/{id}",
+            delete(weixin::routes::delete_account),
+        )
+        .route(
+            "/api/admin/weixin/bindings",
+            get(weixin::routes::list_bindings),
+        )
+        .route(
+            "/api/admin/weixin/bindings/{id}",
+            delete(weixin::routes::delete_binding_admin),
+        )
         .route("/api/admin/weixin/send", post(weixin::routes::send_message))
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
-        .route("/api/admin/clients/{cid}/terminals", get(admin_terminal::list_terminals))
-        .route("/api/admin/clients/{cid}/terminals/{tid}/output", get(admin_terminal::terminal_output))
-        .route("/api/admin/clients/{cid}/terminals/{tid}/input", post(admin_terminal::terminal_input))
-        .route("/api/admin/notifications", get(admin_terminal::list_notifications))
+        .route(
+            "/api/admin/clients/{cid}/terminals",
+            get(admin_terminal::list_terminals),
+        )
+        .route(
+            "/api/admin/clients/{cid}/terminals/{tid}/output",
+            get(admin_terminal::terminal_output),
+        )
+        .route(
+            "/api/admin/clients/{cid}/terminals/{tid}/input",
+            post(admin_terminal::terminal_input),
+        )
+        .route(
+            "/api/admin/notifications",
+            get(admin_terminal::list_notifications),
+        )
         .layer(middleware::from_fn(admin_required))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ));
 
     // Static file serving for admin SPA
     // 注意用 fallback（保留 200 状态），not_found_service 会把 SPA 路由也标成 404
-    let admin_static = ServeDir::new("admin/dist")
-        .fallback(ServeFile::new("admin/dist/index.html"));
+    let admin_static =
+        ServeDir::new("admin/dist").fallback(ServeFile::new("admin/dist/index.html"));
 
     let app = public
         .merge(protected)
@@ -335,7 +476,7 @@ async fn main() -> Result<()> {
                         uri = %request.uri(),
                     )
                 })
-                .on_response(DefaultOnResponse::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
         .with_state(state);
 
