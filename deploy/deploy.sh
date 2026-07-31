@@ -119,7 +119,7 @@ ssh "$SSH_HOST" "cd $REMOTE_SRC && \$HOME/.cargo/bin/cargo build --release -p ha
 
 # ---------- 4. 部署产物 ----------
 log "部署到 $REMOTE_RELEASE ..."
-ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE/admin' '$REMOTE_APP/logs'"
+ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE/admin' '$REMOTE_APP/logs' && chown -R hank:hank '$REMOTE_APP/logs'"
 # 从服务器构建目录拷贝二进制到部署目录
 ssh "$SSH_HOST" "install -m 755 '$REMOTE_SRC/target/release/hank-server' '$REMOTE_RELEASE/hank-server'"
 # admin 静态文件
@@ -162,8 +162,15 @@ set -euo pipefail
 systemctl daemon-reload
 systemctl enable $SERVICE_NAME
 systemctl restart $SERVICE_NAME
-sleep 2
-systemctl is-active $SERVICE_NAME
+for i in \$(seq 1 10); do
+  if systemctl is-active --quiet $SERVICE_NAME; then
+    systemctl is-active $SERVICE_NAME
+    exit 0
+  fi
+  sleep 1
+done
+systemctl status $SERVICE_NAME --no-pager
+exit 1
 REMOTE
 
 # ---------- 6. 健康检查 (服务需先连数据库, 重试最多 30s) ----------
