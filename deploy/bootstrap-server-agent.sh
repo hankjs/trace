@@ -47,6 +47,7 @@ if [[ $EUID -ne 0 ]]; then
   echo "ERROR: 远端 bootstrap 必须以 root 执行" >&2
   exit 1
 fi
+cd /
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq

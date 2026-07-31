@@ -42,6 +42,7 @@ log "校验生产 Git 基线可获取 commit $GIT_SHA ..."
 ssh "$SSH_HOST" bash -s -- "$GIT_SHA" <<'REMOTE'
 set -euo pipefail
 sha="$1"
+cd /
 id hank >/dev/null 2>&1 || { echo "ERROR: 请先运行 make bootstrap-server-agent" >&2; exit 1; }
 for attempt in 1 2 3; do
   if runuser --user hank -- git -C /opt/hank-src fetch --prune origin; then
@@ -181,6 +182,6 @@ exit 1
 REMOTE
 
 log "推进 trace-production 基线 ..."
-ssh "$SSH_HOST" "runuser --user hank -- git -C /opt/hank-src update-ref refs/heads/trace-production '$GIT_SHA'"
+ssh "$SSH_HOST" "cd / && runuser --user hank -- git -C /opt/hank-src update-ref refs/heads/trace-production '$GIT_SHA'"
 
 log "部署完成 ✔  (systemctl status $SERVICE_NAME / journalctl -u $SERVICE_NAME 查看状态)"
