@@ -946,11 +946,12 @@ impl Database {
         .await?;
 
         // Job runs table（定时任务执行日志，镜像 quant_job_run：旁路日志，写失败不影响任务）
+        // 注意 trigger 是 MySQL 保留字，必须带反引号
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS job_runs (
                 id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 job_id VARCHAR(64) NOT NULL,
-                trigger VARCHAR(16) NOT NULL,
+                `trigger` VARCHAR(16) NOT NULL,
                 status VARCHAR(16) NOT NULL,
                 operator VARCHAR(64) DEFAULT NULL,
                 started_at DATETIME NOT NULL,
@@ -3134,7 +3135,7 @@ impl Database {
         let now = Utc::now();
         let res = db_retry!(
             sqlx::query(
-                "INSERT INTO job_runs (job_id, trigger, status, operator, started_at, created_at) VALUES (?, ?, 'running', ?, ?, ?)"
+                "INSERT INTO job_runs (job_id, `trigger`, status, operator, started_at, created_at) VALUES (?, ?, 'running', ?, ?, ?)"
             )
             .bind(job_id)
             .bind(trigger)
