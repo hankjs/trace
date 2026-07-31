@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 from ..db import SessionLocal
 from ..models import BacktestRun, Strategy
 from ..strategy.evidence import advance_after_backtest
-from .engine import run_backtest
+from .engine import BacktestCancelledError, run_backtest
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,7 @@ CLAIMABLE = "pending"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
+CANCELLED = "cancelled"
 
 
 def claim_run(db: Session, run_id: int) -> BacktestRun | None:
@@ -59,7 +60,7 @@ def mark_failed(db: Session, run_id: int, message: str) -> None:
     db.commit()
 
 
-def execute_backtest_run(run_id: int) -> None:
+def execute_backtest_run(run_id: int, *, cancel_event=None) -> None:
     """后台入口:独立 Session 执行并推进证据。"""
     with SessionLocal() as db:
         try:
@@ -91,6 +92,7 @@ def execute_backtest_run(run_id: int) -> None:
                 pool_id=run.pool_id,
                 execution_spec=execution_spec,
                 run_id=run.id,
+                cancel_event=cancel_event,
             )
             transition = None
             try:
@@ -106,6 +108,18 @@ def execute_backtest_run(run_id: int) -> None:
             logger.info(
                 "回测作业完成 run_id=%s transition=%s", run_id, transition,
             )
+        except BacktestCancelledError:
+            logger.info("回测作业取消 run_id=%s", run_id)
+            try:
+                db.rollback()
+                run = db.get(BacktestRun, run_id)
+                if run is not None:
+                    run.status = CANCELLED
+                    run.error = "已在检查点中断,已完成部分不计入结果"
+                    run.finished_at = datetime.now()
+                    db.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception("标记取消状态时出错 run_id=%s", run_id)
         except Exception as exc:  # noqa: BLE001
             logger.exception("回测作业失败 run_id=%s", run_id)
             try:

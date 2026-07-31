@@ -28,6 +28,7 @@ from __future__ import annotations
 import itertools
 import logging
 import math
+import threading
 from collections import Counter
 from copy import deepcopy
 from datetime import date, timedelta
@@ -72,6 +73,16 @@ from ..strategy.spec import (
 from .validation import evaluate_validation
 
 logger = logging.getLogger(__name__)
+
+
+class BacktestCancelledError(Exception):
+    """取消事件在回测检查点被置位时抛出,调用方负责把 run/trial 标为 cancelled。"""
+
+
+def _check_cancel(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise BacktestCancelledError("已在检查点中断,已完成部分不计入结果")
+
 
 DEFAULT_COSTS = {
     "commission": 0.00025,  # 佣金,双边
@@ -435,6 +446,7 @@ def _single_execution_schedule(
     exits: pd.DataFrame,
     reason_map: dict[tuple[pd.Timestamp, str], list[dict]],
     synthetic_entries: pd.DataFrame,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[
     pd.DataFrame, pd.DataFrame, dict[tuple[pd.Timestamp, str], dict], dict[str, int],
 ]:
@@ -458,6 +470,7 @@ def _single_execution_schedule(
     attribution = _empty_execution_attribution()
 
     for code in entries.columns:
+        _check_cancel(cancel_event)
         holding = False
         pending: dict | None = None
         synthetic_pending = False
@@ -522,7 +535,8 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
                   costs: dict, start: date,
                   exit_reasons_by_code: dict[
                       str, dict[pd.Timestamp, list[dict]]
-                  ] | None = None) -> dict[str, dict]:
+                  ] | None = None,
+                  cancel_event: threading.Event | None = None) -> dict[str, dict]:
     """vectorbt 批量单标的回测:同一组 entries/exits 矩阵一次跑完。
 
     dfs/positions 为含预热段的完整序列(positions 与 dfs[code] 行位置对齐),
@@ -546,6 +560,7 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
     if fractional:
         return _batch_single_fractional(
             dfs, positions, costs, start, exit_reasons_by_code,
+            cancel_event=cancel_event,
         )
     idx = pd.DatetimeIndex(
         sorted({d for df in dfs.values() for d in df["date"] if d >= start})
@@ -556,6 +571,7 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
     exits = pd.DataFrame(False, index=idx, columns=close.columns)
     synthetic_entries = pd.DataFrame(False, index=idx, columns=close.columns)
     for code, pos in positions.items():
+        _check_cancel(cancel_event)
         if code not in close.columns:
             continue
         p = pd.Series(pos.to_numpy(float), index=pd.DatetimeIndex(dfs[code]["date"]))
@@ -577,6 +593,7 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
     }
     entries, exits, exit_events, attribution = _single_execution_schedule(
         dfs, idx, entries, exits, reason_map, synthetic_entries,
+        cancel_event=cancel_event,
     )
 
     pf = vbt.Portfolio.from_signals(
@@ -589,6 +606,7 @@ def _batch_single(dfs: dict[str, pd.DataFrame], positions: dict[str, pd.Series],
     details = _trade_details(pf, dfs, reason_map, exit_events=exit_events)
     out: dict[str, dict] = {}
     for code in close.columns:
+        _check_cancel(cancel_event)
         eq = eq_all[code].dropna()
         if len(eq) < 3:
             continue
@@ -613,6 +631,7 @@ def _batch_single_fractional(
     exit_reasons_by_code: dict[
         str, dict[pd.Timestamp, list[dict]]
     ] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, dict]:
     """含中间档位的单标的回测:目标仓位矩阵 -> T+1 开盘 targetpercent 调仓。
 
@@ -657,6 +676,7 @@ def _batch_single_fractional(
     }
     actual, exit_events = _portfolio_execution_schedule(
         w_full, dfs, idx, w_exec, planned, reason_map, synthetic_entries,
+        cancel_event=cancel_event,
     )
 
     commission_fees = np.full(close.shape, costs["commission"], dtype=float)
@@ -705,12 +725,15 @@ def run_backtest(db: Session, strategy, codes: list[str],
                  user_id: str | None = None,
                  pool_id: int | None = None,
                  execution_spec: StrategySpec | dict | None = None,
-                 run_id: int | None = None) -> dict:
+                 run_id: int | None = None,
+                 cancel_event: threading.Event | None = None) -> dict:
     """编译当前 StrategySpec，并复用既有 T+1 撮合完成回测。
 
     规格在函数入口立即解析成不可变快照；数据加载期间即使策略行被原地更新，
     本次运行也不会重新读取。`params` 仅保留给迁移期旧客户端，先转换成完整规格。
+    cancel_event 在各主循环检查点被检查,置位时安全退出,不保留半量结果。
     """
+    _check_cancel(cancel_event)
     costs = _validate_costs(costs)
     legacy_params: dict = {}
     if execution_spec is not None:
@@ -745,6 +768,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
             db, strategy, codes, start, end, snapshot, legacy_params, costs, save,
             dynamic_universe=dynamic_universe, user_id=user_id,
             pool_id=pool_id, run_id=run_id,
+            cancel_event=cancel_event,
         )
 
     warmup_start = start - timedelta(days=SINGLE_WARMUP_DAYS)
@@ -754,6 +778,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
     positions: dict[str, pd.Series] = {}
     exit_reasons: dict[str, dict[pd.Timestamp, list[dict]]] = {}
     for code in codes:
+        _check_cancel(cancel_event)
         # 多加载 start 之前的历史做指标预热;信号在完整序列上计算,引擎内切窗口
         df = load_bars_df(db, code, start=warmup_start, end=end,
                           extra_fields=extra_fields)
@@ -818,6 +843,7 @@ def run_backtest(db: Session, strategy, codes: list[str],
 
     results = _batch_single(
         dfs, positions, costs, start, exit_reasons_by_code=exit_reasons,
+        cancel_event=cancel_event,
     )
     execution_attribution = results.pop(
         "_execution_attribution", _empty_execution_attribution(),
@@ -1001,6 +1027,7 @@ def _portfolio_execution_schedule(
     reason_map: dict[tuple[pd.Timestamp, str], list[dict]],
     synthetic_entries: pd.DataFrame,
     rebalance_mask: pd.DataFrame | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[pd.DataFrame, dict[tuple[pd.Timestamp, str], dict]]:
     """组合订单可成交调度：买入失败丢弃，卖出失败保留并逐日重试。
 
@@ -1025,10 +1052,12 @@ def _portfolio_execution_schedule(
     )
 
     for code in w_exec.columns:
+        _check_cancel(cancel_event)
         pending: dict | None = None
         synthetic_pending_target: float | None = None
         blocked_buy_until_reset = False
         for day in bt_idx:
+            _check_cancel(cancel_event)
             if rebalance.at[day, code]:
                 blocked_buy_until_reset = False
             target = planned_orders.at[day, code]
@@ -1095,6 +1124,7 @@ def _enforce_actual_portfolio_order_tradability(
     exit_events: dict[tuple[pd.Timestamp, str], dict],
     reason_map: dict[tuple[pd.Timestamp, str], list[dict]],
     weights_full: pd.DataFrame,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[pd.DataFrame, dict[tuple[pd.Timestamp, str], dict]]:
     """按 vectorbt 实际订单方向二次约束整行目标权重调仓。
 
@@ -1113,6 +1143,7 @@ def _enforce_actual_portfolio_order_tradability(
     max_updates = max(1, orders.size * 3)
 
     for _ in range(max_updates):
+        _check_cancel(cancel_event)
         probe = vbt.Portfolio.from_orders(
             close, size=orders, size_type="targetpercent", price=open_,
             init_cash=1.0, fees=costs["commission"],
@@ -1180,7 +1211,8 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
                    bt_idx: pd.DatetimeIndex, costs: dict,
                    exit_reasons: dict[
                        tuple[pd.Timestamp, str], list[dict]
-                   ] | None = None) -> dict:
+                   ] | None = None,
+                   cancel_event: threading.Event | None = None) -> dict:
     """组合模拟:weights_full 为含预热段的完整目标权重矩阵(行=交易日)。
 
     先 shift(1) 再截断到 bt_idx:首个交易日以起点前最后一天的权重开盘建仓,
@@ -1214,10 +1246,12 @@ def _portfolio_sim(weights_full: pd.DataFrame, pool_dfs: dict[str, pd.DataFrame]
     w_orders, exit_events = _portfolio_execution_schedule(
         weights_full, pool_dfs, bt_idx, w_exec, planned_orders, reason_map,
         synthetic_entries, rebalance_mask=rebalance,
+        cancel_event=cancel_event,
     )
     w_orders, exit_events = _enforce_actual_portfolio_order_tradability(
         w_orders, close, open_, pool_dfs, bt_idx, costs, synthetic_entries,
         exit_events, reason_map, weights_full,
+        cancel_event=cancel_event,
     )
 
     commission_fees = np.full(w_exec.shape, costs["commission"], dtype=float)
@@ -1259,12 +1293,14 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
                    start: date, end: date, snapshot, legacy_params: dict,
                    costs: dict, save: bool, *, dynamic_universe: bool,
                    user_id: str | None, pool_id: int | None = None,
-                   run_id: int | None = None) -> dict:
+                   run_id: int | None = None,
+                   cancel_event: threading.Event | None = None) -> dict:
     """组合规格编译为目标权重，再交给既有 T+1 组合撮合。"""
     warmup_start = start - timedelta(days=PORTFOLIO_WARMUP_DAYS)
     extra_fields = required_snapshot_fields(snapshot.spec)
     pool_dfs: dict[str, pd.DataFrame] = {}
     for code in codes:
+        _check_cancel(cancel_event)
         df = load_bars_df(db, code, start=warmup_start, end=end,
                           extra_fields=extra_fields)
         if len(df) < MIN_BARS:
@@ -1328,6 +1364,7 @@ def _run_portfolio(db: Session, strategy, codes: list[str],
     sim = _portfolio_sim(
         weights_full, pool_dfs, bt_idx, costs,
         exit_reasons=exit_reasons,
+        cancel_event=cancel_event,
     )
     eq = sim["equity"]
     fee_assumptions = _fee_assumptions(costs)

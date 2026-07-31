@@ -19,6 +19,7 @@ from ..backtest.engine import (
 )
 from ..backtest.evaluate import leaderboard
 from ..backtest.jobs import execute_backtest_run, pending_payload
+from ..backtest.listing import list_runs
 from ..backtest.validation import (
     evaluate_declared_sweep,
     validate_backtest_window,
@@ -571,18 +572,36 @@ def get_backtest(run_id: int, db: Session = Depends(get_db),
     return result
 
 
+@plural_router.get("")
+def list_backtests(
+    strategy_id: int | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=50),
+    before_run_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """列出本人回测 run,summary 字段与 GET /api/backtest/{run_id} 一致。"""
+    return list_runs(
+        db,
+        user_id=user_id_from_claims(claims),
+        strategy_id=strategy_id,
+        limit=limit,
+        before_run_id=before_run_id,
+    )
+
+
 # ---- 全局异步任务系统:handler 注册(app/tasks.py) ----
 
-def _backtest_task_handler(db: Session, task: Task) -> dict | None:
+def _backtest_task_handler(db: Session, task: Task, *, cancel_event=None) -> dict | None:
     """执行已冻结的 BacktestRun,并把它的终态映射到任务上。"""
-    execute_backtest_run(task.ref_id)
+    execute_backtest_run(task.ref_id, cancel_event=cancel_event)
     # execute_backtest_run 用自己的 Session 提交;先结束当前事务快照,
     # 否则 MySQL REPEATABLE READ 下读到的还是执行前的状态
     db.rollback()
     run = db.get(BacktestRun, task.ref_id)
     if run is None:
         raise RuntimeError("回测记录不存在")
-    if run.status != "done":
+    if run.status not in {"done", "cancelled"}:
         raise RuntimeError(run.error or f"回测未成功(状态 {run.status})")
     return None
 
@@ -625,6 +644,6 @@ def _sensitivity_task_handler(db: Session, task: Task) -> dict:
     )
 
 
-register_handler("backtest", _backtest_task_handler)
+register_handler("backtest", _backtest_task_handler, supports_cancel=True)
 register_handler("sweep", _sweep_task_handler)
 register_handler("sensitivity", _sensitivity_task_handler)

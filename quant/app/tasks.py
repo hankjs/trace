@@ -13,7 +13,9 @@ handler 注册:各业务模块(如 app/api/backtest.py)在 import 时调用
 """
 from __future__ import annotations
 
+import inspect
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Callable
@@ -34,8 +36,11 @@ FAILED = "failed"
 CANCELLED = "cancelled"
 ACTIVE_STATUSES = (PENDING, RUNNING)
 
-Handler = Callable[[Session, Task], dict[str, Any] | None]
+Handler = Callable[..., dict[str, Any] | None]
 HANDLERS: dict[str, Handler] = {}
+SUPPORTS_CANCEL: dict[str, bool] = {}
+_cancel_events: dict[int, threading.Event] = {}
+_cancel_lock = threading.Lock()
 
 _executor: ThreadPoolExecutor | None = None
 
@@ -44,8 +49,9 @@ class TaskConflictError(Exception):
     """同一用户已有进行中的任务。"""
 
 
-def register_handler(task_type: str, handler: Handler) -> None:
+def register_handler(task_type: str, handler: Handler, *, supports_cancel: bool = False) -> None:
     HANDLERS[task_type] = handler
+    SUPPORTS_CANCEL[task_type] = supports_cancel
 
 
 def _get_executor() -> ThreadPoolExecutor:
@@ -98,68 +104,93 @@ def submit_task(
 
 def run_task(task_id: int) -> None:
     """worker 入口:原子抢占 pending → running,分发执行,落终态。"""
-    with SessionLocal() as db:
-        try:
-            claimed = db.execute(
-                update(Task)
-                .where(Task.id == task_id, Task.status == PENDING)
-                .values(status=RUNNING, started_at=datetime.now(), error=None)
-            )
-            db.commit()
-            if claimed.rowcount != 1:
-                logger.info("任务 %s 不可抢占(已处理或已取消)", task_id)
-                return
-            task = db.get(Task, task_id)
-            handler = HANDLERS.get(task.type)
-            if handler is None:
-                raise RuntimeError(f"未注册的任务类型: {task.type}")
-            result = handler(db, task)
-            # handler 可能长时间运行并持有很多过期快照,提交一次再写终态,
-            # 避免 REPEATABLE READ 下读到 handler 之前的旧数据
-            db.expire_all()
-            task.status = DONE
-            task.result = result
-            task.finished_at = datetime.now()
-            db.commit()
-            logger.info("任务完成 id=%s type=%s", task_id, task.type)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("任务失败 id=%s", task_id)
+    cancel_event = threading.Event()
+    with _cancel_lock:
+        _cancel_events[task_id] = cancel_event
+    try:
+        with SessionLocal() as db:
             try:
-                db.rollback()
+                claimed = db.execute(
+                    update(Task)
+                    .where(Task.id == task_id, Task.status == PENDING)
+                    .values(status=RUNNING, started_at=datetime.now(), error=None)
+                )
+                db.commit()
+                if claimed.rowcount != 1:
+                    logger.info("任务 %s 不可抢占(已处理或已取消)", task_id)
+                    return
                 task = db.get(Task, task_id)
-                if task is not None:
-                    task.status = FAILED
-                    task.error = str(exc)[:4000]
-                    task.finished_at = datetime.now()
-                    db.commit()
-            except Exception:  # noqa: BLE001
-                logger.exception("标记任务失败状态时出错 id=%s", task_id)
+                handler = HANDLERS.get(task.type)
+                if handler is None:
+                    raise RuntimeError(f"未注册的任务类型: {task.type}")
+                # 向后兼容:只有声明 supports_cancel 的 handler 才传 cancel_event
+                if SUPPORTS_CANCEL.get(task.type):
+                    result = handler(db, task, cancel_event=cancel_event)
+                else:
+                    result = handler(db, task)
+                # handler 可能长时间运行并持有很多过期快照,提交一次再写终态,
+                # 避免 REPEATABLE READ 下读到 handler 之前的旧数据
+                db.expire_all()
+                # 协作取消:handler 正常返回但事件已被置位,任务统一标为 cancelled
+                if SUPPORTS_CANCEL.get(task.type) and cancel_event.is_set():
+                    task.status = CANCELLED
+                    task.error = "已在检查点中断,已完成部分不计入结果"
+                else:
+                    task.status = DONE
+                    task.result = result
+                task.finished_at = datetime.now()
+                db.commit()
+                logger.info("任务完成 id=%s type=%s", task_id, task.type)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("任务失败 id=%s", task_id)
+                try:
+                    db.rollback()
+                    task = db.get(Task, task_id)
+                    if task is not None:
+                        task.status = FAILED
+                        task.error = str(exc)[:4000]
+                        task.finished_at = datetime.now()
+                        db.commit()
+                except Exception:  # noqa: BLE001
+                    logger.exception("标记任务失败状态时出错 id=%s", task_id)
+    finally:
+        with _cancel_lock:
+            _cancel_events.pop(task_id, None)
 
 
 def cancel_task(db: Session, task: Task) -> bool:
-    """取消任务:仅 pending 可取消(running 的线程无法安全中断)。
+    """取消任务:pending 立即取消;running 且任务类型支持协作取消时设置事件。
 
     backtest 任务关联的 BacktestRun 一并标记 cancelled,避免滞留 pending。
-    返回 False 表示任务已不在 pending(调用方转 409)。
+    返回 False 表示任务已不在 pending 或不支持协作取消(调用方转 409)。
     """
-    res = db.execute(
-        update(Task)
-        .where(Task.id == task.id, Task.status == PENDING)
-        .values(status=CANCELLED, finished_at=datetime.now())
-    )
-    if res.rowcount != 1:
-        db.rollback()
-        return False
-    if task.type == "backtest" and task.ref_id is not None:
-        db.execute(
-            update(BacktestRun)
-            .where(BacktestRun.id == task.ref_id, BacktestRun.status == PENDING)
-            .values(
-                status=CANCELLED, error="已取消", finished_at=datetime.now(),
-            )
+    if task.status == PENDING:
+        res = db.execute(
+            update(Task)
+            .where(Task.id == task.id, Task.status == PENDING)
+            .values(status=CANCELLED, finished_at=datetime.now())
         )
-    db.commit()
-    return True
+        if res.rowcount != 1:
+            db.rollback()
+            return False
+        if task.type == "backtest" and task.ref_id is not None:
+            db.execute(
+                update(BacktestRun)
+                .where(BacktestRun.id == task.ref_id, BacktestRun.status == PENDING)
+                .values(
+                    status=CANCELLED, error="已取消", finished_at=datetime.now(),
+                )
+            )
+        db.commit()
+        return True
+
+    if task.status == RUNNING and SUPPORTS_CANCEL.get(task.type):
+        with _cancel_lock:
+            event = _cancel_events.get(task.id)
+        if event is not None:
+            event.set()
+            return True
+    return False
 
 
 def recover_tasks() -> None:

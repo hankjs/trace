@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0024_dynamic_factors"}
+    assert heads == {"0025_a2a_tables"}
     assert current_heads(migrated_db) == heads
 
 
@@ -83,6 +83,9 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_pool",
         "quant_pool_grant",
         "quant_pool_member",
+        "quant_a2a_audit",
+        "quant_research_finding",
+        "quant_factor_evaluation",
         "quant_research_plan",
         "quant_research_plan_item",
         "quant_selection_config",

@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from ..backtest.engine import DEFAULT_COSTS, run_backtest, _validate_costs
+from ..backtest.engine import DEFAULT_COSTS, BacktestCancelledError, run_backtest, _validate_costs
 from ..models import Experiment, ExperimentTrial, Strategy
 from ..strategy.evidence import spec_identity_hash
 from ..strategy.spec import (
@@ -252,6 +252,7 @@ def create_trial_and_run(
     pool_id: int | None = None,
     dynamic_universe: bool = False,
     strategy: Strategy | None = None,
+    cancel_event=None,
 ) -> tuple[ExperimentTrial, dict[str, Any] | None, dict[str, Any]]:
     """创建 trial 并同步执行回测(写入 run + 回填 trial)。
 
@@ -341,6 +342,7 @@ def create_trial_and_run(
             user_id=owner_id,
             pool_id=pool_id,
             execution_spec=parsed,
+            cancel_event=cancel_event,
         )
         trial.backtest_run_id = result.get("run_id")
         trial.outcome = _outcome_from_result(result)
@@ -371,6 +373,17 @@ def create_trial_and_run(
             trial=trial,
             result=result,
         )
+    except BacktestCancelledError:
+        trial.outcome = "error"
+        trial.error = "已在检查点中断,已完成部分不计入结果"
+        exp.status = "running"
+        promotion = {
+            "eligible": False,
+            "suggested_target": None,
+            "checks": [],
+            "block_reasons": ["cancelled"],
+            "todo": None,
+        }
     except Exception as exc:  # noqa: BLE001
         trial.outcome = "error"
         trial.error = str(exc)[:2000]

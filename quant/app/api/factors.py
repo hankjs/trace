@@ -9,7 +9,7 @@ import re
 from datetime import date
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -21,7 +21,7 @@ from ..data.ingest import BAR_FIELDS, SNAPSHOT_SPEC_FIELDS, load_bars_df
 from ..db import get_db
 from ..factors import build_reason_tree, evaluate_factor, invalidate_factor_cache
 from ..factors.backfill import run_factor_backfill_task
-from ..models import FactorDef, SelectionConfig
+from ..models import FactorDef, FactorEvaluation, SelectionConfig
 from ..selection.config import (
     SelectionConfigUpdateIn,
     get_active_selection_config_row,
@@ -288,7 +288,7 @@ def delete_factor(key: str, db: Session = Depends(get_db),
 @router.post("/validate")
 def validate_factor_expression(body: FactorValidateIn,
                                db: Session = Depends(get_db),
-                               _claims: dict = Depends(require_admin)):
+                               _claims: dict = Depends(require_client)):
     """校验表达式并返回规范化哈希、min_bars 等信息。"""
     result = _validate_factor_expression(db, body.expression)
     return result.model_dump(mode="json")
@@ -297,7 +297,7 @@ def validate_factor_expression(body: FactorValidateIn,
 @router.post("/preview")
 def preview_factor(body: FactorPreviewIn,
                    db: Session = Depends(get_db),
-                   _claims: dict = Depends(require_admin)):
+                   _claims: dict = Depends(require_client)):
     """预览表达式/因子在指定股票上的最近 N 日序列与原因树。"""
     if body.factor_key is not None:
         def_ = _get_factor_or_404(db, body.factor_key)
@@ -421,6 +421,71 @@ def backfill_factors(body: FactorBackfillIn,
         },
     )
     return {"task": task_payload(task)}
+
+
+def _evaluation_out(row: FactorEvaluation) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "factor_key": row.factor_key,
+        "expression": row.expression,
+        "expression_hash": row.expression_hash,
+        "start": str(row.start),
+        "end": str(row.end),
+        "pool_id": row.pool_id,
+        "codes": row.codes,
+        "layers": row.layers,
+        "rebalance": row.rebalance,
+        "universe": row.universe,
+        "result": row.result,
+        "status": row.status,
+        "error": row.error,
+        "created_at": (
+            row.created_at.isoformat(sep=" ") if row.created_at else None
+        ),
+        "finished_at": (
+            row.finished_at.isoformat(sep=" ") if row.finished_at else None
+        ),
+    }
+
+
+@router.get("/evaluations")
+def list_evaluations(
+    limit: int = Query(default=20, ge=1, le=50),
+    before_id: int | None = Query(default=None),
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """列出本人因子评估结果,limit 上限 50,before_id 游标分页。"""
+    user_id = user_id_from_claims(claims)
+    q = select(FactorEvaluation).where(FactorEvaluation.user_id == user_id)
+    if before_id is not None:
+        q = q.where(FactorEvaluation.id < before_id)
+    q = q.order_by(FactorEvaluation.id.desc()).limit(limit + 1)
+    rows = list(db.execute(q).scalars().all())
+    has_more = len(rows) > limit
+    return {
+        "items": [_evaluation_out(row) for row in rows[:limit]],
+        "has_more": has_more,
+    }
+
+
+@router.get("/evaluations/{evaluation_id}")
+def get_evaluation(
+    evaluation_id: int,
+    db: Session = Depends(get_db),
+    claims: dict = Depends(require_client),
+):
+    """获取本人单条因子评估详情;非本人按 404 防探测。"""
+    user_id = user_id_from_claims(claims)
+    row = db.execute(
+        select(FactorEvaluation).where(
+            FactorEvaluation.id == evaluation_id,
+            FactorEvaluation.user_id == user_id,
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(404, f"评估 {evaluation_id} 不存在")
+    return _evaluation_out(row)
 
 
 __all__ = ["router"]

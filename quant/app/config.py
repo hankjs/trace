@@ -84,6 +84,11 @@ class Settings:
         # False 时维持旧口径:池内 + 自选股。
         self.full_market_daily: bool = False
 
+        # A2A 配额与限速(可被 quant/config.toml [quant] 段覆盖)
+        self.a2a_daily_quota: int = 50
+        self.a2a_read_rate_limit: int = 60
+        self.a2a_short_task_ttl_minutes: int = 15
+
         # quant 自己的覆盖配置(可选)
         cfg_env: str | None = None
         local_cfg = QUANT_DIR / "config.toml"
@@ -119,6 +124,12 @@ class Settings:
                 self.bulk_daily_bars = bool(local["bulk_daily_bars"])
             if "full_market_daily" in local:
                 self.full_market_daily = bool(local["full_market_daily"])
+            if "a2a_daily_quota" in local:
+                self.a2a_daily_quota = int(local["a2a_daily_quota"])
+            if "a2a_read_rate_limit" in local:
+                self.a2a_read_rate_limit = int(local["a2a_read_rate_limit"])
+            if "a2a_short_task_ttl_minutes" in local:
+                self.a2a_short_task_ttl_minutes = int(local["a2a_short_task_ttl_minutes"])
 
         # QUANT_ENV 优先于 config.toml,便于 systemd 注入而无需改配置文件
         self.env = normalize_env(os.environ.get("QUANT_ENV") or cfg_env)

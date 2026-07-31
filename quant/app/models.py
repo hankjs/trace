@@ -891,3 +891,70 @@ class Task(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class A2aAudit(Base):
+    """A2A 审计缺口列:validate 与运行期失败统一落表,供 gap_summary 聚合。"""
+
+    __tablename__ = "quant_a2a_audit"
+    __table_args__ = (
+        Index("ix_a2a_audit_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    a2a_task_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    skill: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    experiment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    trial_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_kind: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    missing_capability: Mapped[str | None] = mapped_column(
+        String(128), nullable=True, index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class ResearchFinding(Base):
+    """Orchestrator Conclude 步骤的 findings 落表,跨会话聚合系统缺口。"""
+
+    __tablename__ = "quant_research_finding"
+
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    detail: Mapped[str] = mapped_column(String(512), nullable=False)
+    evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
+    suggested_system_work: Mapped[str | None] = mapped_column(Text, nullable=True)
+    experiment_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    session_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class FactorEvaluation(Base):
+    """因子有效性评估结果落库:IC/RankIC/ICIR/分层多空,可复现可复查。"""
+
+    __tablename__ = "quant_factor_evaluation"
+
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    factor_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    expression: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    expression_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    start: Mapped[date] = mapped_column(Date, nullable=False)
+    end: Mapped[date] = mapped_column(Date, nullable=False)
+    pool_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    layers: Mapped[int] = mapped_column(Integer, nullable=False)
+    rebalance: Mapped[str] = mapped_column(String(16), nullable=False)
+    universe: Mapped[dict] = mapped_column(JSON, nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="done", nullable=False, index=True,
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

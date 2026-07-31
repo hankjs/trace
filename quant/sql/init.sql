@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0024_dynamic_factors
+-- Schema revision: 0025_a2a_tables
 
 SET NAMES utf8mb4;
 
@@ -578,6 +578,68 @@ CREATE TABLE `quant_backtest_equity` (
     FOREIGN KEY (`run_id`) REFERENCES `quant_backtest_run` (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
 
+CREATE TABLE `quant_a2a_audit` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `user_id` VARCHAR(36) NOT NULL,
+  `a2a_task_id` VARCHAR(64) NOT NULL,
+  `skill` VARCHAR(64) NOT NULL,
+  `source` VARCHAR(32) NOT NULL,
+  `run_id` INT DEFAULT NULL,
+  `experiment_id` INT DEFAULT NULL,
+  `trial_id` INT DEFAULT NULL,
+  `failure_kind` VARCHAR(32) DEFAULT NULL,
+  `missing_capability` VARCHAR(128) DEFAULT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `ix_a2a_audit_user_created` (`user_id`, `created_at`),
+  KEY `ix_a2a_audit_user_id` (`user_id`),
+  KEY `ix_a2a_audit_a2a_task_id` (`a2a_task_id`),
+  KEY `ix_a2a_audit_skill` (`skill`),
+  KEY `ix_a2a_audit_failure_kind` (`failure_kind`),
+  KEY `ix_a2a_audit_missing_capability` (`missing_capability`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_research_finding` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `user_id` VARCHAR(36) NOT NULL,
+  `kind` VARCHAR(32) NOT NULL,
+  `detail` VARCHAR(512) NOT NULL,
+  `evidence` TEXT DEFAULT NULL,
+  `suggested_system_work` TEXT DEFAULT NULL,
+  `experiment_id` INT DEFAULT NULL,
+  `run_id` INT DEFAULT NULL,
+  `session_ref` VARCHAR(64) DEFAULT NULL,
+  `source` VARCHAR(32) NOT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `ix_quant_research_finding_user_id` (`user_id`),
+  KEY `ix_quant_research_finding_kind` (`kind`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
+CREATE TABLE `quant_factor_evaluation` (
+  `id` BIGINT NOT NULL AUTO_INCREMENT,
+  `user_id` VARCHAR(36) NOT NULL,
+  `factor_key` VARCHAR(64) DEFAULT NULL,
+  `expression` JSON DEFAULT NULL,
+  `expression_hash` VARCHAR(64) DEFAULT NULL,
+  `start` DATE NOT NULL,
+  `end` DATE NOT NULL,
+  `pool_id` INT DEFAULT NULL,
+  `codes` JSON DEFAULT NULL,
+  `layers` INT NOT NULL,
+  `rebalance` VARCHAR(16) NOT NULL,
+  `universe` JSON NOT NULL,
+  `result` JSON DEFAULT NULL,
+  `status` VARCHAR(16) NOT NULL DEFAULT 'done',
+  `error` TEXT DEFAULT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `finished_at` DATETIME DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `ix_quant_factor_evaluation_user_id` (`user_id`),
+  KEY `ix_quant_factor_evaluation_factor_key` (`factor_key`),
+  KEY `ix_quant_factor_evaluation_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci;
+
 START TRANSACTION;
 
 -- 系统池和系统策略使用哨兵 UUID，不依赖共享 users 表中的真实用户。
@@ -692,6 +754,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0024_dynamic_factors');
+VALUES ('0025_a2a_tables');
 
 COMMIT;
