@@ -1416,6 +1416,23 @@ export interface AdminJobsResponse {
   jobs: AdminJob[]
 }
 
+/** A2A 缺口聚合单项 */
+export interface GapItem {
+  missing_capability: string
+  failure_kind: string
+  count: number
+  last_seen?: string | null
+  source?: 'audit' | 'finding'
+}
+
+/** GET /api/admin/a2a-gaps 响应 */
+export interface GapSummaryResponse {
+  audit_items: GapItem[]
+  finding_items: GapItem[]
+  merged: GapItem[]
+  note: string
+}
+
 // ---- 因子库 (factors) ----
 
 export type FactorDirection = 'asc' | 'desc' | string
@@ -1532,6 +1549,13 @@ export const api = {
   adminJobRuns(jobId: string, limit = 20) {
     return request<AdminJobRun[]>(
       `/api/admin/jobs/${encodeURIComponent(jobId)}/runs?limit=${limit}`,
+    )
+  },
+
+  /** A2A 缺口聚合排行(仅 admin):审计缺口列 + research findings 双源合并 */
+  adminA2aGaps(limit = 20, sinceDays = 30) {
+    return request<GapSummaryResponse>(
+      `/api/admin/a2a-gaps?limit=${limit}&since_days=${sinceDays}`,
     )
   },
 

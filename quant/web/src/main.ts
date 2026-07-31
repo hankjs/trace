@@ -38,6 +38,7 @@ const router = createRouter({
     { path: '/settings', name: 'settings', component: () => import('./views/Settings.vue') },
     { path: '/admin/jobs', name: 'admin-jobs', component: () => import('./views/AdminJobs.vue'), meta: { admin: true } },
     { path: '/admin/factors', name: 'admin-factors', component: () => import('./views/FactorsAdmin.vue'), meta: { admin: true } },
+    { path: '/admin/gaps', name: 'admin-gaps', component: () => import('./views/AdminGaps.vue'), meta: { admin: true } },
     {
       path: '/picks',
       redirect: (to) => ({ name: 'selection', query: { ...to.query, tab: 'picks' } }),

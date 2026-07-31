@@ -4,6 +4,7 @@ import type { Component } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import {
   Activity,
+  AlertTriangle,
   Bell,
   BookOpen,
   BriefcaseBusiness,
@@ -124,6 +125,7 @@ const navGroups = computed(() => {
       items: [
         { to: { name: 'admin-jobs' }, name: 'admin-jobs', label: '定时任务', icon: Timer },
         { to: { name: 'admin-factors' }, name: 'admin-factors', label: '因子库', icon: Sigma },
+        { to: { name: 'admin-gaps' }, name: 'admin-gaps', label: '缺口排行', icon: AlertTriangle },
       ],
     })
   }
@@ -148,6 +150,7 @@ const routeTitles: Record<string, string> = {
   settings: '账户设置',
   'admin-jobs': '定时任务',
   'admin-factors': '因子库管理',
+  'admin-gaps': '缺口排行',
 }
 
 const routeDescriptions: Record<string, string> = {
@@ -166,6 +169,7 @@ const routeDescriptions: Record<string, string> = {
   settings: '记录与实盘能力相关的偏好，系统不会代为下单。',
   'admin-jobs': '查看数据采集与研究流水线的调度状态，并可手动触发一次执行。',
   'admin-factors': '动态因子定义、预览、回填与选股评分配置。',
+  'admin-gaps': '聚合 A2A 审计缺口与 Agent findings，按缺失能力与失败类别排序。',
 }
 
 const currentRouteTitle = computed(() => routeTitles[String(route.name)] ?? '研究工作台')

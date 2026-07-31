@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from .. import job_log, scheduler_lock
+from ..a2a.gaps import aggregate_gaps
 from ..auth import require_admin
 from ..config import settings
 from ..backtest.evaluate import run_evaluation
@@ -325,6 +326,26 @@ async def job_runs(job_id: str, limit: int = Query(20, ge=1, le=100)):
     if job_def(job_id) is None:
         raise HTTPException(404, f"未知任务: {job_id}")
     return await run_db_job(lambda db: job_log.recent_runs(db, job_id, limit))
+
+
+@router.get("/a2a-gaps")
+async def a2a_gaps(
+    limit: int = Query(20, ge=1),
+    since_days: int = Query(30, ge=1),
+):
+    """A2A 缺口聚合排行(admin 全局视图)。
+
+    双源聚合:quant_a2a_audit 缺口列 + quant_research_finding。
+    与 system.gap_summary skill 调用同一 aggregate_gaps 函数,禁止复制 SQL。
+    limit 与 since_days 超过硬上限时静默 clamp。
+    """
+    limit = min(limit, 50)
+    since_days = min(since_days, 90)
+    return await run_db_job(
+        lambda db: aggregate_gaps(
+            db, user_id=None, scope="global", limit=limit, since_days=since_days
+        )
+    )
 
 
 @router.post("/jobs/{job_id}/run", status_code=202)
