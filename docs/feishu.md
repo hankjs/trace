@@ -21,7 +21,8 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
 - **确认闸门升级**：微信是文本白名单（回复"确认"），飞书是按钮卡片；回调文本化后走同一套 `handle_quant_confirmation`，code-agent 零改动
-- **远程执行**：会话创建时自动绑定在线桌面 client（与微信渠道同逻辑），飞书派的活在你的桌面上跑
+- **两种执行模式**：默认仍可绑定在线桌面 client；开启 `[server_agent]` 后改为 wananyun 本地 monorepo worktree，完全不依赖 `client/`
+- **管理员边界**：server Agent 只接受绑定到 `can_login_admin = true` 用户的飞书消息
 
 ## 一、飞书开放平台配置
 
@@ -35,6 +36,7 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 6. **权限**（权限管理，按需开通）：
    - `im:message`（读取消息）
    - `im:message:send_as_bot`（以机器人身份发消息）
+   - `im:resource`（下载用户发来的截图）
    - `im:chat:readonly`（可选，后续扩展群信息）
 7. **发布应用**：版本管理与发布 → 创建版本并发布（企业自建应用管理员审核后生效）
 8. 建一个**话题群**，群设置 → 群机器人 → 把应用加进群
@@ -80,14 +82,78 @@ feishu_monitor = false   # 其他实例关掉
 | 操作 | 说明 |
 |------|------|
 | `@机器人 帮我做 xxx` | 派任务：蓝卡片出现，进度 2s 节流原地刷新，结束变绿/红 |
+| 发送截图 | 图片下载后作为多模态输入交给当前话题 Agent |
 | 话题内继续追问 | 同一会话续接（`feishu_chats` 映射），上下文不断 |
 | 高成本 quant 工具 | 弹确认卡片：点「确认」/「否」；文字回复「确认5次」可批量授权（N≤50） |
 | `/new` | 关闭当前话题会话，下次发消息开新会话 |
 | `/stop` | 取消当前执行中的任务 |
 | `/status` | 查看当前话题的会话 ID 与状态 |
+| `/diff` | 查看当前 worktree 相对生产基线的状态与 diff stat |
+| `/test` | 按变更路径运行固定测试矩阵，可用 `/stop` 取消 |
+| `/deploy` | 固化 commit 并发送部署审批卡；只有发起管理员可批准 |
+| `/rollback` | 对最近一次成功部署发送回滚审批卡，切回 previous release 后健康检查 |
 | `/help` | 命令列表 |
 
-## 四、与 agent-os 文档的对应与差异
+## 四、wananyun server Agent
+
+不需要在 wananyun 维护两份手工同步的源码。目录职责如下：
+
+```text
+/opt/hank-src                         只保存 Git 生产基线 trace-production
+/opt/hank-worktrees/<session-uuid>    每个飞书话题一个独立可写 worktree
+/opt/hank*/releases/<deployment-id>   不可变运行 release
+/opt/hank*/current                    systemd/nginx 当前版本链接
+/opt/hank*/previous                   最近一个可回滚版本链接
+/opt/hank/deploy-jobs                 审批后的结构化 manifest 与结果
+```
+
+可迭代范围是 `server/`、`crates/`、`admin/`、`cli/`、`quant/`、`docs/`；`client/` 在文件工具、shell 规则和部署前检查三处拒绝。`deploy/`、systemd、sudoers、`Makefile` 和配置模板属于部署基础设施，不能自部署，需走 SSH 应急入口。
+
+### 首次初始化
+
+首次仍需一次 SSH。先提交并 push 本实现，确认本地或线上已有生产 `config.toml`，然后执行：
+
+```bash
+make bootstrap-server-agent
+make deploy
+make deploy-cli       # 线上需要 hank-cli 时
+make deploy-quant     # 线上需要 quant 时
+make deploy-quant-slidev
+```
+
+`bootstrap-server-agent` 会创建两个账号：`hank` 运行 server 并持有审批权限，`hank-build` 只执行仓库 shell、测试和构建，不具备 root 部署权限。构建用户的 Git 信任范围只包含 `/opt/hank-worktrees/*`。bootstrap 还会安装 root-owned `/usr/local/libexec/hank-deploy`；helper 只接受 UUID，从 `/opt/hank/deploy-jobs` 读取 manifest，并把任务转交给独立 systemd transient unit，因此更新 `hank-server` 本身不会中断部署。
+
+生产配置最终应包含：
+
+```toml
+[server_agent]
+enabled = true
+repository_root = "/opt/hank-src"
+worktrees_root = "/opt/hank-worktrees"
+base_ref = "trace-production"
+deploy_jobs_dir = "/opt/hank/deploy-jobs"
+deploy_helper = "/usr/local/libexec/hank-deploy"
+execution_user = "hank-build"
+deploy_use_sudo = true
+approval_ttl_secs = 600
+```
+
+### 日常流程
+
+1. 在飞书新话题描述需求，server 自动创建独立 worktree。
+2. 继续在同一话题补充、修正；用 `/diff` 检查范围。
+3. 用 `/test` 跑固定测试矩阵。
+4. 用 `/deploy` 生成 10 分钟有效的审批卡，确认目标和 diff stat 后点击部署。
+5. helper 从审批 commit 导出一次性源码快照，先构建非 core 目标，最后切换 core；每个目标切换后检查服务或 HTTP 健康状态。
+6. 任一步失败只回滚本次已切换目标；结果在 server 重启后仍会回到原飞书话题。
+
+并发部署由全局 `flock` 串行化。审批 commit 必须仍基于当前 `trace-production`，基线已前进时旧话题会被拒绝，需在新话题重新应用变更。
+
+### quant 迁移
+
+常规 `/test`、`/deploy` 和 `/rollback` 都不会执行 Alembic。检测到 `quant/alembic/` 变更会直接拒绝部署；维护窗口中先通过 SSH 备份并执行 `uv run alembic upgrade head`，确认 schema 后再部署应用。此例外是刻意保留的 break-glass 流程。
+
+## 五、与 agent-os 文档的对应与差异
 
 | 文档做法 | 本项目实现 | 原因 |
 |---------|-----------|------|
@@ -96,15 +162,19 @@ feishu_monitor = false   # 其他实例关掉
 | 会话存 `data/sessions.json` | `feishu_chats` 表 + server 会话本就在 DB | 天然解决持久化与重启恢复 |
 | 文本回复确认 | 卡片按钮确认 | 文档后期审批篇的形态，提前落地 |
 
-## 五、故障排查
+## 六、故障排查
 
 - **收不到消息**：检查事件订阅是否选了长连接、`im.message.receive_v1` 是否添加、应用是否已发布、机器人是否在群里；群里消息必须 @机器人（权限是"群聊中被 @ 的消息"）
 - **按钮点了没反应**：检查回调订阅是否也开了长连接并添加 `card.action.trigger`
 - **回复"请先生成绑定码"**：Trace client → 设置 → 飞书绑定 → 生成绑定码，发给机器人 `bind 123456`
 - **日志看连接状态**：`feishu monitor started` / `feishu ws connected, service_id=...`；断线会指数退避重连（1s→30s）
 - **常见错误码**：`code=99991663` token 失效（自动刷新）；权限类错误回开放平台检查权限范围
+- **部署启动失败**：检查 `sudo -l -U hank`、`/usr/local/libexec/hank-deploy` 权限和 `/opt/hank/deploy-jobs`
+- **构建用户报权限错误**：检查 `hank`、`hank-build` 都在 `hank-workspace` 组，worktree 目录应为 setgid/group-writable
+- **部署日志**：`journalctl -u 'hank-deploy-*'`；server/CLI/quant 分别看对应 systemd unit
+- **应急回退**：飞书不可用时通过 SSH 将目标的 `current` 原子切到 `previous` 并重启服务；SSH 始终保留为 break-glass
 
-## 六、定时任务（系统主动推送）
+## 七、定时任务（系统主动推送）
 
 `server/src/scheduler/`：cron 调度器（上海时区），agent-os 文档"自动化工作流"的落地。
 管理入口在 admin「定时任务」页：查看调度状态/下次执行时间、启停、手动触发、执行记录。
@@ -121,9 +191,8 @@ feishu_monitor = false   # 其他实例关掉
 
 新增 job 的步骤：在 `scheduler/jobs.rs` 写 handler（返回 JSON 结果），在 `JOB_DEFS` 注册 cron，admin 页面自动出现。
 
-## 七、后续（未实现）
+## 八、后续（未实现）
 
-- 图片/文件下载（`im:resource` 权限 + resource.get），截图修 bug 场景
-- `[file:]` 标记媒体回传（上传 image/file 再发送）
+- 普通文件附件下载（当前已支持图片输入和 `[file:]` 图片回传）
 - 更多 job：agent 整理的简报（cron 驱动 run_chat_turn）、失败 @人告警、巡检类任务
 - 多 bot 互相 @ 协作（agent-os 文档后半程的团队作战）

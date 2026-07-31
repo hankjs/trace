@@ -6,6 +6,7 @@ mod chat;
 mod checkpoints;
 mod channel_records;
 mod config;
+mod deployment;
 mod image_gen;
 mod llm;
 pub mod provider_registry;
@@ -193,6 +194,9 @@ async fn main() -> Result<()> {
 
     // 启动飞书 WS 长连接（为每个 enabled 账号起一个 monitor task）
     feishu::monitor::start_monitors(state.clone());
+
+    // 恢复跨越 server 自身重启的独立部署任务监听。
+    deployment::recover_deployments(state.clone());
 
     // 启动定时任务调度器（cron 驱动的系统主动工作入口）
     scheduler::start(state.clone());

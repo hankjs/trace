@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 
 /// 危险命令黑名单的单一来源（FR-PERM-3）。
 /// shell.rs 与 PermissionGuard 共用此列表，避免两份黑名单漂移。
@@ -87,6 +88,10 @@ pub struct PermissionConfig {
     pub sandbox_paths: Vec<String>,
     /// Shell 额外黑名单命令
     pub blocked_commands: Vec<String>,
+    /// 禁止写入的路径前缀；相对路径以 work_dir 为根解析。
+    pub blocked_paths: Vec<String>,
+    /// 只读文件工具也必须留在 sandbox 内。server Agent 开启，普通会话默认关闭。
+    pub restrict_read_paths: bool,
     /// 自动放行的工具名
     pub auto_approve_tools: Vec<String>,
     /// 预授权的命令前缀（如 "npm test"、"cargo test"，FR-PERM-8）
@@ -102,6 +107,8 @@ impl Default for PermissionConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            blocked_paths: Vec::new(),
+            restrict_read_paths: false,
             auto_approve_tools: vec![
                 "read_file".to_string(),
                 "search".to_string(),
@@ -159,6 +166,27 @@ impl PermissionGuard {
         }
     }
 
+    /// 解析已存在的最长前缀，避免 worktree 内符号链接把读写路径带到 sandbox 外。
+    /// 文件尚不存在时保留尾部组件，供 write_file 的父目录校验使用。
+    fn canonicalize_with_missing(path: &str) -> String {
+        let mut existing = PathBuf::from(path);
+        let mut missing = Vec::new();
+        while !existing.exists() {
+            let Some(name) = existing.file_name().map(|name| name.to_os_string()) else {
+                break;
+            };
+            missing.push(name);
+            if !existing.pop() {
+                break;
+            }
+        }
+        let mut resolved = std::fs::canonicalize(&existing).unwrap_or(existing);
+        for component in missing.into_iter().rev() {
+            resolved.push(component);
+        }
+        Self::normalize_path(&resolved.to_string_lossy())
+    }
+
     /// 检查写路径是否落在 sandbox 内（FR-PERM-4）。
     /// sandbox_paths 为空时回退到 work_dir 前缀。
     /// 先词法归一化再做前缀匹配，并要求边界对齐（避免 /workspace-evil 命中 /workspace）。
@@ -168,7 +196,7 @@ impl PermissionGuard {
         } else {
             format!("{}/{}", work_dir.trim_end_matches('/'), path)
         };
-        let resolved = Self::normalize_path(&joined);
+        let resolved = Self::canonicalize_with_missing(&joined);
         let roots: Vec<String> = if self.config.sandbox_paths.is_empty() {
             if work_dir.is_empty() {
                 return true; // 未配置 work_dir 时不做路径限制
@@ -178,7 +206,9 @@ impl PermissionGuard {
             self.config.sandbox_paths.clone()
         };
         roots.iter().any(|prefix| {
-            let norm_prefix = Self::normalize_path(prefix.trim_end_matches('/'));
+            let norm_prefix = std::fs::canonicalize(Path::new(prefix.trim_end_matches('/')))
+                .map(|path| Self::normalize_path(&path.to_string_lossy()))
+                .unwrap_or_else(|_| Self::normalize_path(prefix.trim_end_matches('/')));
             if norm_prefix.is_empty() {
                 return true;
             }
@@ -186,6 +216,24 @@ impl PermissionGuard {
             resolved.starts_with(&norm_prefix)
                 && (resolved.len() == norm_prefix.len()
                     || resolved.as_bytes().get(norm_prefix.len()) == Some(&b'/'))
+        })
+    }
+
+    fn path_is_blocked(&self, path: &str, work_dir: &str) -> bool {
+        let joined = if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/{}", work_dir.trim_end_matches('/'), path)
+        };
+        let resolved = Self::canonicalize_with_missing(&joined);
+        self.config.blocked_paths.iter().any(|blocked| {
+            let prefix = if blocked.starts_with('/') {
+                blocked.clone()
+            } else {
+                format!("{}/{}", work_dir.trim_end_matches('/'), blocked)
+            };
+            let prefix = Self::canonicalize_with_missing(prefix.trim_end_matches('/'));
+            resolved == prefix || resolved.starts_with(&format!("{prefix}/"))
         })
     }
 
@@ -206,12 +254,39 @@ impl PermissionGuard {
         risk: ToolRisk,
         work_dir: &str,
     ) -> PermissionDecision {
-        // 1. Safe 工具与自动放行工具直接放行（任何模式）
-        if risk == ToolRisk::Safe || self.config.auto_approve_tools.contains(&tool_name.to_string()) {
+        // 1. 文件工具先做路径校验；server Agent 的只读工具也不能越出 worktree。
+        let path_tool = matches!(
+            tool_name,
+            "read_file" | "write_file" | "str_replace" | "list_directory" | "search"
+        );
+        if path_tool {
+            let path = input["path"].as_str().unwrap_or(".");
+            if self.path_is_blocked(path, work_dir) {
+                return PermissionDecision::Deny(format!(
+                    "Path '{path}' is inside a blocked workspace path"
+                ));
+            }
+            let is_write = matches!(tool_name, "write_file" | "str_replace");
+            if (is_write || self.config.restrict_read_paths)
+                && !self.path_in_sandbox(path, work_dir)
+            {
+                return PermissionDecision::Deny(format!(
+                    "Path '{path}' is outside allowed sandbox/workspace roots"
+                ));
+            }
+        }
+
+        // 2. Safe 工具与自动放行工具直接放行（任何模式）
+        if risk == ToolRisk::Safe
+            || self
+                .config
+                .auto_approve_tools
+                .contains(&tool_name.to_string())
+        {
             return PermissionDecision::Allow;
         }
 
-        // 2. Shell 黑名单优先于一切：命中直接 Deny（即使 unrestricted）
+        // 3. Shell 黑名单优先于一切：命中直接 Deny（即使 unrestricted）
         if tool_name == "shell" {
             if let Some(cmd) = input["command"].as_str() {
                 let lower = cmd.to_lowercase();
@@ -225,23 +300,11 @@ impl PermissionGuard {
             }
         }
 
-        // 3. ReadOnly 模式：拒绝所有非只读工具
+        // 4. ReadOnly 模式：拒绝所有非只读工具
         if self.config.mode == PermissionMode::ReadOnly {
             return PermissionDecision::Deny(format!(
                 "Tool '{tool_name}' is not allowed in read-only mode"
             ));
-        }
-
-        // 4. 写路径 sandbox 校验（write_file / str_replace）
-        if tool_name == "write_file" || tool_name == "str_replace" {
-            if let Some(path) = input["path"].as_str() {
-                if !self.path_in_sandbox(path, work_dir) {
-                    return PermissionDecision::Deny(format!(
-                        "Path '{}' is outside allowed sandbox/workspace roots",
-                        path
-                    ));
-                }
-            }
         }
 
         // 5. Unrestricted 模式：黑名单外全部放行
@@ -298,7 +361,12 @@ mod tests {
         // 危险命令在任何模式下都被拒绝（FR-PERM-3）
         for mode in [PermissionMode::WorkspaceWrite, PermissionMode::Unrestricted] {
             let g = guard(mode);
-            let d = g.check("shell", &json!({"command": "rm -rf /"}), ToolRisk::Dangerous, "/work");
+            let d = g.check(
+                "shell",
+                &json!({"command": "rm -rf /"}),
+                ToolRisk::Dangerous,
+                "/work",
+            );
             assert!(matches!(d, PermissionDecision::Deny(_)), "mode {:?}", mode);
         }
     }
@@ -306,28 +374,89 @@ mod tests {
     #[test]
     fn test_read_only_denies_writes() {
         let g = guard(PermissionMode::ReadOnly);
-        let d = g.check("write_file", &json!({"path": "a.txt"}), ToolRisk::Moderate, "/work");
+        let d = g.check(
+            "write_file",
+            &json!({"path": "a.txt"}),
+            ToolRisk::Moderate,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::Deny(_)));
         // 只读工具仍然放行
-        let d2 = g.check("read_file", &json!({"path": "a.txt"}), ToolRisk::Safe, "/work");
+        let d2 = g.check(
+            "read_file",
+            &json!({"path": "a.txt"}),
+            ToolRisk::Safe,
+            "/work",
+        );
         assert!(matches!(d2, PermissionDecision::Allow));
     }
 
     #[test]
     fn test_write_outside_sandbox_denied() {
         let g = guard(PermissionMode::WorkspaceWrite);
-        let d = g.check("write_file", &json!({"path": "/etc/passwd"}), ToolRisk::Moderate, "/work");
+        let d = g.check(
+            "write_file",
+            &json!({"path": "/etc/passwd"}),
+            ToolRisk::Moderate,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::Deny(_)));
         // sandbox 内允许
-        let d2 = g.check("write_file", &json!({"path": "/work/a.txt"}), ToolRisk::Moderate, "/work");
+        let d2 = g.check(
+            "write_file",
+            &json!({"path": "/work/a.txt"}),
+            ToolRisk::Moderate,
+            "/work",
+        );
         assert!(matches!(d2, PermissionDecision::Allow));
     }
 
     #[test]
     fn test_path_traversal_denied() {
         let g = guard(PermissionMode::WorkspaceWrite);
-        let d = g.check("write_file", &json!({"path": "../../etc/passwd"}), ToolRisk::Moderate, "/work");
+        let d = g.check(
+            "write_file",
+            &json!({"path": "../../etc/passwd"}),
+            ToolRisk::Moderate,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::Deny(_)));
+    }
+
+    #[test]
+    fn test_blocked_path_denies_direct_and_traversal_writes() {
+        let mut cfg = PermissionConfig::default();
+        cfg.sandbox_paths = vec!["/work".to_string()];
+        cfg.blocked_paths = vec!["client".to_string()];
+        let guard = PermissionGuard::new(cfg);
+        for path in ["client/src/App.vue", "server/../client/package.json"] {
+            let decision = guard.check(
+                "write_file",
+                &json!({"path": path}),
+                ToolRisk::Moderate,
+                "/work",
+            );
+            assert!(matches!(decision, PermissionDecision::Deny(_)), "{path}");
+        }
+    }
+
+    #[test]
+    fn test_restricted_read_path_cannot_escape_workspace() {
+        let mut cfg = PermissionConfig::default();
+        cfg.sandbox_paths = vec!["/work".to_string()];
+        cfg.restrict_read_paths = true;
+        let guard = PermissionGuard::new(cfg);
+        for (tool, path) in [
+            ("read_file", "/opt/hank/config.toml"),
+            ("list_directory", "../"),
+            ("search", "/etc"),
+        ] {
+            let decision = guard.check(tool, &json!({"path": path}), ToolRisk::Safe, "/work");
+            assert!(
+                matches!(decision, PermissionDecision::Deny(_)),
+                "{tool}: {path}"
+            );
+        }
     }
 
     #[test]
@@ -372,10 +501,82 @@ mod tests {
         assert!(matches!(d, PermissionDecision::Deny(_)));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_cannot_escape_sandbox() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("trace-permission-{}-{nonce}", std::process::id()));
+        let workspace = root.join("workspace");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        std::fs::write(outside.join("secret.txt"), "secret").expect("create outside file");
+        symlink(&outside, workspace.join("escape")).expect("create symlink");
+
+        let mut cfg = PermissionConfig::default();
+        cfg.mode = PermissionMode::WorkspaceWrite;
+        cfg.sandbox_paths = vec![workspace.to_string_lossy().into_owned()];
+        cfg.restrict_read_paths = true;
+        let guard = PermissionGuard::new(cfg);
+        let decision = guard.check(
+            "read_file",
+            &json!({"path": "escape/secret.txt"}),
+            ToolRisk::Safe,
+            &workspace.to_string_lossy(),
+        );
+
+        std::fs::remove_dir_all(&root).expect("clean temporary directory");
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_cannot_enter_blocked_path() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let workspace =
+            std::env::temp_dir().join(format!("trace-blocked-path-{}-{nonce}", std::process::id()));
+        let client = workspace.join("client");
+        std::fs::create_dir_all(&client).expect("create blocked directory");
+        symlink(&client, workspace.join("alias")).expect("create symlink");
+
+        let mut cfg = PermissionConfig::default();
+        cfg.mode = PermissionMode::WorkspaceWrite;
+        cfg.sandbox_paths = vec![workspace.to_string_lossy().into_owned()];
+        cfg.blocked_paths = vec!["client".to_string()];
+        let guard = PermissionGuard::new(cfg);
+        let decision = guard.check(
+            "write_file",
+            &json!({"path": "alias/App.vue"}),
+            ToolRisk::Moderate,
+            &workspace.to_string_lossy(),
+        );
+
+        std::fs::remove_dir_all(&workspace).expect("clean temporary directory");
+        assert!(matches!(decision, PermissionDecision::Deny(_)));
+    }
+
     #[test]
     fn test_dangerous_needs_approval_in_escalated() {
         let g = guard(PermissionMode::Escalated);
-        let d = g.check("shell", &json!({"command": "ls -la"}), ToolRisk::Dangerous, "/work");
+        let d = g.check(
+            "shell",
+            &json!({"command": "ls -la"}),
+            ToolRisk::Dangerous,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::NeedApproval(_)));
     }
 
@@ -383,7 +584,12 @@ mod tests {
     fn test_workspace_write_allows_shell() {
         // workspace-write 模式下普通 shell 自主执行（对齐 Codex sandbox 语义）
         let g = guard(PermissionMode::WorkspaceWrite);
-        let d = g.check("shell", &json!({"command": "ls -la"}), ToolRisk::Dangerous, "/work");
+        let d = g.check(
+            "shell",
+            &json!({"command": "ls -la"}),
+            ToolRisk::Dangerous,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::Allow));
     }
 
@@ -393,14 +599,24 @@ mod tests {
         cfg.mode = PermissionMode::WorkspaceWrite;
         cfg.approved_prefixes = vec!["cargo test".to_string()];
         let g = PermissionGuard::new(cfg);
-        let d = g.check("shell", &json!({"command": "cargo test --workspace"}), ToolRisk::Dangerous, "/work");
+        let d = g.check(
+            "shell",
+            &json!({"command": "cargo test --workspace"}),
+            ToolRisk::Dangerous,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::Allow));
     }
 
     #[test]
     fn test_unrestricted_allows_normal_shell() {
         let g = guard(PermissionMode::Unrestricted);
-        let d = g.check("shell", &json!({"command": "ls -la"}), ToolRisk::Dangerous, "/work");
+        let d = g.check(
+            "shell",
+            &json!({"command": "ls -la"}),
+            ToolRisk::Dangerous,
+            "/work",
+        );
         assert!(matches!(d, PermissionDecision::Allow));
     }
 }

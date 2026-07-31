@@ -4,8 +4,11 @@ After=network.target hank-server.service
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/hank
-ExecStart=/opt/hank/hank-cli --config /opt/hank/hank-cli.toml
+User=hank
+Group=hank
+WorkingDirectory=/opt/hank-cli
+Environment=HOME=/home/hank
+ExecStart=/opt/hank-cli/current/hank-cli --config /opt/hank-cli/hank-cli.toml
 Restart=always
 RestartSec=3
 # 日志直接进 journal (journalctl -u hank-cli)
@@ -14,6 +17,7 @@ StandardError=journal
 # 基础加固; PTY shell 需要写 $HOME(shell-integration) 和配置文件(client_id 写回), 不做只读根
 NoNewPrivileges=true
 PrivateTmp=true
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

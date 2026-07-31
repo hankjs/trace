@@ -18,11 +18,22 @@ enum TestFramework {
 
 pub struct TestRunnerTool {
     work_dir: Option<String>,
+    run_as_user: Option<String>,
 }
 
 impl TestRunnerTool {
     pub fn new(work_dir: Option<String>) -> Self {
-        Self { work_dir }
+        Self {
+            work_dir,
+            run_as_user: None,
+        }
+    }
+
+    pub fn new_as_user(work_dir: Option<String>, user: impl Into<String>) -> Self {
+        Self {
+            work_dir,
+            run_as_user: Some(user.into()),
+        }
     }
 
     fn resolve_dir(&self) -> String {
@@ -38,8 +49,7 @@ impl TestRunnerTool {
         }
         if dir_path.join("package.json").exists() {
             // 检查是否有 jest 配置
-            if dir_path.join("jest.config.js").exists()
-                || dir_path.join("jest.config.ts").exists()
+            if dir_path.join("jest.config.js").exists() || dir_path.join("jest.config.ts").exists()
             {
                 return TestFramework::Jest;
             }
@@ -214,7 +224,26 @@ impl Tool for TestRunnerTool {
             }
         };
 
-        let mut cmd = Command::new(&cmd_name);
+        let mut cmd = if let Some(user) = &self.run_as_user {
+            let mut command = Command::new("sudo");
+            let home = format!("HOME=/home/{user}");
+            let path = format!(
+                "PATH=/home/{user}/.cargo/bin:/home/{user}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+            );
+            command.args([
+                "--non-interactive",
+                "--user",
+                user,
+                "--",
+                "env",
+                &home,
+                &path,
+                &cmd_name,
+            ]);
+            command
+        } else {
+            Command::new(&cmd_name)
+        };
         cmd.args(&args);
         cmd.current_dir(&dir);
 
@@ -258,7 +287,10 @@ impl Tool for TestRunnerTool {
                 is_error: true,
             }),
             Err(_) => Ok(ToolOutput {
-                content: format!("Error: test execution timed out after {}s", LONG_TOOL_TIMEOUT.as_secs()),
+                content: format!(
+                    "Error: test execution timed out after {}s",
+                    LONG_TOOL_TIMEOUT.as_secs()
+                ),
                 is_error: true,
             }),
         }

@@ -1,0 +1,27 @@
+# Trace mdBook 文档，由飞书部署流程发布到 /opt/hank-docs/current。
+server {
+    listen 3002;
+    listen [::]:3002;
+
+    server_name _;
+    root /opt/hank-docs/current;
+    index index.html;
+    charset utf-8;
+
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+
+    gzip on;
+    gzip_vary on;
+    gzip_min_length 1024;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    location / {
+        try_files $uri $uri/ $uri.html =404;
+    }
+
+    location ~ /\. {
+        deny all;
+    }
+}

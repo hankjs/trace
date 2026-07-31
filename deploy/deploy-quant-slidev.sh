@@ -19,6 +19,8 @@ REMOTE_APP="/opt/hank-quant-slidev"
 NGINX_SITE="quant-slidev"
 LISTEN_PORT=3030
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_ID="manual-$(git -C "$PROJECT_ROOT" rev-parse --short=12 HEAD)-$(date +%Y%m%d%H%M%S)"
+REMOTE_RELEASE="$REMOTE_APP/releases/$RELEASE_ID"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
@@ -40,10 +42,20 @@ if [[ ! -f "$PROJECT_ROOT/quant/slidev/dist/index.html" ]]; then
 fi
 
 # ---------- 2. 同步静态文件 ----------
-log "同步 slidev 到服务器 $REMOTE_APP ..."
-ssh "$SSH_HOST" "mkdir -p $REMOTE_APP"
+log "同步 slidev 到服务器 $REMOTE_RELEASE ..."
+ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE'"
 rsync -az --delete -e ssh \
-  "$PROJECT_ROOT/quant/slidev/dist/" "$SSH_HOST:$REMOTE_APP/"
+  "$PROJECT_ROOT/quant/slidev/dist/" "$SSH_HOST:$REMOTE_RELEASE/"
+ssh "$SSH_HOST" bash -s -- "$REMOTE_RELEASE" "$REMOTE_APP" "$RELEASE_ID" <<'REMOTE'
+set -euo pipefail
+release="$1"
+app="$2"
+release_id="$3"
+previous="$(readlink -f "$app/current" 2>/dev/null || true)"
+[[ -z "$previous" ]] || ln -sfn "$previous" "$app/previous"
+ln -s "$release" "$app/current.tmp.$release_id"
+mv -Tf "$app/current.tmp.$release_id" "$app/current"
+REMOTE
 
 # ---------- 3. nginx 站点 ----------
 log "安装 nginx 站点 ($NGINX_SITE, 端口 $LISTEN_PORT)..."

@@ -13,4 +13,5 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }
 futures = { workspace = true }
+shlex = { workspace = true }
 hank-a2a-client = { path = "../hank-a2a-client" }

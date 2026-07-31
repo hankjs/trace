@@ -3,6 +3,7 @@
 //! 手写极简实现（对齐 weixin/api.rs 风格，不引入第三方 SDK）。
 
 use anyhow::{anyhow, bail, Result};
+use futures::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ pub const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
 
 /// token 提前刷新余量（官方有效期约 2 小时）
 const TOKEN_REFRESH_MARGIN: Duration = Duration::from_secs(300);
+const MAX_RESOURCE_BYTES: usize = 10 * 1024 * 1024;
 
 struct CachedToken {
     token: String,
@@ -166,6 +168,94 @@ impl FeishuApi {
     ) -> Result<String> {
         self.reply_message(message_id, "interactive", card.clone(), reply_in_thread)
             .await
+    }
+
+    /// 上传图片并回复到原消息。只接受调用方已校验过的图片字节。
+    pub async fn reply_image(
+        &self,
+        message_id: &str,
+        bytes: Vec<u8>,
+        file_name: &str,
+        media_type: &str,
+        reply_in_thread: bool,
+    ) -> Result<String> {
+        let image_key = self.upload_image(bytes, file_name, media_type).await?;
+        self.reply_message(
+            message_id,
+            "image",
+            json!({ "image_key": image_key }),
+            reply_in_thread,
+        )
+        .await
+    }
+
+    async fn upload_image(
+        &self,
+        bytes: Vec<u8>,
+        file_name: &str,
+        media_type: &str,
+    ) -> Result<String> {
+        if bytes.len() > MAX_RESOURCE_BYTES {
+            bail!("图片超过 10 MiB 限制");
+        }
+        let token = self.tenant_token().await?;
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(file_name.to_string())
+            .mime_str(media_type)?;
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+        let resp = self
+            .http
+            .post(format!("{}/open-apis/im/v1/images", self.base))
+            .bearer_auth(&token)
+            .multipart(form)
+            .send()
+            .await?
+            .json::<ApiResp>()
+            .await?;
+        if resp.code != 0 {
+            bail!("飞书上传图片失败 code={} msg={}", resp.code, resp.msg);
+        }
+        resp.data
+            .and_then(|data| data["image_key"].as_str().map(str::to_string))
+            .ok_or_else(|| anyhow!("飞书上传图片响应缺少 image_key"))
+    }
+
+    /// 下载消息中的图片资源，供多模态 Agent 使用。
+    pub async fn download_message_image(
+        &self,
+        message_id: &str,
+        image_key: &str,
+    ) -> Result<Vec<u8>> {
+        let token = self.tenant_token().await?;
+        let response = self
+            .http
+            .get(format!(
+                "{}/open-apis/im/v1/messages/{}/resources/{}?type=image",
+                self.base, message_id, image_key
+            ))
+            .bearer_auth(&token)
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            bail!("飞书下载图片失败 HTTP {}", response.status());
+        }
+        if let Some(length) = response.content_length() {
+            if length > MAX_RESOURCE_BYTES as u64 {
+                bail!("飞书图片超过 10 MiB 限制");
+            }
+        }
+        let mut bytes = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_RESOURCE_BYTES {
+                bail!("飞书图片超过 10 MiB 限制");
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(bytes)
     }
 
     async fn reply_message(

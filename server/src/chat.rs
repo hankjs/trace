@@ -26,7 +26,7 @@ use code_tools::{
     test_runner::TestRunnerTool,
     web_fetch::WebFetchTool,
     write_file::WriteFileTool,
-    Tool,
+    PermissionConfig, PermissionMode, Tool,
 };
 use futures::stream::Stream;
 use serde::Deserialize;
@@ -215,6 +215,12 @@ pub async fn run_chat_turn(
         .as_ref()
         .and_then(|s| s.exec_client_id.clone());
     let session_user_id = session_record.as_ref().and_then(|s| s.user_id.clone());
+    let server_agent_session = session_record
+        .as_ref()
+        .and_then(|s| s.metadata.as_deref())
+        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+        .and_then(|metadata| metadata["server_agent"].as_bool())
+        .unwrap_or(false);
 
     // Check if this session has a pending ask_user state.
     // quant_confirm 类待确认单优先从进程内 map 读取（设计 §5.4.4），未命中再回退 DB。
@@ -239,6 +245,8 @@ pub async fn run_chat_turn(
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
         let token = opts.auth_token.clone();
         let checksum_store = new_checksum_store();
+        let execution_user = server_agent_session
+            .then(|| state.config.server_agent.execution_user.clone());
         // fs/shell 类工具：绑定 exec_client_id 的会话改用远程代理工具，
         // 在桌面 client 本地执行；test_runner 远程会话不提供（可用 shell 跑测试）
         let mut t: Vec<Arc<dyn Tool>> = match (&exec_client_id, &session_user_id) {
@@ -252,26 +260,40 @@ pub async fn run_chat_turn(
                 remote.push(Arc::new(WebFetchTool::new()));
                 remote
             }
-            _ => vec![
-                Arc::new(ShellTool::new(work_dir.clone())),
-                Arc::new(ReadFileTool::with_checksum_store(
-                    work_dir.clone(),
-                    checksum_store.clone(),
-                )),
-                Arc::new(WriteFileTool::with_checksum_store(
-                    work_dir.clone(),
-                    checksum_store.clone(),
-                )),
-                Arc::new(StrReplaceTool::with_checksum_store(
-                    work_dir.clone(),
-                    checksum_store.clone(),
-                )),
-                Arc::new(ListDirectoryTool::new(work_dir.clone())),
-                Arc::new(SearchTool::new(work_dir.clone())),
-                Arc::new(GitTool::new(work_dir.clone())),
-                Arc::new(WebFetchTool::new()),
-                Arc::new(TestRunnerTool::new(work_dir.clone())),
-            ],
+            _ => {
+                let shell = match &execution_user {
+                    Some(user) => ShellTool::new_as_user(work_dir.clone(), user.clone()),
+                    None => ShellTool::new(work_dir.clone()),
+                };
+                let git = match &execution_user {
+                    Some(user) => GitTool::new_as_user(work_dir.clone(), user.clone()),
+                    None => GitTool::new(work_dir.clone()),
+                };
+                let test_runner = match &execution_user {
+                    Some(user) => TestRunnerTool::new_as_user(work_dir.clone(), user.clone()),
+                    None => TestRunnerTool::new(work_dir.clone()),
+                };
+                vec![
+                    Arc::new(shell),
+                    Arc::new(ReadFileTool::with_checksum_store(
+                        work_dir.clone(),
+                        checksum_store.clone(),
+                    )),
+                    Arc::new(WriteFileTool::with_checksum_store(
+                        work_dir.clone(),
+                        checksum_store.clone(),
+                    )),
+                    Arc::new(StrReplaceTool::with_checksum_store(
+                        work_dir.clone(),
+                        checksum_store.clone(),
+                    )),
+                    Arc::new(ListDirectoryTool::new(work_dir.clone())),
+                    Arc::new(SearchTool::new(work_dir.clone())),
+                    Arc::new(git),
+                    Arc::new(WebFetchTool::new()),
+                    Arc::new(test_runner),
+                ]
+            },
         };
         t.push(Arc::new(UpdateSpecTool::new(
             base_url.clone(),
@@ -623,10 +645,38 @@ pub async fn run_chat_turn(
             );
             // 接入权限模型：workspace-write 模式 + work_dir 作为可写根（FR-PERM-1/4）
             if let Some(ref wd) = work_dir_for_agent {
-                session = session.with_permission(
-                    code_tools::PermissionMode::WorkspaceWrite,
-                    wd.clone(),
-                );
+                if server_agent_session {
+                    let mut permission = PermissionConfig::default();
+                    permission.mode = PermissionMode::WorkspaceWrite;
+                    permission.sandbox_paths = vec![wd.clone()];
+                    permission.blocked_paths = vec![format!("{wd}/client")];
+                    permission.restrict_read_paths = true;
+                    permission.blocked_commands.extend([
+                        "sudo".to_string(),
+                        "systemctl".to_string(),
+                        "service ".to_string(),
+                        "shutdown".to_string(),
+                        "reboot".to_string(),
+                        "kill ".to_string(),
+                        "pkill ".to_string(),
+                        "git reset --hard".to_string(),
+                        "git clean -f".to_string(),
+                        "git checkout --".to_string(),
+                        "client/".to_string(),
+                        "cd client".to_string(),
+                        "cd ./client".to_string(),
+                        "../".to_string(),
+                        "/opt/hank".to_string(),
+                        "/home/hank".to_string(),
+                        "/etc/".to_string(),
+                        "config.toml".to_string(),
+                        "trace-production".to_string(),
+                        "update-ref".to_string(),
+                    ]);
+                    session = session.with_permission_config(permission, wd.clone());
+                } else {
+                    session = session.with_permission(PermissionMode::WorkspaceWrite, wd.clone());
+                }
             }
             // 分层注入运行时 + 环境上下文（FR-CTX-1/2）。
             // base 沿用客户端组装的 system_prompt（业务提示词由客户端负责）。
@@ -667,6 +717,9 @@ pub async fn run_chat_turn(
                     ));
                 }
                 project_segments.append(&mut quant_segments);
+                if server_agent_session {
+                    project_segments.extend(load_server_agent_instructions(&work_dir_for_agent));
+                }
                 let (_assembled, named) = code_agent::build_layered_prompt(
                     Some(&system_prompt),
                     Some(&runtime),
@@ -750,6 +803,27 @@ pub async fn run_chat_turn(
     }.instrument(agent_span));
 
     Ok(ChatTurnHandle { event_rx: rx })
+}
+
+fn load_server_agent_instructions(work_dir: &Option<String>) -> Vec<code_agent::PromptSegment> {
+    let Some(work_dir) = work_dir else { return Vec::new() };
+    let root = std::path::Path::new(work_dir);
+    let mut segments = Vec::new();
+    for (name, path) in [
+        ("AGENTS.md", root.join("AGENTS.md")),
+        ("quant/AGENTS.md", root.join("quant/AGENTS.md")),
+    ] {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => segments.push(code_agent::PromptSegment::Dynamic(
+                format!("项目指令 {name}:\n{content}"),
+            )),
+            Err(e) => tracing::debug!(path = %path.display(), "server agent instruction unavailable: {e}"),
+        }
+    }
+    segments.push(code_agent::PromptSegment::Dynamic(
+        "你正在 wananyun 的 server-only 工作区中工作。client/ 永远不在迭代和部署范围内；不要调用 sudo、systemctl 或直接修改运行目录。完成代码后使用 /diff、/test、/deploy，由用户在飞书审批部署。".to_string(),
+    ));
+    segments
 }
 
 // PLACEHOLDER_CHAT_HANDLER

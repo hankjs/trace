@@ -20,15 +20,35 @@
 set -euo pipefail
 
 SSH_HOST="${SSH_HOST:-wananyun}"
-REMOTE_SRC="/root/hank-src"       # 服务器上的源码构建目录
+REMOTE_SRC="/root/hank-build"     # SSH 应急部署的临时构建目录
 REMOTE_APP="/opt/hank"            # 部署目录
 SERVICE_NAME="hank-server"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GIT_SHA="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+RELEASE_ID="manual-${GIT_SHA:0:12}-$(date +%Y%m%d%H%M%S)"
+REMOTE_RELEASE="$REMOTE_APP/releases/$RELEASE_ID"
 
 SKIP_DEPS=0
 [[ "${1:-}" == "--skip-deps" ]] && SKIP_DEPS=1
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain)" ]]; then
+  echo "ERROR: 手工部署前请先提交全部改动，trace-production 必须对应确定的 commit" >&2
+  exit 1
+fi
+
+log "校验生产 Git 基线可获取 commit $GIT_SHA ..."
+ssh "$SSH_HOST" bash -s -- "$GIT_SHA" <<'REMOTE'
+set -euo pipefail
+sha="$1"
+id hank >/dev/null 2>&1 || { echo "ERROR: 请先运行 make bootstrap-server-agent" >&2; exit 1; }
+runuser --user hank -- git -C /opt/hank-src fetch --prune origin
+runuser --user hank -- git -C /opt/hank-src cat-file -e "$sha^{commit}" || {
+  echo "ERROR: 当前 commit 尚未 push 到 origin" >&2
+  exit 1
+}
+REMOTE
 
 # ---------- 1. 服务器构建依赖 ----------
 # 国内服务器默认走 rsproxy.cn 镜像加速 rustup/crates; CARGO_MIRROR=none 可关闭
@@ -88,27 +108,41 @@ log "服务器上 cargo build --release (首次较慢)..."
 ssh "$SSH_HOST" "cd $REMOTE_SRC && \$HOME/.cargo/bin/cargo build --release -p hank-server"
 
 # ---------- 4. 部署产物 ----------
-log "部署到 $REMOTE_APP ..."
-ssh "$SSH_HOST" "mkdir -p $REMOTE_APP/admin $REMOTE_APP/logs"
+log "部署到 $REMOTE_RELEASE ..."
+ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE/admin' '$REMOTE_APP/logs'"
 # 从服务器构建目录拷贝二进制到部署目录
-ssh "$SSH_HOST" "install -m 755 $REMOTE_SRC/target/release/hank-server $REMOTE_APP/hank-server"
+ssh "$SSH_HOST" "install -m 755 '$REMOTE_SRC/target/release/hank-server' '$REMOTE_RELEASE/hank-server'"
 # admin 静态文件
 rsync -az --delete -e ssh \
-  "$PROJECT_ROOT/admin/dist/" "$SSH_HOST:$REMOTE_APP/admin/dist/"
+  "$PROJECT_ROOT/admin/dist/" "$SSH_HOST:$REMOTE_RELEASE/admin/dist/"
+ssh "$SSH_HOST" "ln -s '$REMOTE_APP/logs' '$REMOTE_RELEASE/logs'"
 
 # config.toml: 只在服务器缺失时上传, 绝不覆盖
 if ssh "$SSH_HOST" "[[ ! -f $REMOTE_APP/config.toml ]]"; then
   if [[ -f "$PROJECT_ROOT/config.toml" ]]; then
     log "上传 config.toml (仅首次)..."
     scp -q "$PROJECT_ROOT/config.toml" "$SSH_HOST:$REMOTE_APP/config.toml"
-    ssh "$SSH_HOST" "chmod 600 $REMOTE_APP/config.toml"
+    ssh "$SSH_HOST" "chown root:hank '$REMOTE_APP/config.toml' && chmod 640 '$REMOTE_APP/config.toml'"
   else
     echo "ERROR: 服务器上没有 config.toml, 本地也没有, 请先从 config.example.toml 创建" >&2
     exit 1
   fi
 else
   log "服务器已有 config.toml, 跳过 (如需更新请手动 scp)"
+  ssh "$SSH_HOST" "chown root:hank '$REMOTE_APP/config.toml' && chmod 640 '$REMOTE_APP/config.toml'"
 fi
+
+# current 使用同目录临时链接原子切换，previous 保留上一个可回退版本。
+ssh "$SSH_HOST" bash -s -- "$REMOTE_RELEASE" "$REMOTE_APP" "$RELEASE_ID" <<'REMOTE'
+set -euo pipefail
+release="$1"
+app="$2"
+release_id="$3"
+previous="$(readlink -f "$app/current" 2>/dev/null || true)"
+[[ -z "$previous" ]] || ln -sfn "$previous" "$app/previous"
+ln -s "$release" "$app/current.tmp.$release_id"
+mv -Tf "$app/current.tmp.$release_id" "$app/current"
+REMOTE
 
 # ---------- 5. systemd 服务 ----------
 log "注册并重启 systemd 服务..."
@@ -136,5 +170,8 @@ done
 echo "ERROR: 健康检查失败, 查看 journalctl -u hank-server" >&2
 exit 1
 REMOTE
+
+log "推进 trace-production 基线 ..."
+ssh "$SSH_HOST" "runuser --user hank -- git -C /opt/hank-src update-ref refs/heads/trace-production '$GIT_SHA'"
 
 log "部署完成 ✔  (systemctl status $SERVICE_NAME / journalctl -u $SERVICE_NAME 查看状态)"

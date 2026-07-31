@@ -11,6 +11,20 @@ database_url = "mysql://user:password@host:3306/dbname"
 # 留空时自动探测常见路径，也可用 CHROME_PATH 环境变量指定
 # chrome_path = "/usr/bin/chromium"
 
+# 飞书驱动的 server-only monorepo Agent（默认关闭）。
+# 开启后，绑定到 can_login_admin 用户的飞书话题会创建独立 Git worktree，
+# 可迭代 server/crates/admin/cli/quant/docs，但 client/ 永远拒绝部署。
+[server_agent]
+enabled = false
+repository_root = "/opt/hank-src"
+worktrees_root = "/opt/hank-worktrees"
+base_ref = "trace-production"
+deploy_jobs_dir = "/opt/hank/deploy-jobs"
+deploy_helper = "/usr/local/libexec/hank-deploy"
+execution_user = "hank-build"
+deploy_use_sudo = true
+approval_ttl_secs = 600
+
 [quant_a2a]
 # 是否在所有已登录会话注册 quant_* 工具（默认 false）。
 # 开启后每个会话都会挂载 19 个 quant 工具 schema 并向系统提示注入 quant-research skill。

@@ -5,7 +5,7 @@ server {
     listen [::]:3030 default_server;
 
     server_name _;
-    root /opt/hank-quant-slidev;
+    root /opt/hank-quant-slidev/current;
     index index.html;
     charset utf-8;
 

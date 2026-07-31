@@ -27,6 +27,8 @@ SSH_HOST="${SSH_HOST:-wananyun}"
 REMOTE_APP="/opt/hank-quant"        # 部署目录
 SERVICE_NAME="hank-quant"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_ID="manual-$(git -C "$PROJECT_ROOT" rev-parse --short=12 HEAD)-$(date +%Y%m%d%H%M%S)"
+REMOTE_RELEASE="$REMOTE_APP/releases/$RELEASE_ID"
 
 SKIP_DEPS=0
 [[ "${1:-}" == "--skip-deps" ]] && SKIP_DEPS=1
@@ -41,10 +43,12 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates
-if [[ ! -x "$HOME/.local/bin/uv" ]]; then
-  curl -LsSf https://astral.sh/uv/install.sh | sh
+id hank >/dev/null 2>&1 || { echo "ERROR: 请先运行 make bootstrap-server-agent" >&2; exit 1; }
+if [[ ! -x /home/hank-build/.local/bin/uv ]]; then
+  runuser --user hank-build -- env HOME=/home/hank-build bash -c \
+    'curl -LsSf https://astral.sh/uv/install.sh -o /tmp/hank-uv.sh && sh /tmp/hank-uv.sh && rm -f /tmp/hank-uv.sh'
 fi
-"$HOME/.local/bin/uv" --version
+/home/hank-build/.local/bin/uv --version
 REMOTE
 else
   log "跳过依赖安装"
@@ -58,8 +62,8 @@ pnpm build
 cd "$PROJECT_ROOT"
 
 # ---------- 3. 同步源码与前端产物 ----------
-log "同步 quant 到服务器 $REMOTE_APP ..."
-ssh "$SSH_HOST" "mkdir -p $REMOTE_APP"
+log "同步 quant 到服务器 $REMOTE_RELEASE ..."
+ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE'"
 rsync -az --delete -e ssh \
   --exclude '.venv' \
   --exclude '__pycache__' \
@@ -67,18 +71,16 @@ rsync -az --delete -e ssh \
   --exclude 'web/node_modules' \
   --exclude 'web/dist' \
   --exclude 'config.toml' \
-  "$PROJECT_ROOT/quant/" "$SSH_HOST:$REMOTE_APP/"
+  "$PROJECT_ROOT/quant/" "$SSH_HOST:$REMOTE_RELEASE/"
 # 前端产物单独同步(上面排除了, 避免 --delete 误删后又全量重传)
 rsync -az --delete -e ssh \
-  "$PROJECT_ROOT/quant/web/dist/" "$SSH_HOST:$REMOTE_APP/web/dist/"
+  "$PROJECT_ROOT/quant/web/dist/" "$SSH_HOST:$REMOTE_RELEASE/web/dist/"
 
 # ---------- 4. 服务器创建/更新 venv ----------
 # uv.lock 已固定阿里云镜像的文件 URL(见 pyproject [tool.uv.index]),
 # sync 直接从镜像下载, 不会再走 pypi.org
-log "服务器 uv sync --frozen (首次需下载 Python, 较慢)..."
-ssh "$SSH_HOST" "cd $REMOTE_APP && UV_HTTP_TIMEOUT=300 \$HOME/.local/bin/uv sync --frozen"
-
-# ---------- 5. config.toml: 只在服务器缺失时生成, 绝不覆盖 ----------
+log "准备 config.toml ..."
+# ---------- 4. config.toml: 只在服务器缺失时生成, 绝不覆盖 ----------
 if ssh "$SSH_HOST" "[[ ! -f $REMOTE_APP/config.toml ]]"; then
   log "生成服务器 config.toml (仅首次, 从本地根 config.toml 提取 database_url)..."
   DB_URL=$(python3 -c "
@@ -86,12 +88,37 @@ import tomllib
 with open('$PROJECT_ROOT/config.toml', 'rb') as f:
     print(tomllib.load(f)['server']['database_url'])
 ")
-  ssh "$SSH_HOST" "printf '[quant]\nenv = \"prod\"\ndatabase_url = \"%s\"\n' '$DB_URL' > $REMOTE_APP/config.toml && chmod 600 $REMOTE_APP/config.toml"
+  ssh "$SSH_HOST" "printf '[quant]\nenv = \"prod\"\ndatabase_url = \"%s\"\n' '$DB_URL' > '$REMOTE_APP/config.toml'"
 else
   log "服务器已有 config.toml, 跳过 (如需更新请手动 ssh 修改 $REMOTE_APP/config.toml)"
 fi
 
-# ---------- 6. systemd 服务 ----------
+# 不执行 Alembic；有迁移时必须先走维护窗口。每个 release 拥有独立 venv。
+log "服务器 uv sync --frozen + pytest (不执行数据库迁移)..."
+ssh "$SSH_HOST" bash -s -- "$REMOTE_RELEASE" "$REMOTE_APP" <<'REMOTE'
+set -euo pipefail
+release="$1"
+app="$2"
+install -o root -g hank -m 640 "$app/config.toml" "$release/config.toml"
+chown -R hank-build:hank-build "$release"
+runuser --user hank-build -- env HOME=/home/hank-build PATH=/home/hank-build/.local/bin:/usr/local/bin:/usr/bin:/bin \
+  bash -c "cd '$release' && UV_HTTP_TIMEOUT=300 uv sync --frozen && uv run pytest tests/"
+chown -R root:root "$release"
+chown root:hank "$release/config.toml"
+REMOTE
+
+ssh "$SSH_HOST" bash -s -- "$REMOTE_RELEASE" "$REMOTE_APP" "$RELEASE_ID" <<'REMOTE'
+set -euo pipefail
+release="$1"
+app="$2"
+release_id="$3"
+previous="$(readlink -f "$app/current" 2>/dev/null || true)"
+[[ -z "$previous" ]] || ln -sfn "$previous" "$app/previous"
+ln -s "$release" "$app/current.tmp.$release_id"
+mv -Tf "$app/current.tmp.$release_id" "$app/current"
+REMOTE
+
+# ---------- 5. systemd 服务 ----------
 log "注册并重启 systemd 服务..."
 scp -q "$PROJECT_ROOT/deploy/hank-quant.service" "$SSH_HOST:/etc/systemd/system/$SERVICE_NAME.service"
 ssh "$SSH_HOST" bash -s <<REMOTE
@@ -103,7 +130,7 @@ sleep 2
 systemctl is-active $SERVICE_NAME
 REMOTE
 
-# ---------- 7. 健康检查 (首次启动需连数据库建表, 重试最多 30s) ----------
+# ---------- 6. 健康检查（启动只校验 Alembic 版本，不自动建表/迁移） ----------
 log "健康检查..."
 ssh "$SSH_HOST" bash -s <<'REMOTE'
 set -euo pipefail

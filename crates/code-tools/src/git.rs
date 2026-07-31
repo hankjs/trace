@@ -8,9 +8,25 @@ use tracing::warn;
 
 /// Git 子命令白名单
 const ALLOWED_COMMANDS: &[&str] = &[
-    "status", "diff", "log", "commit", "add", "branch", "checkout",
-    "stash", "reset", "show", "blame", "tag", "merge", "rebase",
-    "cherry-pick", "fetch", "pull", "rev-parse", "config",
+    "status",
+    "diff",
+    "log",
+    "commit",
+    "add",
+    "branch",
+    "checkout",
+    "stash",
+    "reset",
+    "show",
+    "blame",
+    "tag",
+    "merge",
+    "rebase",
+    "cherry-pick",
+    "fetch",
+    "pull",
+    "rev-parse",
+    "config",
 ];
 
 /// 需要确认的危险操作
@@ -24,11 +40,22 @@ const DANGEROUS_PATTERNS: &[&str] = &[
 
 pub struct GitTool {
     work_dir: Option<String>,
+    run_as_user: Option<String>,
 }
 
 impl GitTool {
     pub fn new(work_dir: Option<String>) -> Self {
-        Self { work_dir }
+        Self {
+            work_dir,
+            run_as_user: None,
+        }
+    }
+
+    pub fn new_as_user(work_dir: Option<String>, user: impl Into<String>) -> Self {
+        Self {
+            work_dir,
+            run_as_user: Some(user.into()),
+        }
     }
 
     fn parse_subcommand(args: &str) -> Option<&str> {
@@ -48,8 +75,15 @@ impl GitTool {
     fn is_write_command(subcommand: &str) -> bool {
         matches!(
             subcommand,
-            "commit" | "checkout" | "stash" | "add" | "reset"
-                | "merge" | "rebase" | "cherry-pick" | "tag"
+            "commit"
+                | "checkout"
+                | "stash"
+                | "add"
+                | "reset"
+                | "merge"
+                | "rebase"
+                | "cherry-pick"
+                | "tag"
         )
     }
 }
@@ -93,10 +127,7 @@ impl Tool for GitTool {
     }
 
     async fn execute(&self, input: Value) -> Result<ToolOutput> {
-        let args = input["args"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        let args = input["args"].as_str().unwrap_or_default().to_string();
 
         if args.is_empty() {
             return Ok(ToolOutput {
@@ -139,18 +170,38 @@ impl Tool for GitTool {
             });
         }
 
-        // 执行 git 命令
-        let mut shell_cmd = Command::new("sh");
-        shell_cmd.arg("-c").arg(format!("git {args}"));
+        let Some(parsed_args) = shlex::split(&args) else {
+            return Ok(ToolOutput {
+                content: "Error: could not parse git arguments".to_string(),
+                is_error: true,
+            });
+        };
+        let mut shell_cmd = if let Some(user) = &self.run_as_user {
+            let mut cmd = Command::new("sudo");
+            let home = format!("HOME=/home/{user}");
+            let path = format!(
+                "PATH=/home/{user}/.cargo/bin:/home/{user}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+            );
+            cmd.args([
+                "--non-interactive",
+                "--user",
+                user,
+                "--",
+                "env",
+                &home,
+                &path,
+                "git",
+            ]);
+            cmd
+        } else {
+            Command::new("git")
+        };
+        shell_cmd.args(&parsed_args);
         if let Some(ref dir) = self.work_dir {
             shell_cmd.current_dir(dir);
         }
 
-        let result = tokio::time::timeout(
-            LONG_TOOL_TIMEOUT,
-            shell_cmd.output(),
-        )
-        .await;
+        let result = tokio::time::timeout(LONG_TOOL_TIMEOUT, shell_cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -196,5 +247,18 @@ impl Tool for GitTool {
                 is_error: true,
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GitTool;
+
+    #[test]
+    fn shell_control_operators_are_arguments_not_commands() {
+        let parsed = shlex::split("status && cat /opt/hank/config.toml").unwrap();
+        assert_eq!(parsed[0], "status");
+        assert_eq!(parsed[1], "&&");
+        assert!(GitTool::is_allowed(&parsed[0]));
     }
 }

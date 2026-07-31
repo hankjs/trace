@@ -7,8 +7,80 @@ pub const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
+    /// 飞书驱动的 server-only monorepo Agent。默认关闭，避免本地开发环境
+    /// 意外把消息路由到服务器文件系统。
+    #[serde(default)]
+    pub server_agent: ServerAgentConfig,
     #[serde(default)]
     pub quant_a2a: Option<QuantA2aConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServerAgentConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_repository_root")]
+    pub repository_root: String,
+    #[serde(default = "default_worktrees_root")]
+    pub worktrees_root: String,
+    #[serde(default = "default_base_ref")]
+    pub base_ref: String,
+    #[serde(default = "default_deploy_jobs_dir")]
+    pub deploy_jobs_dir: String,
+    #[serde(default = "default_deploy_helper")]
+    pub deploy_helper: String,
+    /// 执行仓库 shell、测试和构建的低权限用户，不具备部署 sudoers。
+    #[serde(default = "default_execution_user")]
+    pub execution_user: String,
+    /// 生产环境以非 root 用户运行 server 时，通过 sudo 调用唯一允许的部署 helper。
+    #[serde(default)]
+    pub deploy_use_sudo: bool,
+    #[serde(default = "default_deploy_approval_ttl_secs")]
+    pub approval_ttl_secs: u64,
+}
+
+impl Default for ServerAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repository_root: default_repository_root(),
+            worktrees_root: default_worktrees_root(),
+            base_ref: default_base_ref(),
+            deploy_jobs_dir: default_deploy_jobs_dir(),
+            deploy_helper: default_deploy_helper(),
+            execution_user: default_execution_user(),
+            deploy_use_sudo: false,
+            approval_ttl_secs: default_deploy_approval_ttl_secs(),
+        }
+    }
+}
+
+fn default_repository_root() -> String {
+    "/opt/hank-src".to_string()
+}
+
+fn default_worktrees_root() -> String {
+    "/opt/hank-worktrees".to_string()
+}
+
+fn default_base_ref() -> String {
+    "trace-production".to_string()
+}
+
+fn default_deploy_jobs_dir() -> String {
+    "/opt/hank/deploy-jobs".to_string()
+}
+
+fn default_deploy_helper() -> String {
+    "/usr/local/libexec/hank-deploy".to_string()
+}
+
+fn default_execution_user() -> String {
+    "hank-build".to_string()
+}
+
+fn default_deploy_approval_ttl_secs() -> u64 {
+    10 * 60
 }
 
 #[derive(Debug, Clone, Deserialize)]

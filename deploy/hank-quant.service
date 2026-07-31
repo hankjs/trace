@@ -1,13 +1,17 @@
 [Unit]
 Description=Hank Quant - A股日频量化信息系统
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/hank-quant
+User=hank
+Group=hank
+WorkingDirectory=/opt/hank-quant/current
 # 生产环境:启用 APScheduler(日线/盘中/估值等定时任务);本地 dev 默认不启
 Environment=QUANT_ENV=prod
-ExecStart=/opt/hank-quant/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8100
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/hank-quant/current/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8100
 Restart=always
 RestartSec=3
 # stdout 进 journal: journalctl -u hank-quant
@@ -17,6 +21,7 @@ StandardError=journal
 NoNewPrivileges=true
 ProtectSystem=full
 PrivateTmp=true
+UMask=0027
 
 [Install]
 WantedBy=multi-user.target

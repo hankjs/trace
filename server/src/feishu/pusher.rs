@@ -10,6 +10,7 @@ use crate::feishu::card::{
     ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
 };
 use crate::AppState;
+use anyhow::{bail, Context, Result};
 use code_agent::AgentEvent;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -258,7 +259,17 @@ async fn run(
                         footer: Some(footer.clone()),
                     }))
                     .await;
-                send_final_text(&api, &message_id, &body, &files, &footer, in_thread).await;
+                send_final_text(
+                    &state,
+                    &session_id,
+                    &api,
+                    &message_id,
+                    &body,
+                    &files,
+                    &footer,
+                    in_thread,
+                )
+                .await;
                 break;
             }
             AgentEvent::RunFailed { message, .. } => {
@@ -301,11 +312,10 @@ async fn run(
     }
 
     updater.cancel().await;
-    let _ = state;
 }
 
 /// 从最终文本中提取 [file:/路径] 标记（与 weixin/pusher.rs 同一约定）。
-/// 媒体回传二期再接，当前以文本列出路径。
+/// send_final_text 会校验路径和图片格式后上传飞书。
 fn extract_file_markers(text: &str) -> (String, Vec<String>) {
     let mut files = Vec::new();
     let mut out = String::with_capacity(text.len());
@@ -332,6 +342,8 @@ fn extract_file_markers(text: &str) -> (String, Vec<String>) {
 }
 
 async fn send_final_text(
+    state: &Arc<AppState>,
+    session_id: &str,
     api: &FeishuApi,
     message_id: &str,
     body: &str,
@@ -349,14 +361,112 @@ async fn send_final_text(
         t
     };
     if !files.is_empty() {
-        msg.push_str("\n\n生成文件：");
-        for f in files {
-            msg.push_str(&format!("\n- {f}"));
-        }
+        msg.push_str(&format!("\n\n图片将另行发送：{} 张", files.len()));
     }
     msg.push_str(&format!("\n{footer}"));
     if let Err(e) = api.reply_text(message_id, &msg, in_thread).await {
         tracing::warn!("feishu: send final text failed: {e:#}");
+    }
+    for path in files {
+        match load_outbound_image(state, session_id, path).await {
+            Ok(image) => {
+                let sent = api
+                    .reply_image(
+                        message_id,
+                        image.bytes,
+                        &image.file_name,
+                        image.media_type,
+                        in_thread,
+                    )
+                    .await;
+                if let Err(e) = sent {
+                    tracing::warn!(path, "feishu: send image failed: {e:#}");
+                    let _ = api
+                        .reply_text(message_id, &format!("图片回传失败：{e:#}"), in_thread)
+                        .await;
+                } else if image.remove_after_send {
+                    let _ = tokio::fs::remove_file(&image.canonical_path).await;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path, "feishu: rejected outbound file: {e:#}");
+                let _ = api
+                    .reply_text(message_id, &format!("图片回传被拒绝：{e:#}"), in_thread)
+                    .await;
+            }
+        }
+    }
+}
+
+struct OutboundImage {
+    bytes: Vec<u8>,
+    file_name: String,
+    media_type: &'static str,
+    canonical_path: std::path::PathBuf,
+    remove_after_send: bool,
+}
+
+async fn load_outbound_image(
+    state: &Arc<AppState>,
+    session_id: &str,
+    path: &str,
+) -> Result<OutboundImage> {
+    const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+    let canonical_path = tokio::fs::canonicalize(path)
+        .await
+        .with_context(|| format!("图片不存在: {path}"))?;
+    let temp_root = tokio::fs::canonicalize(std::env::temp_dir()).await?;
+    let worktree = state
+        .db
+        .get_session(session_id)
+        .await?
+        .and_then(|session| session.work_dir);
+    let worktree_root = match worktree {
+        Some(path) => tokio::fs::canonicalize(path).await.ok(),
+        None => None,
+    };
+    let in_temp = canonical_path.starts_with(&temp_root)
+        && canonical_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("trace-"));
+    let in_worktree = worktree_root
+        .as_ref()
+        .is_some_and(|root| canonical_path.starts_with(root));
+    if !in_temp && !in_worktree {
+        bail!("文件不在当前 worktree 或 server 临时目录");
+    }
+    let metadata = tokio::fs::metadata(&canonical_path).await?;
+    if !metadata.is_file() || metadata.len() > MAX_IMAGE_BYTES {
+        bail!("文件不是普通图片或超过 10 MiB");
+    }
+    let bytes = tokio::fs::read(&canonical_path).await?;
+    let media_type = image_media_type(&bytes).ok_or_else(|| anyhow::anyhow!("不支持的图片格式"))?;
+    let file_name = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("trace-image")
+        .to_string();
+    Ok(OutboundImage {
+        bytes,
+        file_name,
+        media_type,
+        canonical_path,
+        remove_after_send: in_temp,
+    })
+}
+
+fn image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
     }
 }
 
@@ -378,5 +488,11 @@ mod tests {
             p.record_tool("shell");
         }
         assert_eq!(p.percent(), PROGRESS_CAP_RUNNING);
+    }
+
+    #[test]
+    fn detects_supported_image_types() {
+        assert_eq!(image_media_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_media_type(b"not-an-image"), None);
     }
 }

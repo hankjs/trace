@@ -4,6 +4,7 @@ use crate::weixin::api::{IlinkClient, IlinkMessage};
 use crate::weixin::router;
 use crate::AppState;
 use hank_db::WeixinAccount;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +17,21 @@ pub fn start_monitors(state: Arc<AppState>) {
     tokio::spawn(async move {
         match state.db.list_weixin_accounts().await {
             Ok(accounts) => {
+                if let Err(e) = state.db.purge_old_weixin_messages().await {
+                    tracing::warn!("weixin: purge old inbound message claims failed: {e:#}");
+                }
+                // 历史版本可能把同一个 bot 重复落库；同一 bot 只启动一个 monitor 消费 cursor。
+                let mut selected: HashMap<String, WeixinAccount> = HashMap::new();
                 for account in accounts.into_iter().filter(|a| a.enabled) {
+                    let bot_id = account.ilink_bot_id.clone();
+                    let replace = selected
+                        .get(&bot_id)
+                        .map_or(true, |current| account.created_at > current.created_at);
+                    if replace {
+                        selected.insert(bot_id, account);
+                    }
+                }
+                for account in selected.into_values() {
                     spawn_monitor(state.clone(), account);
                 }
             }
@@ -33,14 +48,17 @@ pub fn spawn_monitor(state: Arc<AppState>, account: WeixinAccount) {
     }
     let account_id = account.id.clone();
     tokio::spawn(async move {
-        stop_monitor(&state, &account_id).await;
         let token = Arc::new(CancellationToken::new());
-        {
+        let previous = {
             let mut monitors = state.weixin_monitors.write().await;
-            monitors.insert(account_id.clone(), token.clone());
+            monitors.insert(account_id.clone(), token.clone())
+        };
+        if let Some(previous) = previous {
+            previous.cancel();
+            tracing::info!(account_id, "weixin monitor stopped before restart");
         }
         tracing::info!(account_id, ilink_bot_id = %account.ilink_bot_id, "weixin monitor started");
-        tokio::spawn(monitor_loop(state, account, token));
+        monitor_loop(state, account, token).await;
     });
 }
 
@@ -115,6 +133,33 @@ async fn monitor_loop(state: Arc<AppState>, account: WeixinAccount, token: Arc<C
 }
 
 async fn dispatch(state: Arc<AppState>, account: WeixinAccount, msg: IlinkMessage) {
+    if let Some(message_id) = msg.message_id {
+        match state
+            .db
+            .claim_weixin_message(&account.ilink_bot_id, message_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::info!(
+                    ilink_bot_id = %account.ilink_bot_id,
+                    message_id,
+                    "weixin: duplicate inbound message ignored"
+                );
+                return;
+            }
+            Err(e) => {
+                // Do not execute an unclaimed message: a DB failure must not
+                // turn a transient monitor issue into duplicate side effects.
+                tracing::warn!(
+                    ilink_bot_id = %account.ilink_bot_id,
+                    message_id,
+                    "weixin: claim inbound message failed: {e:#}"
+                );
+                return;
+            }
+        }
+    }
     if let Err(e) = router::handle_message(state, account, msg).await {
         tracing::warn!("weixin: handle message failed: {e:#}");
     }

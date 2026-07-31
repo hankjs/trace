@@ -18,10 +18,12 @@
 set -euo pipefail
 
 SSH_HOST="${SSH_HOST:-wananyun}"
-REMOTE_SRC="/root/hank-src"       # 服务器上的源码构建目录 (与 deploy.sh 一致)
-REMOTE_APP="/opt/hank"            # 部署目录
+REMOTE_SRC="/root/hank-build"     # 服务器上的 SSH 应急构建目录
+REMOTE_APP="/opt/hank-cli"        # release 部署目录
 SERVICE_NAME="hank-cli"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RELEASE_ID="manual-$(git -C "$PROJECT_ROOT" rev-parse --short=12 HEAD)-$(date +%Y%m%d%H%M%S)"
+REMOTE_RELEASE="$REMOTE_APP/releases/$RELEASE_ID"
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
@@ -37,8 +39,8 @@ log "服务器上 cargo build --release (cli 是独立项目, 首次较慢)..."
 ssh "$SSH_HOST" "cd $REMOTE_SRC/cli && \$HOME/.cargo/bin/cargo build --release"
 
 # ---------- 3. 安装二进制 ----------
-log "安装二进制到 $REMOTE_APP/hank-cli ..."
-ssh "$SSH_HOST" "install -m 755 $REMOTE_SRC/cli/target/release/hank-cli $REMOTE_APP/hank-cli"
+log "安装二进制到 $REMOTE_RELEASE/hank-cli ..."
+ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE' && install -m 755 '$REMOTE_SRC/cli/target/release/hank-cli' '$REMOTE_RELEASE/hank-cli'"
 
 # ---------- 4. 配置: 只在缺失时上传, 绝不覆盖 ----------
 if ssh "$SSH_HOST" "[[ ! -f $REMOTE_APP/hank-cli.toml ]]"; then
@@ -51,7 +53,7 @@ if ssh "$SSH_HOST" "[[ ! -f $REMOTE_APP/hank-cli.toml ]]"; then
     fi
     log "上传本地 ~/.hank-cli/config.toml -> $REMOTE_APP/hank-cli.toml (仅首次)..."
     scp -q "$LOCAL_CFG" "$SSH_HOST:$REMOTE_APP/hank-cli.toml"
-    ssh "$SSH_HOST" "chmod 600 $REMOTE_APP/hank-cli.toml"
+    ssh "$SSH_HOST" "chown hank:hank '$REMOTE_APP/hank-cli.toml' && chmod 600 '$REMOTE_APP/hank-cli.toml'"
     # client_id 是节点身份, 线上应是独立节点: 删掉让 CLI 在服务器上重新生成
     ssh "$SSH_HOST" "sed -i '/^client_id\s*=/d' $REMOTE_APP/hank-cli.toml"
     log "提示: 配置里的 server 指向 $(grep '^server' "$LOCAL_CFG" | head -1), 线上应为本机 http://127.0.0.1:3000"
@@ -62,7 +64,19 @@ if ssh "$SSH_HOST" "[[ ! -f $REMOTE_APP/hank-cli.toml ]]"; then
   fi
 else
   log "服务器已有 hank-cli.toml, 跳过 (如需更新请手动 scp)"
+  ssh "$SSH_HOST" "chown hank:hank '$REMOTE_APP/hank-cli.toml' && chmod 600 '$REMOTE_APP/hank-cli.toml'"
 fi
+
+ssh "$SSH_HOST" bash -s -- "$REMOTE_RELEASE" "$REMOTE_APP" "$RELEASE_ID" <<'REMOTE'
+set -euo pipefail
+release="$1"
+app="$2"
+release_id="$3"
+previous="$(readlink -f "$app/current" 2>/dev/null || true)"
+[[ -z "$previous" ]] || ln -sfn "$previous" "$app/previous"
+ln -s "$release" "$app/current.tmp.$release_id"
+mv -Tf "$app/current.tmp.$release_id" "$app/current"
+REMOTE
 
 # ---------- 5. systemd 服务 ----------
 log "注册并重启 systemd 服务..."

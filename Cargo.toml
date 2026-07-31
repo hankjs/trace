@@ -23,6 +23,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 futures = "0.3"
+shlex = "1"
+base64 = "0.22"
 reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono", "uuid"] }
 axum = { version = "0.8", features = ["multipart"] }

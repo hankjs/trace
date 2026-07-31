@@ -108,6 +108,32 @@ pub struct FeishuChat {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 飞书发起的 monorepo 部署任务。任务状态落库，server 重启后可继续恢复和通知。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct Deployment {
+    pub id: String,
+    pub session_id: String,
+    pub user_id: String,
+    pub account_id: String,
+    pub chat_id: String,
+    pub topic_id: String,
+    pub source_dir: String,
+    pub commit_sha: String,
+    /// JSON 字符串，内容是受影响的固定部署目标数组。
+    pub targets: String,
+    pub summary: String,
+    pub status: String,
+    pub card_message_id: Option<String>,
+    pub approved_by: Option<String>,
+    pub approval_expires_at: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 飞书自建应用账号（feishu_accounts 表，凭证由 admin REST 管理）
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct FeishuAccount {
@@ -858,7 +884,8 @@ impl Database {
                 bot_user_id VARCHAR(128) DEFAULT NULL,
                 get_updates_buf MEDIUMTEXT DEFAULT NULL,
                 enabled BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at DATETIME NOT NULL DEFAULT NOW()
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                UNIQUE KEY uk_weixin_bot_id (ilink_bot_id)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -903,6 +930,19 @@ impl Database {
                 created_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (binding_id) REFERENCES weixin_bindings(id) ON DELETE CASCADE,
                 UNIQUE KEY uk_weixin_chat_binding (binding_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // 微信入站消息 claim：ilink 可能重复投递，多个 monitor 也不能重复执行同一消息。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS weixin_inbound_messages (
+                ilink_bot_id VARCHAR(128) NOT NULL,
+                message_id BIGINT UNSIGNED NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (ilink_bot_id, message_id),
+                INDEX idx_weixin_inbound_created (created_at)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -981,6 +1021,37 @@ impl Database {
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (account_id) REFERENCES feishu_accounts(id) ON DELETE CASCADE,
                 UNIQUE KEY uk_feishu_chat_topic (account_id, chat_id, topic_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // 飞书发起的代码部署任务。独立部署进程会跨越 hank-server 自身重启，
+        // 因此审批、目标和终态必须持久化。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS deployments (
+                id VARCHAR(36) PRIMARY KEY,
+                session_id VARCHAR(36) NOT NULL,
+                user_id VARCHAR(36) NOT NULL,
+                account_id VARCHAR(36) NOT NULL,
+                chat_id VARCHAR(128) NOT NULL,
+                topic_id VARCHAR(128) NOT NULL DEFAULT 'main',
+                source_dir VARCHAR(1024) NOT NULL,
+                commit_sha VARCHAR(64) NOT NULL,
+                targets JSON NOT NULL,
+                summary TEXT NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'awaiting_approval',
+                card_message_id VARCHAR(256) DEFAULT NULL,
+                approved_by VARCHAR(36) DEFAULT NULL,
+                approval_expires_at DATETIME NOT NULL,
+                started_at DATETIME DEFAULT NULL,
+                finished_at DATETIME DEFAULT NULL,
+                result MEDIUMTEXT DEFAULT NULL,
+                error TEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                INDEX idx_deployments_status (status, updated_at),
+                INDEX idx_deployments_session (session_id, created_at)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -1107,6 +1178,13 @@ impl Database {
             "ALTER TABLE sessions ADD COLUMN exec_client_id VARCHAR(36) DEFAULT NULL",
         )
         .await?;
+        // 为旧库补 bot 唯一键；历史重复记录会使这条 DDL 失败，但运行时仍由
+        // create_weixin_account 的查询和 monitor 的 bot 级去重兼容处理。
+        let _ = sqlx::query(
+            "ALTER TABLE weixin_accounts ADD UNIQUE KEY uk_weixin_bot_id (ilink_bot_id)",
+        )
+        .execute(&pool)
+        .await;
 
         Ok(Self { pool })
     }
@@ -2730,11 +2808,36 @@ impl Database {
 
     // Weixin accounts
     pub async fn create_weixin_account(&self, ilink_bot_id: &str, bot_token: &str, base_url: &str, bot_user_id: Option<&str>) -> Result<String> {
+        // 兼容尚未有 bot 唯一键的旧库，避免重复登录再次插入账号；新库由唯一键保护并发插入。
+        let existing: Option<(String,)> = db_retry!(
+            sqlx::query_as(
+                "SELECT id FROM weixin_accounts WHERE ilink_bot_id = ? ORDER BY created_at DESC LIMIT 1"
+            )
+            .bind(ilink_bot_id)
+            .fetch_optional(&self.pool)
+        )?;
+        if let Some((existing_id,)) = existing {
+            db_retry!(
+                sqlx::query(
+                    "UPDATE weixin_accounts SET bot_token = ?, base_url = ?, bot_user_id = ?, enabled = TRUE WHERE id = ?"
+                )
+                .bind(bot_token)
+                .bind(base_url)
+                .bind(bot_user_id)
+                .bind(&existing_id)
+                .execute(&self.pool)
+            )?;
+            return Ok(existing_id);
+        }
+
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         db_retry!(
             sqlx::query(
-                "INSERT INTO weixin_accounts (id, ilink_bot_id, bot_token, base_url, bot_user_id, created_at) VALUES (?, ?, ?, ?, ?, ?)"
+                "INSERT INTO weixin_accounts (id, ilink_bot_id, bot_token, base_url, bot_user_id, enabled, created_at)
+                 VALUES (?, ?, ?, ?, ?, TRUE, ?)
+                 ON DUPLICATE KEY UPDATE bot_token = VALUES(bot_token), base_url = VALUES(base_url),
+                    bot_user_id = VALUES(bot_user_id), enabled = TRUE"
             )
             .bind(&id)
             .bind(ilink_bot_id)
@@ -2744,7 +2847,15 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
         )?;
-        Ok(id)
+        // 旧库可能已经有重复行，始终返回该 bot 最新的账号记录。
+        let row: Option<(String,)> = db_retry!(
+            sqlx::query_as(
+                "SELECT id FROM weixin_accounts WHERE ilink_bot_id = ? ORDER BY created_at DESC LIMIT 1"
+            )
+            .bind(ilink_bot_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row.map(|r| r.0).unwrap_or(id))
     }
 
     pub async fn list_weixin_accounts(&self) -> Result<Vec<WeixinAccount>> {
@@ -2848,6 +2959,23 @@ impl Database {
         Ok(row)
     }
 
+    /// 按 bot 身份查绑定，兼容历史上同一个 bot 被重复落库的账号记录。
+    pub async fn get_weixin_binding_by_bot(&self, ilink_bot_id: &str, ilink_user_id: &str) -> Result<Option<WeixinBinding>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, WeixinBinding>(
+                "SELECT b.id, b.account_id, b.ilink_user_id, b.user_id, b.context_token, b.created_at
+                 FROM weixin_bindings b
+                 JOIN weixin_accounts a ON a.id = b.account_id
+                 WHERE a.ilink_bot_id = ? AND b.ilink_user_id = ?
+                 ORDER BY b.created_at DESC LIMIT 1"
+            )
+            .bind(ilink_bot_id)
+            .bind(ilink_user_id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
     pub async fn get_weixin_binding_by_id(&self, id: &str) -> Result<Option<WeixinBinding>> {
         let row = db_retry!(
             sqlx::query_as::<_, WeixinBinding>(
@@ -2888,6 +3016,30 @@ impl Database {
                 .execute(&self.pool)
         )?;
         Ok(())
+    }
+
+    /// 原子领取一条微信入站消息。重复投递或重复 monitor 只允许首个调用继续处理。
+    pub async fn claim_weixin_message(&self, ilink_bot_id: &str, message_id: u64) -> Result<bool> {
+        let res = db_retry!(
+            sqlx::query(
+                "INSERT IGNORE INTO weixin_inbound_messages (ilink_bot_id, message_id) VALUES (?, ?)"
+            )
+            .bind(ilink_bot_id)
+            .bind(message_id)
+            .execute(&self.pool)
+        )?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// 入站消息只用于短期去重，定期删除过期 claim 避免表无限增长。
+    pub async fn purge_old_weixin_messages(&self) -> Result<u64> {
+        let res = db_retry!(
+            sqlx::query(
+                "DELETE FROM weixin_inbound_messages WHERE created_at < NOW() - INTERVAL 30 DAY"
+            )
+            .execute(&self.pool)
+        )?;
+        Ok(res.rows_affected())
     }
 
     pub async fn delete_weixin_binding(&self, id: &str) -> Result<()> {
@@ -3196,6 +3348,175 @@ impl Database {
                 .execute(&self.pool)
         )?;
         Ok(())
+    }
+
+    // 飞书 monorepo 部署任务
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_deployment(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        account_id: &str,
+        chat_id: &str,
+        topic_id: &str,
+        source_dir: &str,
+        commit_sha: &str,
+        targets: &str,
+        summary: &str,
+        approval_expires_at: DateTime<Utc>,
+    ) -> Result<Deployment> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO deployments
+                 (id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
+                  commit_sha, targets, summary, status, approval_expires_at, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_approval', ?, ?, ?)"
+            )
+            .bind(&id)
+            .bind(session_id)
+            .bind(user_id)
+            .bind(account_id)
+            .bind(chat_id)
+            .bind(topic_id)
+            .bind(source_dir)
+            .bind(commit_sha)
+            .bind(targets)
+            .bind(summary)
+            .bind(approval_expires_at)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        self.get_deployment(&id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("deployment inserted but not found: {id}"))
+    }
+
+    pub async fn get_deployment(&self, id: &str) -> Result<Option<Deployment>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, Deployment>(
+                "SELECT id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
+                        commit_sha, targets, summary, status, card_message_id, approved_by,
+                        approval_expires_at, started_at, finished_at, result, error,
+                        created_at, updated_at
+                 FROM deployments WHERE id = ?"
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
+    }
+
+    pub async fn set_deployment_card(&self, id: &str, card_message_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "UPDATE deployments SET card_message_id = ?, updated_at = NOW() WHERE id = ?"
+            )
+            .bind(card_message_id)
+            .bind(id)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 原子批准部署：仅任务发起人、未过期且尚待审批时能成功。
+    pub async fn approve_deployment(&self, id: &str, user_id: &str) -> Result<Option<Deployment>> {
+        let result = db_retry!(
+            sqlx::query(
+                "UPDATE deployments
+                 SET status = 'approved', approved_by = ?, updated_at = NOW()
+                 WHERE id = ? AND user_id = ? AND status = 'awaiting_approval'
+                   AND approval_expires_at > NOW()"
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+        )?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_deployment(id).await
+    }
+
+    pub async fn cancel_deployment(&self, id: &str, user_id: &str) -> Result<bool> {
+        let result = db_retry!(
+            sqlx::query(
+                "UPDATE deployments
+                 SET status = 'cancelled', approved_by = ?, finished_at = NOW(), updated_at = NOW()
+                 WHERE id = ? AND user_id = ? AND status = 'awaiting_approval'"
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+        )?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_deployment_status(
+        &self,
+        id: &str,
+        status: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let terminal = matches!(status, "succeeded" | "failed" | "rolled_back" | "cancelled");
+        db_retry!(
+            sqlx::query(
+                "UPDATE deployments
+                 SET status = ?,
+                     started_at = CASE WHEN ? IN ('starting', 'building', 'installing')
+                                       THEN COALESCE(started_at, NOW()) ELSE started_at END,
+                     finished_at = CASE WHEN ? THEN NOW() ELSE finished_at END,
+                     result = COALESCE(?, result), error = COALESCE(?, error), updated_at = NOW()
+                 WHERE id = ?"
+            )
+            .bind(status)
+            .bind(status)
+            .bind(terminal)
+            .bind(result)
+            .bind(error)
+            .bind(id)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn list_recoverable_deployments(&self) -> Result<Vec<Deployment>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, Deployment>(
+                "SELECT id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
+                        commit_sha, targets, summary, status, card_message_id, approved_by,
+                        approval_expires_at, started_at, finished_at, result, error,
+                        created_at, updated_at
+                 FROM deployments
+                 WHERE status IN ('approved', 'starting', 'building', 'installing', 'restarting', 'verifying')
+                 ORDER BY created_at ASC"
+            )
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    /// 最近一次成功发布，用于创建显式回滚审批。
+    pub async fn get_latest_successful_deployment(&self) -> Result<Option<Deployment>> {
+        let row = db_retry!(
+            sqlx::query_as::<_, Deployment>(
+                "SELECT id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
+                        commit_sha, targets, summary, status, card_message_id, approved_by,
+                        approval_expires_at, started_at, finished_at, result, error,
+                        created_at, updated_at
+                 FROM deployments
+                 WHERE status = 'succeeded'
+                 ORDER BY finished_at DESC, created_at DESC
+                 LIMIT 1"
+            )
+            .fetch_optional(&self.pool)
+        )?;
+        Ok(row)
     }
 
     // 渠道消息留档

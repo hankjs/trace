@@ -42,7 +42,7 @@ pub async fn handle_message(state: Arc<AppState>, account: WeixinAccount, msg: I
     // 已绑定则顺手刷新 context_token
     let binding = state
         .db
-        .get_weixin_binding(&account.id, &from)
+        .get_weixin_binding_by_bot(&account.ilink_bot_id, &from)
         .await
         .unwrap_or(None);
     if let Some(ref b) = binding {
@@ -66,6 +66,13 @@ pub async fn handle_message(state: Arc<AppState>, account: WeixinAccount, msg: I
             return Ok(());
         }
     };
+
+    // bind 是一次性绑定流程。重复投递或用户再次发送绑定码都必须停在
+    // 渠道层，不能因为“已经绑定”而把原始 bind 文本派发给 coding agent。
+    if parse_bind_code(&text).is_some() {
+        reply("这个微信已经绑定 Trace 账号，直接发消息即可开始对话").await;
+        return Ok(());
+    }
 
     // kimi <text>：转发给托管的 Kimi CLI 终端（含 kimi /yolo 这类 CLI 自身命令）
     // 必须放在 /ai 与斜杠命令检查之前，避免内容以 / 开头时被命令分支拦截
@@ -114,11 +121,7 @@ async fn handle_unbound<Fut: std::future::Future<Output = ()>>(
     text: &str,
     reply: impl FnOnce(&str) -> Fut,
 ) {
-    let code = text
-        .strip_prefix("bind")
-        .map(str::trim)
-        .filter(|c| c.len() == 6 && c.chars().all(|c| c.is_ascii_digit()));
-    let code = match code {
+    let code = match parse_bind_code(text) {
         Some(c) => c.to_string(),
         None => {
             reply("请先在 Trace client 生成绑定码，然后发送 bind 123456").await;
@@ -144,6 +147,11 @@ async fn handle_unbound<Fut: std::future::Future<Output = ()>>(
             reply("绑定失败，请稍后重试").await;
         }
     }
+}
+
+fn parse_bind_code(text: &str) -> Option<&str> {
+    let code = text.trim().strip_prefix("bind")?.trim();
+    (code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())).then_some(code)
 }
 
 /// 斜杠命令：/new /stop /status /terms /term /send /shot /snap。
@@ -851,4 +859,19 @@ async fn stop_current_task(state: &Arc<AppState>, binding: &WeixinBinding) -> bo
 /// 绑定码有效期（供 routes 生成绑定码时使用）
 pub fn bind_code_expires_at() -> i64 {
     chrono::Utc::now().timestamp_millis() + BIND_CODE_TTL_MS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bind_code;
+
+    #[test]
+    fn parses_only_six_digit_bind_codes() {
+        assert_eq!(parse_bind_code("bind 766750"), Some("766750"));
+        assert_eq!(parse_bind_code("  bind 000001  "), Some("000001"));
+        assert_eq!(parse_bind_code("bind 12345"), None);
+        assert_eq!(parse_bind_code("bind 1234567"), None);
+        assert_eq!(parse_bind_code("bind abcdef"), None);
+        assert_eq!(parse_bind_code("binding 123456"), None);
+    }
 }

@@ -7,9 +7,11 @@
 
 use crate::chat::{run_chat_turn, ChatTurnOpts};
 use crate::feishu::api::FeishuApi;
+use crate::feishu::card::{build_deployment_card, DeploymentCardOptions};
 use crate::feishu::pusher;
 use crate::AppState;
 use anyhow::{anyhow, Result};
+use base64::Engine as _;
 use hank_db::FeishuAccount;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -164,15 +166,23 @@ pub enum SlashCommand {
     New,
     Stop,
     Status,
+    Diff,
+    Test,
+    Deploy,
+    Rollback,
     Help,
 }
 
 pub fn parse_command(text: &str) -> Option<SlashCommand> {
     let t = text.trim();
-    const COMMANDS: [(&str, SlashCommand); 4] = [
+    const COMMANDS: [(&str, SlashCommand); 8] = [
         ("/new", SlashCommand::New),
         ("/stop", SlashCommand::Stop),
         ("/status", SlashCommand::Status),
+        ("/diff", SlashCommand::Diff),
+        ("/test", SlashCommand::Test),
+        ("/deploy", SlashCommand::Deploy),
+        ("/rollback", SlashCommand::Rollback),
         ("/help", SlashCommand::Help),
     ];
     for (pat, cmd) in COMMANDS {
@@ -238,6 +248,7 @@ async fn handle_message(
         .into_iter()
         .map(|me| Mention { key: me.key, name: me.name })
         .collect();
+    let image_key = extract_image_key(&m.message_type, &m.content);
     let raw_text = extract_text(&m.message_type, &m.content);
     let msg = IncomingMessage {
         message_id: m.message_id,
@@ -305,6 +316,14 @@ async fn handle_message(
     };
     let user_id = binding.user_id.clone();
 
+    if state.config.server_agent.enabled {
+        if let Err(e) = crate::deployment::ensure_server_agent_admin(&state, &user_id).await {
+            api.reply_text(&msg.message_id, &format!("无权使用 server Agent：{e}"), msg.in_thread())
+                .await?;
+            return Ok(());
+        }
+    }
+
     if parse_bind_code(&msg.text).is_some() {
         api.reply_text(
             &msg.message_id,
@@ -320,12 +339,44 @@ async fn handle_message(
         return handle_command(&state, &api, &account, &msg, cmd).await;
     }
 
+    if let Some(image_key) = image_key {
+        let bytes = match api.download_message_image(&msg.message_id, &image_key).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                api.reply_text(
+                    &msg.message_id,
+                    &format!("读取飞书图片失败：{e:#}"),
+                    msg.in_thread(),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
+        let Some(media_type) = detect_image_media_type(&bytes) else {
+            api.reply_text(&msg.message_id, "暂不支持这种图片格式", msg.in_thread())
+                .await?;
+            return Ok(());
+        };
+        let blocks = vec![
+            hank_provider::ContentBlock::Text {
+                text: "请分析这张飞书图片，并结合当前话题上下文完成任务。".to_string(),
+            },
+            hank_provider::ContentBlock::Image {
+                source: hank_provider::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: media_type.to_string(),
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                },
+            },
+        ];
+        return dispatch_task_content(&state, &api, &account, &msg, &user_id, blocks).await;
+    }
+
     if msg.text.is_empty() {
-        // 图片/文件等富媒体二期再解析；空文本不派发，避免空 prompt 白跑一轮
         if msg.message_type != "text" {
             api.reply_text(
                 &msg.message_id,
-                "收到，但暂时只支持文字消息（图片/文件解析二期上线）",
+                "收到，但当前只支持文字和图片消息",
                 msg.in_thread(),
             )
             .await?;
@@ -334,6 +385,31 @@ async fn handle_message(
     }
 
     dispatch_task(&state, &api, &account, &msg, &user_id, &msg.text.clone()).await
+}
+
+fn extract_image_key(message_type: &str, content: &str) -> Option<String> {
+    if message_type != "image" {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?["image_key"]
+        .as_str()
+        .filter(|key| !key.is_empty())
+        .map(str::to_string)
+}
+
+fn detect_image_media_type(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 /// 未绑定用户：bind <6位码> 或提示（与微信同一绑定码模式）。
@@ -416,7 +492,7 @@ async fn handle_command(
         SlashCommand::Help => {
             api.reply_text(
                 &msg.message_id,
-                "/new 开启新会话\n/stop 停止当前任务\n/status 查看当前会话\n/help 查看命令",
+                "/new 开启新话题工作区\n/stop 停止当前任务\n/status 查看当前会话\n/diff 查看代码变更\n/test 运行受影响项目测试\n/deploy 创建部署审批\n/rollback 创建回滚审批\n/help 查看命令",
                 msg.in_thread(),
             )
             .await?;
@@ -426,11 +502,20 @@ async fn handle_command(
             let text = match chat {
                 Some(c) => {
                     let running = state.active_tasks.read().await.contains_key(&c.session_id);
+                    let work_dir = state
+                        .db
+                        .get_session(&c.session_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|s| s.work_dir)
+                        .unwrap_or_else(|| "未设置".to_string());
                     format!(
-                        "会话：{}\n状态：{}\n话题：{}",
+                        "会话：{}\n状态：{}\n话题：{}\n工作区：{}",
                         c.session_id,
                         if running { "执行中" } else { "空闲" },
-                        topic
+                        topic,
+                        work_dir
                     )
                 }
                 None => "当前话题还没有会话，直接发消息即可开始".to_string(),
@@ -467,6 +552,130 @@ async fn handle_command(
             };
             api.reply_text(&msg.message_id, text, msg.in_thread()).await?;
         }
+        SlashCommand::Diff => {
+            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
+                return Ok(());
+            };
+            let diff = match crate::deployment::workspace_diff(state, &chat.session_id, &chat.user_id).await {
+                Ok(diff) => diff,
+                Err(e) => format!("读取变更失败：{e:#}"),
+            };
+            api.reply_text(&msg.message_id, &diff, msg.in_thread()).await?;
+        }
+        SlashCommand::Test => {
+            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
+                return Ok(());
+            };
+            if state.active_tasks.read().await.contains_key(&chat.session_id) {
+                api.reply_text(&msg.message_id, "当前 Agent 仍在执行，请完成或 /stop 后再测试", msg.in_thread()).await?;
+                return Ok(());
+            }
+            api.reply_text(&msg.message_id, "已开始运行受影响项目的测试", msg.in_thread()).await?;
+            let state = state.clone();
+            let api = api.clone();
+            let message_id = msg.message_id.clone();
+            let in_thread = msg.in_thread();
+            let session_id = chat.session_id.clone();
+            let cancel = tokio_util::sync::CancellationToken::new();
+            state.active_tasks.write().await.insert(session_id.clone(), cancel.clone());
+            tokio::spawn(async move {
+                let text = match crate::deployment::test_workspace(
+                    &state,
+                    &session_id,
+                    &chat.user_id,
+                    &cancel,
+                )
+                .await
+                {
+                    Ok(summary) => format!("测试通过\n{summary}"),
+                    Err(e) => format!("测试失败\n{e:#}"),
+                };
+                state.active_tasks.write().await.remove(&session_id);
+                if let Err(e) = api.reply_text(&message_id, &text, in_thread).await {
+                    tracing::warn!("feishu: reply test result failed: {e:#}");
+                }
+            });
+        }
+        SlashCommand::Deploy => {
+            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
+                return Ok(());
+            };
+            if state.active_tasks.read().await.contains_key(&chat.session_id) {
+                api.reply_text(&msg.message_id, "当前 Agent 仍在执行，请完成或 /stop 后再部署", msg.in_thread()).await?;
+                return Ok(());
+            }
+            let prepared = match crate::deployment::prepare_deployment(
+                state,
+                &chat.session_id,
+                &chat.user_id,
+                &account.id,
+                &msg.chat_id,
+                &topic,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    api.reply_text(&msg.message_id, &format!("无法创建部署：{e:#}"), msg.in_thread()).await?;
+                    return Ok(());
+                }
+            };
+            let card = build_deployment_card(&DeploymentCardOptions {
+                deployment_id: prepared.record.id.clone(),
+                session_id: prepared.record.session_id.clone(),
+                chat_id: msg.chat_id.clone(),
+                topic_id: topic.clone(),
+                summary: prepared.record.summary.clone(),
+                targets: prepared.targets.iter().map(|target| target.label().to_string()).collect(),
+                diff_stat: prepared.diff_stat,
+                expires_at: prepared.record.approval_expires_at.to_rfc3339(),
+                approve_label: prepared.approval_label.to_string(),
+            });
+            let card_message_id = api.reply_card(&msg.message_id, &card, msg.in_thread()).await?;
+            state.db.set_deployment_card(&prepared.record.id, &card_message_id).await?;
+        }
+        SlashCommand::Rollback => {
+            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
+                return Ok(());
+            };
+            if state.active_tasks.read().await.contains_key(&chat.session_id) {
+                api.reply_text(&msg.message_id, "当前 Agent 仍在执行，请完成或 /stop 后再回滚", msg.in_thread()).await?;
+                return Ok(());
+            }
+            let prepared = match crate::deployment::prepare_rollback(
+                state,
+                &chat.session_id,
+                &chat.user_id,
+                &account.id,
+                &msg.chat_id,
+                &topic,
+            )
+            .await
+            {
+                Ok(prepared) => prepared,
+                Err(e) => {
+                    api.reply_text(&msg.message_id, &format!("无法创建回滚：{e:#}"), msg.in_thread()).await?;
+                    return Ok(());
+                }
+            };
+            let card = build_deployment_card(&DeploymentCardOptions {
+                deployment_id: prepared.record.id.clone(),
+                session_id: prepared.record.session_id.clone(),
+                chat_id: msg.chat_id.clone(),
+                topic_id: topic.clone(),
+                summary: prepared.record.summary.clone(),
+                targets: prepared.targets.iter().map(|target| target.label().to_string()).collect(),
+                diff_stat: prepared.diff_stat,
+                expires_at: prepared.record.approval_expires_at.to_rfc3339(),
+                approve_label: prepared.approval_label.to_string(),
+            });
+            let card_message_id = api.reply_card(&msg.message_id, &card, msg.in_thread()).await?;
+            state.db.set_deployment_card(&prepared.record.id, &card_message_id).await?;
+        }
     }
     Ok(())
 }
@@ -486,10 +695,54 @@ pub async fn dispatch_task(
     user_id: &str,
     text: &str,
 ) -> Result<()> {
+    dispatch_task_content(
+        state,
+        api,
+        account,
+        msg,
+        user_id,
+        vec![hank_provider::ContentBlock::Text {
+            text: text.to_string(),
+        }],
+    )
+    .await
+}
+
+async fn dispatch_task_content(
+    state: &Arc<AppState>,
+    api: &FeishuApi,
+    account: &FeishuAccount,
+    msg: &IncomingMessage,
+    user_id: &str,
+    content: Vec<hank_provider::ContentBlock>,
+) -> Result<()> {
     let topic = msg.topic_id();
 
     // 找/建 feishu_chats 映射的 session
     let session_id = match state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await {
+        Ok(Some(c)) if state.config.server_agent.enabled => {
+            let is_server_session = state
+                .db
+                .get_session(&c.session_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|session| session.metadata)
+                .and_then(|metadata| serde_json::from_str::<serde_json::Value>(&metadata).ok())
+                .and_then(|metadata| metadata["server_agent"].as_bool())
+                .unwrap_or(false);
+            if is_server_session {
+                c.session_id
+            } else {
+                state.db.delete_feishu_chat(&account.id, &msg.chat_id, &topic).await?;
+                let session = create_feishu_session(state, user_id).await?;
+                state
+                    .db
+                    .set_feishu_chat(&account.id, &msg.chat_id, &topic, &session.id, user_id)
+                    .await?;
+                session.id
+            }
+        }
         Ok(Some(c)) => c.session_id,
         _ => match create_feishu_session(state, user_id).await {
             Ok(session) => {
@@ -559,9 +812,6 @@ pub async fn dispatch_task(
         apply_change_id: None,
         auth_token: jwt,
     };
-    let content = vec![hank_provider::ContentBlock::Text {
-        text: text.to_string(),
-    }];
     match run_chat_turn(state, &session_id, content, opts).await {
         Ok(handle) => {
             pusher::spawn(
@@ -609,6 +859,40 @@ fn archive_inbound_content(msg: &IncomingMessage) -> String {
 }
 
 async fn create_feishu_session(state: &Arc<AppState>, user_id: &str) -> Result<hank_db::Session> {
+    if state.config.server_agent.enabled {
+        crate::deployment::ensure_server_agent_admin(state, user_id).await?;
+        let metadata = serde_json::json!({
+            "source": "feishu",
+            "server_agent": true,
+            "client_excluded": true,
+        })
+        .to_string();
+        let mut session = state
+            .db
+            .create_session(
+                "",
+                "",
+                None,
+                Some(user_id),
+                Some("server"),
+                Some("chat"),
+                Some(&metadata),
+            )
+            .await
+            .map_err(|e| anyhow!("create server session: {e:#}"))?;
+        match crate::deployment::prepare_session_workspace(state, &session.id).await {
+            Ok(work_dir) => {
+                state.db.update_session_work_dir(&session.id, Some(&work_dir)).await?;
+                session.work_dir = Some(work_dir);
+                return Ok(session);
+            }
+            Err(e) => {
+                let _ = state.db.delete_session(&session.id).await;
+                return Err(e);
+            }
+        }
+    }
+
     let metadata = serde_json::json!({ "source": "feishu" }).to_string();
     // 有在线且接受远程任务的桌面 client 时，会话绑定到该 client 本地执行
     let client = crate::remote_exec::pick_online_client(state, user_id).await;
@@ -671,6 +955,16 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_detects_image_resources() {
+        assert_eq!(
+            extract_image_key("image", r#"{"image_key":"img_v3_x"}"#).as_deref(),
+            Some("img_v3_x")
+        );
+        assert_eq!(detect_image_media_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(detect_image_media_type(b"not-an-image"), None);
+    }
+
+    #[test]
     fn resolve_mentions_replaces_placeholders() {
         let mentions = vec![
             Mention { key: "@_user_1".into(), name: Some("MyBot".into()) },
@@ -693,6 +987,10 @@ mod tests {
         assert_eq!(parse_command("/new"), Some(SlashCommand::New));
         assert_eq!(parse_command("/stop"), Some(SlashCommand::Stop));
         assert_eq!(parse_command("/status"), Some(SlashCommand::Status));
+        assert_eq!(parse_command("/diff"), Some(SlashCommand::Diff));
+        assert_eq!(parse_command("/test"), Some(SlashCommand::Test));
+        assert_eq!(parse_command("/deploy"), Some(SlashCommand::Deploy));
+        assert_eq!(parse_command("/rollback"), Some(SlashCommand::Rollback));
         assert_eq!(parse_command("/help"), Some(SlashCommand::Help));
         assert_eq!(parse_command("@MyBot /status"), Some(SlashCommand::Status));
         assert_eq!(parse_command("@Agent OS /status"), Some(SlashCommand::Status));
