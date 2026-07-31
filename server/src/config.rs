@@ -44,6 +44,9 @@ pub struct ServerConfig {
     /// 是否启动飞书 WS 长连接。多实例共库时只能有一个实例开启（与 weixin_monitor 同理）
     #[serde(default = "default_true")]
     pub feishu_monitor: bool,
+    /// 是否启动定时任务调度器。多实例共库时只能有一个实例开启（避免重复推送/执行）
+    #[serde(default = "default_true")]
+    pub scheduler_enabled: bool,
     /// Chrome/Chromium 可执行文件路径（/snap 网页截图用）。留空则自动探测常见路径
     #[serde(default)]
     pub chrome_path: Option<String>,

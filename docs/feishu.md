@@ -104,8 +104,26 @@ feishu_monitor = false   # 其他实例关掉
 - **日志看连接状态**：`feishu monitor started` / `feishu ws connected, service_id=...`；断线会指数退避重连（1s→30s）
 - **常见错误码**：`code=99991663` token 失效（自动刷新）；权限类错误回开放平台检查权限范围
 
-## 六、后续（未实现）
+## 六、定时任务（系统主动推送）
+
+`server/src/scheduler/`：cron 调度器（上海时区），agent-os 文档"自动化工作流"的落地。
+管理入口在 admin「定时任务」页：查看调度状态/下次执行时间、启停、手动触发、执行记录。
+
+- 任务定义在代码（`JOB_DEFS` 注册表），启停状态在 `job_states` 表，执行日志在 `job_runs` 表（镜像 quant 的 `quant_job_run` 模型）
+- 多实例共库只能一个实例开调度：`[server] scheduler_enabled = false` 关闭其他实例
+- 手动触发与系统调度走同一执行路径，不绕过任务内部守卫；每 job 一把并发锁；进程重启遗留的"执行中"记录启动时自动收尾为失败
+
+**当前注册的 job**：
+
+| id | 调度 | 说明 |
+|----|------|------|
+| `quant_signal_brief` | 工作日 17:45 | 盘后信号简报：逐绑定用户签内部 JWT 调 quant `/api/signals?date=today`（策略可见性过滤天然生效），有信号推飞书单聊，无信号保持安静 |
+
+新增 job 的步骤：在 `scheduler/jobs.rs` 写 handler（返回 JSON 结果），在 `JOB_DEFS` 注册 cron，admin 页面自动出现。
+
+## 七、后续（未实现）
 
 - 图片/文件下载（`im:resource` 权限 + resource.get），截图修 bug 场景
 - `[file:]` 标记媒体回传（上传 image/file 再发送）
-- 多 bot 互相 @ 协作、定时巡检（agent-os 文档后半程的团队作战）
+- 更多 job：agent 整理的简报（cron 驱动 run_chat_turn）、失败 @人告警、巡检类任务
+- 多 bot 互相 @ 协作（agent-os 文档后半程的团队作战）

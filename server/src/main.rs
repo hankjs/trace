@@ -19,6 +19,7 @@ mod specs;
 mod termshot;
 mod websnap;
 mod feishu;
+mod scheduler;
 mod weixin;
 
 use anyhow::Result;
@@ -56,6 +57,8 @@ pub struct AppState {
     pub weixin_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
     /// 飞书账号 WS 长连接（account_id → 停止令牌）
     pub feishu_monitors: RwLock<HashMap<String, Arc<CancellationToken>>>,
+    /// 定时任务调度器状态（并发锁 + 下次执行时间）
+    pub scheduler: scheduler::SchedulerState,
     /// 微信渠道 agent 的短期对话记忆（binding_id → 最近若干轮问答）
     pub weixin_channel_history:
         RwLock<HashMap<String, std::collections::VecDeque<weixin::channel::ChannelTurn>>>,
@@ -171,6 +174,7 @@ async fn main() -> Result<()> {
         weixin_logins: RwLock::new(HashMap::new()),
         weixin_monitors: RwLock::new(HashMap::new()),
         feishu_monitors: RwLock::new(HashMap::new()),
+        scheduler: scheduler::SchedulerState::new(),
         weixin_channel_history: RwLock::new(HashMap::new()),
         client_hubs: RwLock::new(HashMap::new()),
         quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
@@ -184,6 +188,9 @@ async fn main() -> Result<()> {
 
     // 启动飞书 WS 长连接（为每个 enabled 账号起一个 monitor task）
     feishu::monitor::start_monitors(state.clone());
+
+    // 启动定时任务调度器（cron 驱动的系统主动工作入口）
+    scheduler::start(state.clone());
 
     // 启动 kimi 托管通知消费循环（client 通知 → 微信推送）
     tokio::spawn(weixin::kimi::run_notification_consumer(state.clone()));
@@ -476,6 +483,20 @@ async fn main() -> Result<()> {
             delete(feishu::routes::delete_binding_admin),
         )
         .route("/api/admin/feishu/send", post(feishu::routes::send_message))
+        // Scheduler admin routes（定时任务管理）
+        .route("/api/admin/jobs", get(scheduler::routes::list_jobs))
+        .route(
+            "/api/admin/jobs/{id}",
+            patch(scheduler::routes::update_job),
+        )
+        .route(
+            "/api/admin/jobs/{id}/runs",
+            get(scheduler::routes::job_runs),
+        )
+        .route(
+            "/api/admin/jobs/{id}/run",
+            post(scheduler::routes::run_job),
+        )
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
         .route(

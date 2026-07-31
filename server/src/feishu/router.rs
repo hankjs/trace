@@ -5,14 +5,12 @@
 //! - 一个话题 = 一个会话（feishu_chats 映射，topic = thread_id || root_id || "main"）
 //! - /new /stop /status /help 命令管理当前话题会话
 
-use crate::auth::Claims;
 use crate::chat::{run_chat_turn, ChatTurnOpts};
 use crate::feishu::api::FeishuApi;
 use crate::feishu::pusher;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use hank_db::FeishuAccount;
-use jsonwebtoken::{encode, EncodingKey, Header};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -408,19 +406,7 @@ async fn handle_command(
 // ── 任务派发 ──
 
 fn sign_internal_jwt(state: &AppState, user_id: &str, username: &str) -> Result<String> {
-    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
-    let claims = Claims {
-        sub: user_id.to_string(),
-        username: username.to_string(),
-        can_admin: false,
-        can_client: true,
-        exp,
-    };
-    Ok(encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    )?)
+    Ok(crate::auth::sign_internal_jwt(&state.jwt_secret, user_id, username)?)
 }
 
 /// 派发任务：找/建话题会话，跑一轮 chat，事件流交给 pusher 刷新卡片。

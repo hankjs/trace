@@ -21,6 +21,7 @@
 │   ├── chat.rs          # SSE 聊天处理（run_chat_turn 与传输层解耦，各渠道复用）
 │   ├── weixin/          # 微信渠道（ilink 长轮询 monitor/router/pusher）
 │   ├── feishu/          # 飞书渠道（pbbp2 WS 长连接 + 任务卡片 + 按钮确认，见 docs/feishu.md）
+│   ├── scheduler/       # 定时任务调度（cron + job_runs 日志 + admin 手动触发）
 │   ├── changes.rs       # 变更管理 API
 │   ├── specs.rs         # Spec 管理 API
 │   ├── admin.rs         # 管理端点

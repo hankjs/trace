@@ -165,6 +165,29 @@ export interface FeishuBinding {
   created_at: string
 }
 
+export interface JobRun {
+  id: number
+  job_id: string
+  trigger: 'system' | 'manual'
+  status: 'running' | 'finished' | 'failed'
+  operator: string | null
+  started_at: string
+  finished_at: string | null
+  result: string | null
+  error: string | null
+}
+
+export interface AdminJob {
+  id: string
+  name: string
+  description: string
+  schedule: string
+  enabled: boolean
+  next_run_time: string | null
+  last_system_run: JobRun | null
+  manual_run: JobRun | null
+}
+
 export interface AgentEventRecord {
   id: string
   session_id: string
@@ -409,6 +432,26 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ binding_id: bindingId, text }),
     })
+  },
+
+  // Scheduler job management
+  listJobs() {
+    return request<{ scheduler_running: boolean; jobs: AdminJob[] }>('/api/admin/jobs')
+  },
+
+  updateJob(id: string, data: { enabled: boolean }) {
+    return request<void>(`/api/admin/jobs/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    })
+  },
+
+  jobRuns(id: string, limit = 20) {
+    return request<JobRun[]>(`/api/admin/jobs/${id}/runs?limit=${limit}`)
+  },
+
+  runJob(id: string) {
+    return request<{ status: string }>(`/api/admin/jobs/${id}/run`, { method: 'POST' })
   },
 
   chatGenerate(prompt: string, context?: string) {

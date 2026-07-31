@@ -1,6 +1,5 @@
 //! 微信消息路由：绑定检查 / bind 码 / 斜杠命令 / 渠道 agent 决策分发。
 
-use crate::auth::Claims;
 use crate::chat::{run_chat_turn, ChatTurnOpts};
 use crate::weixin::api::{IlinkClient, IlinkMessage};
 use crate::weixin::channel::{self, ChannelAction};
@@ -8,26 +7,13 @@ use crate::weixin::pusher;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use hank_db::{WeixinAccount, WeixinBinding};
-use jsonwebtoken::{encode, EncodingKey, Header};
 use std::sync::Arc;
 
 const BIND_CODE_TTL_MS: i64 = 10 * 60 * 1000;
 
 /// 为绑定用户签发短期 JWT（1 小时），供 spec 类工具回调 server 使用。
 fn sign_internal_jwt(state: &AppState, user_id: &str, username: &str) -> Result<String> {
-    let exp = (chrono::Utc::now() + chrono::Duration::hours(1)).timestamp() as usize;
-    let claims = Claims {
-        sub: user_id.to_string(),
-        username: username.to_string(),
-        can_admin: false,
-        can_client: true,
-        exp,
-    };
-    Ok(encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    )?)
+    Ok(crate::auth::sign_internal_jwt(&state.jwt_secret, user_id, username)?)
 }
 
 pub async fn handle_message(state: Arc<AppState>, account: WeixinAccount, msg: IlinkMessage) -> Result<()> {

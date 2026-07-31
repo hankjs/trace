@@ -44,3 +44,6 @@ chromiumoxide = "0.7"
 # 飞书渠道:WS 长连接(pbbp2 protobuf 帧)+ REST API(手写,对齐 weixin 模块风格)
 tokio-tungstenite = "0.24"
 prost = "0.13"
+# 定时任务调度(cron 解析 + 上海时区)
+cron = "0.15"
+chrono-tz = "0.10"

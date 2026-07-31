@@ -141,6 +141,24 @@ pub struct FeishuBindingWithUsername {
     pub created_at: DateTime<Utc>,
 }
 
+/// 定时任务执行记录（job_runs 表，镜像 quant_job_run 模型）
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct JobRun {
+    pub id: i64,
+    pub job_id: String,
+    /// system（调度器）| manual（admin 手动触发）
+    pub trigger: String,
+    /// running | finished | failed
+    pub status: String,
+    pub operator: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    /// 任务返回值的 JSON 文本
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct AgentMetric {
     pub id: String,
@@ -922,6 +940,36 @@ impl Database {
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (account_id) REFERENCES feishu_accounts(id) ON DELETE CASCADE,
                 UNIQUE KEY uk_feishu_chat_topic (account_id, chat_id, topic_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Job runs table（定时任务执行日志，镜像 quant_job_run：旁路日志，写失败不影响任务）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS job_runs (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                job_id VARCHAR(64) NOT NULL,
+                trigger VARCHAR(16) NOT NULL,
+                status VARCHAR(16) NOT NULL,
+                operator VARCHAR(64) DEFAULT NULL,
+                started_at DATETIME NOT NULL,
+                finished_at DATETIME DEFAULT NULL,
+                result MEDIUMTEXT DEFAULT NULL,
+                error TEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                INDEX idx_job_runs_job (job_id, id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Job states table（定时任务启停开关；任务定义在代码里，状态在 DB）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS job_states (
+                job_id VARCHAR(64) PRIMARY KEY,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at DATETIME NOT NULL DEFAULT NOW()
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -3078,6 +3126,104 @@ impl Database {
                 .execute(&self.pool)
         )?;
         Ok(())
+    }
+
+    // Job runs（定时任务执行日志）
+    /// 写入一条 running 记录，返回行 id
+    pub async fn create_job_run(&self, job_id: &str, trigger: &str, operator: Option<&str>) -> Result<i64> {
+        let now = Utc::now();
+        let res = db_retry!(
+            sqlx::query(
+                "INSERT INTO job_runs (job_id, trigger, status, operator, started_at, created_at) VALUES (?, ?, 'running', ?, ?, ?)"
+            )
+            .bind(job_id)
+            .bind(trigger)
+            .bind(operator)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(res.last_insert_id() as i64)
+    }
+
+    pub async fn finish_job_run(&self, id: i64, status: &str, result: Option<&str>, error: Option<&str>) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE job_runs SET status = ?, finished_at = ?, result = ?, error = ? WHERE id = ?")
+                .bind(status)
+                .bind(Utc::now())
+                .bind(result)
+                .bind(error)
+                .bind(id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 启动时收尾：进程崩溃遗留的 running 行标记为 failed
+    pub async fn fail_stale_running_job_runs(&self) -> Result<u64> {
+        let res = db_retry!(
+            sqlx::query("UPDATE job_runs SET status = 'failed', finished_at = ?, error = '进程重启，执行中断' WHERE status = 'running'")
+                .bind(Utc::now())
+                .execute(&self.pool)
+        )?;
+        Ok(res.rows_affected())
+    }
+
+    pub async fn recent_job_runs(&self, job_id: &str, limit: u32) -> Result<Vec<JobRun>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, JobRun>(
+                "SELECT id, job_id, `trigger`, status, operator, started_at, finished_at, result, error, created_at FROM job_runs WHERE job_id = ? ORDER BY id DESC LIMIT ?"
+            )
+            .bind(job_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    /// 每个 job 每种 trigger 的最新一条（列表页展示用）
+    pub async fn latest_job_runs(&self) -> Result<Vec<JobRun>> {
+        let rows = db_retry!(
+            sqlx::query_as::<_, JobRun>(
+                "SELECT r.id, r.job_id, r.`trigger`, r.status, r.operator, r.started_at, r.finished_at, r.result, r.error, r.created_at
+                 FROM job_runs r
+                 INNER JOIN (SELECT job_id, `trigger`, MAX(id) AS max_id FROM job_runs GROUP BY job_id, `trigger`) latest
+                   ON r.id = latest.max_id"
+            )
+            .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
+    }
+
+    // Job states（启停开关，默认 enabled）
+    pub async fn get_job_enabled(&self, job_id: &str) -> Result<bool> {
+        let row: Option<(bool,)> = db_retry!(
+            sqlx::query_as("SELECT enabled FROM job_states WHERE job_id = ?")
+                .bind(job_id)
+                .fetch_optional(&self.pool)
+        )?;
+        Ok(row.map(|r| r.0).unwrap_or(true))
+    }
+
+    pub async fn set_job_enabled(&self, job_id: &str, enabled: bool) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO job_states (job_id, enabled, updated_at) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), updated_at = NOW()"
+            )
+            .bind(job_id)
+            .bind(enabled)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 所有显式设置过的开关（job_id → enabled）
+    pub async fn list_job_states(&self) -> Result<Vec<(String, bool)>> {
+        let rows: Vec<(String, bool)> = db_retry!(
+            sqlx::query_as("SELECT job_id, enabled FROM job_states")
+                .fetch_all(&self.pool)
+        )?;
+        Ok(rows)
     }
 
     // Client agents
