@@ -141,7 +141,16 @@ install -d -o hank -g hank-workspace -m 2770 /opt/hank-worktrees
 if [[ ! -d /opt/hank-src/.git ]]; then
   runuser --user hank -- git clone "$REPO_URL" /opt/hank-src
 fi
-runuser --user hank -- git -C /opt/hank-src fetch --prune origin
+for attempt in 1 2 3; do
+  if runuser --user hank -- git -C /opt/hank-src fetch --prune origin; then
+    break
+  fi
+  if [[ $attempt -eq 3 ]]; then
+    echo "ERROR: Git fetch 连续失败 3 次" >&2
+    exit 1
+  fi
+  sleep "$((attempt * 2))"
+done
 if ! runuser --user hank -- git -C /opt/hank-src cat-file -e "$BOOTSTRAP_REF^{commit}"; then
   echo "ERROR: BOOTSTRAP_REF=$BOOTSTRAP_REF 不在远端仓库，请先 push" >&2
   exit 1

@@ -43,7 +43,16 @@ ssh "$SSH_HOST" bash -s -- "$GIT_SHA" <<'REMOTE'
 set -euo pipefail
 sha="$1"
 id hank >/dev/null 2>&1 || { echo "ERROR: 请先运行 make bootstrap-server-agent" >&2; exit 1; }
-runuser --user hank -- git -C /opt/hank-src fetch --prune origin
+for attempt in 1 2 3; do
+  if runuser --user hank -- git -C /opt/hank-src fetch --prune origin; then
+    break
+  fi
+  if [[ $attempt -eq 3 ]]; then
+    echo "ERROR: Git fetch 连续失败 3 次" >&2
+    exit 1
+  fi
+  sleep "$((attempt * 2))"
+done
 runuser --user hank -- git -C /opt/hank-src cat-file -e "$sha^{commit}" || {
   echo "ERROR: 当前 commit 尚未 push 到 origin" >&2
   exit 1
