@@ -25,7 +25,7 @@ LOCAL_BUNDLE="$LOCAL_STAGE/repository.bundle"
 REMOTE_BUNDLE=""
 
 cleanup() {
-  if [[ -n "$REMOTE_BUNDLE" ]]; then
+  if [[ "$REMOTE_BUNDLE" =~ ^/tmp/hank-sync\.[[:alnum:]]+\.bundle$ ]]; then
     ssh "$SSH_HOST" "unlink '$REMOTE_BUNDLE'" >/dev/null 2>&1 || true
   fi
   [[ ! -f "$LOCAL_BUNDLE" ]] || unlink "$LOCAL_BUNDLE"
@@ -37,10 +37,10 @@ log "在 $SSH_HOST 生成离线 Git bundle ..."
 REMOTE_BUNDLE="$(
   ssh "$SSH_HOST" "cd / && runuser --user hank -- mktemp /tmp/hank-sync.XXXXXX.bundle"
 )"
-case "$REMOTE_BUNDLE" in
-  /tmp/hank-sync.*.bundle) ;;
-  *) echo "ERROR: 远端 Git bundle 路径异常: $REMOTE_BUNDLE" >&2; exit 1 ;;
-esac
+if [[ ! "$REMOTE_BUNDLE" =~ ^/tmp/hank-sync\.[[:alnum:]]+\.bundle$ ]]; then
+  echo "ERROR: 远端 Git bundle 路径异常: $REMOTE_BUNDLE" >&2
+  exit 1
+fi
 
 ssh "$SSH_HOST" bash -s -- "$REMOTE_BUNDLE" <<'REMOTE'
 set -euo pipefail

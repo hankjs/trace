@@ -14,7 +14,7 @@ REMOTE_STAGE=""
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 
 cleanup() {
-  if [[ -n "$REMOTE_STAGE" ]]; then
+  if [[ "$REMOTE_STAGE" =~ ^/tmp/hank-bootstrap\.[[:alnum:]]+$ ]]; then
     ssh "$SSH_HOST" "rm -rf -- '$REMOTE_STAGE'" >/dev/null 2>&1 || true
   fi
   [[ -z "$LOCAL_BUNDLE" || ! -f "$LOCAL_BUNDLE" ]] || unlink "$LOCAL_BUNDLE"
@@ -37,10 +37,10 @@ git -C "$PROJECT_ROOT" bundle verify "$LOCAL_BUNDLE" >/dev/null 2>&1
 
 log "上传 server Agent 基础设施到 $SSH_HOST ..."
 REMOTE_STAGE="$(ssh "$SSH_HOST" 'mktemp -d /tmp/hank-bootstrap.XXXXXX')"
-case "$REMOTE_STAGE" in
-  /tmp/hank-bootstrap.*) ;;
-  *) echo "ERROR: 远端临时目录异常: $REMOTE_STAGE" >&2; exit 1 ;;
-esac
+if [[ ! "$REMOTE_STAGE" =~ ^/tmp/hank-bootstrap\.[[:alnum:]]+$ ]]; then
+  echo "ERROR: 远端临时目录异常: $REMOTE_STAGE" >&2
+  exit 1
+fi
 
 scp -q \
   "$PROJECT_ROOT/deploy/hank-deploy" \
