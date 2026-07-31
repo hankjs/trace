@@ -18,7 +18,15 @@ use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 struct EventEnvelope {
+    #[serde(default)]
+    header: EventHeader,
     event: EventData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EventHeader {
+    event_id: Option<String>,
+    create_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,6 +57,7 @@ struct EventMessage {
     root_id: Option<String>,
     thread_id: Option<String>,
     mentions: Option<Vec<MentionEvent>>,
+    create_time: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -181,6 +190,16 @@ pub fn parse_command(text: &str) -> Option<SlashCommand> {
     None
 }
 
+fn parse_bind_code(text: &str) -> Option<&str> {
+    let code = text.trim().strip_prefix("bind")?.trim();
+    (code.len() == 6 && code.chars().all(|c| c.is_ascii_digit())).then_some(code)
+}
+
+pub(crate) fn parse_feishu_timestamp(value: Option<&str>) -> Option<chrono::DateTime<chrono::Utc>> {
+    let millis = value?.parse::<i64>().ok()?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+}
+
 // ── 事件入口 ──
 
 pub async fn handle_event(state: Arc<AppState>, account: FeishuAccount, payload: &[u8]) -> Result<()> {
@@ -190,7 +209,7 @@ pub async fn handle_event(state: Arc<AppState>, account: FeishuAccount, payload:
     match event_type {
         "im.message.receive_v1" => {
             let envelope: EventEnvelope = serde_json::from_slice(payload)?;
-            handle_message(state, account, envelope.event).await
+            handle_message(state, account, envelope.header, envelope.event).await
         }
         other => {
             tracing::debug!(event_type = other, "feishu: ignore event");
@@ -199,12 +218,20 @@ pub async fn handle_event(state: Arc<AppState>, account: FeishuAccount, payload:
     }
 }
 
-async fn handle_message(state: Arc<AppState>, account: FeishuAccount, data: EventData) -> Result<()> {
+async fn handle_message(
+    state: Arc<AppState>,
+    account: FeishuAccount,
+    header: EventHeader,
+    data: EventData,
+) -> Result<()> {
     // 忽略 bot 自己/其他应用的消息，防自循环
     if data.sender.sender_type.as_deref() != Some("user") {
         return Ok(());
     }
     let m = data.message;
+    let created_at = parse_feishu_timestamp(m.create_time.as_deref())
+        .or_else(|| parse_feishu_timestamp(header.create_time.as_deref()))
+        .unwrap_or_else(chrono::Utc::now);
     let mentions: Vec<Mention> = m
         .mentions
         .unwrap_or_default()
@@ -229,6 +256,8 @@ async fn handle_message(state: Arc<AppState>, account: FeishuAccount, data: Even
     let log_text = archive_inbound_content(&msg);
     tracing::info!(
         account_id = %account.id,
+        event_id = header.event_id.as_deref().unwrap_or(""),
+        message_id = %msg.message_id,
         chat = %msg.chat_id,
         topic = %msg.topic_id(),
         sender = %msg.sender_open_id,
@@ -260,7 +289,7 @@ async fn handle_message(state: Arc<AppState>, account: FeishuAccount, data: Even
             Some(&msg.sender_open_id),
             binding.as_ref().map(|binding| binding.user_id.as_str()),
             None,
-            chrono::Utc::now(),
+            created_at,
         )
         .await?;
     if !inserted {
@@ -275,6 +304,16 @@ async fn handle_message(state: Arc<AppState>, account: FeishuAccount, data: Even
         }
     };
     let user_id = binding.user_id.clone();
+
+    if parse_bind_code(&msg.text).is_some() {
+        api.reply_text(
+            &msg.message_id,
+            "这个飞书账号已经绑定 Trace 用户，直接发送消息即可开始对话",
+            msg.in_thread(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // 斜杠命令
     if let Some(cmd) = parse_command(&msg.text) {
@@ -304,12 +343,7 @@ async fn handle_unbound(
     account: &FeishuAccount,
     msg: &IncomingMessage,
 ) {
-    let code = msg
-        .text
-        .strip_prefix("bind")
-        .map(str::trim)
-        .filter(|c| c.len() == 6 && c.chars().all(|c| c.is_ascii_digit()))
-        .map(|c| c.to_string());
+    let code = parse_bind_code(&msg.text).map(str::to_string);
     let Some(code) = code else {
         let _ = api
             .reply_text(
@@ -329,6 +363,16 @@ async fn handle_unbound(
             {
                 Ok(_) => {
                     tracing::info!(user_id, open_id = %msg.sender_open_id, "feishu binding created");
+                    if let Err(e) = state
+                        .db
+                        .link_channel_message_user("feishu", &account.id, &msg.message_id, &user_id)
+                        .await
+                    {
+                        tracing::warn!(
+                            message_id = %msg.message_id,
+                            "feishu: link bind message to user failed: {e:#}"
+                        );
+                    }
                     let _ = api
                         .reply_text(
                             &msg.message_id,
@@ -655,6 +699,23 @@ mod tests {
         assert_eq!(parse_command("帮我运行 /status"), None);
         assert_eq!(parse_command("/unknown"), None);
         assert_eq!(parse_command("@MyBot"), None);
+    }
+
+    #[test]
+    fn parses_only_six_digit_bind_codes() {
+        assert_eq!(parse_bind_code("bind 181277"), Some("181277"));
+        assert_eq!(parse_bind_code("  bind 000001  "), Some("000001"));
+        assert_eq!(parse_bind_code("bind 12345"), None);
+        assert_eq!(parse_bind_code("bind abcdef"), None);
+        assert_eq!(parse_bind_code("binding 123456"), None);
+    }
+
+    #[test]
+    fn parses_feishu_millisecond_timestamp() {
+        let timestamp = parse_feishu_timestamp(Some("1785487725000")).unwrap();
+        assert_eq!(timestamp.timestamp_millis(), 1_785_487_725_000);
+        assert!(parse_feishu_timestamp(Some("invalid")).is_none());
+        assert!(parse_feishu_timestamp(None).is_none());
     }
 
     #[test]

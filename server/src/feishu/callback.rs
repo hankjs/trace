@@ -44,6 +44,9 @@ pub async fn handle_card_action(
 ) -> Result<Value> {
     // 外层 envelope（schema 2.0）：{"schema","header","event":{...}}；容错扁平结构
     let root: Value = serde_json::from_slice(payload)?;
+    let event_id = root["header"]["event_id"].as_str().map(str::to_string);
+    let created_at = router::parse_feishu_timestamp(root["header"]["create_time"].as_str())
+        .unwrap_or_else(chrono::Utc::now);
     let body = if root.get("event").is_some() {
         root["event"].clone()
     } else {
@@ -91,20 +94,13 @@ pub async fn handle_card_action(
     let user_id = binding.user_id.clone();
 
     tracing::info!(
+        event_id = event_id.as_deref().unwrap_or(""),
+        card_message_id = card_message_id.as_deref().unwrap_or(""),
         operator = %operator_open_id,
         choice = %choice,
         session_id = %session_id,
         "feishu: 卡片按钮点击"
     );
-
-    // 把确认卡片原地改成终态（防重复点击）
-    if let Some(card_mid) = &card_message_id {
-        let question = value["question"].as_str().unwrap_or("确认操作");
-        let done = build_confirm_done_card("待确认", question, &choice, "你");
-        if let Err(e) = api.update_card(card_mid, &done).await {
-            tracing::warn!("feishu: patch confirm card failed: {e:#}");
-        }
-    }
 
     // 构造一条"虚拟用户消息"走正常派发：确认/否/选项文本 → 现有确认解析层接住
     let in_thread = topic_id != "main";
@@ -117,12 +113,12 @@ pub async fn handle_card_action(
         thread_id: if in_thread { topic_id } else { String::new() },
         sender_open_id: operator_open_id,
     };
-    let card_external_id = format!(
-        "card-action:{}:{}",
-        card_message_id.as_deref().unwrap_or(&chat_id),
-        choice
+    let card_external_id = card_action_claim_id(
+        card_message_id.as_deref(),
+        event_id.as_deref(),
+        &chat_id,
+        &session_id,
     );
-    let card_external_id: String = card_external_id.chars().take(240).collect();
     let account_name = if account.name.trim().is_empty() {
         account.app_id.clone()
     } else {
@@ -144,7 +140,7 @@ pub async fn handle_card_action(
             Some(&msg.sender_open_id),
             Some(&user_id),
             (!session_id.is_empty()).then_some(session_id.as_str()),
-            chrono::Utc::now(),
+            created_at,
         )
         .await?;
     if !inserted {
@@ -152,6 +148,16 @@ pub async fn handle_card_action(
             "toast": { "type": "warning", "content": "这个操作已经提交过了" }
         }));
     }
+
+    // claim 成功后再改卡片，重复或冲突点击不能覆盖首次选择的终态。
+    if let Some(card_mid) = &card_message_id {
+        let question = value["question"].as_str().unwrap_or("确认操作");
+        let done = build_confirm_done_card("待确认", question, &choice, "你");
+        if let Err(e) = api.update_card(card_mid, &done).await {
+            tracing::warn!("feishu: patch confirm card failed: {e:#}");
+        }
+    }
+
     let state2 = state.clone();
     let api2 = api.clone();
     let choice_for_dispatch = choice.clone();
@@ -166,4 +172,41 @@ pub async fn handle_card_action(
     Ok(json!({
         "toast": { "type": "success", "content": format!("已提交：{choice}") }
     }))
+}
+
+fn card_action_claim_id(
+    card_message_id: Option<&str>,
+    event_id: Option<&str>,
+    chat_id: &str,
+    session_id: &str,
+) -> String {
+    let raw = if let Some(card_message_id) = card_message_id.filter(|id| !id.is_empty()) {
+        format!("card-action:{card_message_id}")
+    } else if let Some(event_id) = event_id.filter(|id| !id.is_empty()) {
+        format!("card-action-event:{event_id}")
+    } else {
+        format!("card-action:{chat_id}:{session_id}")
+    };
+    raw.chars().take(240).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::card_action_claim_id;
+
+    #[test]
+    fn card_action_claim_is_scoped_to_the_card() {
+        let first = card_action_claim_id(Some("om_card"), Some("evt_1"), "oc_1", "session_1");
+        let retry = card_action_claim_id(Some("om_card"), Some("evt_2"), "oc_1", "session_1");
+        assert_eq!(first, retry);
+        assert_eq!(first, "card-action:om_card");
+    }
+
+    #[test]
+    fn card_action_claim_falls_back_to_event_id() {
+        assert_eq!(
+            card_action_claim_id(None, Some("evt_1"), "oc_1", "session_1"),
+            "card-action-event:evt_1"
+        );
+    }
 }

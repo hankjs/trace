@@ -3346,6 +3346,30 @@ impl Database {
         Ok(())
     }
 
+    /// 绑定成功后，为绑定消息补上用户快照，确保其回复也能继承用户上下文。
+    pub async fn link_channel_message_user(
+        &self,
+        channel: &str,
+        account_id: &str,
+        external_message_id: &str,
+        user_id: &str,
+    ) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "UPDATE channel_messages
+                 SET user_id = ?, username = (SELECT username FROM users WHERE id = ? LIMIT 1)
+                 WHERE channel = ? AND account_id = ? AND external_message_id = ?"
+            )
+            .bind(user_id)
+            .bind(user_id)
+            .bind(channel)
+            .bind(account_id)
+            .bind(external_message_id)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
     /// Agent 会话确定后，为当前渠道消息补上 session 关联。
     pub async fn link_channel_message_session(
         &self,
