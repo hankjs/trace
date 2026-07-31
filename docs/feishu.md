@@ -111,7 +111,7 @@ feishu_monitor = false   # 其他实例关掉
 
 ### 首次初始化
 
-首次仍需一次 SSH。先提交并 push 本实现，确认本地或线上已有生产 `config.toml`，然后执行：
+首次仍需一次 SSH。先在本机提交实现并确认本地或线上已有生产 `config.toml`，然后执行：
 
 ```bash
 make bootstrap-server-agent
@@ -122,6 +122,8 @@ make deploy-quant-slidev
 ```
 
 `bootstrap-server-agent` 会创建两个账号：`hank` 运行 server 并持有审批权限，`hank-build` 只执行仓库 shell、测试和构建，不具备 root 部署权限。构建用户的 Git 信任范围只包含 `/opt/hank-worktrees/*`。bootstrap 还会安装 root-owned `/usr/local/libexec/hank-deploy`；helper 只接受 UUID，从 `/opt/hank/deploy-jobs` 读取 manifest，并把任务转交给独立 systemd transient unit，因此更新 `hank-server` 本身不会中断部署。
+
+bootstrap 由本机生成 Git bundle 并通过 SSH 上传，wananyun 不执行 `clone`、`fetch` 或 `push` GitHub。仓库的 `origin` URL 仅保留为 SSH break-glass 元数据。
 
 生产配置最终应包含：
 
@@ -148,6 +150,33 @@ approval_ttl_secs = 600
 6. 任一步失败只回滚本次已切换目标；结果在 server 重启后仍会回到原飞书话题。
 
 并发部署由全局 `flock` 串行化。审批 commit 必须仍基于当前 `trace-production`，基线已前进时旧话题会被拒绝，需在新话题重新应用变更。
+
+### 离线 Git 回传
+
+wananyun 不需要连接 GitHub。飞书 Agent 在 `feishu/<session-uuid>` 分支提交，部署成功后 helper 将 `trace-production` 快进到审批 commit。本机能连接 wananyun 时执行：
+
+```bash
+make sync-server-agent
+```
+
+脚本在 wananyun 以 `hank` 用户生成临时 Git bundle，拉回后只更新：
+
+```text
+refs/remotes/wananyun/trace-production
+refs/remotes/wananyun/feishu/*
+```
+
+它不会切换或修改本机当前分支，不会自动 merge/rebase，也不会连接或 push GitHub。脚本还会检查生产提交与所有话题分支没有 `client/` 改动；发现越界会保留远端跟踪引用用于审计，但以失败状态退出。
+
+生产分支可快进时，检查提交后由用户手动执行：
+
+```bash
+git log --stat HEAD..refs/remotes/wananyun/trace-production
+git merge --ff-only refs/remotes/wananyun/trace-production
+git push origin master
+```
+
+若脚本报告分叉，不自动合并；先检查两侧历史，再手动 rebase 或 cherry-pick。尚未部署的话题提交也会保留在 `refs/remotes/wananyun/feishu/*`，可单独审阅和取回。
 
 ### quant 迁移
 

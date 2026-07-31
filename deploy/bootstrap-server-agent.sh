@@ -7,13 +7,33 @@ SSH_HOST="${SSH_HOST:-wananyun}"
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_URL="${REPO_URL:-$(git -C "$PROJECT_ROOT" remote get-url origin)}"
 BOOTSTRAP_REF="${BOOTSTRAP_REF:-$(git -C "$PROJECT_ROOT" rev-parse HEAD)}"
+LOCAL_STAGE=""
+LOCAL_BUNDLE=""
+REMOTE_STAGE=""
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+cleanup() {
+  if [[ -n "$REMOTE_STAGE" ]]; then
+    ssh "$SSH_HOST" "rm -rf -- '$REMOTE_STAGE'" >/dev/null 2>&1 || true
+  fi
+  [[ -z "$LOCAL_BUNDLE" || ! -f "$LOCAL_BUNDLE" ]] || unlink "$LOCAL_BUNDLE"
+  [[ -z "$LOCAL_STAGE" ]] || rmdir "$LOCAL_STAGE" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 if [[ -n "$(git -C "$PROJECT_ROOT" status --porcelain)" ]]; then
   echo "ERROR: bootstrap 前请先提交当前改动，生产基线必须对应一个 Git commit" >&2
   exit 1
 fi
+if ! git -C "$PROJECT_ROOT" merge-base --is-ancestor "$BOOTSTRAP_REF" HEAD; then
+  echo "ERROR: BOOTSTRAP_REF 必须是当前 HEAD 或其祖先，才能随离线 bundle 上传" >&2
+  exit 1
+fi
+LOCAL_STAGE="$(mktemp -d "${TMPDIR:-/tmp}/hank-bootstrap.XXXXXX")"
+LOCAL_BUNDLE="$LOCAL_STAGE/repository.bundle"
+git -C "$PROJECT_ROOT" bundle create "$LOCAL_BUNDLE" HEAD --branches
+git -C "$PROJECT_ROOT" bundle verify "$LOCAL_BUNDLE" >/dev/null 2>&1
 
 log "上传 server Agent 基础设施到 $SSH_HOST ..."
 REMOTE_STAGE="$(ssh "$SSH_HOST" 'mktemp -d /tmp/hank-bootstrap.XXXXXX')"
@@ -21,8 +41,6 @@ case "$REMOTE_STAGE" in
   /tmp/hank-bootstrap.*) ;;
   *) echo "ERROR: 远端临时目录异常: $REMOTE_STAGE" >&2; exit 1 ;;
 esac
-cleanup() { ssh "$SSH_HOST" "rm -rf -- '$REMOTE_STAGE'" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
 
 scp -q \
   "$PROJECT_ROOT/deploy/hank-deploy" \
@@ -32,6 +50,11 @@ scp -q \
   "$PROJECT_ROOT/deploy/quant-slidev.nginx" \
   "$PROJECT_ROOT/deploy/hank-docs.nginx" \
   "$SSH_HOST:$REMOTE_STAGE/"
+scp -q "$LOCAL_BUNDLE" "$SSH_HOST:$REMOTE_STAGE/repository.bundle"
+unlink "$LOCAL_BUNDLE"
+LOCAL_BUNDLE=""
+rmdir "$LOCAL_STAGE"
+LOCAL_STAGE=""
 if [[ -f "$PROJECT_ROOT/config.toml" ]]; then
   scp -q "$PROJECT_ROOT/config.toml" "$SSH_HOST:$REMOTE_STAGE/config.toml"
 fi
@@ -67,7 +90,7 @@ fi
 usermod -a -G hank-workspace hank
 usermod -a -G hank-workspace hank-build
 
-# wananyun 到 GitHub 的 HTTP/2 链路偶发长时间无响应，两个 Git 执行账号统一使用 HTTP/1.1。
+# origin 只作为 SSH 应急入口的仓库地址元数据，正常 bootstrap、迭代与部署均不访问 GitHub。
 (
   cd /
   runuser --user hank -- git config --global http.version HTTP/1.1
@@ -140,26 +163,32 @@ chown -R hank:hank /opt/hank/logs
 install -d -o hank -g hank-workspace -m 2750 /opt/hank-src
 install -d -o hank -g hank-workspace -m 2770 /opt/hank-worktrees
 
+BUNDLE_FILE="$(mktemp /tmp/hank-bootstrap-repository.XXXXXX.bundle)"
+install -o hank -g hank -m 600 "$STAGE/repository.bundle" "$BUNDLE_FILE"
+cleanup_bundle() { unlink "$BUNDLE_FILE" 2>/dev/null || true; }
+trap cleanup_bundle EXIT
+
 if [[ ! -d /opt/hank-src/.git ]]; then
-  runuser --user hank -- git clone "$REPO_URL" /opt/hank-src
+  runuser --user hank -- git -C /opt/hank-src init
 fi
-for attempt in 1 2 3; do
-  if runuser --user hank -- git -C /opt/hank-src fetch --prune origin; then
-    break
-  fi
-  if [[ $attempt -eq 3 ]]; then
-    echo "ERROR: Git fetch 连续失败 3 次" >&2
-    exit 1
-  fi
-  sleep "$((attempt * 2))"
-done
+if runuser --user hank -- git -C /opt/hank-src config --get remote.origin.url >/dev/null 2>&1; then
+  runuser --user hank -- git -C /opt/hank-src remote set-url origin "$REPO_URL"
+else
+  runuser --user hank -- git -C /opt/hank-src remote add origin "$REPO_URL"
+fi
+runuser --user hank -- git -C /opt/hank-src fetch "$BUNDLE_FILE" HEAD
 if ! runuser --user hank -- git -C /opt/hank-src cat-file -e "$BOOTSTRAP_REF^{commit}"; then
-  echo "ERROR: BOOTSTRAP_REF=$BOOTSTRAP_REF 不在远端仓库，请先 push" >&2
+  echo "ERROR: BOOTSTRAP_REF=$BOOTSTRAP_REF 不在本机上传的 Git bundle 中" >&2
   exit 1
 fi
 BASE_SHA="$(runuser --user hank -- git -C /opt/hank-src rev-parse "$BOOTSTRAP_REF^{commit}")"
 if ! runuser --user hank -- git -C /opt/hank-src rev-parse --verify trace-production >/dev/null 2>&1; then
   runuser --user hank -- git -C /opt/hank-src update-ref refs/heads/trace-production "$BASE_SHA"
+fi
+if ! runuser --user hank -- git -C /opt/hank-src symbolic-ref --quiet HEAD >/dev/null 2>&1 || \
+   ! runuser --user hank -- git -C /opt/hank-src rev-parse --verify HEAD >/dev/null 2>&1; then
+  runuser --user hank -- git -C /opt/hank-src symbolic-ref HEAD refs/heads/trace-production
+  runuser --user hank -- git -C /opt/hank-src reset --hard trace-production
 fi
 chown -R hank:hank-workspace /opt/hank-src /opt/hank-worktrees
 # 构建用户只需读取生产仓库；公共 config、hooks 和 trace-production ref 不可写。
