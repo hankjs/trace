@@ -17,6 +17,7 @@ const nav = [
   { to: '/providers', label: '供应商', icon: '⚡' },
   { to: '/image-providers', label: '生图供应商', icon: '🖼' },
   { to: '/weixin', label: '微信机器人', icon: '✆' },
+  { to: '/feishu', label: '飞书机器人', icon: '✈' },
   { to: '/terminals', label: '终端', icon: '▸' },
   { to: '/notifications', label: '通知', icon: '◉' },
   { to: '/users', label: '用户', icon: '⚇' },

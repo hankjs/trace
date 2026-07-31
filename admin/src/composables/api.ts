@@ -148,6 +148,23 @@ export interface WeixinBinding {
   created_at: string
 }
 
+export interface FeishuAccount {
+  id: string
+  name: string
+  app_id: string
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface FeishuBinding {
+  id: string
+  account_id: string
+  username: string
+  open_id: string
+  created_at: string
+}
+
 export interface AgentEventRecord {
   id: string
   session_id: string
@@ -354,6 +371,37 @@ export const api = {
 
   deleteWeixinBinding(id: string) {
     return request<void>(`/api/admin/weixin/bindings/${id}`, { method: 'DELETE' })
+  },
+
+  // Feishu bot management
+  listFeishuAccounts() {
+    return request<FeishuAccount[]>('/api/admin/feishu/accounts')
+  },
+
+  createFeishuAccount(data: { name?: string; app_id: string; app_secret: string }) {
+    return request<{ id: string }>('/api/admin/feishu/accounts', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+  },
+
+  updateFeishuAccount(id: string, data: { enabled?: boolean; name?: string; app_secret?: string }) {
+    return request<void>(`/api/admin/feishu/accounts/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    })
+  },
+
+  deleteFeishuAccount(id: string) {
+    return request<void>(`/api/admin/feishu/accounts/${id}`, { method: 'DELETE' })
+  },
+
+  listFeishuBindings() {
+    return request<FeishuBinding[]>('/api/admin/feishu/bindings')
+  },
+
+  deleteFeishuBinding(id: string) {
+    return request<void>(`/api/admin/feishu/bindings/${id}`, { method: 'DELETE' })
   },
 
   chatGenerate(prompt: string, context?: string) {
