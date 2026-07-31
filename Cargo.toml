@@ -42,7 +42,8 @@ unicode-width = "0.2"
 # 网页截图(需求 B):headless Chrome DevTools 协议
 chromiumoxide = "0.7"
 # 飞书渠道:WS 长连接(pbbp2 protobuf 帧)+ REST API(手写,对齐 weixin 模块风格)
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 prost = "0.13"
 # 定时任务调度(cron 解析 + 上海时区)
 cron = "0.15"

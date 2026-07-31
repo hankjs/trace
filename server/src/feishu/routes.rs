@@ -1,7 +1,7 @@
-//! 飞书模块 HTTP 接口：admin（应用账号管理）+ client（绑定管理）。
+//! 飞书模块 HTTP 接口：admin（应用账号与绑定管理）+ client（绑定管理）。
 //!
 //! 与 weixin/routes.rs 同一模式：账号凭证入 DB，启停跟随 monitor；
-//! 用户绑定走一次性 6 位绑定码（client 生成 → 飞书里发给 bot）。
+//! 用户绑定走一次性 6 位绑定码（admin/client 生成 → 飞书里发给 bot）。
 
 use crate::auth::Claims;
 use crate::feishu::{api::FeishuApi, monitor};
@@ -130,6 +130,27 @@ pub async fn list_bindings(State(state): State<Arc<AppState>>) -> impl IntoRespo
     }
 }
 
+#[derive(Deserialize)]
+pub struct AdminCreateBindCodeRequest {
+    pub user_id: String,
+}
+
+/// POST /api/admin/feishu/bind-code — 管理员为指定 Trace 用户生成绑定码。
+pub async fn create_bind_code_admin(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AdminCreateBindCodeRequest>,
+) -> impl IntoResponse {
+    let user_id = body.user_id.trim();
+    if user_id.is_empty() {
+        return R::bad_request("user_id 不能为空");
+    }
+    match state.db.get_user_by_id(user_id).await {
+        Ok(Some(_)) => issue_bind_code(&state, user_id).await,
+        Ok(None) => R::not_found("user not found"),
+        Err(e) => R::internal_error(e),
+    }
+}
+
 /// DELETE /api/admin/feishu/bindings/{id}
 pub async fn delete_binding_admin(
     State(state): State<Arc<AppState>>,
@@ -189,11 +210,15 @@ pub async fn create_bind_code(
     State(state): State<Arc<AppState>>,
     Extension(claims): Extension<Claims>,
 ) -> impl IntoResponse {
+    issue_bind_code(&state, &claims.sub).await
+}
+
+async fn issue_bind_code(state: &Arc<AppState>, user_id: &str) -> axum::response::Response {
     let code = random_six_digits();
     let expires_at = bind_code_expires_at();
     match state
         .db
-        .create_feishu_bind_code(&code, &claims.sub, expires_at)
+        .create_feishu_bind_code(&code, user_id, expires_at)
         .await
     {
         Ok(()) => R::ok(serde_json::json!({ "code": code, "expires_at": expires_at })),

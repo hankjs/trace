@@ -165,6 +165,11 @@ export interface FeishuBinding {
   created_at: string
 }
 
+export interface FeishuBindCode {
+  code: string
+  expires_at: number
+}
+
 export interface JobRun {
   id: number
   job_id: string
@@ -421,6 +426,13 @@ export const api = {
 
   listFeishuBindings() {
     return request<FeishuBinding[]>('/api/admin/feishu/bindings')
+  },
+
+  createFeishuBindCode(userId: string) {
+    return request<FeishuBindCode>('/api/admin/feishu/bind-code', {
+      method: 'POST',
+      body: JSON.stringify({ user_id: userId }),
+    })
   },
 
   deleteFeishuBinding(id: string) {

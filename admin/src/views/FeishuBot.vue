@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { api, type FeishuAccount, type FeishuBinding } from '../composables/api'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { api, type FeishuAccount, type FeishuBinding, type User } from '../composables/api'
 
 const accounts = ref<FeishuAccount[]>([])
 const bindings = ref<FeishuBinding[]>([])
 const loading = ref(true)
 const bindingsLoading = ref(true)
+const users = ref<User[]>([])
+const usersLoading = ref(true)
 
 // 添加应用表单
 const showAdd = ref(false)
@@ -29,6 +31,19 @@ async function loadBindings() {
     bindings.value = await api.listFeishuBindings()
   } catch (e) { /* ignore */ }
   bindingsLoading.value = false
+}
+
+async function loadUsers() {
+  usersLoading.value = true
+  try {
+    users.value = await api.listUsers()
+    if (!bindUserId.value && users.value.length > 0) {
+      bindUserId.value = users.value[0].id
+    }
+  } catch (e: any) {
+    bindCodeError.value = e?.message || '用户列表加载失败'
+  }
+  usersLoading.value = false
 }
 
 async function addAccount() {
@@ -73,6 +88,67 @@ async function unbind(id: string) {
   await loadBindings()
 }
 
+// 管理员生成绑定码
+const bindUserId = ref('')
+const bindCode = ref('')
+const bindCodeUsername = ref('')
+const bindCodeExpiresAt = ref(0)
+const bindCodeNow = ref(Date.now())
+const bindCodeGenerating = ref(false)
+const bindCodeCopied = ref(false)
+const bindCodeError = ref('')
+let bindCodeTimer: ReturnType<typeof setInterval> | undefined
+let copiedTimer: ReturnType<typeof setTimeout> | undefined
+
+const bindCodeRemainingSeconds = computed(() =>
+  Math.max(0, Math.ceil((bindCodeExpiresAt.value - bindCodeNow.value) / 1000)),
+)
+const bindCodeCountdown = computed(() => {
+  const minutes = Math.floor(bindCodeRemainingSeconds.value / 60)
+  const seconds = bindCodeRemainingSeconds.value % 60
+  return `${minutes}:${String(seconds).padStart(2, '0')}`
+})
+const bindCodeExpired = computed(() => !!bindCode.value && bindCodeRemainingSeconds.value === 0)
+
+function startBindCodeTimer() {
+  clearInterval(bindCodeTimer)
+  bindCodeNow.value = Date.now()
+  bindCodeTimer = setInterval(() => {
+    bindCodeNow.value = Date.now()
+    if (bindCodeNow.value >= bindCodeExpiresAt.value) clearInterval(bindCodeTimer)
+  }, 1000)
+}
+
+async function generateBindCode() {
+  if (!bindUserId.value || bindCodeGenerating.value) return
+  bindCodeGenerating.value = true
+  bindCodeError.value = ''
+  bindCodeCopied.value = false
+  try {
+    const result = await api.createFeishuBindCode(bindUserId.value)
+    bindCode.value = result.code
+    bindCodeExpiresAt.value = result.expires_at
+    bindCodeUsername.value = users.value.find((user) => user.id === bindUserId.value)?.username || ''
+    startBindCodeTimer()
+  } catch (e: any) {
+    bindCodeError.value = e?.message || '绑定码生成失败'
+  } finally {
+    bindCodeGenerating.value = false
+  }
+}
+
+async function copyBindCommand() {
+  if (!bindCode.value || bindCodeExpired.value) return
+  try {
+    await navigator.clipboard.writeText(`bind ${bindCode.value}`)
+    bindCodeCopied.value = true
+    clearTimeout(copiedTimer)
+    copiedTimer = setTimeout(() => { bindCodeCopied.value = false }, 2000)
+  } catch {
+    bindCodeError.value = '复制失败，请手动复制绑定命令'
+  }
+}
+
 // 主动发送
 const sendBindingId = ref('')
 const sendText = ref('')
@@ -96,6 +172,12 @@ async function sendMessage() {
 onMounted(() => {
   load()
   loadBindings()
+  loadUsers()
+})
+
+onUnmounted(() => {
+  clearInterval(bindCodeTimer)
+  clearTimeout(copiedTimer)
 })
 </script>
 
@@ -103,7 +185,15 @@ onMounted(() => {
   <div>
     <div class="flex items-center justify-between mb-6">
       <h1 class="text-lg font-semibold text-text-primary">飞书机器人</h1>
-      <button @click="showAdd = !showAdd" class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90">添加应用</button>
+      <div class="flex items-center gap-3">
+        <a
+          href="https://open.feishu.cn/document/home/index"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="text-xs text-text-secondary hover:text-text-primary hover:underline"
+        >飞书开放平台文档 ↗</a>
+        <button @click="showAdd = !showAdd" class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90">添加应用</button>
+      </div>
     </div>
 
     <!-- 添加应用 -->
@@ -160,8 +250,40 @@ onMounted(() => {
     </table>
 
     <!-- 用户绑定 -->
-    <h2 class="text-sm font-semibold text-text-primary mb-3">用户绑定</h2>
-    <p class="text-xs text-text-tertiary mb-3">用户在 Trace client「设置 → 飞书绑定」生成绑定码后，在飞书里向机器人发送 bind + 绑定码完成绑定。</p>
+    <h2 class="text-sm font-semibold text-text-primary mb-2">用户绑定</h2>
+    <p class="text-xs text-text-tertiary mb-3">选择 Trace 用户生成绑定码，然后在飞书里向机器人发送绑定命令。</p>
+    <div class="flex items-end gap-3 max-w-xl mb-3">
+      <label class="flex-1 text-xs text-text-secondary">
+        Trace 用户
+        <select
+          v-model="bindUserId"
+          :disabled="usersLoading || users.length === 0"
+          class="mt-1 w-full px-3 py-1.5 text-sm bg-transparent border border-border-subtle rounded-md text-text-primary disabled:opacity-40"
+        >
+          <option value="" disabled>{{ usersLoading ? '加载用户中...' : '选择用户' }}</option>
+          <option v-for="user in users" :key="user.id" :value="user.id">{{ user.username }}</option>
+        </select>
+      </label>
+      <button
+        @click="generateBindCode"
+        :disabled="!bindUserId || bindCodeGenerating"
+        class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
+      >{{ bindCodeGenerating ? '生成中...' : bindCode ? '重新生成' : '生成绑定码' }}</button>
+    </div>
+    <div v-if="bindCode" class="flex flex-wrap items-center gap-3 max-w-xl mb-4 px-3 py-2.5 border border-border-subtle rounded-md">
+      <span class="text-xs text-text-tertiary">发送给机器人</span>
+      <code class="px-2 py-1 rounded bg-active text-sm text-text-primary">bind {{ bindCode }}</code>
+      <button
+        @click="copyBindCommand"
+        :disabled="bindCodeExpired"
+        class="text-xs text-accent hover:text-accent-hover disabled:text-text-tertiary disabled:cursor-not-allowed"
+      >{{ bindCodeCopied ? '已复制' : '复制命令' }}</button>
+      <span class="ml-auto text-xs" :class="bindCodeExpired ? 'text-red-400' : 'text-text-tertiary'">
+        {{ bindCodeUsername }} · {{ bindCodeExpired ? '已过期' : `${bindCodeCountdown} 后过期` }}
+      </span>
+    </div>
+    <p v-if="bindCodeError" class="text-xs text-red-400 mb-3">{{ bindCodeError }}</p>
+    <p v-else-if="!usersLoading && users.length === 0" class="text-xs text-text-tertiary mb-3">暂无 Trace 用户，请先在“用户”页面创建。</p>
     <div v-if="bindingsLoading" class="text-sm text-text-tertiary">加载中...</div>
     <div v-else-if="bindings.length === 0" class="text-sm text-text-tertiary">暂无绑定。</div>
     <table v-else class="w-full text-sm">

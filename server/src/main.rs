@@ -146,6 +146,10 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("安装 Rustls ring CryptoProvider 失败"))?;
+
     // 日志：同时输出到终端和文件（按天滚动，实时写入）
     let file_appender = tracing_appender::rolling::daily("logs", "hank.log");
 
@@ -477,6 +481,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/feishu/bindings",
             get(feishu::routes::list_bindings),
+        )
+        .route(
+            "/api/admin/feishu/bind-code",
+            post(feishu::routes::create_bind_code_admin),
         )
         .route(
             "/api/admin/feishu/bindings/{id}",

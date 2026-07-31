@@ -290,7 +290,7 @@ async fn handle_unbound(
         let _ = api
             .reply_text(
                 &msg.message_id,
-                "请先在 Trace client（设置 → 飞书绑定）生成绑定码，然后发送 bind 123456",
+                "你的飞书账号尚未绑定 Trace 用户。\n\n请联系管理员在 Trace 管理后台「飞书机器人 → 用户绑定」生成绑定码；如使用 Trace client，也可在「设置 → 飞书绑定」自行生成。\n\n生成后发送：bind 123456",
                 msg.in_thread(),
             )
             .await;
@@ -325,7 +325,7 @@ async fn handle_unbound(
             let _ = api
                 .reply_text(
                     &msg.message_id,
-                    "绑定码无效或已过期，请重新生成",
+                    "绑定码无效或已过期。请让管理员在 Trace 管理后台重新生成，或在 Trace client「设置 → 飞书绑定」自行生成。",
                     msg.in_thread(),
                 )
                 .await;
