@@ -812,6 +812,10 @@ fn load_server_agent_instructions(work_dir: &Option<String>) -> Vec<code_agent::
     for (name, path) in [
         ("AGENTS.md", root.join("AGENTS.md")),
         ("quant/AGENTS.md", root.join("quant/AGENTS.md")),
+        (
+            "Server Agent 双向 Git 同步协议",
+            root.join("docs/src/operations/server-agent-sync.md"),
+        ),
     ] {
         match std::fs::read_to_string(&path) {
             Ok(content) => segments.push(code_agent::PromptSegment::Dynamic(
@@ -1228,6 +1232,22 @@ fn extract_event_type(event: &AgentEvent) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_server_agent_loads_shared_sync_protocol() {
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("server crate should be inside project root")
+            .to_string_lossy()
+            .into_owned();
+        let segments = load_server_agent_instructions(&Some(project_root));
+        let prompt = code_agent::build_system_prompt(&segments);
+
+        assert!(prompt.contains("Server Agent 双向 Git 同步协议"));
+        assert!(prompt.contains("协议版本："));
+        assert!(prompt.contains("wananyun 不依赖 GitHub 网络"));
+        assert!(prompt.contains("始终排除 `client/`"));
+    }
 
     #[test]
     fn test_normalize_quant_confirm() {

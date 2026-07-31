@@ -135,6 +135,12 @@ make app                          # 构建 Trace.app 并安装到 /Applications
 
 ## 部署
 
+### Server Agent 双向 Git 同步（必读）
+
+涉及飞书 server-only 开发、`/deploy`、`make sync-server-agent`、本机部署或分支协调前，
+必须先阅读 `docs/src/operations/server-agent-sync.md`。该文件是本机与 wananyun 共同维护的唯一同步协议；
+其他文档不得复制另一套流程。wananyun 不访问 GitHub，服务器提交只由本机拉回、人工合并并手动 push。
+
 通过 `deploy/` 下的脚本 SSH 到线上服务器（`SSH_HOST`，默认 `wananyun`），systemd 管理服务：
 
 ```bash
@@ -142,6 +148,7 @@ make deploy               # server + admin: 服务器装依赖 -> 本地构建 a
 make deploy-cli           # hank-cli (需先跑过 make deploy)
 make deploy-quant         # quant 量化系统 (同机, 端口 8100)
 make deploy-quant-slidev  # quant 系统介绍 Slidev (同机 nginx 静态, 端口 3030)
+make sync-server-agent    # 拉回 wananyun Git 分支，不 merge、不 push
 # 跳过依赖安装: make deploy SKIP_DEPS=--skip-deps
 ```
 

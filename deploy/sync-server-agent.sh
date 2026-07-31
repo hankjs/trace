@@ -138,7 +138,7 @@ elif git -C "$PROJECT_ROOT" merge-base --is-ancestor "$SERVER_HEAD" "$LOCAL_HEAD
   echo "状态：本机领先 wananyun，当前没有需要拉回的生产提交。"
 else
   echo "状态：本机与 wananyun 已分叉，拒绝自动合并。"
-  echo "请先检查以下两侧提交，再手动 rebase/cherry-pick："
+  echo "请按 docs/src/operations/server-agent-sync.md 检查两侧提交，再人工协调："
   git -C "$PROJECT_ROOT" log --left-right --oneline --no-decorate "$LOCAL_HEAD...$PRODUCTION_REF"
 fi
 

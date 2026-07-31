@@ -153,30 +153,8 @@ approval_ttl_secs = 600
 
 ### 离线 Git 回传
 
-wananyun 不需要连接 GitHub。飞书 Agent 在 `feishu/<session-uuid>` 分支提交，部署成功后 helper 将 `trace-production` 快进到审批 commit。本机能连接 wananyun 时执行：
-
-```bash
-make sync-server-agent
-```
-
-脚本在 wananyun 以 `hank` 用户生成临时 Git bundle，拉回后只更新：
-
-```text
-refs/remotes/wananyun/trace-production
-refs/remotes/wananyun/feishu/*
-```
-
-它不会切换或修改本机当前分支，不会自动 merge/rebase，也不会连接或 push GitHub。脚本还会检查生产提交与所有话题分支没有 `client/` 改动；发现越界会保留远端跟踪引用用于审计，但以失败状态退出。
-
-生产分支可快进时，检查提交后由用户手动执行：
-
-```bash
-git log --stat HEAD..refs/remotes/wananyun/trace-production
-git merge --ff-only refs/remotes/wananyun/trace-production
-git push origin master
-```
-
-若脚本报告分叉，不自动合并；先检查两侧历史，再手动 rebase 或 cherry-pick。尚未部署的话题提交也会保留在 `refs/remotes/wananyun/feishu/*`，可单独审阅和取回。
+本机与 wananyun 的分支职责、拉回命令、分叉处理、安全边界和协议维护方式统一见
+[`Server Agent 双向 Git 同步协议`](src/operations/server-agent-sync.md)。该文件是唯一事实来源，本指南不重复维护第二套步骤。
 
 ### quant 迁移
 
