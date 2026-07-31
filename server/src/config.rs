@@ -23,6 +23,9 @@ pub struct ServerAgentConfig {
     pub repository_root: String,
     #[serde(default = "default_worktrees_root")]
     pub worktrees_root: String,
+    /// 与 Trace/quant 无关的任务使用普通隔离目录，不创建 Git worktree。
+    #[serde(default = "default_general_workspaces_root")]
+    pub general_workspaces_root: String,
     #[serde(default = "default_base_ref")]
     pub base_ref: String,
     #[serde(default = "default_deploy_jobs_dir")]
@@ -45,6 +48,7 @@ impl Default for ServerAgentConfig {
             enabled: false,
             repository_root: default_repository_root(),
             worktrees_root: default_worktrees_root(),
+            general_workspaces_root: default_general_workspaces_root(),
             base_ref: default_base_ref(),
             deploy_jobs_dir: default_deploy_jobs_dir(),
             deploy_helper: default_deploy_helper(),
@@ -61,6 +65,10 @@ fn default_repository_root() -> String {
 
 fn default_worktrees_root() -> String {
     "/opt/hank-worktrees".to_string()
+}
+
+fn default_general_workspaces_root() -> String {
+    "/opt/hank-workspaces".to_string()
 }
 
 fn default_base_ref() -> String {

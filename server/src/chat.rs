@@ -215,12 +215,23 @@ pub async fn run_chat_turn(
         .as_ref()
         .and_then(|s| s.exec_client_id.clone());
     let session_user_id = session_record.as_ref().and_then(|s| s.user_id.clone());
-    let server_agent_session = session_record
+    let session_metadata = session_record.as_ref().and_then(|s| s.metadata.as_deref());
+    let session_metadata_value =
+        session_metadata.and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok());
+    let server_agent_session = session_metadata_value
         .as_ref()
-        .and_then(|s| s.metadata.as_deref())
-        .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
         .and_then(|metadata| metadata["server_agent"].as_bool())
         .unwrap_or(false);
+    let repository_workspace =
+        crate::deployment::is_repository_workspace_metadata(session_metadata);
+    let routed_agent_kind = session_metadata_value
+        .as_ref()
+        .and_then(|metadata| metadata["agent_kind"].as_str());
+    let conversation_agent = routed_agent_kind
+        .map(|kind| kind == "conversation")
+        .unwrap_or(false);
+    let quant_code_agent = routed_agent_kind.map(|kind| kind == "quant_code").unwrap_or(false);
+    let legacy_repository_agent = repository_workspace && routed_agent_kind.is_none();
 
     // Check if this session has a pending ask_user state.
     // quant_confirm 类待确认单优先从进程内 map 读取（设计 §5.4.4），未命中再回退 DB。
@@ -241,7 +252,11 @@ pub async fn run_chat_turn(
     // 标记本会话是否注册了 quant_* 工具，用于后续决定是否注入 quant-research skill 全文。
     let mut quant_tools_added = false;
 
-    let tools: Vec<Arc<dyn Tool>> = {
+    let tools: Vec<Arc<dyn Tool>> = if conversation_agent {
+        // 路由 Agent 已将该话题标记为纯对话：没有文件系统工作区，也不暴露 shell/Git
+        // 等工具，避免无 cwd 的会话意外操作 server 进程目录。
+        Vec::new()
+    } else {
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
         let token = opts.auth_token.clone();
         let checksum_store = new_checksum_store();
@@ -649,7 +664,6 @@ pub async fn run_chat_turn(
                     let mut permission = PermissionConfig::default();
                     permission.mode = PermissionMode::WorkspaceWrite;
                     permission.sandbox_paths = vec![wd.clone()];
-                    permission.blocked_paths = vec![format!("{wd}/client")];
                     permission.restrict_read_paths = true;
                     permission.blocked_commands.extend([
                         "sudo".to_string(),
@@ -662,17 +676,22 @@ pub async fn run_chat_turn(
                         "git reset --hard".to_string(),
                         "git clean -f".to_string(),
                         "git checkout --".to_string(),
-                        "client/".to_string(),
-                        "cd client".to_string(),
-                        "cd ./client".to_string(),
                         "../".to_string(),
                         "/opt/hank".to_string(),
                         "/home/hank".to_string(),
                         "/etc/".to_string(),
-                        "config.toml".to_string(),
-                        "trace-production".to_string(),
-                        "update-ref".to_string(),
                     ]);
+                    if repository_workspace {
+                        permission.blocked_paths.push(format!("{wd}/client"));
+                        permission.blocked_commands.extend([
+                            "client/".to_string(),
+                            "cd client".to_string(),
+                            "cd ./client".to_string(),
+                            "config.toml".to_string(),
+                            "trace-production".to_string(),
+                            "update-ref".to_string(),
+                        ]);
+                    }
                     session = session.with_permission_config(permission, wd.clone());
                 } else {
                     session = session.with_permission(PermissionMode::WorkspaceWrite, wd.clone());
@@ -703,7 +722,9 @@ pub async fn run_chat_turn(
                     shell: "/bin/sh".to_string(),
                     current_date: chrono::Utc::now().format("%Y-%m-%d").to_string(),
                     timezone: "UTC".to_string(),
-                    repo_root: work_dir_for_agent.clone(),
+                    repo_root: repository_workspace
+                        .then(|| work_dir_for_agent.clone())
+                        .flatten(),
                     sandbox_mode: "workspace-write".to_string(),
                     network_policy: "restricted".to_string(),
                 };
@@ -717,8 +738,25 @@ pub async fn run_chat_turn(
                     ));
                 }
                 project_segments.append(&mut quant_segments);
-                if server_agent_session {
-                    project_segments.extend(load_server_agent_instructions(&work_dir_for_agent));
+                if conversation_agent {
+                    project_segments.push(code_agent::PromptSegment::Dynamic(
+                        "路由 Agent 已将当前话题标记为纯对话。没有工作目录，也没有本地执行工具；\
+                        直接结合对话上下文回答用户。若用户后续转为需要文件、命令或 Trace/quant 代码的任务，\
+                        请提示用户使用 /new 开启新话题，以便重新路由并分配合适工作区。"
+                            .to_string(),
+                    ));
+                } else if repository_workspace {
+                    project_segments.extend(load_server_agent_instructions(
+                        &work_dir_for_agent,
+                        quant_code_agent || legacy_repository_agent,
+                    ));
+                } else if server_agent_session {
+                    project_segments.push(code_agent::PromptSegment::Dynamic(
+                        "你正在 wananyun 的普通隔离工作区中工作。这个话题与 Trace/quant 仓库无关，\
+                        不要访问 /opt/hank-src 或任何 Trace worktree，也不能使用 /diff、/test、/deploy、\
+                        /rollback。该目录会在同一飞书话题中持续复用。"
+                            .to_string(),
+                    ));
                 }
                 let (_assembled, named) = code_agent::build_layered_prompt(
                     Some(&system_prompt),
@@ -805,18 +843,24 @@ pub async fn run_chat_turn(
     Ok(ChatTurnHandle { event_rx: rx })
 }
 
-fn load_server_agent_instructions(work_dir: &Option<String>) -> Vec<code_agent::PromptSegment> {
+fn load_server_agent_instructions(
+    work_dir: &Option<String>,
+    include_quant: bool,
+) -> Vec<code_agent::PromptSegment> {
     let Some(work_dir) = work_dir else { return Vec::new() };
     let root = std::path::Path::new(work_dir);
     let mut segments = Vec::new();
-    for (name, path) in [
+    let mut instruction_files = vec![
         ("AGENTS.md", root.join("AGENTS.md")),
-        ("quant/AGENTS.md", root.join("quant/AGENTS.md")),
         (
             "Server Agent 双向 Git 同步协议",
             root.join("docs/src/operations/server-agent-sync.md"),
         ),
-    ] {
+    ];
+    if include_quant {
+        instruction_files.insert(1, ("quant/AGENTS.md", root.join("quant/AGENTS.md")));
+    }
+    for (name, path) in instruction_files {
         match std::fs::read_to_string(&path) {
             Ok(content) => segments.push(code_agent::PromptSegment::Dynamic(
                 format!("项目指令 {name}:\n{content}"),
@@ -1240,7 +1284,7 @@ mod tests {
             .expect("server crate should be inside project root")
             .to_string_lossy()
             .into_owned();
-        let segments = load_server_agent_instructions(&Some(project_root));
+        let segments = load_server_agent_instructions(&Some(project_root), true);
         let prompt = code_agent::build_system_prompt(&segments);
 
         assert!(prompt.contains("Server Agent 双向 Git 同步协议"));

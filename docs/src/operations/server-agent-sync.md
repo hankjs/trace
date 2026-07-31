@@ -1,13 +1,13 @@
 # Server Agent 双向 Git 同步协议
 
-> 协议版本：1
+> 协议版本：2
 >
 > 本文件是本机、wananyun 和飞书 server Agent 共同维护的唯一同步流程。
 > `AGENTS.md`、飞书指南和脚本只引用本文件，不复制另一套流程。
 
 ## 目标
 
-- 飞书 Agent 在 wananyun 本地完成代码修改、提交、测试和审批部署。
+- 飞书 Agent 在 wananyun 本地完成代码修改、提交、测试和审批部署；工作区由任务意图决定。
 - wananyun 不依赖 GitHub 网络，不执行 GitHub `clone`、`fetch` 或 `push`。
 - 本机通过 SSH 拉回 wananyun 的 Git 提交，人工检查后合并并手动 push GitHub。
 - server 与本机共享同一段 Git 历史，不通过 rsync 覆盖开发工作区。
@@ -20,6 +20,7 @@
 | `master` | 本机 / GitHub | 上游历史 | 本机人工 push |
 | `trace-production` | wananyun `/opt/hank-src` | 当前生产代码基线 | 审批后的部署 helper，或 SSH 手工部署 |
 | `feishu/<session-uuid>` | wananyun | 一个飞书话题的工作分支 | 对应话题 Agent |
+| `/opt/hank-workspaces/<session-uuid>` | wananyun | 与 Trace/quant 无关话题的普通隔离目录，不进入 Git 同步 | 对应话题 Agent |
 | `refs/remotes/wananyun/trace-production` | 本机 | 最近一次拉回的生产快照 | `make sync-server-agent` |
 | `refs/remotes/wananyun/feishu/*` | 本机 | 最近一次拉回的话题分支快照 | `make sync-server-agent` |
 
@@ -34,7 +35,14 @@ git -C /opt/hank-src rev-parse trace-production
 git -C /opt/hank-src show trace-production:docs/src/operations/server-agent-sync.md
 ```
 
-飞书话题 worktree 总是从 `trace-production` 创建，因此会得到当前协议文件。
+Trace/quant 飞书话题 worktree 从 `trace-production` 创建，因此会得到当前协议文件；普通隔离目录不加载本协议。
+
+## 工作区路由
+
+1. 命令、帮助、问候和尚未形成具体事项的消息路由到 conversation Agent，只创建无工作目录的 session，不创建工作区。
+2. `feishu_chats` 已有映射时，历史话题始终复用原 session/workspace，不重新分类。
+3. 新消息由路由 Agent 标记为 `conversation`、`trace_code`、`quant_code` 或 `general_task`，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。两类代码 Agent 使用 Git worktree，通用任务使用普通隔离目录；判断失败默认普通隔离目录，避免误触生产仓库。
+4. 只有 repository workspace 可以运行 `/diff`、`/test`、`/deploy`、`/rollback`，普通 workspace 只能进行该话题范围内的通用工作。
 
 ## 数据流
 
@@ -58,7 +66,7 @@ wananyun Git 对象库 ──→ trace-production ──→ 新建 feishu/*
 
 ## 飞书侧标准流程
 
-1. 在新话题描述需求，server 从当前 `trace-production` 创建 `feishu/<session-uuid>` worktree。
+1. 在新话题描述需求，server 按工作区路由规则创建 Git worktree 或普通隔离目录。
 2. Agent 开始工作前读取 `AGENTS.md` 和本协议；修改 quant 时还必须读取 `quant/AGENTS.md`。
 3. Agent 只修改允许的项目目录，不修改 `client/`、生产配置或部署基础设施。
 4. 在同一话题迭代，用 `/diff` 检查范围，用 `/test` 运行固定测试矩阵。

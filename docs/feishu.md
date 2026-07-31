@@ -21,7 +21,7 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
 - **确认闸门升级**：微信是文本白名单（回复"确认"），飞书是按钮卡片；回调文本化后走同一套 `handle_quant_confirmation`，code-agent 零改动
-- **两种执行模式**：默认仍可绑定在线桌面 client；开启 `[server_agent]` 后改为 wananyun 本地 monorepo worktree，完全不依赖 `client/`
+- **执行模式**：默认仍可绑定在线桌面 client；开启 `[server_agent]` 后，新话题按任务意图选择 Trace/quant Git worktree 或普通隔离目录，完全不依赖 `client/`
 - **管理员边界**：server Agent 只接受绑定到 `can_login_admin = true` 用户的飞书消息
 
 ## 一、飞书开放平台配置
@@ -101,6 +101,7 @@ feishu_monitor = false   # 其他实例关掉
 ```text
 /opt/hank-src                         只保存 Git 生产基线 trace-production
 /opt/hank-worktrees/<session-uuid>    每个飞书话题一个独立可写 worktree
+/opt/hank-workspaces/<session-uuid>   与 Trace/quant 无关话题的普通隔离目录
 /opt/hank*/releases/<deployment-id>   不可变运行 release
 /opt/hank*/current                    systemd/nginx 当前版本链接
 /opt/hank*/previous                   最近一个可回滚版本链接
@@ -121,7 +122,7 @@ make deploy-quant     # 线上需要 quant 时
 make deploy-quant-slidev
 ```
 
-`bootstrap-server-agent` 会创建两个账号：`hank` 运行 server 并持有审批权限，`hank-build` 只执行仓库 shell、测试和构建，不具备 root 部署权限。构建用户的 Git 信任范围只包含 `/opt/hank-worktrees/*`。bootstrap 还会安装 root-owned `/usr/local/libexec/hank-deploy`；helper 只接受 UUID，从 `/opt/hank/deploy-jobs` 读取 manifest，并把任务转交给独立 systemd transient unit，因此更新 `hank-server` 本身不会中断部署。
+`bootstrap-server-agent` 会创建两个账号：`hank` 运行 server 并持有审批权限，`hank-build` 只执行工作区 shell、测试和构建，不具备 root 部署权限。构建用户只信任生产基线和 server 为话题注册的具体 worktree。bootstrap 还会安装 root-owned `/usr/local/libexec/hank-deploy`；helper 只接受 UUID，从 `/opt/hank/deploy-jobs` 读取 manifest，并把任务转交给独立 systemd transient unit，因此更新 `hank-server` 本身不会中断部署。
 
 bootstrap 由本机生成 Git bundle 并通过 SSH 上传，wananyun 不执行 `clone`、`fetch` 或 `push` GitHub。仓库的 `origin` URL 仅保留为 SSH break-glass 元数据。
 
@@ -132,6 +133,7 @@ bootstrap 由本机生成 Git bundle 并通过 SSH 上传，wananyun 不执行 `
 enabled = true
 repository_root = "/opt/hank-src"
 worktrees_root = "/opt/hank-worktrees"
+general_workspaces_root = "/opt/hank-workspaces"
 base_ref = "trace-production"
 deploy_jobs_dir = "/opt/hank/deploy-jobs"
 deploy_helper = "/usr/local/libexec/hank-deploy"
@@ -140,9 +142,16 @@ deploy_use_sudo = true
 approval_ttl_secs = 600
 ```
 
+### 工作区路由
+
+- `/help`、`help`、`?help`、`？help`、`帮助` 等命令不创建会话工作区。
+- 同一飞书话题已有 `feishu_chats` 映射时，始终复用原 session 和原工作区，不重新分类。
+- 新话题会先由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。`trace_code`/`quant_code` 从 `trace-production` 创建 Git worktree，`general_task` 创建普通隔离目录，`conversation` 不创建目录；同一话题后续固定复用该路由结果。
+- 只有 Git worktree 会注入 Trace/quant/同步协议，并支持 `/diff`、`/test`、`/deploy`、`/rollback`；普通隔离目录不能部署。
+
 ### 日常流程
 
-1. 在飞书新话题描述需求，server 自动创建独立 worktree。
+1. 在飞书新话题描述需求，server 按上面的规则选择工作区。
 2. 继续在同一话题补充、修正；用 `/diff` 检查范围。
 3. 用 `/test` 跑固定测试矩阵。
 4. 用 `/deploy` 生成 10 分钟有效的审批卡，确认目标和 diff stat 后点击部署。
@@ -177,7 +186,7 @@ approval_ttl_secs = 600
 - **日志看连接状态**：`feishu monitor started` / `feishu ws connected, service_id=...`；断线会指数退避重连（1s→30s）
 - **常见错误码**：`code=99991663` token 失效（自动刷新）；权限类错误回开放平台检查权限范围
 - **部署启动失败**：检查 `sudo -l -U hank`、`/usr/local/libexec/hank-deploy` 权限和 `/opt/hank/deploy-jobs`
-- **构建用户报权限错误**：检查 `hank`、`hank-build` 都在 `hank-workspace` 组，worktree 目录应为 setgid/group-writable
+- **构建用户报权限错误**：检查 `hank`、`hank-build` 都在 `hank-workspace` 组，worktree 目录应为 setgid/group-writable；旧版 Git 的 `safe.directory` 必须注册具体 worktree 路径，不能使用 `*` 通配
 - **部署日志**：`journalctl -u 'hank-deploy-*'`；server/CLI/quant 分别看对应 systemd unit
 - **应急回退**：飞书不可用时通过 SSH 将目标的 `current` 原子切到 `previous` 并重启服务；SSH 始终保留为 break-glass
 

@@ -12,12 +12,14 @@ database_url = "mysql://user:password@host:3306/dbname"
 # chrome_path = "/usr/bin/chromium"
 
 # 飞书驱动的 server-only monorepo Agent（默认关闭）。
-# 开启后，绑定到 can_login_admin 用户的飞书话题会创建独立 Git worktree，
-# 可迭代 server/crates/admin/cli/quant/docs，但 client/ 永远拒绝部署。
+# 开启后，绑定到 can_login_admin 用户的飞书新话题会先判断任务归属：
+# Trace/quant 任务创建 Git worktree，其他任务创建普通隔离目录，命令和问询不建目录。
+# 仓库任务可迭代 server/crates/admin/cli/quant/docs，但 client/ 永远拒绝部署。
 [server_agent]
 enabled = false
 repository_root = "/opt/hank-src"
 worktrees_root = "/opt/hank-worktrees"
+general_workspaces_root = "/opt/hank-workspaces"
 base_ref = "trace-production"
 deploy_jobs_dir = "/opt/hank/deploy-jobs"
 deploy_helper = "/usr/local/libexec/hank-deploy"

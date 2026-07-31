@@ -78,8 +78,11 @@ pub struct PreparedDeployment {
     pub approval_label: &'static str,
 }
 
-/// 为飞书话题创建独立 worktree。配置关闭时调用方不应进入这里。
-pub async fn prepare_session_workspace(state: &Arc<AppState>, session_id: &str) -> Result<String> {
+/// 为 Trace/quant 飞书话题创建独立 worktree。配置关闭时调用方不应进入这里。
+pub async fn prepare_repository_workspace(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Result<String> {
     let cfg = &state.config.server_agent;
     if !cfg.enabled {
         bail!("server_agent 未启用");
@@ -96,7 +99,11 @@ pub async fn prepare_session_workspace(state: &Arc<AppState>, session_id: &str) 
     tokio::fs::create_dir_all(&worktrees_root).await?;
     let worktree = worktrees_root.join(session_id);
     if worktree.join(".git").exists() {
-        return Ok(worktree.to_string_lossy().into_owned());
+        let worktree_str = worktree.to_string_lossy().into_owned();
+        ensure_safe_directory_as_user(&worktree_str, &cfg.execution_user)
+            .await
+            .context("信任已有话题 worktree")?;
+        return Ok(worktree_str);
     }
     if worktree.exists() {
         bail!(
@@ -106,9 +113,12 @@ pub async fn prepare_session_workspace(state: &Arc<AppState>, session_id: &str) 
     }
 
     let branch = format!("feishu/{}", session_id);
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&repo)
+    let repo_str = repo.to_string_lossy().into_owned();
+    ensure_safe_directory_as_user(&repo_str, &cfg.execution_user)
+        .await
+        .context("信任生产基线仓库")?;
+    let output = git_command_as_user(&cfg.execution_user)
+        .args(["-C", &repo_str])
         .args(["worktree", "add", "--no-checkout", "-b", &branch])
         .arg(&worktree)
         .arg(&cfg.base_ref)
@@ -119,17 +129,75 @@ pub async fn prepare_session_workspace(state: &Arc<AppState>, session_id: &str) 
         bail!("创建 Git worktree 失败: {}", command_error(&output));
     }
     let worktree_str = worktree.to_string_lossy().into_owned();
-    if let Err(e) = git_as_user(&worktree_str, ["checkout", &branch], &cfg.execution_user).await {
-        let _ = Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(["worktree", "remove", "--force"])
-            .arg(&worktree)
-            .output()
-            .await;
+    let setup_result = async {
+        ensure_safe_directory_as_user(&worktree_str, &cfg.execution_user)
+            .await
+            .context("信任新话题 worktree")?;
+        git_as_user(&worktree_str, ["checkout", &branch], &cfg.execution_user)
+            .await
+            .context("checkout 话题分支")?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    if let Err(e) = setup_result {
+        cleanup_failed_session_workspace(&repo, &worktree, &branch).await;
         return Err(e).context("初始化话题 worktree");
     }
     Ok(worktree_str)
+}
+
+/// 为与 Trace/quant 无关的飞书话题创建普通隔离目录。
+pub async fn prepare_general_workspace(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Result<String> {
+    let cfg = &state.config.server_agent;
+    if !cfg.enabled {
+        bail!("server_agent 未启用");
+    }
+    validate_uuid(session_id)?;
+
+    let root = canonical_dir(&cfg.general_workspaces_root).with_context(|| {
+        format!(
+            "server_agent.general_workspaces_root 无效: {}",
+            cfg.general_workspaces_root
+        )
+    })?;
+    let workspace = root.join(session_id);
+    if workspace.is_dir() {
+        return Ok(workspace.to_string_lossy().into_owned());
+    }
+    if workspace.exists() {
+        bail!("普通工作区路径已存在但不是目录: {}", workspace.display());
+    }
+
+    let workspace_str = workspace.to_string_lossy().into_owned();
+    let output = command_as_user(&cfg.execution_user, "install")
+        .args(["-d", "-m", "2770", &workspace_str])
+        .output()
+        .await
+        .context("创建普通隔离工作区")?;
+    if !output.status.success() {
+        bail!("创建普通隔离工作区失败: {}", command_error(&output));
+    }
+    Ok(workspace_str)
+}
+
+async fn cleanup_failed_session_workspace(repo: &Path, worktree: &Path, branch: &str) {
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove", "--force"])
+        .arg(worktree)
+        .output()
+        .await;
+    let branch_ref = format!("refs/heads/{branch}");
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["update-ref", "-d", &branch_ref])
+        .output()
+        .await;
 }
 
 /// 把当前 worktree 固化为 commit，识别部署目标并创建待审批任务。
@@ -148,6 +216,7 @@ pub async fn prepare_deployment(
         .get_session(session_id)
         .await?
         .ok_or_else(|| anyhow!("会话不存在"))?;
+    ensure_repository_workspace(session.metadata.as_deref())?;
     let source_dir = session
         .work_dir
         .ok_or_else(|| anyhow!("当前会话没有 server worktree"))?;
@@ -311,6 +380,12 @@ pub async fn prepare_rollback(
     topic_id: &str,
 ) -> Result<PreparedDeployment> {
     ensure_server_agent_admin(state, user_id).await?;
+    let session = state
+        .db
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow!("会话不存在"))?;
+    ensure_repository_workspace(session.metadata.as_deref())?;
     let latest = state
         .db
         .get_latest_successful_deployment()
@@ -399,6 +474,7 @@ pub async fn workspace_diff(
         .get_session(session_id)
         .await?
         .ok_or_else(|| anyhow!("会话不存在"))?;
+    ensure_repository_workspace(session.metadata.as_deref())?;
     let worktree = session
         .work_dir
         .ok_or_else(|| anyhow!("当前会话没有 server worktree"))?;
@@ -478,6 +554,7 @@ pub async fn test_workspace(
         .get_session(session_id)
         .await?
         .ok_or_else(|| anyhow!("会话不存在"))?;
+    ensure_repository_workspace(session.metadata.as_deref())?;
     let worktree = session
         .work_dir
         .ok_or_else(|| anyhow!("当前会话没有 server worktree"))?;
@@ -940,7 +1017,7 @@ async fn git<const N: usize>(worktree: &str, args: [&str; N]) -> Result<String> 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-fn git_command_as_user(user: &str) -> Command {
+fn command_as_user(user: &str, program: &str) -> Command {
     let mut command = Command::new("sudo");
     let home = format!("HOME=/home/{user}");
     let path = format!(
@@ -954,9 +1031,66 @@ fn git_command_as_user(user: &str) -> Command {
         "env",
         &home,
         &path,
-        "git",
+        program,
     ]);
     command
+}
+
+fn git_command_as_user(user: &str) -> Command {
+    command_as_user(user, "git")
+}
+
+/// 新会话显式记录 workspace_kind；旧 server_agent 会话没有该字段，兼容为 repository。
+pub fn is_repository_workspace_metadata(metadata: Option<&str>) -> bool {
+    let Some(value) = metadata.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    else {
+        return false;
+    };
+    match value["workspace_kind"].as_str() {
+        Some("repository") => true,
+        Some(_) => false,
+        None => value["server_agent"].as_bool().unwrap_or(false),
+    }
+}
+
+fn ensure_repository_workspace(metadata: Option<&str>) -> Result<()> {
+    if !is_repository_workspace_metadata(metadata) {
+        bail!("当前话题是普通隔离工作区，不支持代码 diff、测试、部署或回滚");
+    }
+    Ok(())
+}
+
+async fn ensure_safe_directory_as_user(worktree: &str, user: &str) -> Result<()> {
+    let current = git_command_as_user(user)
+        .args(["config", "--global", "--get-all", "safe.directory"])
+        .output()
+        .await
+        .context("读取 Git safe.directory")?;
+    if !current.status.success() && current.status.code() != Some(1) {
+        bail!("读取 Git safe.directory 失败: {}", command_error(&current));
+    }
+    if String::from_utf8_lossy(&current.stdout)
+        .lines()
+        .any(|configured| configured == worktree)
+    {
+        return Ok(());
+    }
+
+    let output = git_command_as_user(user)
+        .args([
+            "config",
+            "--global",
+            "--add",
+            "safe.directory",
+            worktree,
+        ])
+        .output()
+        .await
+        .context("写入 Git safe.directory")?;
+    if !output.status.success() {
+        bail!("写入 Git safe.directory 失败: {}", command_error(&output));
+    }
+    Ok(())
 }
 
 async fn git_as_user<const N: usize>(
@@ -1081,6 +1215,23 @@ mod tests {
     fn rejects_client_and_config() {
         assert!(reject_forbidden_changes(["client/src/App.vue"].into_iter()).is_err());
         assert!(reject_forbidden_changes(["quant/config.toml"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn recognizes_new_and_legacy_repository_metadata() {
+        assert!(is_repository_workspace_metadata(Some(
+            r#"{"server_agent":true,"workspace_kind":"repository"}"#
+        )));
+        assert!(is_repository_workspace_metadata(Some(
+            r#"{"server_agent":true}"#
+        )));
+        assert!(!is_repository_workspace_metadata(Some(
+            r#"{"server_agent":true,"workspace_kind":"general"}"#
+        )));
+        assert!(!is_repository_workspace_metadata(Some(
+            r#"{"server_agent":true,"agent_kind":"conversation","workspace_kind":"none"}"#
+        )));
+        assert!(!is_repository_workspace_metadata(None));
     }
 
     #[test]

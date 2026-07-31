@@ -162,6 +162,7 @@ install -d -o hank -g hank -m 755 /opt/hank/logs
 chown -R hank:hank /opt/hank/logs
 install -d -o hank -g hank-workspace -m 2750 /opt/hank-src
 install -d -o hank -g hank-workspace -m 2770 /opt/hank-worktrees
+install -d -o hank-build -g hank-workspace -m 2770 /opt/hank-workspaces
 
 BUNDLE_FILE="$(mktemp /tmp/hank-bootstrap-repository.XXXXXX.bundle)"
 install -o hank -g hank -m 600 "$STAGE/repository.bundle" "$BUNDLE_FILE"
@@ -190,11 +191,12 @@ if ! runuser --user hank -- git -C /opt/hank-src symbolic-ref --quiet HEAD >/dev
   runuser --user hank -- git -C /opt/hank-src symbolic-ref HEAD refs/heads/trace-production
   runuser --user hank -- git -C /opt/hank-src reset --hard trace-production
 fi
-chown -R hank:hank-workspace /opt/hank-src /opt/hank-worktrees
+chown -R hank:hank-workspace /opt/hank-src
+chgrp -R hank-workspace /opt/hank-worktrees /opt/hank-workspaces
 # 构建用户只需读取生产仓库；公共 config、hooks 和 trace-production ref 不可写。
 chmod -R u+rwX,g+rX,o-rwx /opt/hank-src
-chmod -R u+rwX,g+rwX,o-rwx /opt/hank-worktrees
-find /opt/hank-src /opt/hank-worktrees -type d -exec chmod g+s {} +
+chmod -R u+rwX,g+rwX,o-rwx /opt/hank-worktrees /opt/hank-workspaces
+find /opt/hank-src /opt/hank-worktrees /opt/hank-workspaces -type d -exec chmod g+s {} +
 
 # Linked worktree 只开放不可变对象库、话题分支和各 worktree 元数据。
 # refs/heads 根目录保持不可写，因此 hank-build 不能创建或替换 trace-production.lock。
@@ -210,10 +212,16 @@ for shared_path in \
   find "$shared_path" -type d -exec chmod g+s {} +
 done
 runuser --user hank -- git -C /opt/hank-src config --unset-all core.hooksPath || true
-# worktree 由 hank 创建、Git 工具由 hank-build 执行。仅信任话题 worktree 根，
-# 避免 Git 的 dubious ownership 检查阻断 add/commit 等正常操作。
+runuser --user hank -- git -C /opt/hank-src config core.sharedRepository group
+# worktree 从创建到 checkout 都由 hank-build 执行。Git 2.17 不支持
+# safe.directory 通配符；基线仓库在这里注册，话题 worktree 由 server 注册精确路径。
 runuser --user hank-build -- env HOME=/home/hank-build \
-  git config --global --replace-all safe.directory '/opt/hank-worktrees/*'
+  git config --global --unset-all safe.directory '^/opt/hank-worktrees/\*$' || true
+if ! runuser --user hank-build -- env HOME=/home/hank-build \
+  git config --global --get-all safe.directory | grep -Fxq /opt/hank-src; then
+  runuser --user hank-build -- env HOME=/home/hank-build \
+    git config --global --add safe.directory /opt/hank-src
+fi
 
 install -d -o root -g root -m 755 /usr/local/libexec
 install -o root -g root -m 755 "$STAGE/hank-deploy" /usr/local/libexec/hank-deploy
@@ -244,6 +252,7 @@ if ! grep -q '^\[server_agent\]' /opt/hank/config.toml; then
 enabled = true
 repository_root = "/opt/hank-src"
 worktrees_root = "/opt/hank-worktrees"
+general_workspaces_root = "/opt/hank-workspaces"
 base_ref = "trace-production"
 deploy_jobs_dir = "/opt/hank/deploy-jobs"
 deploy_helper = "/usr/local/libexec/hank-deploy"
@@ -262,6 +271,7 @@ desired = {
     "enabled": "enabled = true\n",
     "repository_root": 'repository_root = "/opt/hank-src"\n',
     "worktrees_root": 'worktrees_root = "/opt/hank-worktrees"\n',
+    "general_workspaces_root": 'general_workspaces_root = "/opt/hank-workspaces"\n',
     "base_ref": 'base_ref = "trace-production"\n',
     "deploy_jobs_dir": 'deploy_jobs_dir = "/opt/hank/deploy-jobs"\n',
     "deploy_helper": 'deploy_helper = "/usr/local/libexec/hank-deploy"\n',

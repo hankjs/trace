@@ -9,10 +9,13 @@ use crate::chat::{run_chat_turn, ChatTurnOpts};
 use crate::feishu::api::FeishuApi;
 use crate::feishu::card::{build_deployment_card, DeploymentCardOptions};
 use crate::feishu::pusher;
+use crate::provider_registry;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
+use futures::StreamExt;
 use hank_db::FeishuAccount;
+use hank_provider::{CompletionRequest, ContentBlock, Message, Role, StreamEvent};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -173,8 +176,54 @@ pub enum SlashCommand {
     Help,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceKind {
+    None,
+    Repository,
+    General,
+}
+
+impl WorkspaceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Repository => "repository",
+            Self::General => "general",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(tag = "agent_kind", rename_all = "snake_case")]
+enum NewTopicDecision {
+    Conversation,
+    TraceCode,
+    QuantCode,
+    GeneralTask,
+}
+
+impl NewTopicDecision {
+    fn agent_kind(&self) -> &'static str {
+        match self {
+            Self::Conversation => "conversation",
+            Self::TraceCode => "trace_code",
+            Self::QuantCode => "quant_code",
+            Self::GeneralTask => "general_task",
+        }
+    }
+
+    fn workspace_kind(&self) -> WorkspaceKind {
+        match self {
+            Self::Conversation => WorkspaceKind::None,
+            Self::TraceCode | Self::QuantCode => WorkspaceKind::Repository,
+            Self::GeneralTask => WorkspaceKind::General,
+        }
+    }
+}
+
 pub fn parse_command(text: &str) -> Option<SlashCommand> {
-    let t = text.trim();
+    let normalized = text.trim().to_ascii_lowercase();
+    let t = normalized.as_str();
     const COMMANDS: [(&str, SlashCommand); 8] = [
         ("/new", SlashCommand::New),
         ("/stop", SlashCommand::Stop),
@@ -186,18 +235,28 @@ pub fn parse_command(text: &str) -> Option<SlashCommand> {
         ("/help", SlashCommand::Help),
     ];
     for (pat, cmd) in COMMANDS {
-        if t == pat {
+        if matches_command_text(t, pat) {
             return Some(cmd);
         }
-        // "@提及 /cmd" 形式：以 @ 开头、以命令结尾、命令前是空白
-        if t.starts_with('@') && t.ends_with(pat) {
-            let prefix = &t[..t.len() - pat.len()];
-            if prefix.ends_with(char::is_whitespace) {
-                return Some(cmd);
-            }
+    }
+    for alias in ["help", "?help", "? help", "？help", "？ help", "帮助"] {
+        if matches_command_text(t, alias) {
+            return Some(SlashCommand::Help);
         }
     }
     None
+}
+
+fn matches_command_text(text: &str, command: &str) -> bool {
+    if text == command {
+        return true;
+    }
+    // "@提及 command" 形式：提及名可包含空格，命令前必须是空白。
+    if text.starts_with('@') && text.ends_with(command) {
+        let prefix = &text[..text.len() - command.len()];
+        return prefix.ends_with(char::is_whitespace);
+    }
+    false
 }
 
 fn parse_bind_code(text: &str) -> Option<&str> {
@@ -682,6 +741,88 @@ async fn handle_command(
 
 // ── 任务派发 ──
 
+/// 新话题先判断是否真的需要工作区，以及工作区是否属于 Trace monorepo。
+/// 分类失败时降级到普通隔离目录，绝不误创建仓库 worktree。
+async fn decide_new_topic(state: &AppState, text: &str) -> NewTopicDecision {
+    match try_decide_new_topic(state, text).await {
+        Ok(decision) => {
+            tracing::info!(?decision, "feishu: new topic workspace decision");
+            decision
+        }
+        Err(e) => {
+            tracing::warn!("feishu: workspace decision failed, fallback to general: {e:#}");
+            NewTopicDecision::GeneralTask
+        }
+    }
+}
+
+async fn try_decide_new_topic(state: &AppState, text: &str) -> Result<NewTopicDecision> {
+    let (record, provider) = provider_registry::resolve_default(&state.db)
+        .await
+        .ok_or_else(|| anyhow!("没有可用的 LLM provider"))?;
+    let system = "你是飞书任务的路由 Agent。只输出一个 JSON 对象，不要输出 markdown 或其他文字。\n\
+        可选结果：\n\
+        - {\"agent_kind\":\"trace_code\"}：需要读取、修改、测试或部署 Trace/Hank monorepo 的 server、\
+          crates、admin、cli、docs、飞书/微信渠道或同步流程；不包括 client 和 quant。\n\
+        - {\"agent_kind\":\"quant_code\"}：需要读取、修改或测试 monorepo 的 quant 项目代码、策略、看板或文档。\n\
+        - {\"agent_kind\":\"general_task\"}：具体任务与 Trace/quant 无关，但需要文件、代码、命令、下载、分析产物或持续迭代工作区。\n\
+        - {\"agent_kind\":\"conversation\"}：用户在问候、讨论、咨询、分析问题，或者尚未给出需要文件和命令的事项。\
+          后续对话 Agent 会负责正式回答；路由器不要回答用户问题。\n\
+        判断 Agent 必须看语义，不只看是否出现项目名。拿不准是否属于 Trace/quant 时选择 general_task；\
+        拿不准是否需要文件或命令时选择 conversation。";
+    let request = CompletionRequest {
+        model: provider_registry::resolve_default_model(&record),
+        system: Some(system.to_string()),
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: text.chars().take(4000).collect(),
+            }],
+        }],
+        tools: vec![],
+        max_tokens: 256,
+    };
+    let mut stream = provider.stream(request).await?;
+    let mut output = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(text)) => output.push_str(&text),
+            Ok(StreamEvent::MessageEnd { .. }) => break,
+            Err(e) => return Err(anyhow!("workspace decision stream failed: {e}")),
+            _ => {}
+        }
+    }
+    parse_new_topic_decision(&output)
+}
+
+fn parse_new_topic_decision(output: &str) -> Result<NewTopicDecision> {
+    let trimmed = output.trim();
+    let json = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|value| value.strip_suffix("```"))
+        .unwrap_or(trimmed)
+        .trim();
+    serde_json::from_str(json)
+        .map_err(|e| anyhow!("无法解析工作区分类: {e}; output={trimmed}"))
+}
+
+fn classification_text(content: &[ContentBlock]) -> String {
+    let text = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        "用户发送了一个需要处理的非文本内容。".to_string()
+    } else {
+        text
+    }
+}
+
 fn sign_internal_jwt(state: &AppState, user_id: &str, username: &str) -> Result<String> {
     Ok(crate::auth::sign_internal_jwt(&state.jwt_secret, user_id, username)?)
 }
@@ -718,8 +859,9 @@ async fn dispatch_task_content(
 ) -> Result<()> {
     let topic = msg.topic_id();
 
-    // 找/建 feishu_chats 映射的 session
-    let session_id = match state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await {
+    // 找/建 feishu_chats 映射的 session。任何初始化错误都要转成用户可见回复，
+    // 不能只让 WS 后台任务记一条日志后静默结束。
+    let session_result = match state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await {
         Ok(Some(c)) if state.config.server_agent.enabled => {
             let is_server_session = state
                 .db
@@ -732,36 +874,36 @@ async fn dispatch_task_content(
                 .and_then(|metadata| metadata["server_agent"].as_bool())
                 .unwrap_or(false);
             if is_server_session {
-                c.session_id
+                Ok(Some(c.session_id))
             } else {
-                state.db.delete_feishu_chat(&account.id, &msg.chat_id, &topic).await?;
-                let session = create_feishu_session(state, user_id).await?;
-                state
-                    .db
-                    .set_feishu_chat(&account.id, &msg.chat_id, &topic, &session.id, user_id)
-                    .await?;
-                session.id
+                match state.db.delete_feishu_chat(&account.id, &msg.chat_id, &topic).await {
+                    Ok(()) => create_and_map_feishu_session(
+                        state, account, msg, &topic, user_id, &content,
+                    )
+                    .await,
+                    Err(e) => Err(anyhow!("重置旧飞书话题会话失败: {e:#}")),
+                }
             }
         }
-        Ok(Some(c)) => c.session_id,
-        _ => match create_feishu_session(state, user_id).await {
-            Ok(session) => {
-                if let Err(e) = state
-                    .db
-                    .set_feishu_chat(&account.id, &msg.chat_id, &topic, &session.id, user_id)
-                    .await
-                {
-                    tracing::warn!("feishu: set chat failed: {e:#}");
-                }
-                session.id
-            }
-            Err(e) => {
-                tracing::warn!("feishu: create session failed: {e:#}");
-                api.reply_text(&msg.message_id, "创建会话失败，请稍后重试", msg.in_thread())
-                    .await?;
-                return Ok(());
-            }
-        },
+        Ok(Some(c)) => Ok(Some(c.session_id)),
+        Ok(None) => {
+            create_and_map_feishu_session(state, account, msg, &topic, user_id, &content).await
+        }
+        Err(e) => Err(anyhow!("读取飞书话题会话失败: {e:#}")),
+    };
+    let session_id = match session_result {
+        Ok(Some(session_id)) => session_id,
+        Ok(None) => return Ok(()),
+        Err(e) => {
+            tracing::warn!("feishu: create session workspace failed: {e:#}");
+            api.reply_text(
+                &msg.message_id,
+                "创建工作区失败，已记录日志，请稍后重试",
+                msg.in_thread(),
+            )
+            .await?;
+            return Ok(());
+        }
     };
 
     if let Err(e) = state
@@ -834,6 +976,36 @@ async fn dispatch_task_content(
     Ok(())
 }
 
+async fn create_and_map_feishu_session(
+    state: &Arc<AppState>,
+    account: &FeishuAccount,
+    msg: &IncomingMessage,
+    topic: &str,
+    user_id: &str,
+    content: &[ContentBlock],
+) -> Result<Option<String>> {
+    let decision = if state.config.server_agent.enabled {
+        decide_new_topic(state, &classification_text(content)).await
+    } else {
+        NewTopicDecision::GeneralTask
+    };
+    let session = create_feishu_session(
+        state,
+        user_id,
+        decision.agent_kind(),
+        decision.workspace_kind(),
+    )
+    .await?;
+    if let Err(e) = state
+        .db
+        .set_feishu_chat(&account.id, &msg.chat_id, topic, &session.id, user_id)
+        .await
+    {
+        tracing::warn!(session_id = %session.id, "feishu: set chat failed: {e:#}");
+    }
+    Ok(Some(session.id))
+}
+
 fn archive_account_name(account: &FeishuAccount) -> &str {
     if account.name.trim().is_empty() {
         &account.app_id
@@ -858,12 +1030,20 @@ fn archive_inbound_content(msg: &IncomingMessage) -> String {
     }
 }
 
-async fn create_feishu_session(state: &Arc<AppState>, user_id: &str) -> Result<hank_db::Session> {
+async fn create_feishu_session(
+    state: &Arc<AppState>,
+    user_id: &str,
+    agent_kind: &str,
+    workspace_kind: WorkspaceKind,
+) -> Result<hank_db::Session> {
     if state.config.server_agent.enabled {
         crate::deployment::ensure_server_agent_admin(state, user_id).await?;
         let metadata = serde_json::json!({
             "source": "feishu",
             "server_agent": true,
+            "agent_backend": "native",
+            "agent_kind": agent_kind,
+            "workspace_kind": workspace_kind.as_str(),
             "client_excluded": true,
         })
         .to_string();
@@ -880,10 +1060,28 @@ async fn create_feishu_session(state: &Arc<AppState>, user_id: &str) -> Result<h
             )
             .await
             .map_err(|e| anyhow!("create server session: {e:#}"))?;
-        match crate::deployment::prepare_session_workspace(state, &session.id).await {
+        let workspace = match workspace_kind {
+            WorkspaceKind::None => Ok(None),
+            WorkspaceKind::Repository => {
+                crate::deployment::prepare_repository_workspace(state, &session.id)
+                    .await
+                    .map(Some)
+            }
+            WorkspaceKind::General => {
+                crate::deployment::prepare_general_workspace(state, &session.id)
+                    .await
+                    .map(Some)
+            }
+        };
+        match workspace {
             Ok(work_dir) => {
-                state.db.update_session_work_dir(&session.id, Some(&work_dir)).await?;
-                session.work_dir = Some(work_dir);
+                if let Some(work_dir) = work_dir {
+                    state
+                        .db
+                        .update_session_work_dir(&session.id, Some(&work_dir))
+                        .await?;
+                    session.work_dir = Some(work_dir);
+                }
                 return Ok(session);
             }
             Err(e) => {
@@ -992,11 +1190,70 @@ mod tests {
         assert_eq!(parse_command("/deploy"), Some(SlashCommand::Deploy));
         assert_eq!(parse_command("/rollback"), Some(SlashCommand::Rollback));
         assert_eq!(parse_command("/help"), Some(SlashCommand::Help));
+        assert_eq!(parse_command("help"), Some(SlashCommand::Help));
+        assert_eq!(parse_command("?help"), Some(SlashCommand::Help));
+        assert_eq!(parse_command("？help"), Some(SlashCommand::Help));
+        assert_eq!(parse_command("？ help"), Some(SlashCommand::Help));
+        assert_eq!(parse_command("帮助"), Some(SlashCommand::Help));
+        assert_eq!(parse_command("@Agent OS ？help"), Some(SlashCommand::Help));
         assert_eq!(parse_command("@MyBot /status"), Some(SlashCommand::Status));
         assert_eq!(parse_command("@Agent OS /status"), Some(SlashCommand::Status));
         assert_eq!(parse_command("帮我运行 /status"), None);
+        assert_eq!(parse_command("怎么使用 help"), None);
         assert_eq!(parse_command("/unknown"), None);
         assert_eq!(parse_command("@MyBot"), None);
+    }
+
+    #[test]
+    fn parses_new_topic_workspace_decisions() {
+        assert_eq!(
+            parse_new_topic_decision(r#"{"agent_kind":"trace_code"}"#).unwrap(),
+            NewTopicDecision::TraceCode
+        );
+        assert_eq!(
+            parse_new_topic_decision("```json\n{\"agent_kind\":\"quant_code\"}\n```")
+                .unwrap(),
+            NewTopicDecision::QuantCode
+        );
+        assert_eq!(
+            parse_new_topic_decision(r#"{"agent_kind":"conversation"}"#).unwrap(),
+            NewTopicDecision::Conversation
+        );
+        assert_eq!(
+            NewTopicDecision::GeneralTask.workspace_kind(),
+            WorkspaceKind::General
+        );
+        assert_eq!(
+            NewTopicDecision::QuantCode.workspace_kind(),
+            WorkspaceKind::Repository
+        );
+    }
+
+    #[test]
+    fn classification_text_ignores_image_payload() {
+        let content = vec![
+            ContentBlock::Text {
+                text: "分析这张图".to_string(),
+            },
+            ContentBlock::Image {
+                source: hank_provider::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "encoded".to_string(),
+                },
+            },
+        ];
+        assert_eq!(classification_text(&content), "分析这张图");
+        assert_eq!(
+            classification_text(&[ContentBlock::Image {
+                source: hank_provider::ImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: "image/png".to_string(),
+                    data: "encoded".to_string(),
+                },
+            }]),
+            "用户发送了一个需要处理的非文本内容。"
+        );
     }
 
     #[test]

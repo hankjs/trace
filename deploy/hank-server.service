@@ -21,7 +21,7 @@ StandardError=journal
 # Agent 与 server 都以 hank 用户运行；root helper 只接受 UUID，不接受 shell 参数。
 ProtectSystem=strict
 PrivateTmp=true
-ReadWritePaths=/home/hank /home/hank-build /opt/hank/logs /opt/hank/deploy-jobs /opt/hank-src /opt/hank-worktrees
+ReadWritePaths=/home/hank /home/hank-build /opt/hank/logs /opt/hank/deploy-jobs /opt/hank-src /opt/hank-worktrees /opt/hank-workspaces
 UMask=0007
 
 [Install]
