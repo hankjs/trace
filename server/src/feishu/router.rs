@@ -3,7 +3,7 @@
 //! 复刻 docs/book/agent-os 第 04/06 篇：
 //! - text/post 正文提取、@_user_N 提及还原、thread_id/root_id 话题定位
 //! - 一个话题 = 一个会话（feishu_chats 映射，topic = thread_id || root_id || "main"）
-//! - /new /stop /status /help 命令管理当前话题会话
+//! - /new /stop /status /nodes /help 命令管理当前话题会话
 
 use crate::chat::{run_chat_turn, ChatTurnOpts};
 use crate::feishu::api::FeishuApi;
@@ -171,11 +171,22 @@ pub enum SlashCommand {
     New,
     Stop,
     Status,
+    Nodes,
     Diff,
     Test,
     Deploy,
     Rollback,
     Help,
+}
+
+/// hank-cli 节点快照（用于 /nodes 回复与 conversation prompt 注入）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HankCliNodeInfo {
+    pub client_id: String,
+    pub hostname: Option<String>,
+    pub online: bool,
+    pub work_dir: Option<String>,
+    pub agent_backends: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,10 +300,11 @@ impl NewTopicDecision {
 pub fn parse_command(text: &str) -> Option<SlashCommand> {
     let normalized = text.trim().to_ascii_lowercase();
     let t = normalized.as_str();
-    const COMMANDS: [(&str, SlashCommand); 8] = [
+    const COMMANDS: [(&str, SlashCommand); 9] = [
         ("/new", SlashCommand::New),
         ("/stop", SlashCommand::Stop),
         ("/status", SlashCommand::Status),
+        ("/nodes", SlashCommand::Nodes),
         ("/diff", SlashCommand::Diff),
         ("/test", SlashCommand::Test),
         ("/deploy", SlashCommand::Deploy),
@@ -447,17 +459,9 @@ async fn handle_message(
     };
     let user_id = binding.user_id.clone();
 
-    if state.config.server_agent.enabled {
-        if let Err(e) = crate::deployment::ensure_server_agent_admin(&state, &user_id).await {
-            api.reply_text(
-                &msg.message_id,
-                &format!("无权使用 server Agent：{e}"),
-                msg.in_thread(),
-            )
-            .await?;
-            return Ok(());
-        }
-    }
+    // 不再在消息入口按 server_agent 卡 admin：仅 server worktree/部署路径在
+    // create_feishu_session 的 native 分支内做 ensure_server_agent_admin。
+    // client-only hank-cli 与纯对话用户不需要 can_login_admin。
 
     if parse_bind_code(&msg.text).is_some() {
         api.reply_text(
@@ -471,7 +475,7 @@ async fn handle_message(
 
     // 斜杠命令
     if let Some(cmd) = parse_command(&msg.text) {
-        return handle_command(&state, &api, &account, &msg, cmd).await;
+        return handle_command(&state, &api, &account, &msg, &user_id, cmd).await;
     }
 
     if let Some(image_key) = image_key {
@@ -622,6 +626,7 @@ async fn handle_command(
     api: &FeishuApi,
     account: &FeishuAccount,
     msg: &IncomingMessage,
+    user_id: &str,
     cmd: SlashCommand,
 ) -> Result<()> {
     let topic = msg.topic_id();
@@ -629,10 +634,16 @@ async fn handle_command(
         SlashCommand::Help => {
             api.reply_text(
                 &msg.message_id,
-                "/new 开启新话题\n/stop 停止当前任务\n/status 查看当前会话\n/diff 查看 server worktree 变更（本机 CLI 会话不支持）\n/test 运行 server worktree 测试（本机 CLI 会话不支持）\n/deploy 创建 server 部署审批（本机 CLI 会话不支持）\n/rollback 创建 server 回滚审批（本机 CLI 会话不支持）\n/help 查看命令",
+                "/new 开启新话题\n/stop 停止当前任务\n/status 查看当前会话\n/nodes 列出本机 hank-cli 节点（在线状态与 backends）\n/diff 查看 server worktree 变更（本机 CLI 会话不支持）\n/test 运行 server worktree 测试（本机 CLI 会话不支持）\n/deploy 创建 server 部署审批（本机 CLI 会话不支持）\n/rollback 创建 server 回滚审批（本机 CLI 会话不支持）\n/help 查看命令",
                 msg.in_thread(),
             )
             .await?;
+        }
+        SlashCommand::Nodes => {
+            let nodes = collect_hank_cli_nodes(state, user_id).await;
+            let text = format_nodes_command_reply(&nodes);
+            api.reply_text(&msg.message_id, &text, msg.in_thread())
+                .await?;
         }
         SlashCommand::Status => {
             let chat = state
@@ -979,15 +990,19 @@ async fn handle_command(
 // ── 任务派发 ──
 
 /// 新话题先判断是否真的需要工作区，以及工作区是否属于 Trace monorepo。
-/// 分类失败时降级到普通隔离目录，绝不误创建仓库 worktree。
+/// 分类失败时降级到 general_task + 默认 CLI 后端（client-only），绝不静默建 server worktree。
 /// 默认外部 Agent 后端按当前用户在线 hank-cli 节点能力选择，不看 server 侧凭据。
+///
+/// client-only hank-cli 路由**不依赖** `[server_agent].enabled`：关闭时代码/文件任务
+/// 仍走本机节点；开启时仅额外允许 native conversation 使用 server 侧无工具会话。
 async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTopicDecision {
     let default_backend =
         AgentBackend::preferred(crate::cli_agent::preferred_backend(state, user_id).await);
-    match try_decide_new_topic(state, text, default_backend).await {
+    let server_agent_enabled = state.config.server_agent.enabled;
+    match try_decide_new_topic(state, text, default_backend, server_agent_enabled).await {
         Ok(decision) => {
             let decision = decision.normalized(default_backend);
-            tracing::info!(?decision, "feishu: new topic workspace decision");
+            tracing::info!(?decision, server_agent_enabled, "feishu: new topic workspace decision");
             decision
         }
         Err(e) => {
@@ -1001,11 +1016,26 @@ async fn try_decide_new_topic(
     state: &AppState,
     text: &str,
     default_backend: AgentBackend,
+    server_agent_enabled: bool,
 ) -> Result<NewTopicDecision> {
     let (record, provider) = provider_registry::resolve_default(&state.db)
         .await
         .ok_or_else(|| anyhow!("没有可用的 LLM provider"))?;
+    let env_note = if server_agent_enabled {
+        "当前环境已开启 server_agent：conversation 的 native 可在 server 无工具运行；\
+         代码/文件任务（trace_code/quant_code/general_task）仍必须走用户本机 hank-cli（codex/claude/grok/kimi），\
+         不会在 server bubblewrap 执行。"
+            .to_string()
+    } else {
+        "当前环境未开启 server_agent，没有 server 侧代码工作区（worktree/bubblewrap）。\
+         凡需要读改代码、跑命令、操作文件的任务（trace_code / quant_code / general_task）\
+         都必须在用户本机在线的 hank-cli 节点上通过 codex/claude/grok/kimi 执行，\
+         agent_backend 不可选 native（仅 conversation 可选 native）。\
+         没有匹配在线节点时创建会话会明确失败，这是预期行为。"
+            .to_string()
+    };
     let system = format!("你是飞书任务的路由 Agent。只输出一个 JSON 对象，不要输出 markdown 或其他文字。\n\
+        {env_note}\n\
         输出字段 agent_kind 可选值：\n\
         - trace_code：需要读取、修改、测试或部署 Trace/Hank monorepo 的 server、\
           crates、admin、cli、docs、飞书/微信渠道或同步流程；不包括 client 和 quant。\n\
@@ -1018,6 +1048,7 @@ async fn try_decide_new_topic(
         示例：{{\"agent_kind\":\"trace_code\",\"agent_backend\":\"{default_backend}\"}}。\n\
         判断 Agent 必须看语义，不只看是否出现项目名。拿不准是否属于 Trace/quant 时选择 general_task；\
         拿不准是否需要文件或命令时选择 conversation。",
+        env_note = env_note,
         default_backend = default_backend.as_str()
     );
     let request = CompletionRequest {
@@ -1211,12 +1242,19 @@ async fn dispatch_task_content(
         .unwrap_or_default();
     let jwt = sign_internal_jwt(state, user_id, &username)?;
 
+    // 仅 conversation（native 无工具）注入链路说明与节点快照，避免模型对 hank-cli 一无所知。
+    let extra_prompt_segments = if session_is_conversation(state, &session_id).await {
+        build_feishu_conversation_extra_prompts(state, user_id).await
+    } else {
+        Vec::new()
+    };
     let opts = ChatTurnOpts {
         provider: None,
         model: None,
         parent_id: None,
         apply_change_id: None,
         auth_token: jwt,
+        extra_prompt_segments,
     };
     let turn = run_chat_turn(state, &session_id, content, opts).await;
     // run_chat_turn 返回时 active_tasks 已登记（或本轮启动失败），
@@ -1367,15 +1405,9 @@ async fn create_and_map_feishu_session(
     user_id: &str,
     content: &[ContentBlock],
 ) -> Result<Option<String>> {
-    let decision = if state.config.server_agent.enabled {
-        decide_new_topic(state, user_id, &classification_text(content)).await
-    } else {
-        // server_agent 关闭时不做代码 Agent 路由；native + 可选远程工具节点。
-        NewTopicDecision {
-            agent_kind: AgentKind::GeneralTask,
-            agent_backend: AgentBackend::Native,
-        }
-    };
+    // client-only hank-cli 路由始终可用：不因 server_agent.enabled=false 短路成 Native。
+    // conversation → native 无工具；代码/文件任务 → 外部 CLI 后端，缺节点时明确失败。
+    let decision = decide_new_topic(state, user_id, &classification_text(content)).await;
     let session = create_feishu_session(
         state,
         user_id,
@@ -1481,6 +1513,177 @@ fn missing_agent_node_message(backend: &str) -> String {
     format!(
         "没有在线且支持 {backend} 的 hank-cli 节点。请在目标电脑启动 hank-cli，确认 work_dir 有效且 agent_backends 包含 {backend} 后重试；不会回退到 server bubblewrap 或其他节点。"
     )
+}
+
+/// 节点展示名：hostname 优先，否则 client_id 前 8 位。
+fn node_display_name(node: &HankCliNodeInfo) -> String {
+    match node.hostname.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => name.to_string(),
+        None => {
+            let id = node.client_id.as_str();
+            let short = if id.len() > 8 { &id[..8] } else { id };
+            short.to_string()
+        }
+    }
+}
+
+/// 渲染 /nodes 命令回复（纯函数，便于单测）。
+fn format_nodes_command_reply(nodes: &[HankCliNodeInfo]) -> String {
+    if nodes.is_empty() {
+        return "当前没有注册的 hank-cli 节点。\n\
+请在目标电脑安装并启动 hank-cli，在配置中设置 work_dir 与 agent_backends \
+（如 codex/claude/grok/kimi），启动后使用 /nodes 可再次查看。"
+            .to_string();
+    }
+    let mut lines = vec![format!("hank-cli 节点（共 {} 台）：", nodes.len())];
+    for node in nodes {
+        let status = if node.online { "在线" } else { "离线" };
+        let work_dir = node
+            .work_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("未设置");
+        let backends = if node.agent_backends.is_empty() {
+            "（未上报）".to_string()
+        } else {
+            node.agent_backends.join(", ")
+        };
+        lines.push(format!(
+            "· {} | {} | work_dir={} | backends=[{}]",
+            node_display_name(node),
+            status,
+            work_dir,
+            backends
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 渲染 conversation 注入用的节点快照（纯函数；数据必须来自调用方真实查询）。
+fn render_hank_cli_nodes_snapshot(nodes: &[HankCliNodeInfo]) -> String {
+    let online_count = nodes.iter().filter(|n| n.online).count();
+    if nodes.is_empty() || online_count == 0 {
+        let mut text = "当前没有在线的 hank-cli 节点。".to_string();
+        if !nodes.is_empty() {
+            text.push_str(" 已注册但全部离线的节点：\n");
+            for node in nodes {
+                let work_dir = node
+                    .work_dir
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("未设置");
+                let backends = if node.agent_backends.is_empty() {
+                    "（未上报）".to_string()
+                } else {
+                    node.agent_backends.join(", ")
+                };
+                text.push_str(&format!(
+                    "· {} | 离线 | work_dir={} | backends=[{}]\n",
+                    node_display_name(node),
+                    work_dir,
+                    backends
+                ));
+            }
+        }
+        return text.trim_end().to_string();
+    }
+    let mut lines = vec![format!(
+        "当前用户 hank-cli 节点快照（共 {} 台，其中 {} 台在线）：",
+        nodes.len(),
+        online_count
+    )];
+    for node in nodes {
+        let status = if node.online { "在线" } else { "离线" };
+        let work_dir = node
+            .work_dir
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("未设置");
+        let backends = if node.agent_backends.is_empty() {
+            "（未上报）".to_string()
+        } else {
+            node.agent_backends.join(", ")
+        };
+        lines.push(format!(
+            "· {} | {} | work_dir={} | backends=[{}]",
+            node_display_name(node),
+            status,
+            work_dir,
+            backends
+        ));
+    }
+    lines.join("\n")
+}
+
+/// 飞书 conversation 会话的链路架构说明（不含节点快照）。
+fn feishu_conversation_architecture_text() -> &'static str {
+    "【飞书链路与执行架构】\n\
+     - 用户通过飞书对话，消息经 Trace server 转发。\n\
+     - 代码/文件/命令类任务由 server 路由到用户本机在线的 hank-cli 节点，在节点上调用本机 \
+codex / claude（Claude Code）/ grok / kimi CLI 执行，凭据留在本机不上传 server。\n\
+     - 一个飞书话题 = 一个会话，话题固定首次选定的 backend 与节点；换后端或换节点需要 /new。\n\
+     - 可用命令：/new /stop /status /nodes /help（/diff /test /deploy /rollback 仅 server worktree 会话）。\n\
+     - 当前话题是纯对话模式，没有工作目录也没有本地执行工具；用户要跑命令或改代码时应提示用 /new 重新路由。\n\
+     以下节点信息来自 server 实时查询，请直接据此回答，不要猜测或编造节点状态。"
+}
+
+/// 从 DB + client_hubs 收集用户的 hank-cli 节点快照。
+async fn collect_hank_cli_nodes(state: &AppState, user_id: &str) -> Vec<HankCliNodeInfo> {
+    let agents = match state.db.list_client_agents(user_id).await {
+        Ok(list) => list,
+        Err(e) => {
+            tracing::warn!(user_id = %user_id, "feishu: list_client_agents failed: {e:#}");
+            return Vec::new();
+        }
+    };
+    let mut nodes = Vec::with_capacity(agents.len());
+    for agent in agents {
+        let online = crate::remote_exec::is_client_online(state, user_id, &agent.id).await;
+        // agent_backends 仅在节点 poll/register 时存在于内存 hub；离线时可能为空。
+        let agent_backends = {
+            let hubs = state.client_hubs.read().await;
+            hubs.get(user_id)
+                .and_then(|hub| hub.agent_backends.get(&agent.id))
+                .cloned()
+                .unwrap_or_default()
+        };
+        nodes.push(HankCliNodeInfo {
+            client_id: agent.id,
+            hostname: agent.hostname,
+            online,
+            work_dir: agent.work_dir,
+            agent_backends,
+        });
+    }
+    nodes
+}
+
+async fn build_feishu_conversation_extra_prompts(
+    state: &AppState,
+    user_id: &str,
+) -> Vec<String> {
+    let nodes = collect_hank_cli_nodes(state, user_id).await;
+    let snapshot = render_hank_cli_nodes_snapshot(&nodes);
+    vec![format!(
+        "{}\n\n【当前用户 hank-cli 节点快照】\n{}",
+        feishu_conversation_architecture_text(),
+        snapshot
+    )]
+}
+
+async fn session_is_conversation(state: &AppState, session_id: &str) -> bool {
+    let metadata = match state.db.get_session(session_id).await {
+        Ok(Some(session)) => session.metadata,
+        _ => return false,
+    };
+    metadata
+        .as_deref()
+        .and_then(parse_session_metadata_json)
+        .and_then(|value| value["agent_kind"].as_str().map(|k| k == "conversation"))
+        .unwrap_or(false)
 }
 
 fn archive_inbound_content(msg: &IncomingMessage) -> String {
@@ -1594,8 +1797,14 @@ async fn create_feishu_session(
         "agent_kind": agent_kind,
     })
     .to_string();
-    // 有在线且接受远程任务的桌面 client 时，会话绑定到该 client 本地执行（普通远程工具，非 Agent CLI）
-    let client = crate::remote_exec::pick_online_client(state, user_id).await;
+    // conversation 是纯对话：无工具、无工作区，不得绑定 exec_client / work_dir，
+    // 否则 chat.rs 会注入「在本地桌面执行」说明，与「没有本地执行工具」自相矛盾。
+    // 非 conversation 的 native 会话仍可绑在线桌面 client 使用普通远程工具。
+    let client = if should_bind_remote_exec_client(agent_kind) {
+        crate::remote_exec::pick_online_client(state, user_id).await
+    } else {
+        None
+    };
     let work_dir = client.as_ref().and_then(|c| c.work_dir.clone());
     let mut session = state
         .db
@@ -1624,6 +1833,12 @@ async fn create_feishu_session(
         }
     }
     Ok(session)
+}
+
+/// native fallback 分支是否应绑定远程执行节点。
+/// conversation 纯对话无工具/无工作区，不得绑定；其余 native 任务可绑桌面 client。
+fn should_bind_remote_exec_client(agent_kind: &str) -> bool {
+    agent_kind != "conversation"
 }
 
 #[cfg(test)]
@@ -1702,6 +1917,7 @@ mod tests {
         assert_eq!(parse_command("/new"), Some(SlashCommand::New));
         assert_eq!(parse_command("/stop"), Some(SlashCommand::Stop));
         assert_eq!(parse_command("/status"), Some(SlashCommand::Status));
+        assert_eq!(parse_command("/nodes"), Some(SlashCommand::Nodes));
         assert_eq!(parse_command("/diff"), Some(SlashCommand::Diff));
         assert_eq!(parse_command("/test"), Some(SlashCommand::Test));
         assert_eq!(parse_command("/deploy"), Some(SlashCommand::Deploy));
@@ -1718,10 +1934,97 @@ mod tests {
             parse_command("@Agent OS /status"),
             Some(SlashCommand::Status)
         );
+        assert_eq!(parse_command("@MyBot /nodes"), Some(SlashCommand::Nodes));
+        assert_eq!(
+            parse_command("@Agent OS /nodes"),
+            Some(SlashCommand::Nodes)
+        );
         assert_eq!(parse_command("帮我运行 /status"), None);
         assert_eq!(parse_command("怎么使用 help"), None);
         assert_eq!(parse_command("/unknown"), None);
         assert_eq!(parse_command("@MyBot"), None);
+    }
+
+    #[test]
+    fn format_nodes_command_reply_empty() {
+        let text = format_nodes_command_reply(&[]);
+        assert!(text.contains("没有注册的 hank-cli 节点"), "{text}");
+        assert!(text.contains("安装并启动"), "{text}");
+        assert!(text.contains("work_dir"), "{text}");
+        assert!(text.contains("agent_backends"), "{text}");
+    }
+
+    #[test]
+    fn render_nodes_snapshot_covers_empty_partial_and_online() {
+        // 无节点
+        let empty = render_hank_cli_nodes_snapshot(&[]);
+        assert!(empty.contains("当前没有在线的 hank-cli 节点"), "{empty}");
+
+        // 全部离线
+        let offline_only = vec![HankCliNodeInfo {
+            client_id: "abcdef012345".into(),
+            hostname: Some("mbp".into()),
+            online: false,
+            work_dir: Some("/Users/me/proj".into()),
+            agent_backends: vec!["codex".into()],
+        }];
+        let offline_text = render_hank_cli_nodes_snapshot(&offline_only);
+        assert!(
+            offline_text.contains("当前没有在线的 hank-cli 节点"),
+            "{offline_text}"
+        );
+        assert!(offline_text.contains("mbp"), "{offline_text}");
+        assert!(offline_text.contains("离线"), "{offline_text}");
+        assert!(offline_text.contains("codex"), "{offline_text}");
+
+        // 部分在线
+        let mixed = vec![
+            HankCliNodeInfo {
+                client_id: "online-1".into(),
+                hostname: Some("desk".into()),
+                online: true,
+                work_dir: Some("/work".into()),
+                agent_backends: vec!["claude".into(), "grok".into()],
+            },
+            HankCliNodeInfo {
+                client_id: "offline-1".into(),
+                hostname: None,
+                online: false,
+                work_dir: None,
+                agent_backends: vec![],
+            },
+        ];
+        let mixed_text = render_hank_cli_nodes_snapshot(&mixed);
+        assert!(mixed_text.contains("desk"), "{mixed_text}");
+        assert!(mixed_text.contains("在线"), "{mixed_text}");
+        assert!(mixed_text.contains("离线"), "{mixed_text}");
+        assert!(mixed_text.contains("claude"), "{mixed_text}");
+        // hostname 缺失时用 client_id 前 8 位
+        assert!(mixed_text.contains("offline-"), "{mixed_text}");
+        assert!(!mixed_text.contains("当前没有在线"), "{mixed_text}");
+
+        let cmd_text = format_nodes_command_reply(&mixed);
+        assert!(cmd_text.contains("desk"), "{cmd_text}");
+        assert!(cmd_text.contains("在线"), "{cmd_text}");
+        assert!(cmd_text.contains("离线"), "{cmd_text}");
+    }
+
+    #[test]
+    fn architecture_text_mentions_nodes_command_and_cli_chain() {
+        let text = feishu_conversation_architecture_text();
+        assert!(text.contains("hank-cli"));
+        assert!(text.contains("/nodes"));
+        assert!(text.contains("codex"));
+        assert!(text.contains("/new"));
+        assert!(text.contains("纯对话"));
+    }
+
+    #[test]
+    fn conversation_does_not_bind_remote_exec_client() {
+        assert!(!should_bind_remote_exec_client("conversation"));
+        assert!(should_bind_remote_exec_client("general_task"));
+        assert!(should_bind_remote_exec_client("trace_code"));
+        assert!(should_bind_remote_exec_client("quant_code"));
     }
 
     #[test]

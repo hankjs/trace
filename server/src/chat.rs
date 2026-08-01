@@ -152,6 +152,9 @@ pub struct ChatTurnOpts {
     pub apply_change_id: Option<String>,
     /// JWT carried by spec-family tools when they call back into this server.
     pub auth_token: String,
+    /// 渠道可选的额外 system prompt 片段（追加为 Dynamic PromptSegment）。
+    /// 例如飞书 conversation 会话注入链路说明与 hank-cli 节点快照。
+    pub extra_prompt_segments: Vec<String>,
 }
 
 /// Handle returned by [`run_chat_turn`]. The receiver is subscribed to the
@@ -455,6 +458,7 @@ pub async fn run_chat_turn(
     let sid = session_id.clone();
     let content_text = text_from_blocks(&content);
     let apply_change_id = opts.apply_change_id.clone();
+    let extra_prompt_segments = opts.extra_prompt_segments;
 
     // If pending_ask_user, the user's reply becomes a tool_result
     let user_content: Vec<hank_provider::ContentBlock> = if let Some(ref pending_json) =
@@ -799,6 +803,10 @@ pub async fn run_chat_turn(
                     ));
                 }
                 project_segments.append(&mut quant_segments);
+                // 渠道注入的额外片段（如飞书 conversation 的链路说明与节点快照）
+                for segment in &extra_prompt_segments {
+                    project_segments.push(code_agent::PromptSegment::Dynamic(segment.clone()));
+                }
                 if conversation_agent {
                     project_segments.push(code_agent::PromptSegment::Dynamic(
                         "路由 Agent 已将当前话题标记为纯对话。没有工作目录，也没有本地执行工具；\
@@ -962,6 +970,7 @@ pub async fn chat_handler(
         parent_id: body.parent_id,
         apply_change_id: body.apply_change_id,
         auth_token,
+        extra_prompt_segments: Vec::new(),
     };
 
     match run_chat_turn(&state, &session_id, blocks, opts).await {

@@ -21,8 +21,8 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
 - **确认闸门升级**：微信是文本白名单（回复"确认"），飞书是按钮卡片；回调文本化后走同一套 `handle_quant_confirmation`，code-agent 零改动
-- **执行模式**：开启 `[server_agent]` 后，新话题同时确定 Agent 类型和执行后端。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。纯对话 `native` 仍可在 server 侧无工具运行。
-- **管理员边界**：开启 server_agent 时，飞书消息仍要求绑定用户具备 `can_login_admin = true`
+- **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。纯对话 `native` 在 server_agent 开启时走 server 无工具会话，关闭时走普通 remote/native 会话。
+- **管理员边界**：`can_login_admin` 仅在创建 **server 侧** native / worktree 会话时校验；纯对话与 client-only hank-cli 用户不要求 admin
 
 ## 一、飞书开放平台配置
 
@@ -88,6 +88,7 @@ feishu_monitor = false   # 其他实例关掉
 | `/new` | 关闭当前话题会话，下次发消息开新会话 |
 | `/stop` | 取消当前执行中的任务 |
 | `/status` | 查看当前话题的会话 ID 与状态 |
+| `/nodes` | 列出当前绑定用户注册的 hank-cli 节点：hostname、在线/离线、work_dir、上报的 agent_backends |
 | `/diff` | **仅 server worktree 会话**：查看相对生产基线的状态与 diff stat。**本机 CLI（client-only）会话会明确拒绝**，不会静默调用 server 部署逻辑 |
 | `/test` | **仅 server worktree 会话**：按变更路径运行固定测试矩阵。**client-only 会话明确拒绝** |
 | `/deploy` | **仅 server worktree 会话**：固化 commit 并发送部署审批卡。**client-only 会话明确拒绝** |
@@ -97,6 +98,10 @@ feishu_monitor = false   # 其他实例关掉
 ### 本机 Agent CLI（client-only，默认代码执行路径）
 
 `hank-cli` 启动时会探测本机 PATH 中的 `codex`、`claude`、`grok`、`kimi` 并把能力上报给 server。飞书新话题只要路由到这些外部后端（用户点名或任务分类为代码/文件任务），**必须**绑定一台在线且上报了对应 backend 的 `hank-cli` 节点；否则返回明确错误（例如「没有在线且支持 claude 的 hank-cli 节点」），**不会**回退到 server bubblewrap 或 native Agent。
+
+**与 `[server_agent]` 解耦**：client-only 路径（`飞书 → server → hank-cli → 本机 CLI`）在 `[server_agent].enabled = false` 时同样可用。关闭 server_agent 时，路由仍会对新话题做 `agent_kind` / `agent_backend` 分类；代码/文件任务落到 hank-cli，缺节点时用户可见失败；纯对话 `conversation` 走 native 无工具。可用 `/nodes` 查看本机节点在线状态与 backends。
+
+**conversation 会话上下文**：纯对话话题会在 system prompt 中注入飞书链路说明（话题固定 backend/节点、可用命令、本机 CLI 执行边界）以及**注入时刻**的 hank-cli 节点快照（hostname / 在线状态 / work_dir / backends），因此「现在有什么 cli 在线」类问题可直接据实回答，模型不得编造节点。conversation 会话**不绑定** `exec_client_id`、也无 `work_dir`（与 `WorkspaceKind::None` 一致）；即使本机有在线桌面 client，也不会挂远程执行工具，避免「有工作目录」与「纯对话无工具」的 prompt 冲突。
 
 凭据和 CLI 配置留在本机，不上传 server。飞书不直连家庭网络，而是经 server 转发到 `hank-cli` 的出站长轮询，因此无需给电脑开公网端口。
 
@@ -178,14 +183,15 @@ approval_ttl_secs = 600
 
 ### 工作区路由（迁移后）
 
-- `/help`、`help`、`?help`、`？help`、`帮助` 等命令不创建会话工作区。
+- `/help`、`help`、`?help`、`？help`、`帮助`、`/nodes` 等命令不创建会话工作区。
 - 同一飞书话题已有 `feishu_chats` 映射时：
   - **client-only**（`agent_location=client`）：固定复用 backend / `exec_client_id` / `agent_thread_id`，不重新分类、不换节点。
   - **历史 server-agent + 外部 backend**：拒绝复用，要求 `/new`。
   - **native conversation** 等非外部后端 managed 会话：可继续复用。
-- 新话题由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex`、`claude`、`grok` 或 `kimi`。`conversation` 强制 `native`；其他任务若误返回 `native` 会归一为默认 CLI 后端（优先 Codex，否则 Claude）。用户点名后端时保留选择。
+- 新话题**始终**由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex`、`claude`、`grok` 或 `kimi`（**即使 `[server_agent].enabled = false`**）。`conversation` 强制 `native`；其他任务若误返回 `native` 会归一为默认 CLI 后端（优先 Codex，否则 Claude）。用户点名后端时保留选择。`server_agent` 关闭时 prompt 会明确告知无 server 工作区，代码任务只能落到 hank-cli。
 - **外部 backend（codex/claude/grok/kimi）只走 client-only**：必须命中在线且上报该能力的 `hank-cli`；否则用户可见失败。**飞书不再创建 server bubblewrap / worktree 代码会话**（server-only 实现仍保留编译兼容，但不由飞书入口创建）。
-- `native` 对话不创建代码工作区；client-only 会话的工作目录是节点 `work_dir`，不在 wananyun 上建 worktree。
+- `native` 对话不创建代码工作区；client-only 会话的工作目录是节点 `work_dir`，不在 wananyun 上建 worktree。conversation 会话会注入链路说明与节点快照（见上文「本机 Agent CLI」），且不绑定 `exec_client_id` / `work_dir`。
+- `/nodes` 列出当前用户注册的 hank-cli 节点（在线状态、work_dir、backends）；无节点时给出安装/启动提示。
 - `/diff`、`/test`、`/deploy`、`/rollback` 仅适用于仍存在的 server worktree 管理会话；对 client-only 会话返回「本机 CLI 会话不支持该命令 / 请在本机执行」，**不会误报成功或静默操作 server 部署**。
 - 本机 CLI 的 stdout 按 JSONL 解析，线程 ID 写回 metadata；server 处理超时、输出上限、`/stop` 取消与飞书终态卡片。节点离线或结果超时时明确失败。
 

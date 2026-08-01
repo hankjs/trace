@@ -795,6 +795,7 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
         parent_id: None,
         apply_change_id: None,
         auth_token: jwt,
+        extra_prompt_segments: Vec::new(),
     };
     let content = vec![hank_provider::ContentBlock::Text {
         text: format!("{text}{WEIXIN_FILE_HINT}"),
