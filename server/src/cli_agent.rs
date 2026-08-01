@@ -6,6 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use code_agent::{AgentEvent, FileChange, FileChangeKind, RunStatus};
 use hank_db::Session;
 use hank_provider::ContentBlock;
+use serde::Serialize;
 use std::collections::HashSet;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -29,6 +30,48 @@ const AUTH_ENV_KEYS: &[&str] = &[
     "OPENAI_BASE_URL",
 ];
 
+/// 各后端允许的凭据环境变量名。第三方 Anthropic 中转通常只认 ANTHROPIC_AUTH_TOKEN，
+/// 官方 key 用 ANTHROPIC_API_KEY，订阅登录用 CLAUDE_CODE_OAUTH_TOKEN，三者不可混用。
+pub(crate) const CLAUDE_AUTH_KINDS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+];
+pub(crate) const CODEX_AUTH_KINDS: &[&str] = &["OPENAI_API_KEY"];
+
+/// admin 可配置的附加环境变量白名单。只允许模型与输出上限这类无副作用的字段，
+/// 防止把任意环境变量注入到沙箱里的 CLI 进程。
+pub(crate) const CLAUDE_EXTRA_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+];
+pub(crate) const CODEX_EXTRA_ENV_KEYS: &[&str] = &[];
+
+/// 返回后端允许的 auth_kind 与附加环境变量白名单，未知后端返回 None。
+pub(crate) fn backend_env_whitelist(
+    backend: &str,
+) -> Option<(&'static [&'static str], &'static [&'static str])> {
+    match backend {
+        "claude" => Some((CLAUDE_AUTH_KINDS, CLAUDE_EXTRA_ENV_KEYS)),
+        "codex" => Some((CODEX_AUTH_KINDS, CODEX_EXTRA_ENV_KEYS)),
+        _ => None,
+    }
+}
+
+/// 凭据的实际来源，admin 用它显示「当前生效的是库里的配置还是服务器上的环境文件」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AuthSource {
+    /// admin 在 agent_cli_configs 里配置的行
+    Db,
+    /// 服务器 /opt/hank/agent-cli.env
+    Env,
+    /// 复用 server 里已启用的 provider 记录
+    Provider,
+}
+
 #[derive(Default)]
 struct CliRunState {
     final_text: String,
@@ -47,6 +90,65 @@ struct CliAuth {
     env: Vec<(&'static str, String)>,
     model: Option<String>,
     base_url: Option<String>,
+}
+
+/// 把 admin 存在库里的配置行翻译成 CliAuth。纯函数，不碰环境变量和数据库，
+/// 便于单测优先级与白名单过滤。返回 None 表示这行不可用（停用或没有凭据），
+/// 调用方据此继续往下走 env / provider 兜底。
+fn auth_from_db_config(
+    backend: &str,
+    config: &hank_db::AgentCliConfigRecord,
+) -> Option<CliAuth> {
+    if !config.enabled {
+        return None;
+    }
+    let api_key = config.api_key.trim();
+    if api_key.is_empty() {
+        return None;
+    }
+    let (auth_kinds, extra_keys) = backend_env_whitelist(backend)?;
+    // auth_kind 必须命中白名单，才能拿到 auth.env 需要的 'static key。
+    let auth_key = auth_kinds
+        .iter()
+        .find(|candidate| **candidate == config.auth_kind.trim())
+        .copied()
+        // 历史行或 codex 可能没填 auth_kind，退回该后端的默认凭据变量名。
+        .or_else(|| auth_kinds.first().copied())?;
+
+    let mut auth = CliAuth::default();
+    auth.env.push((auth_key, api_key.to_string()));
+
+    let base_url = config.base_url.trim();
+    if !base_url.is_empty() {
+        match backend {
+            // Codex 0.146 不读 OPENAI_BASE_URL，要转成 -c openai_base_url 配置。
+            "codex" => auth.base_url = Some(base_url.to_string()),
+            _ => auth.env.push(("ANTHROPIC_BASE_URL", base_url.to_string())),
+        }
+    }
+
+    let model = config.model.trim();
+    if !model.is_empty() {
+        auth.model = Some(model.to_string());
+        if backend == "claude" {
+            // Claude 除了 --model 参数也读这个环境变量，保持与 env 文件路径一致。
+            auth.env.push(("ANTHROPIC_MODEL", model.to_string()));
+        }
+    }
+
+    // extra_env 是 admin 填的 JSON 对象，只放行白名单内的键。
+    if let Ok(serde_json::Value::Object(map)) =
+        serde_json::from_str::<serde_json::Value>(&config.extra_env)
+    {
+        for key in extra_keys {
+            if let Some(value) = map.get(*key).and_then(serde_json::Value::as_str) {
+                if !value.trim().is_empty() {
+                    auth.env.push((key, value.trim().to_string()));
+                }
+            }
+        }
+    }
+    Some(auth)
 }
 
 pub async fn run_cli_turn(
@@ -834,6 +936,14 @@ async fn handle_claude_event(
 }
 
 async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAuth> {
+    // 优先用 admin 在库里配的凭据，改完下一轮任务即生效，不必重启 systemd。
+    // 行不存在、被停用或没填 key 时继续往下用环境文件兜底。
+    if let Ok(Some(config)) = state.db.get_agent_cli_config(backend).await {
+        if let Some(auth) = auth_from_db_config(backend, &config) {
+            return Ok(auth);
+        }
+    }
+
     let mut auth = CliAuth::default();
     let relevant_keys: &[&str] = match backend {
         "codex" => &["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"],
@@ -892,10 +1002,10 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
     });
     let provider = provider.ok_or_else(|| match backend {
         "codex" => anyhow!(
-            "codex 没有 Responses API 凭据：请在 /opt/hank/agent-cli.env 配置 OPENAI_API_KEY，可选配置兼容 Responses API 的 OPENAI_BASE_URL"
+            "codex 没有 Responses API 凭据：请在 admin 的「Agent CLI」页配置，或在 /opt/hank/agent-cli.env 配置 OPENAI_API_KEY 与兼容 Responses API 的 OPENAI_BASE_URL"
         ),
         _ => anyhow!(
-            "{backend} 没有可用凭据：请配置 /opt/hank/agent-cli.env 或启用对应 provider"
+            "{backend} 没有可用凭据：请在 admin 的「Agent CLI」页配置，或配置 /opt/hank/agent-cli.env 或启用对应 provider"
         ),
     })?;
     if provider.api_key.trim().is_empty() {
@@ -922,6 +1032,16 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
 
 /// 新话题未明确指定 CLI 时，优先选择当前确实有可用凭据的后端。
 pub(crate) async fn preferred_backend(state: &AppState) -> &'static str {
+    // admin 在库里配的凭据与环境变量同权：两处任一可用都算这个后端能跑，
+    // 否则 admin 配好 claude 后新话题仍会被路由到没凭据的 codex。
+    let configs = state.db.list_agent_cli_configs().await.unwrap_or_default();
+    let db_ready = |backend: &str| {
+        configs.iter().any(|config| {
+            config.backend == backend
+                && config.enabled
+                && !config.api_key.trim().is_empty()
+        })
+    };
     let codex_env = std::env::var("OPENAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
     let claude_env = [
         "ANTHROPIC_API_KEY",
@@ -936,14 +1056,41 @@ pub(crate) async fn preferred_backend(state: &AppState) -> &'static str {
         .iter()
         .any(|provider| provider.enabled && provider.provider_type == "anthropic");
 
-    if codex_env || codex_provider {
+    if db_ready("codex") || codex_env || codex_provider {
         "codex"
-    } else if claude_env || claude_provider {
+    } else if db_ready("claude") || claude_env || claude_provider {
         "claude"
     } else {
         // 保留一个确定的失败路径，由 resolve_cli_auth 返回可操作的配置说明。
         "codex"
     }
+}
+
+/// 计算某后端当前实际生效的凭据来源，供 admin 页展示「库里的配置是否真的在用」。
+/// 与 resolve_cli_auth 的优先级保持一致：库 → 环境文件 → provider 记录。
+pub(crate) async fn effective_auth_source(
+    state: &Arc<AppState>,
+    backend: &str,
+) -> Option<AuthSource> {
+    if let Ok(Some(config)) = state.db.get_agent_cli_config(backend).await {
+        if auth_from_db_config(backend, &config).is_some() {
+            return Some(AuthSource::Db);
+        }
+    }
+    let (auth_kinds, _) = backend_env_whitelist(backend)?;
+    if auth_kinds
+        .iter()
+        .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
+    {
+        return Some(AuthSource::Env);
+    }
+    let providers = state.db.list_providers_ordered().await.unwrap_or_default();
+    let has_provider = providers.iter().any(|provider| match backend {
+        "claude" => provider.enabled && provider.provider_type == "anthropic",
+        "codex" => codex_provider_is_compatible(provider),
+        _ => false,
+    });
+    has_provider.then_some(AuthSource::Provider)
 }
 
 fn codex_provider_is_compatible(provider: &hank_db::ProviderRecord) -> bool {
@@ -1358,5 +1505,148 @@ mod tests {
         assert!(codex_provider_is_compatible(&provider));
         provider.provider_type = "anthropic".to_string();
         assert!(!codex_provider_is_compatible(&provider));
+    }
+
+    fn db_config(backend: &str) -> hank_db::AgentCliConfigRecord {
+        hank_db::AgentCliConfigRecord {
+            backend: backend.to_string(),
+            auth_kind: String::new(),
+            api_key: "relay-secret".to_string(),
+            base_url: String::new(),
+            model: String::new(),
+            extra_env: "{}".to_string(),
+            enabled: true,
+            updated_at: chrono::Utc::now(),
+            updated_by: "admin".to_string(),
+        }
+    }
+
+    /// 停用或没填 key 的行必须让位给 agent-cli.env 兜底，否则 admin 存了一行空配置
+    /// 就会把服务器上原本能用的凭据顶掉。
+    #[test]
+    fn db_config_is_skipped_when_disabled_or_keyless() {
+        let mut config = db_config("claude");
+        config.enabled = false;
+        assert!(auth_from_db_config("claude", &config).is_none());
+
+        config.enabled = true;
+        config.api_key = "   ".to_string();
+        assert!(auth_from_db_config("claude", &config).is_none());
+
+        config.api_key = "relay-secret".to_string();
+        assert!(auth_from_db_config("claude", &config).is_some());
+        // 未知后端不允许通过，避免注入到不存在的 CLI。
+        assert!(auth_from_db_config("gemini", &config).is_none());
+    }
+
+    /// 第三方 Anthropic 中转要 ANTHROPIC_AUTH_TOKEN，官方 key 要 ANTHROPIC_API_KEY，
+    /// auth_kind 必须如实落到环境变量名上。
+    #[test]
+    fn claude_auth_kind_selects_env_var_name() {
+        let mut config = db_config("claude");
+        config.auth_kind = "ANTHROPIC_AUTH_TOKEN".to_string();
+        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        assert!(auth
+            .env
+            .iter()
+            .any(|(key, value)| *key == "ANTHROPIC_AUTH_TOKEN" && value == "relay-secret"));
+        assert!(!auth.env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
+
+        // auth_kind 为空（历史行）时退回该后端第一个白名单变量。
+        config.auth_kind = String::new();
+        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        assert!(auth.env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
+
+        // 白名单外的变量名不被接受，回退到默认值而不是注入任意环境变量。
+        config.auth_kind = "AWS_SECRET_ACCESS_KEY".to_string();
+        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        assert!(auth.env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
+        assert!(!auth
+            .env
+            .iter()
+            .any(|(key, _)| *key == "AWS_SECRET_ACCESS_KEY"));
+    }
+
+    /// Codex 0.146 不读 OPENAI_BASE_URL，base_url 必须走 -c openai_base_url；
+    /// Claude 则相反，用环境变量。
+    #[test]
+    fn base_url_routing_differs_between_backends() {
+        let mut codex = db_config("codex");
+        codex.base_url = "https://relay.example.com/v1".to_string();
+        let auth = auth_from_db_config("codex", &codex).expect("配置可用");
+        assert_eq!(auth.base_url.as_deref(), Some("https://relay.example.com/v1"));
+        assert!(!auth.env.iter().any(|(key, _)| *key == "OPENAI_BASE_URL"));
+
+        let mut claude = db_config("claude");
+        claude.base_url = "https://relay.example.com".to_string();
+        let auth = auth_from_db_config("claude", &claude).expect("配置可用");
+        assert!(auth.base_url.is_none());
+        assert!(auth
+            .env
+            .iter()
+            .any(|(key, value)| *key == "ANTHROPIC_BASE_URL"
+                && value == "https://relay.example.com"));
+    }
+
+    /// extra_env 由 admin 填写，只能放行白名单键，其他一律丢弃。
+    #[test]
+    fn extra_env_filters_non_whitelisted_keys() {
+        let mut config = db_config("claude");
+        config.extra_env = serde_json::json!({
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5",
+            "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "64000",
+            "LD_PRELOAD": "/tmp/evil.so",
+            "PATH": "/tmp/bin",
+        })
+        .to_string();
+        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        assert!(auth
+            .env
+            .iter()
+            .any(|(key, value)| *key == "ANTHROPIC_DEFAULT_OPUS_MODEL" && value == "claude-opus-5"));
+        assert!(auth
+            .env
+            .iter()
+            .any(|(key, _)| *key == "CLAUDE_CODE_MAX_OUTPUT_TOKENS"));
+        assert!(!auth
+            .env
+            .iter()
+            .any(|(key, _)| matches!(*key, "LD_PRELOAD" | "PATH")));
+
+        // extra_env 是坏 JSON 时不应让整行失效，凭据仍要能用。
+        config.extra_env = "not json".to_string();
+        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        assert!(auth.env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
+    }
+
+    /// 库里配置的模型要既进 auth.model（命令行 --model）又进 ANTHROPIC_MODEL，
+    /// 与 agent-cli.env 路径的行为保持一致。
+    #[test]
+    fn db_model_populates_both_flag_and_env_for_claude() {
+        let mut config = db_config("claude");
+        config.model = "claude-opus-5".to_string();
+        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        assert_eq!(auth.model.as_deref(), Some("claude-opus-5"));
+        assert!(auth
+            .env
+            .iter()
+            .any(|(key, value)| *key == "ANTHROPIC_MODEL" && value == "claude-opus-5"));
+
+        // codex 只用 --model 参数，不注入 OPENAI_MODEL。
+        let mut codex = db_config("codex");
+        codex.model = "gpt-5.6".to_string();
+        let auth = auth_from_db_config("codex", &codex).expect("配置可用");
+        assert_eq!(auth.model.as_deref(), Some("gpt-5.6"));
+        assert!(!auth.env.iter().any(|(key, _)| *key == "OPENAI_MODEL"));
+    }
+
+    /// 库里的凭据也必须被日志脱敏覆盖，否则 CLI 报错回显会把 key 写进事件流。
+    #[test]
+    fn db_sourced_secret_is_redacted_from_output() {
+        let config = db_config("claude");
+        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let redacted = redact_secrets("error: bad key relay-secret", &auth);
+        assert!(!redacted.contains("relay-secret"));
+        assert!(redacted.contains("[redacted]"));
     }
 }

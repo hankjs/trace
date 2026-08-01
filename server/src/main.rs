@@ -410,6 +410,23 @@ async fn main() -> Result<()> {
         .route("/api/admin/providers", post(admin::create_provider))
         .route("/api/admin/providers/{id}", put(admin::update_provider))
         .route("/api/admin/providers/{id}", delete(admin::delete_provider))
+        // 外部 Agent CLI（codex / claude）凭据：admin 改完下一轮任务即生效
+        .route(
+            "/api/admin/agent-cli-config",
+            get(admin::list_agent_cli_configs),
+        )
+        .route(
+            "/api/admin/agent-cli-config/{backend}",
+            put(admin::update_agent_cli_config),
+        )
+        .route(
+            "/api/admin/agent-cli-config/{backend}",
+            delete(admin::delete_agent_cli_config),
+        )
+        .route(
+            "/api/admin/agent-cli-config/{backend}/test",
+            post(admin::test_agent_cli_config),
+        )
         // Image providers admin
         .route(
             "/api/admin/image-providers",

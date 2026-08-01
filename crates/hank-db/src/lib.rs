@@ -95,6 +95,25 @@ pub struct Setting {
     pub value: String,
 }
 
+/// 外部 CLI Agent（codex / claude）的运行时凭据配置（agent_cli_configs 表）。
+/// 存在的意义是让部署环境的第三方 API 端点能在 admin 里改，不必登服务器改
+/// `/opt/hank/agent-cli.env` 再重启 systemd。cli_agent 每轮任务读一次，即时生效。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AgentCliConfigRecord {
+    pub backend: String,
+    /// 凭据注入用的环境变量名。第三方 Anthropic 中转多数要 ANTHROPIC_AUTH_TOKEN
+    /// 而不是 ANTHROPIC_API_KEY，两者不能混用，所以必须显式记录。
+    pub auth_kind: String,
+    pub api_key: String,
+    pub base_url: String,
+    pub model: String,
+    /// 其余白名单环境变量的 JSON 对象，如 ANTHROPIC_DEFAULT_OPUS_MODEL。
+    pub extra_env: String,
+    pub enabled: bool,
+    pub updated_at: DateTime<Utc>,
+    pub updated_by: String,
+}
+
 /// 飞书话题=会话映射（feishu_chats 表）
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct FeishuChat {
@@ -1210,6 +1229,24 @@ impl Database {
             .await;
         }
 
+        // 外部 CLI Agent 凭据：一行一个后端，admin 可改，cli_agent 每轮读取。
+        // 没有行或行被停用时由 agent-cli.env 兜底，保留登服务器改文件的应急路径。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_cli_configs (
+                backend VARCHAR(16) PRIMARY KEY,
+                auth_kind VARCHAR(32) NOT NULL DEFAULT '',
+                api_key VARCHAR(512) NOT NULL DEFAULT '',
+                base_url VARCHAR(512) NOT NULL DEFAULT '',
+                model VARCHAR(128) NOT NULL DEFAULT '',
+                extra_env TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_by VARCHAR(128) NOT NULL DEFAULT ''
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
         Ok(Self { pool })
     }
 
@@ -1541,6 +1578,80 @@ impl Database {
             .bind(key)
             .bind(value)
             .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    // Agent CLI 凭据配置（codex / claude）
+    pub async fn list_agent_cli_configs(&self) -> Result<Vec<AgentCliConfigRecord>> {
+        let rows = db_retry!(sqlx::query_as::<_, AgentCliConfigRecord>(
+            "SELECT backend, auth_kind, api_key, base_url, model, extra_env, enabled, \
+             updated_at, updated_by FROM agent_cli_configs ORDER BY backend"
+        )
+        .fetch_all(&self.pool))?;
+        Ok(rows)
+    }
+
+    pub async fn get_agent_cli_config(
+        &self,
+        backend: &str,
+    ) -> Result<Option<AgentCliConfigRecord>> {
+        let row = db_retry!(sqlx::query_as::<_, AgentCliConfigRecord>(
+            "SELECT backend, auth_kind, api_key, base_url, model, extra_env, enabled, \
+             updated_at, updated_by FROM agent_cli_configs WHERE backend = ?"
+        )
+        .bind(backend)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 写入后端凭据配置。api_key 传空串表示保留库里已有的 key，避免 admin 每次改
+    /// base_url 或模型都要重新粘贴凭据。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_agent_cli_config(
+        &self,
+        backend: &str,
+        auth_kind: &str,
+        api_key: Option<&str>,
+        base_url: &str,
+        model: &str,
+        extra_env: &str,
+        enabled: bool,
+        updated_by: &str,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "INSERT INTO agent_cli_configs \
+             (backend, auth_kind, api_key, base_url, model, extra_env, enabled, updated_at, updated_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?) \
+             ON DUPLICATE KEY UPDATE \
+             auth_kind = VALUES(auth_kind), \
+             api_key = IF(VALUES(api_key) = '', api_key, VALUES(api_key)), \
+             base_url = VALUES(base_url), \
+             model = VALUES(model), \
+             extra_env = VALUES(extra_env), \
+             enabled = VALUES(enabled), \
+             updated_at = NOW(), \
+             updated_by = VALUES(updated_by)"
+        )
+        .bind(backend)
+        .bind(auth_kind)
+        .bind(api_key.unwrap_or(""))
+        .bind(base_url)
+        .bind(model)
+        .bind(extra_env)
+        .bind(enabled)
+        .bind(updated_by)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 删除后端配置行，彻底清掉库里的凭据。停用只是不再使用，凭据仍留在库里；
+    /// 轮换掉泄露的 key 时需要真正删除。删除后自动回退到 agent-cli.env。
+    pub async fn delete_agent_cli_config(&self, backend: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("DELETE FROM agent_cli_configs WHERE backend = ?")
+                .bind(backend)
+                .execute(&self.pool)
         )?;
         Ok(())
     }

@@ -121,6 +121,45 @@ export interface Provider {
   created_at: string
 }
 
+/**
+ * 外部 Agent CLI（codex / claude）在部署环境的凭据配置。
+ * 后端从不回传 api_key 明文，只给 api_key_set。
+ */
+export interface AgentCliConfig {
+  backend: string
+  /** 凭据注入用的环境变量名，如 ANTHROPIC_AUTH_TOKEN */
+  auth_kind: string
+  /** 库里是否已存有凭据；为 true 时提交空 api_key 表示保留原值 */
+  api_key_set: boolean
+  base_url: string
+  model: string
+  extra_env: Record<string, string>
+  enabled: boolean
+  updated_at: string | null
+  updated_by: string
+  /** 当前真正生效的来源：db=库里的配置，env=服务器环境文件，provider=复用供应商记录 */
+  effective_source: 'db' | 'env' | 'provider' | null
+  auth_kind_options: string[]
+  extra_env_keys: string[]
+}
+
+export interface AgentCliConfigUpdate {
+  auth_kind?: string
+  /** 留空表示保留库里已有的凭据 */
+  api_key?: string
+  base_url?: string
+  model?: string
+  extra_env?: Record<string, string>
+  enabled?: boolean
+}
+
+export interface AgentCliTestResult {
+  ok: boolean
+  status?: number
+  message: string
+  detail?: string
+}
+
 export interface WeixinLoginStart {
   login_id: string
   qrcode_url: string
@@ -352,6 +391,29 @@ export const api = {
 
   deleteProvider(id: string) {
     return request<void>(`/api/admin/providers/${id}`, { method: 'DELETE' })
+  },
+
+  // 外部 Agent CLI（codex / claude）凭据：改完下一轮飞书任务即生效，无需重启服务
+  listAgentCliConfigs() {
+    return request<AgentCliConfig[]>('/api/admin/agent-cli-config')
+  },
+
+  updateAgentCliConfig(backend: string, data: AgentCliConfigUpdate) {
+    return request<{ status: string }>(`/api/admin/agent-cli-config/${backend}`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    })
+  },
+
+  testAgentCliConfig(backend: string) {
+    return request<AgentCliTestResult>(`/api/admin/agent-cli-config/${backend}/test`, {
+      method: 'POST',
+    })
+  },
+
+  /** 彻底清掉库里的凭据（停用只是不再使用，凭据仍在库里） */
+  deleteAgentCliConfig(backend: string) {
+    return request<void>(`/api/admin/agent-cli-config/${backend}`, { method: 'DELETE' })
   },
 
   // Image provider management

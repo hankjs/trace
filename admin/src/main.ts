@@ -18,6 +18,7 @@ const router = createRouter({
     { path: '/prompts', component: () => import('./views/PromptLab.vue') },
     { path: '/users', component: () => import('./views/Users.vue') },
     { path: '/providers', component: () => import('./views/Providers.vue') },
+    { path: '/agent-cli', component: () => import('./views/AgentCli.vue') },
     { path: '/image-providers', component: () => import('./views/ImageProviders.vue') },
     { path: '/weixin', component: () => import('./views/WeixinBot.vue') },
     { path: '/feishu', component: () => import('./views/FeishuBot.vue') },
