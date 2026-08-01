@@ -149,17 +149,19 @@ GitHub `origin` 在 wananyun 只保留为 break-glass 元数据。禁止把 GitH
 
 外部 Agent 的凭据有两条来源，`cli_agent` 每轮任务按以下优先级解析：
 
-1. **admin「Agent CLI」页**（`agent_cli_configs` 表）——启用且填了凭据的行优先。改完下一轮任务即生效，不重启服务。
-2. **`/opt/hank/agent-cli.env`**——库里没有行、行被停用或没填凭据时兜底。登服务器改文件的应急路径保持可用，改完仍需重启 `hank-server`。
+1. **admin「Agent CLI」页**（`agent_cli_profiles` 表）——每个后端可存多份命名配置，同时启用一份（`is_active`）。切换启用后下一轮任务即生效，不重启服务。
+2. **`/opt/hank/agent-cli.env`**——该后端一份都没启用、或启用的那份没填凭据时兜底。登服务器改文件的应急路径保持可用，改完仍需重启 `hank-server`。
 3. **server 中已启用的 provider 记录**——两者都没有时的最后回退。
 
 日常轮换第三方 API 端点走 admin 页即可：本机 `pnpm dev` 起的 admin 默认代理到线上 server（见 `admin/vite.config.ts`），所以本地打开页面改的就是部署环境的配置。dev 自身的 `server_agent.enabled=false`，不会真的拉起外部 CLI。
 
-页面上「当前生效」一行显示实际来源，用来区分「存了配置但没启用，其实还在用环境文件」。「测试连通性」按钮用配置里的凭据向端点发一次最小推理请求；Codex 走 Responses API，与真实调用同协议，能暴露「Chat Completions 通但 Responses 不支持」的中转。
+多份配置的用法与 CC Switch 一致：给每个中转各建一份（如「penguinapi」「官方」），点「启用」切换。切换是单条 SQL 完成的，不存在「一份都没启用」的中间态被并发任务读到而误退到环境文件。同一后端内配置名唯一。
+
+页面上「当前生效」一行显示实际来源，用来区分「存了几份但都没启用，其实还在用环境文件」。「测试」按钮用那份配置的凭据向端点发一次最小推理请求，不要求先启用，所以能在切换前先验证；Codex 走 Responses API，与真实调用同协议，能暴露「Chat Completions 通但 Responses 不支持」的中转。
 
 凭据只在服务端注入子进程环境，GET 接口从不回传明文，只回传是否已设置。admin 可配置的附加环境变量限定在模型与输出上限白名单内，其他键一律拒绝。改端点或模型时凭据留空即保留原值。
 
-注意「停用」与「清除凭据」不同：停用只是不再使用这一行、回退到环境文件，凭据仍存在库里；轮换掉泄露的 key 要用「清除凭据」真正删除该行。
+注意「停用」与「删除」不同：停用只是该后端不再用库里的配置、回退到环境文件，凭据仍存在库里；轮换掉泄露的 key 要用「删除」真正删掉那份配置。
 
 ### 批量复用本机配置
 
@@ -171,7 +173,7 @@ make sync-agent-cli-config
 
 脚本只同步 `~/.claude/settings.json`、`~/.codex/auth.json` 和 `~/.codex/config.toml`，不传历史会话、缓存或插件。完整源文件安装到 `/home/hank` 的标准配置目录，并在 `/opt/hank-agent-config/current` 保存一份 `root:hank` 受限副本；飞书 Agent 只使用结构化提取到 `/opt/hank/agent-cli.env` 的认证、端点和模型白名单。Codex 当前 Provider 必须使用 Responses API。
 
-注意该脚本写的是上面第 2 层的环境文件。如果 admin 里已有启用的配置行，它的优先级更高，同步后不会生效——需要在 admin 停用对应后端，或直接在 admin 里改。
+注意该脚本写的是上面第 2 层的环境文件。如果 admin 里某后端已有启用的配置，它的优先级更高，同步后不会生效——需要在 admin 里「停用」该后端，或直接在 admin 里改。
 
 配置文件和本地/远端临时目录均不得进入 Git。同步脚本不输出凭据，远端文件权限必须保持 `root:hank 0640` 或 `hank:hank 0600`；脚本完成后重启 `hank-server`，使 systemd 重新加载环境文件。
 

@@ -410,22 +410,34 @@ async fn main() -> Result<()> {
         .route("/api/admin/providers", post(admin::create_provider))
         .route("/api/admin/providers/{id}", put(admin::update_provider))
         .route("/api/admin/providers/{id}", delete(admin::delete_provider))
-        // 外部 Agent CLI（codex / claude）凭据：admin 改完下一轮任务即生效
+        // 外部 Agent CLI（codex / claude）凭据：每后端多份配置，切换启用即时生效
         .route(
             "/api/admin/agent-cli-config",
             get(admin::list_agent_cli_configs),
         )
         .route(
             "/api/admin/agent-cli-config/{backend}",
-            put(admin::update_agent_cli_config),
+            post(admin::create_agent_cli_profile),
         )
         .route(
-            "/api/admin/agent-cli-config/{backend}",
-            delete(admin::delete_agent_cli_config),
+            "/api/admin/agent-cli-config/{backend}/deactivate",
+            post(admin::deactivate_agent_cli_profiles),
         )
         .route(
-            "/api/admin/agent-cli-config/{backend}/test",
-            post(admin::test_agent_cli_config),
+            "/api/admin/agent-cli-config/profiles/{id}",
+            put(admin::update_agent_cli_profile),
+        )
+        .route(
+            "/api/admin/agent-cli-config/profiles/{id}",
+            delete(admin::delete_agent_cli_profile),
+        )
+        .route(
+            "/api/admin/agent-cli-config/profiles/{id}/activate",
+            post(admin::activate_agent_cli_profile),
+        )
+        .route(
+            "/api/admin/agent-cli-config/profiles/{id}/test",
+            post(admin::test_agent_cli_profile),
         )
         // Image providers admin
         .route(

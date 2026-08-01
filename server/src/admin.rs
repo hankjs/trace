@@ -497,33 +497,59 @@ pub async fn delete_provider(
 // --- Agent CLI 凭据管理（codex / claude） ---
 //
 // 部署环境的第三方 API 端点用完或轮换时，过去只能登服务器改 /opt/hank/agent-cli.env
-// 再重启 systemd。这组端点把配置放进库里，cli_agent 每轮任务读一次，改完即时生效。
-// 与 /api/admin/providers 不同，这里的 GET 绝不回传 api_key，只回传是否已设置。
+// 再重启 systemd。这组端点把配置放进库里：每个后端可存多份命名配置，同时启用一份，
+// 切换后下一轮任务即生效。与 /api/admin/providers 不同，这里绝不回传 api_key 明文。
 
-/// 后端凭据配置的对外表示。api_key 只以布尔形式暴露，避免明文凭据经浏览器流转。
+/// 一份命名配置的对外表示。api_key 只以布尔形式暴露。
 #[derive(Serialize)]
-pub struct AgentCliConfigView {
+pub struct AgentCliProfileView {
+    pub id: String,
     pub backend: String,
+    pub name: String,
     pub auth_kind: String,
     /// 库里是否已存有凭据；前端据此显示「已配置，留空则不修改」。
     pub api_key_set: bool,
     pub base_url: String,
     pub model: String,
     pub extra_env: serde_json::Value,
-    pub enabled: bool,
-    pub updated_at: Option<String>,
+    pub is_active: bool,
+    pub updated_at: String,
     pub updated_by: String,
+}
+
+/// 单个后端的配置集合与元信息。
+#[derive(Serialize)]
+pub struct AgentCliBackendView {
+    pub backend: String,
+    pub profiles: Vec<AgentCliProfileView>,
     /// 当前真正生效的来源：db / env / provider，都没有时为 null。
-    /// 让 admin 能看出「我存了配置但还没启用，实际仍在用服务器上的环境文件」。
+    /// 让 admin 能看出「一份都没启用，实际仍在用服务器上的环境文件」。
     pub effective_source: Option<crate::cli_agent::AuthSource>,
     /// 该后端允许的 auth_kind 与附加环境变量键，供前端渲染选项。
     pub auth_kind_options: Vec<String>,
     pub extra_env_keys: Vec<String>,
 }
 
-/// GET /api/admin/agent-cli-config — 返回两个后端的配置与实际生效来源
+fn to_profile_view(record: &hank_db::AgentCliProfileRecord) -> AgentCliProfileView {
+    AgentCliProfileView {
+        id: record.id.clone(),
+        backend: record.backend.clone(),
+        name: record.name.clone(),
+        auth_kind: record.auth_kind.clone(),
+        api_key_set: !record.api_key.trim().is_empty(),
+        base_url: record.base_url.clone(),
+        model: record.model.clone(),
+        extra_env: serde_json::from_str(&record.extra_env)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        is_active: record.is_active,
+        updated_at: record.updated_at.to_rfc3339(),
+        updated_by: record.updated_by.clone(),
+    }
+}
+
+/// GET /api/admin/agent-cli-config — 按后端分组返回全部配置与实际生效来源
 pub async fn list_agent_cli_configs(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let stored = match state.db.list_agent_cli_configs().await {
+    let stored = match state.db.list_agent_cli_profiles().await {
         Ok(rows) => rows,
         Err(e) => return R::internal_error(e),
     };
@@ -533,24 +559,14 @@ pub async fn list_agent_cli_configs(State(state): State<Arc<AppState>>) -> impl 
         else {
             continue;
         };
-        let record = stored.iter().find(|row| row.backend == backend);
-        let effective_source = crate::cli_agent::effective_auth_source(&state, backend).await;
-        views.push(AgentCliConfigView {
+        views.push(AgentCliBackendView {
             backend: backend.to_string(),
-            auth_kind: record
-                .map(|row| row.auth_kind.clone())
-                .filter(|kind| !kind.is_empty())
-                .unwrap_or_else(|| auth_kinds[0].to_string()),
-            api_key_set: record.is_some_and(|row| !row.api_key.trim().is_empty()),
-            base_url: record.map(|row| row.base_url.clone()).unwrap_or_default(),
-            model: record.map(|row| row.model.clone()).unwrap_or_default(),
-            extra_env: record
-                .and_then(|row| serde_json::from_str(&row.extra_env).ok())
-                .unwrap_or_else(|| serde_json::json!({})),
-            enabled: record.is_some_and(|row| row.enabled),
-            updated_at: record.map(|row| row.updated_at.to_rfc3339()),
-            updated_by: record.map(|row| row.updated_by.clone()).unwrap_or_default(),
-            effective_source,
+            profiles: stored
+                .iter()
+                .filter(|row| row.backend == backend)
+                .map(to_profile_view)
+                .collect(),
+            effective_source: crate::cli_agent::effective_auth_source(&state, backend).await,
             auth_kind_options: auth_kinds.iter().map(|key| key.to_string()).collect(),
             extra_env_keys: extra_keys.iter().map(|key| key.to_string()).collect(),
         });
@@ -558,126 +574,277 @@ pub async fn list_agent_cli_configs(State(state): State<Arc<AppState>>) -> impl 
     R::ok(views)
 }
 
+/// 校验并规范化提交的配置字段，返回 (auth_kind, base_url, model, extra_env_json)。
+fn validate_profile_fields(
+    backend: &str,
+    auth_kind: Option<&str>,
+    base_url: Option<&str>,
+    model: Option<&str>,
+    extra_env: Option<serde_json::Value>,
+) -> Result<(&'static str, String, String, String), String> {
+    let Some((auth_kinds, extra_keys)) = crate::cli_agent::backend_env_whitelist(backend) else {
+        return Err(format!("不支持的外部 Agent 后端: {backend}"));
+    };
+    let requested = auth_kind
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or(auth_kinds[0]);
+    // 必须命中白名单才能拿到注入子进程所需的 'static key，也防止注入任意环境变量。
+    let Some(auth_kind) = auth_kinds
+        .iter()
+        .find(|candidate| **candidate == requested)
+        .copied()
+    else {
+        return Err(format!(
+            "{backend} 的凭据变量名只能是 {}",
+            auth_kinds.join(" / ")
+        ));
+    };
+
+    let base_url = base_url.map(str::trim).unwrap_or_default();
+    if !base_url.is_empty() && !base_url.starts_with("https://") {
+        // 凭据会随请求发往该端点，明文 HTTP 会让 key 暴露在链路上。
+        return Err("base URL 必须是 https:// 开头".to_string());
+    }
+
+    // extra_env 只接受白名单键的字符串值，其他键直接拒绝而不是静默丢弃，
+    // 避免 admin 以为配上了却没生效。
+    let mut normalized = serde_json::Map::new();
+    if let Some(serde_json::Value::Object(map)) = extra_env {
+        for (key, value) in map {
+            if !extra_keys.contains(&key.as_str()) {
+                return Err(format!("{backend} 不允许配置环境变量 {key}"));
+            }
+            let Some(text) = value.as_str() else {
+                return Err(format!("环境变量 {key} 的值必须是字符串"));
+            };
+            let text = text.trim();
+            // 控制字符会破坏子进程环境，且可能被用来伪造日志行。
+            if text.contains(['\n', '\r', '\0']) {
+                return Err(format!("环境变量 {key} 的值包含非法控制字符"));
+            }
+            if !text.is_empty() {
+                normalized.insert(key, serde_json::Value::String(text.to_string()));
+            }
+        }
+    }
+
+    Ok((
+        auth_kind,
+        base_url.to_string(),
+        model.map(str::trim).unwrap_or_default().to_string(),
+        serde_json::Value::Object(normalized).to_string(),
+    ))
+}
+
 #[derive(Deserialize)]
-pub struct UpdateAgentCliConfigRequest {
+pub struct CreateAgentCliProfileRequest {
+    pub name: String,
+    pub auth_kind: Option<String>,
+    pub api_key: String,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub extra_env: Option<serde_json::Value>,
+    /// 建完是否立刻启用。默认不启用，避免误把未验证的端点切上去。
+    pub activate: Option<bool>,
+}
+
+/// POST /api/admin/agent-cli-config/{backend} — 新建一份命名配置
+pub async fn create_agent_cli_profile(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Path(backend): Path<String>,
+    Json(body): Json<CreateAgentCliProfileRequest>,
+) -> impl IntoResponse {
+    let name = body.name.trim();
+    if name.is_empty() {
+        return R::bad_request("配置名不能为空");
+    }
+    if name.chars().count() > 64 {
+        return R::bad_request("配置名过长");
+    }
+    let api_key = body.api_key.trim();
+    if api_key.is_empty() {
+        return R::bad_request("新建配置必须填写凭据");
+    }
+    let (auth_kind, base_url, model, extra_env) = match validate_profile_fields(
+        &backend,
+        body.auth_kind.as_deref(),
+        body.base_url.as_deref(),
+        body.model.as_deref(),
+        body.extra_env,
+    ) {
+        Ok(fields) => fields,
+        Err(message) => return R::bad_request(message),
+    };
+
+    let id = match state
+        .db
+        .create_agent_cli_profile(
+            &backend,
+            name,
+            auth_kind,
+            api_key,
+            &base_url,
+            &model,
+            &extra_env,
+            &claims.username,
+        )
+        .await
+    {
+        Ok(id) => id,
+        // 同后端内名字重复由 UNIQUE 约束拒绝，回一个可读的提示而不是 500。
+        Err(e) => return R::bad_request(format!("创建失败（名字可能已存在）：{e}")),
+    };
+
+    if body.activate.unwrap_or(false) {
+        if let Err(e) = state
+            .db
+            .activate_agent_cli_profile(&id, &claims.username)
+            .await
+        {
+            return R::internal_error(e);
+        }
+    }
+    tracing::info!(
+        backend = %backend,
+        profile = %name,
+        operator = %claims.username,
+        "新建外部 Agent CLI 凭据配置"
+    );
+    R::created(serde_json::json!({"id": id}))
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAgentCliProfileRequest {
+    pub name: String,
     pub auth_kind: Option<String>,
     /// 留空或不传表示保留库里已有的凭据，只改端点/模型时不必重新粘贴 key。
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
     pub extra_env: Option<serde_json::Value>,
-    pub enabled: Option<bool>,
 }
 
-/// PUT /api/admin/agent-cli-config/{backend} — 写入某后端的凭据配置
-pub async fn update_agent_cli_config(
+/// PUT /api/admin/agent-cli-config/profiles/{id} — 更新一份配置（不改启用状态）
+pub async fn update_agent_cli_profile(
     State(state): State<Arc<AppState>>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Path(backend): Path<String>,
-    Json(body): Json<UpdateAgentCliConfigRequest>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateAgentCliProfileRequest>,
 ) -> impl IntoResponse {
-    let Some((auth_kinds, extra_keys)) = crate::cli_agent::backend_env_whitelist(&backend) else {
-        return R::bad_request(format!("不支持的外部 Agent 后端: {backend}"));
+    let existing = match state.db.get_agent_cli_profile(&id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return R::not_found("配置不存在"),
+        Err(e) => return R::internal_error(e),
     };
-
-    let auth_kind = body
-        .auth_kind
-        .as_deref()
-        .map(str::trim)
-        .filter(|kind| !kind.is_empty())
-        .unwrap_or(auth_kinds[0]);
-    if !auth_kinds.contains(&auth_kind) {
-        return R::bad_request(format!(
-            "{backend} 的凭据变量名只能是 {}",
-            auth_kinds.join(" / ")
-        ));
+    let name = body.name.trim();
+    if name.is_empty() {
+        return R::bad_request("配置名不能为空");
     }
-
-    // extra_env 只接受白名单键的字符串值，其他键直接拒绝而不是静默丢弃，
-    // 避免 admin 以为配上了却没生效。
-    let mut extra_env = serde_json::Map::new();
-    if let Some(serde_json::Value::Object(map)) = body.extra_env {
-        for (key, value) in map {
-            if !extra_keys.contains(&key.as_str()) {
-                return R::bad_request(format!("{backend} 不允许配置环境变量 {key}"));
-            }
-            let Some(text) = value.as_str() else {
-                return R::bad_request(format!("环境变量 {key} 的值必须是字符串"));
-            };
-            let text = text.trim();
-            // 控制字符会破坏子进程环境，且可能被用来伪造日志行。
-            if text.contains(['\n', '\r', '\0']) {
-                return R::bad_request(format!("环境变量 {key} 的值包含非法控制字符"));
-            }
-            if !text.is_empty() {
-                extra_env.insert(key, serde_json::Value::String(text.to_string()));
-            }
-        }
+    if name.chars().count() > 64 {
+        return R::bad_request("配置名过长");
     }
-
-    let base_url = body.base_url.as_deref().map(str::trim).unwrap_or_default();
-    if !base_url.is_empty() && !base_url.starts_with("https://") {
-        // 凭据会随请求发往该端点，明文 HTTP 会让 key 暴露在链路上。
-        return R::bad_request("base URL 必须是 https:// 开头");
-    }
-    let model = body.model.as_deref().map(str::trim).unwrap_or_default();
+    let (auth_kind, base_url, model, extra_env) = match validate_profile_fields(
+        &existing.backend,
+        body.auth_kind.as_deref(),
+        body.base_url.as_deref(),
+        body.model.as_deref(),
+        body.extra_env,
+    ) {
+        Ok(fields) => fields,
+        Err(message) => return R::bad_request(message),
+    };
     let api_key = body.api_key.as_deref().map(str::trim).unwrap_or_default();
-    let enabled = body.enabled.unwrap_or(false);
 
-    // 启用就必须真的有凭据可用，否则会静默退回环境文件，看起来「配好了」其实没生效。
-    if enabled && api_key.is_empty() {
-        let stored_key = state
-            .db
-            .get_agent_cli_config(&backend)
-            .await
-            .ok()
-            .flatten()
-            .is_some_and(|row| !row.api_key.trim().is_empty());
-        if !stored_key {
-            return R::bad_request("启用前需要先填写凭据");
-        }
-    }
-
-    let extra_env_json = serde_json::Value::Object(extra_env).to_string();
     if let Err(e) = state
         .db
-        .upsert_agent_cli_config(
-            &backend,
+        .update_agent_cli_profile(
+            &id,
+            name,
             auth_kind,
-            Some(api_key),
-            base_url,
-            model,
-            &extra_env_json,
-            enabled,
+            api_key,
+            &base_url,
+            &model,
+            &extra_env,
             &claims.username,
         )
         .await
     {
-        return R::internal_error(e);
+        return R::bad_request(format!("保存失败（名字可能已存在）：{e}"));
     }
     tracing::info!(
-        backend = %backend,
-        enabled,
+        backend = %existing.backend,
+        profile = %name,
         operator = %claims.username,
         "更新外部 Agent CLI 凭据配置"
     );
     R::ok(serde_json::json!({"status": "ok"}))
 }
 
-/// POST /api/admin/agent-cli-config/{backend}/test — 用库里的配置向端点发一次最小请求
-///
-/// 换第三方中转后最想知道的是「这个 key 和端点到底能不能用」。等飞书任务跑失败再看日志
-/// 反馈太慢，这里直接探一次。不落库、不改配置，只回报连通性。
-pub async fn test_agent_cli_config(
+/// POST /api/admin/agent-cli-config/profiles/{id}/activate — 启用这份，同后端其余自动停用
+pub async fn activate_agent_cli_profile(
     State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let profile = match state.db.get_agent_cli_profile(&id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return R::not_found("配置不存在"),
+        Err(e) => return R::internal_error(e),
+    };
+    // 启用一份没有凭据的配置会让该后端静默回退到环境文件，看起来「切过去了」其实没有。
+    if profile.api_key.trim().is_empty() {
+        return R::bad_request("这份配置没有凭据，先补上再启用");
+    }
+    if let Err(e) = state
+        .db
+        .activate_agent_cli_profile(&id, &claims.username)
+        .await
+    {
+        return R::internal_error(e);
+    }
+    tracing::info!(
+        backend = %profile.backend,
+        profile = %profile.name,
+        operator = %claims.username,
+        "切换外部 Agent CLI 凭据配置"
+    );
+    R::ok(serde_json::json!({"status": "ok"}))
+}
+
+/// POST /api/admin/agent-cli-config/{backend}/deactivate — 全部停用，回退到 agent-cli.env
+pub async fn deactivate_agent_cli_profiles(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Path(backend): Path<String>,
 ) -> impl IntoResponse {
     if crate::cli_agent::backend_env_whitelist(&backend).is_none() {
         return R::bad_request(format!("不支持的外部 Agent 后端: {backend}"));
     }
-    let config = match state.db.get_agent_cli_config(&backend).await {
+    if let Err(e) = state.db.deactivate_agent_cli_profiles(&backend).await {
+        return R::internal_error(e);
+    }
+    tracing::info!(
+        backend = %backend,
+        operator = %claims.username,
+        "停用外部 Agent CLI 库内配置，回退环境文件"
+    );
+    R::ok(serde_json::json!({"status": "ok"}))
+}
+
+/// POST /api/admin/agent-cli-config/profiles/{id}/test — 用这份配置向端点发一次最小请求
+///
+/// 换第三方中转后最想知道的是「这个 key 和端点到底能不能用」。等飞书任务跑失败再看日志
+/// 反馈太慢，这里直接探一次。不落库、不改配置，也不要求先启用。
+pub async fn test_agent_cli_profile(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let config = match state.db.get_agent_cli_profile(&id).await {
         Ok(Some(row)) if !row.api_key.trim().is_empty() => row,
-        Ok(_) => return R::bad_request("还没有配置凭据"),
+        Ok(Some(_)) => return R::bad_request("这份配置没有凭据"),
+        Ok(None) => return R::not_found("配置不存在"),
         Err(e) => return R::internal_error(e),
     };
 
@@ -691,9 +858,9 @@ pub async fn test_agent_cli_config(
     let api_key = config.api_key.trim();
     let base_url = config.base_url.trim().trim_end_matches('/');
 
-    // 两个后端的探测都用「1 token 的最小对话」，比拉模型列表更接近真实调用路径：
+    // 两个后端的探测都用「最小的一次推理」，比拉模型列表更接近真实调用路径：
     // 中转常见的失败是端点通但不支持某协议，只有真正发一次推理请求才能暴露。
-    let result = if backend == "claude" {
+    let result = if config.backend == "claude" {
         let base = if base_url.is_empty() {
             "https://api.anthropic.com"
         } else {
@@ -771,29 +938,32 @@ pub async fn test_agent_cli_config(
     }
 }
 
-/// DELETE /api/admin/agent-cli-config/{backend} — 彻底清掉库里的凭据行
+/// DELETE /api/admin/agent-cli-config/profiles/{id} — 删除一份配置，彻底清掉其中的凭据
 ///
-/// 停用（enabled=false）只是不再使用，凭据仍留在库里；轮换掉泄露的 key 时需要真正删除。
-/// 删除后该后端自动回退到服务器上的 agent-cli.env。
-pub async fn delete_agent_cli_config(
+/// 停用只是不再使用，凭据仍留在库里；轮换掉泄露的 key 时需要真正删除。
+/// 删掉当前启用的那份后该后端回退到 agent-cli.env。
+pub async fn delete_agent_cli_profile(
     State(state): State<Arc<AppState>>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-    Path(backend): Path<String>,
+    Path(id): Path<String>,
 ) -> impl IntoResponse {
-    if crate::cli_agent::backend_env_whitelist(&backend).is_none() {
-        return R::bad_request(format!("不支持的外部 Agent 后端: {backend}"));
-    }
-    if let Err(e) = state.db.delete_agent_cli_config(&backend).await {
+    let profile = match state.db.get_agent_cli_profile(&id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return R::not_found("配置不存在"),
+        Err(e) => return R::internal_error(e),
+    };
+    if let Err(e) = state.db.delete_agent_cli_profile(&id).await {
         return R::internal_error(e);
     }
     tracing::info!(
-        backend = %backend,
+        backend = %profile.backend,
+        profile = %profile.name,
+        was_active = profile.is_active,
         operator = %claims.username,
         "删除外部 Agent CLI 凭据配置"
     );
     R::no_content()
 }
-
 // --- Image Provider Management ---
 
 pub async fn list_image_providers(

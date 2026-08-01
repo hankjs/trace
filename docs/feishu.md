@@ -167,7 +167,7 @@ make install-agent-clis
 
 脚本固定下载 `@openai/codex` 与 `@anthropic-ai/claude-code-linux-x64` 的 Linux x64 原生制品，先校验 npm 发布元数据中的 SHA-1，再生成 SHA-256 清单连同制品传到 wananyun；远端复验后安装到 `/opt/hank-agent-cli` 并原子更新 `current` 链接。wananyun 不访问 GitHub，也不在线下载 CLI。
 
-凭据按三级优先级解析，每轮任务读一次：admin「Agent CLI」页（`agent_cli_configs` 表，改完即时生效）→ wananyun 的 `/opt/hank/agent-cli.env`（`root:hank 0640`，可配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN` 或 `CLAUDE_CODE_OAUTH_TOKEN`）→ server 中已启用的 provider 记录。Claude 可复用已启用的 Anthropic provider；Codex 只自动复用官方 `api.openai.com` provider，因为 Codex 0.146 只支持 Responses API，普通 Chat Completions 兼容网关不能直接复用。第三方 Responses 兼容端点必须在 admin 或环境文件中显式配置 key 和 base URL。环境文件不回传、不进 Git，凭据不写入命令行、session metadata 或日志；修改环境文件后需重启 `hank-server` 让 systemd 重新载入，改 admin 配置则不需要。
+凭据按三级优先级解析，每轮任务读一次：admin「Agent CLI」页（`agent_cli_profiles` 表，每后端可存多份命名配置、同时启用一份，切换即时生效）→ wananyun 的 `/opt/hank/agent-cli.env`（`root:hank 0640`，可配置 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`OPENAI_MODEL`、`ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN` 或 `CLAUDE_CODE_OAUTH_TOKEN`）→ server 中已启用的 provider 记录。Claude 可复用已启用的 Anthropic provider；Codex 只自动复用官方 `api.openai.com` provider，因为 Codex 0.146 只支持 Responses API，普通 Chat Completions 兼容网关不能直接复用。第三方 Responses 兼容端点必须在 admin 或环境文件中显式配置 key 和 base URL。环境文件不回传、不进 Git，凭据不写入命令行、session metadata 或日志；修改环境文件后需重启 `hank-server` 让 systemd 重新载入，改 admin 配置则不需要。
 
 本机 CC Switch 不安装到无 GUI 的 wananyun。需要复用本机已经生效的 Claude Code / Codex 第三方 API 配置时执行：
 

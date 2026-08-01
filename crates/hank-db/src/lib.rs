@@ -95,12 +95,15 @@ pub struct Setting {
     pub value: String,
 }
 
-/// 外部 CLI Agent（codex / claude）的运行时凭据配置（agent_cli_configs 表）。
-/// 存在的意义是让部署环境的第三方 API 端点能在 admin 里改，不必登服务器改
-/// `/opt/hank/agent-cli.env` 再重启 systemd。cli_agent 每轮任务读一次，即时生效。
+/// 外部 CLI Agent（codex / claude）的一份命名凭据配置（agent_cli_profiles 表）。
+/// 每个后端可存多份（不同第三方中转、不同模型），同时只有一份 is_active。
+/// 换端点时切换 active 即可，不必重新粘贴凭据，也不用登服务器改 agent-cli.env。
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct AgentCliConfigRecord {
+pub struct AgentCliProfileRecord {
+    pub id: String,
     pub backend: String,
+    /// 便于识别的名字，如「penguinapi」「官方」。同后端内唯一。
+    pub name: String,
     /// 凭据注入用的环境变量名。第三方 Anthropic 中转多数要 ANTHROPIC_AUTH_TOKEN
     /// 而不是 ANTHROPIC_API_KEY，两者不能混用，所以必须显式记录。
     pub auth_kind: String,
@@ -109,7 +112,9 @@ pub struct AgentCliConfigRecord {
     pub model: String,
     /// 其余白名单环境变量的 JSON 对象，如 ANTHROPIC_DEFAULT_OPUS_MODEL。
     pub extra_env: String,
-    pub enabled: bool,
+    /// 该后端当前启用的是哪一份。每个 backend 至多一行为 true。
+    pub is_active: bool,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub updated_by: String,
 }
@@ -1229,23 +1234,54 @@ impl Database {
             .await;
         }
 
-        // 外部 CLI Agent 凭据：一行一个后端，admin 可改，cli_agent 每轮读取。
-        // 没有行或行被停用时由 agent-cli.env 兜底，保留登服务器改文件的应急路径。
+        // 外部 CLI Agent 凭据：每个后端可存多份命名配置，同时只启用一份（is_active）。
+        // 没有启用行时由 agent-cli.env 兜底，保留登服务器改文件的应急路径。
         sqlx::query(
-            "CREATE TABLE IF NOT EXISTS agent_cli_configs (
-                backend VARCHAR(16) PRIMARY KEY,
+            "CREATE TABLE IF NOT EXISTS agent_cli_profiles (
+                id VARCHAR(36) PRIMARY KEY,
+                backend VARCHAR(16) NOT NULL,
+                name VARCHAR(64) NOT NULL,
                 auth_kind VARCHAR(32) NOT NULL DEFAULT '',
                 api_key VARCHAR(512) NOT NULL DEFAULT '',
                 base_url VARCHAR(512) NOT NULL DEFAULT '',
                 model VARCHAR(128) NOT NULL DEFAULT '',
                 extra_env TEXT NOT NULL,
-                enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                is_active BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
-                updated_by VARCHAR(128) NOT NULL DEFAULT ''
+                updated_by VARCHAR(128) NOT NULL DEFAULT '',
+                UNIQUE KEY uk_agent_cli_backend_name (backend, name),
+                INDEX idx_agent_cli_active (backend, is_active)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
         .await?;
+
+        // 从单行结构（agent_cli_configs）迁移到多配置。旧表每后端至多一行，
+        // 迁成名为「默认」的配置并沿用原 enabled 作为 is_active。迁完删旧表，
+        // 避免两份凭据并存。旧表不存在时（新库）整段静默跳过。
+        let legacy_exists: Option<(String,)> = sqlx::query_as(
+            "SELECT table_name FROM information_schema.tables \
+             WHERE table_schema = DATABASE() AND table_name = 'agent_cli_configs'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap_or(None);
+        if legacy_exists.is_some() {
+            let _ = sqlx::query(
+                "INSERT IGNORE INTO agent_cli_profiles \
+                 (id, backend, name, auth_kind, api_key, base_url, model, extra_env, \
+                  is_active, created_at, updated_at, updated_by) \
+                 SELECT UUID(), backend, '默认', auth_kind, api_key, base_url, model, \
+                        extra_env, enabled, updated_at, updated_at, updated_by \
+                 FROM agent_cli_configs",
+            )
+            .execute(&pool)
+            .await;
+            let _ = sqlx::query("DROP TABLE agent_cli_configs")
+                .execute(&pool)
+                .await;
+        }
 
         Ok(Self { pool })
     }
@@ -1582,77 +1618,149 @@ impl Database {
         Ok(())
     }
 
-    // Agent CLI 凭据配置（codex / claude）
-    pub async fn list_agent_cli_configs(&self) -> Result<Vec<AgentCliConfigRecord>> {
-        let rows = db_retry!(sqlx::query_as::<_, AgentCliConfigRecord>(
-            "SELECT backend, auth_kind, api_key, base_url, model, extra_env, enabled, \
-             updated_at, updated_by FROM agent_cli_configs ORDER BY backend"
-        )
-        .fetch_all(&self.pool))?;
+    // Agent CLI 凭据配置（codex / claude），每后端多份、同时启用一份
+    const AGENT_CLI_COLUMNS: &'static str = "id, backend, name, auth_kind, api_key, base_url, \
+         model, extra_env, is_active, created_at, updated_at, updated_by";
+
+    pub async fn list_agent_cli_profiles(&self) -> Result<Vec<AgentCliProfileRecord>> {
+        let sql = format!(
+            "SELECT {} FROM agent_cli_profiles ORDER BY backend, name",
+            Self::AGENT_CLI_COLUMNS
+        );
+        let rows = db_retry!(sqlx::query_as::<_, AgentCliProfileRecord>(&sql).fetch_all(&self.pool))?;
         Ok(rows)
     }
 
-    pub async fn get_agent_cli_config(
-        &self,
-        backend: &str,
-    ) -> Result<Option<AgentCliConfigRecord>> {
-        let row = db_retry!(sqlx::query_as::<_, AgentCliConfigRecord>(
-            "SELECT backend, auth_kind, api_key, base_url, model, extra_env, enabled, \
-             updated_at, updated_by FROM agent_cli_configs WHERE backend = ?"
-        )
-        .bind(backend)
-        .fetch_optional(&self.pool))?;
+    pub async fn get_agent_cli_profile(&self, id: &str) -> Result<Option<AgentCliProfileRecord>> {
+        let sql = format!(
+            "SELECT {} FROM agent_cli_profiles WHERE id = ?",
+            Self::AGENT_CLI_COLUMNS
+        );
+        let row = db_retry!(sqlx::query_as::<_, AgentCliProfileRecord>(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool))?;
         Ok(row)
     }
 
-    /// 写入后端凭据配置。api_key 传空串表示保留库里已有的 key，避免 admin 每次改
-    /// base_url 或模型都要重新粘贴凭据。
-    #[allow(clippy::too_many_arguments)]
-    pub async fn upsert_agent_cli_config(
+    /// 取某后端当前启用的那份配置，cli_agent 每轮任务调用。
+    pub async fn get_active_agent_cli_profile(
         &self,
         backend: &str,
+    ) -> Result<Option<AgentCliProfileRecord>> {
+        let sql = format!(
+            "SELECT {} FROM agent_cli_profiles WHERE backend = ? AND is_active = TRUE LIMIT 1",
+            Self::AGENT_CLI_COLUMNS
+        );
+        let row = db_retry!(sqlx::query_as::<_, AgentCliProfileRecord>(&sql)
+            .bind(backend)
+            .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 新建一份命名配置。同后端内名字重复由 UNIQUE 约束拒绝。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_agent_cli_profile(
+        &self,
+        backend: &str,
+        name: &str,
         auth_kind: &str,
-        api_key: Option<&str>,
+        api_key: &str,
         base_url: &str,
         model: &str,
         extra_env: &str,
-        enabled: bool,
         updated_by: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
         db_retry!(sqlx::query(
-            "INSERT INTO agent_cli_configs \
-             (backend, auth_kind, api_key, base_url, model, extra_env, enabled, updated_at, updated_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), ?) \
-             ON DUPLICATE KEY UPDATE \
-             auth_kind = VALUES(auth_kind), \
-             api_key = IF(VALUES(api_key) = '', api_key, VALUES(api_key)), \
-             base_url = VALUES(base_url), \
-             model = VALUES(model), \
-             extra_env = VALUES(extra_env), \
-             enabled = VALUES(enabled), \
-             updated_at = NOW(), \
-             updated_by = VALUES(updated_by)"
+            "INSERT INTO agent_cli_profiles \
+             (id, backend, name, auth_kind, api_key, base_url, model, extra_env, \
+              is_active, created_at, updated_at, updated_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, FALSE, NOW(), NOW(), ?)"
         )
+        .bind(&id)
         .bind(backend)
+        .bind(name)
         .bind(auth_kind)
-        .bind(api_key.unwrap_or(""))
+        .bind(api_key)
         .bind(base_url)
         .bind(model)
         .bind(extra_env)
-        .bind(enabled)
         .bind(updated_by)
+        .execute(&self.pool))?;
+        Ok(id)
+    }
+
+    /// 更新一份配置。api_key 传空串表示保留库里已有的 key，避免每次改端点或模型
+    /// 都要重新粘贴凭据。不改 is_active，切换启用走 activate_agent_cli_profile。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_agent_cli_profile(
+        &self,
+        id: &str,
+        name: &str,
+        auth_kind: &str,
+        api_key: &str,
+        base_url: &str,
+        model: &str,
+        extra_env: &str,
+        updated_by: &str,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE agent_cli_profiles SET \
+             name = ?, auth_kind = ?, \
+             api_key = IF(? = '', api_key, ?), \
+             base_url = ?, model = ?, extra_env = ?, \
+             updated_at = NOW(), updated_by = ? \
+             WHERE id = ?"
+        )
+        .bind(name)
+        .bind(auth_kind)
+        .bind(api_key)
+        .bind(api_key)
+        .bind(base_url)
+        .bind(model)
+        .bind(extra_env)
+        .bind(updated_by)
+        .bind(id)
         .execute(&self.pool))?;
         Ok(())
     }
 
-    /// 删除后端配置行，彻底清掉库里的凭据。停用只是不再使用，凭据仍留在库里；
-    /// 轮换掉泄露的 key 时需要真正删除。删除后自动回退到 agent-cli.env。
-    pub async fn delete_agent_cli_config(&self, backend: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM agent_cli_configs WHERE backend = ?")
-                .bind(backend)
-                .execute(&self.pool)
-        )?;
+    /// 启用某份配置，同后端其余自动停用。用单条 UPDATE 完成，避免「先清空再置位」
+    /// 中间态被并发的任务读到「一份都没启用」而错误回退到 agent-cli.env。
+    pub async fn activate_agent_cli_profile(&self, id: &str, updated_by: &str) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE agent_cli_profiles \
+             SET is_active = (id = ?), \
+                 updated_at = IF(id = ?, NOW(), updated_at), \
+                 updated_by = IF(id = ?, ?, updated_by) \
+             WHERE backend = (SELECT backend FROM (SELECT backend FROM agent_cli_profiles \
+                              WHERE id = ?) AS target)"
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .bind(updated_by)
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 停用某后端的全部配置，回退到 agent-cli.env。
+    pub async fn deactivate_agent_cli_profiles(&self, backend: &str) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE agent_cli_profiles SET is_active = FALSE WHERE backend = ?"
+        )
+        .bind(backend)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 删除一份配置，彻底清掉其中的凭据。停用只是不再使用，凭据仍留在库里；
+    /// 轮换掉泄露的 key 时需要真正删除。
+    pub async fn delete_agent_cli_profile(&self, id: &str) -> Result<()> {
+        db_retry!(sqlx::query("DELETE FROM agent_cli_profiles WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 

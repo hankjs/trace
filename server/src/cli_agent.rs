@@ -93,15 +93,12 @@ struct CliAuth {
 }
 
 /// 把 admin 存在库里的配置行翻译成 CliAuth。纯函数，不碰环境变量和数据库，
-/// 便于单测优先级与白名单过滤。返回 None 表示这行不可用（停用或没有凭据），
+/// 便于单测优先级与白名单过滤。返回 None 表示这行不可用（没有凭据），
 /// 调用方据此继续往下走 env / provider 兜底。
 fn auth_from_db_config(
     backend: &str,
-    config: &hank_db::AgentCliConfigRecord,
+    config: &hank_db::AgentCliProfileRecord,
 ) -> Option<CliAuth> {
-    if !config.enabled {
-        return None;
-    }
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
         return None;
@@ -936,9 +933,9 @@ async fn handle_claude_event(
 }
 
 async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAuth> {
-    // 优先用 admin 在库里配的凭据，改完下一轮任务即生效，不必重启 systemd。
-    // 行不存在、被停用或没填 key 时继续往下用环境文件兜底。
-    if let Ok(Some(config)) = state.db.get_agent_cli_config(backend).await {
+    // 优先用 admin 在库里启用的那份配置，切换后下一轮任务即生效，不必重启 systemd。
+    // 没有启用行或该行没填 key 时继续往下用环境文件兜底。
+    if let Ok(Some(config)) = state.db.get_active_agent_cli_profile(backend).await {
         if let Some(auth) = auth_from_db_config(backend, &config) {
             return Ok(auth);
         }
@@ -1032,14 +1029,14 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
 
 /// 新话题未明确指定 CLI 时，优先选择当前确实有可用凭据的后端。
 pub(crate) async fn preferred_backend(state: &AppState) -> &'static str {
-    // admin 在库里配的凭据与环境变量同权：两处任一可用都算这个后端能跑，
+    // admin 里启用的配置与环境变量同权：两处任一可用都算这个后端能跑，
     // 否则 admin 配好 claude 后新话题仍会被路由到没凭据的 codex。
-    let configs = state.db.list_agent_cli_configs().await.unwrap_or_default();
+    let profiles = state.db.list_agent_cli_profiles().await.unwrap_or_default();
     let db_ready = |backend: &str| {
-        configs.iter().any(|config| {
-            config.backend == backend
-                && config.enabled
-                && !config.api_key.trim().is_empty()
+        profiles.iter().any(|profile| {
+            profile.backend == backend
+                && profile.is_active
+                && !profile.api_key.trim().is_empty()
         })
     };
     let codex_env = std::env::var("OPENAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
@@ -1072,7 +1069,7 @@ pub(crate) async fn effective_auth_source(
     state: &Arc<AppState>,
     backend: &str,
 ) -> Option<AuthSource> {
-    if let Ok(Some(config)) = state.db.get_agent_cli_config(backend).await {
+    if let Ok(Some(config)) = state.db.get_active_agent_cli_profile(backend).await {
         if auth_from_db_config(backend, &config).is_some() {
             return Some(AuthSource::Db);
         }
@@ -1507,29 +1504,28 @@ mod tests {
         assert!(!codex_provider_is_compatible(&provider));
     }
 
-    fn db_config(backend: &str) -> hank_db::AgentCliConfigRecord {
-        hank_db::AgentCliConfigRecord {
+    fn db_config(backend: &str) -> hank_db::AgentCliProfileRecord {
+        hank_db::AgentCliProfileRecord {
+            id: "profile-1".to_string(),
             backend: backend.to_string(),
+            name: "默认".to_string(),
             auth_kind: String::new(),
             api_key: "relay-secret".to_string(),
             base_url: String::new(),
             model: String::new(),
             extra_env: "{}".to_string(),
-            enabled: true,
+            is_active: true,
+            created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             updated_by: "admin".to_string(),
         }
     }
 
-    /// 停用或没填 key 的行必须让位给 agent-cli.env 兜底，否则 admin 存了一行空配置
-    /// 就会把服务器上原本能用的凭据顶掉。
+    /// 没填 key 的配置必须让位给 agent-cli.env 兜底，否则 admin 存了一份空配置
+    /// 并启用，就会把服务器上原本能用的凭据顶掉。
     #[test]
-    fn db_config_is_skipped_when_disabled_or_keyless() {
+    fn db_config_is_skipped_when_keyless() {
         let mut config = db_config("claude");
-        config.enabled = false;
-        assert!(auth_from_db_config("claude", &config).is_none());
-
-        config.enabled = true;
         config.api_key = "   ".to_string();
         assert!(auth_from_db_config("claude", &config).is_none());
 

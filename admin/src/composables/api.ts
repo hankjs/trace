@@ -122,11 +122,13 @@ export interface Provider {
 }
 
 /**
- * 外部 Agent CLI（codex / claude）在部署环境的凭据配置。
+ * 外部 Agent CLI（codex / claude）的一份命名凭据配置。
  * 后端从不回传 api_key 明文，只给 api_key_set。
  */
-export interface AgentCliConfig {
+export interface AgentCliProfile {
+  id: string
   backend: string
+  name: string
   /** 凭据注入用的环境变量名，如 ANTHROPIC_AUTH_TOKEN */
   auth_kind: string
   /** 库里是否已存有凭据；为 true 时提交空 api_key 表示保留原值 */
@@ -134,23 +136,30 @@ export interface AgentCliConfig {
   base_url: string
   model: string
   extra_env: Record<string, string>
-  enabled: boolean
-  updated_at: string | null
+  /** 该后端当前启用的是不是这一份 */
+  is_active: boolean
+  updated_at: string
   updated_by: string
-  /** 当前真正生效的来源：db=库里的配置，env=服务器环境文件，provider=复用供应商记录 */
+}
+
+/** 单个后端的配置集合。每个后端可存多份，同时只启用一份。 */
+export interface AgentCliBackend {
+  backend: string
+  profiles: AgentCliProfile[]
+  /** 当前真正生效的来源：db=库里启用的配置，env=服务器环境文件，provider=复用供应商记录 */
   effective_source: 'db' | 'env' | 'provider' | null
   auth_kind_options: string[]
   extra_env_keys: string[]
 }
 
-export interface AgentCliConfigUpdate {
+export interface AgentCliProfileInput {
+  name: string
   auth_kind?: string
-  /** 留空表示保留库里已有的凭据 */
+  /** 更新时留空表示保留库里已有的凭据；新建时必填 */
   api_key?: string
   base_url?: string
   model?: string
   extra_env?: Record<string, string>
-  enabled?: boolean
 }
 
 export interface AgentCliTestResult {
@@ -393,27 +402,48 @@ export const api = {
     return request<void>(`/api/admin/providers/${id}`, { method: 'DELETE' })
   },
 
-  // 外部 Agent CLI（codex / claude）凭据：改完下一轮飞书任务即生效，无需重启服务
+  // 外部 Agent CLI（codex / claude）凭据：每后端多份配置，切换启用即时生效
   listAgentCliConfigs() {
-    return request<AgentCliConfig[]>('/api/admin/agent-cli-config')
+    return request<AgentCliBackend[]>('/api/admin/agent-cli-config')
   },
 
-  updateAgentCliConfig(backend: string, data: AgentCliConfigUpdate) {
-    return request<{ status: string }>(`/api/admin/agent-cli-config/${backend}`, {
+  createAgentCliProfile(backend: string, data: AgentCliProfileInput & { activate?: boolean }) {
+    return request<{ id: string }>(`/api/admin/agent-cli-config/${backend}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
+  },
+
+  updateAgentCliProfile(id: string, data: AgentCliProfileInput) {
+    return request<{ status: string }>(`/api/admin/agent-cli-config/profiles/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     })
   },
 
-  testAgentCliConfig(backend: string) {
-    return request<AgentCliTestResult>(`/api/admin/agent-cli-config/${backend}/test`, {
+  /** 启用这份配置，同后端其余自动停用 */
+  activateAgentCliProfile(id: string) {
+    return request<{ status: string }>(`/api/admin/agent-cli-config/profiles/${id}/activate`, {
       method: 'POST',
     })
   },
 
-  /** 彻底清掉库里的凭据（停用只是不再使用，凭据仍在库里） */
-  deleteAgentCliConfig(backend: string) {
-    return request<void>(`/api/admin/agent-cli-config/${backend}`, { method: 'DELETE' })
+  /** 停用该后端全部配置，回退到服务器上的 agent-cli.env */
+  deactivateAgentCliProfiles(backend: string) {
+    return request<{ status: string }>(`/api/admin/agent-cli-config/${backend}/deactivate`, {
+      method: 'POST',
+    })
+  },
+
+  testAgentCliProfile(id: string) {
+    return request<AgentCliTestResult>(`/api/admin/agent-cli-config/profiles/${id}/test`, {
+      method: 'POST',
+    })
+  },
+
+  /** 删除这份配置，彻底清掉其中的凭据（停用只是不再使用，凭据仍在库里） */
+  deleteAgentCliProfile(id: string) {
+    return request<void>(`/api/admin/agent-cli-config/profiles/${id}`, { method: 'DELETE' })
   },
 
   // Image provider management
