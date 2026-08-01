@@ -833,10 +833,59 @@ pub async fn deactivate_agent_cli_profiles(
     R::ok(serde_json::json!({"status": "ok"}))
 }
 
+/// 拉取端点的模型列表。第三方中转普遍实现这个接口（OpenAI 兼容格式），
+/// 用来在「模型」留空时挑一个真实存在的探测模型，以及在模型名不对时告诉用户有哪些可选。
+/// 拿不到就返回空列表，探测流程不因此失败。
+async fn fetch_endpoint_models(
+    client: &reqwest::Client,
+    base: &str,
+    api_key: &str,
+    backend: &str,
+) -> Vec<String> {
+    // 路径要和推理请求保持一致：claude 的 base 不含 /v1（推理走 {base}/v1/messages），
+    // codex 的 base 已含 /v1（推理走 {base}/responses）。
+    let url = if backend == "claude" {
+        format!("{base}/v1/models")
+    } else {
+        format!("{base}/models")
+    };
+    let request = client.get(url);
+    // Anthropic 用 x-api-key，OpenAI 兼容端点用 Bearer；中转通常两者都收，各按本协议发。
+    let request = if backend == "claude" {
+        request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.bearer_auth(api_key)
+    };
+    let Ok(response) = request.send().await else {
+        return Vec::new();
+    };
+    if !response.status().is_success() {
+        return Vec::new();
+    }
+    let Ok(value) = response.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
+    // OpenAI 格式是 {"data":[{"id":...}]}，Anthropic 也用 data 数组。
+    value["data"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item["id"].as_str().map(ToOwned::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// POST /api/admin/agent-cli-config/profiles/{id}/test — 用这份配置向端点发一次最小请求
 ///
 /// 换第三方中转后最想知道的是「这个 key 和端点到底能不能用」。等飞书任务跑失败再看日志
 /// 反馈太慢，这里直接探一次。不落库、不改配置，也不要求先启用。
+///
+/// 「模型」留空时不猜固定的官方模型名——中转不一定有，猜错会把可用的端点报成故障。
+/// 改为先拉 /models 取一个真实存在的模型来探测。
 pub async fn test_agent_cli_profile(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -857,55 +906,69 @@ pub async fn test_agent_cli_profile(
     };
     let api_key = config.api_key.trim();
     let base_url = config.base_url.trim().trim_end_matches('/');
+    let is_claude = config.backend == "claude";
+    let base = if !base_url.is_empty() {
+        base_url
+    } else if is_claude {
+        "https://api.anthropic.com"
+    } else {
+        "https://api.openai.com/v1"
+    };
 
-    // 两个后端的探测都用「最小的一次推理」，比拉模型列表更接近真实调用路径：
-    // 中转常见的失败是端点通但不支持某协议，只有真正发一次推理请求才能暴露。
-    let result = if config.backend == "claude" {
-        let base = if base_url.is_empty() {
-            "https://api.anthropic.com"
+    let available = fetch_endpoint_models(&client, base, api_key, &config.backend).await;
+    let configured = config.model.trim();
+    // 配置了模型就用它（用户想验证的正是这个）；留空则取端点自报的第一个。
+    let probe_model = if !configured.is_empty() {
+        configured.to_string()
+    } else if let Some(first) = available.first() {
+        first.clone()
+    } else {
+        // 端点不支持 /models，只能退回猜测，并在结果里说明这一点。
+        if is_claude {
+            "claude-sonnet-4-20250514".to_string()
         } else {
-            base_url
-        };
-        let model = if config.model.trim().is_empty() {
-            "claude-sonnet-4-20250514"
-        } else {
-            config.model.trim()
-        };
+            "gpt-5".to_string()
+        }
+    };
+    let model_source = if !configured.is_empty() {
+        "配置的模型"
+    } else if !available.is_empty() {
+        "端点自报的模型"
+    } else {
+        "推测的模型（端点未提供模型列表）"
+    };
+
+    // 探测用「最小的一次推理」，比只拉模型列表更接近真实调用路径：中转常见的失败是
+    // 端点通但不支持某协议，只有真正发一次推理请求才能暴露。
+    let result = if is_claude {
         client
             .post(format!("{base}/v1/messages"))
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
             .json(&serde_json::json!({
-                "model": model,
+                "model": probe_model,
                 "max_tokens": 1,
                 "messages": [{"role": "user", "content": "ping"}],
             }))
             .send()
             .await
     } else {
-        let base = if base_url.is_empty() {
-            "https://api.openai.com/v1"
-        } else {
-            base_url
-        };
-        let model = if config.model.trim().is_empty() {
-            "gpt-5"
-        } else {
-            config.model.trim()
-        };
         // Codex 0.146 只走 Responses API，探测也必须用同一个协议，
         // 否则「Chat Completions 能通但 Responses 不支持」的中转会被误判为可用。
         client
             .post(format!("{base}/responses"))
             .bearer_auth(api_key)
             .json(&serde_json::json!({
-                "model": model,
+                "model": probe_model,
                 "input": "ping",
                 "max_output_tokens": 16,
             }))
             .send()
             .await
     };
+
+    // 端点支持的模型列表，前端用来提示可填什么。截断避免中转返回上百个模型撑爆界面。
+    let models_preview: Vec<String> = available.iter().take(40).cloned().collect();
 
     match result {
         Ok(response) => {
@@ -914,7 +977,9 @@ pub async fn test_agent_cli_profile(
                 R::ok(serde_json::json!({
                     "ok": true,
                     "status": status.as_u16(),
-                    "message": "端点可用",
+                    "message": format!("端点可用（用{model_source} {probe_model} 验证）"),
+                    "models": models_preview,
+                    "models_total": available.len(),
                 }))
             } else {
                 // 回传响应体片段帮助定位（模型名错、余额不足、协议不支持），
@@ -923,17 +988,32 @@ pub async fn test_agent_cli_profile(
                 let body = response.text().await.unwrap_or_default();
                 let body = body.replace(api_key, "[redacted]");
                 let detail: String = body.chars().take(400).collect();
+                // model_not_found 意味着凭据和端点其实是通的，只是模型名不对——
+                // 报成「端点返回 503」会让人以为中转挂了，实际只需换模型名。
+                let model_rejected = detail.contains("model_not_found")
+                    || detail.contains("No available channel for model")
+                    || detail.contains("does not exist");
+                let message = if model_rejected {
+                    format!("凭据可用，但端点不支持模型 {probe_model}，请在「模型」里填一个下面列出的名字")
+                } else {
+                    format!("端点返回 {status}")
+                };
                 R::ok(serde_json::json!({
                     "ok": false,
                     "status": status.as_u16(),
-                    "message": format!("端点返回 {status}"),
+                    "message": message,
                     "detail": detail,
+                    "model_rejected": model_rejected,
+                    "models": models_preview,
+                    "models_total": available.len(),
                 }))
             }
         }
         Err(e) => R::ok(serde_json::json!({
             "ok": false,
             "message": format!("请求失败: {e}"),
+            "models": models_preview,
+            "models_total": available.len(),
         })),
     }
 }

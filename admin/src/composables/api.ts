@@ -167,6 +167,11 @@ export interface AgentCliTestResult {
   status?: number
   message: string
   detail?: string
+  /** 凭据与端点其实是通的，只是模型名不被支持 */
+  model_rejected?: boolean
+  /** 端点自报支持的模型（最多 40 个），用于提示可填什么 */
+  models?: string[]
+  models_total?: number
 }
 
 export interface WeixinLoginStart {

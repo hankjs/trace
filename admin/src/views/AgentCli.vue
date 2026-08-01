@@ -198,6 +198,28 @@ async function remove(profile: AgentCliProfile) {
   busy.value = null
 }
 
+/** 从测试结果里点选模型：直接落库保存，省去再进编辑态一次。 */
+async function pickModel(profile: AgentCliProfile, model: string) {
+  busy.value = profile.id
+  delete errors.value[profile.backend]
+  try {
+    await api.updateAgentCliProfile(profile.id, {
+      name: profile.name,
+      auth_kind: profile.auth_kind,
+      api_key: '',
+      base_url: profile.base_url,
+      model,
+      extra_env: profile.extra_env,
+    })
+    notice.value[profile.backend] = `已设为 ${model}`
+    delete results.value[profile.id]
+    await load()
+  } catch (e) {
+    errors.value[profile.backend] = e instanceof Error ? e.message : '设置失败'
+  }
+  busy.value = null
+}
+
 onMounted(load)
 </script>
 
@@ -321,9 +343,32 @@ onMounted(load)
               class="mt-2 p-2 text-xs rounded border"
               :class="results[profile.id].ok
                 ? 'border-border-subtle text-text-secondary'
-                : 'border-red-500/40 text-red-500'"
+                : results[profile.id].model_rejected
+                  ? 'border-amber-500/40 text-amber-600'
+                  : 'border-red-500/40 text-red-500'"
             >
-              <div>{{ results[profile.id].ok ? '✓' : '✗' }} {{ results[profile.id].message }}</div>
+              <div>
+                {{ results[profile.id].ok ? '✓' : results[profile.id].model_rejected ? '!' : '✗' }}
+                {{ results[profile.id].message }}
+              </div>
+              <div v-if="results[profile.id].models?.length" class="mt-2">
+                <div class="text-[11px] text-text-tertiary mb-1">
+                  端点支持的模型（点击设为该配置的模型）<span
+                    v-if="(results[profile.id].models_total || 0) > (results[profile.id].models?.length || 0)"
+                  >，共 {{ results[profile.id].models_total }} 个</span>
+                </div>
+                <div class="flex flex-wrap gap-1">
+                  <button
+                    v-for="model in results[profile.id].models"
+                    :key="model"
+                    @click="pickModel(profile, model)"
+                    :disabled="busy === profile.id"
+                    class="px-1.5 py-0.5 text-[11px] font-mono border border-border-subtle rounded text-text-secondary hover:bg-hover disabled:opacity-40"
+                  >
+                    {{ model }}
+                  </button>
+                </div>
+              </div>
               <pre
                 v-if="results[profile.id].detail"
                 class="mt-1 whitespace-pre-wrap break-all font-mono text-[11px] text-text-tertiary"
