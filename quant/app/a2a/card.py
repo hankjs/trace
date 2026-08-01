@@ -54,7 +54,7 @@ def _card_dict() -> dict[str, Any]:
             {
                 "id": "catalog.get",
                 "name": "Get research catalog",
-                "description": "Fixed dictionaries: filter fields, operators, labels, snippet metadata. Call before authoring new specs.",
+                "description": "Research dictionaries plus the strategy_authoring contract: exact operator shapes and complete valid StrategySpec examples. Call before authoring specs.",
                 "tags": ["catalog", "read"],
                 "input_modes": ["application/json"],
                 "output_modes": ["application/json"],

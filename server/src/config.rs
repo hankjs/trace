@@ -138,6 +138,7 @@ pub struct QuantA2aConfig {
     /// 需显式 opt-in。
     #[serde(default)]
     pub enabled: bool,
+    /// quant 服务根地址或完整 `/a2a` RPC 地址；客户端会统一规范化。
     #[serde(default = "default_quant_a2a_base_url")]
     pub base_url: String,
 }

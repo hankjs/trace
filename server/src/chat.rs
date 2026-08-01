@@ -106,6 +106,23 @@ impl EventBuffer {
     }
 }
 
+/// Chat 的 AgentSession 会在 `run()` 返回前发出 TurnComplete，但服务端要在
+/// `run()` 返回后才保存完整消息链。这里暂不广播终态，避免客户端立即回复
+/// ask_user 时读到旧 active_leaf，形成孤立的 tool_result。
+fn push_chat_stream_event(buffer: &mut EventBuffer, event: AgentEvent) {
+    if !matches!(event, AgentEvent::TurnComplete) {
+        buffer.push(event);
+    }
+}
+
+/// event_tx 关闭意味着 Agent 已返回且消息链已保存，此时才关闭 SSE。
+fn finish_chat_stream(buffer: &mut EventBuffer) {
+    if !buffer.completed {
+        buffer.push(AgentEvent::TurnComplete);
+        buffer.completed = true;
+    }
+}
+
 // --- Request types ---
 
 #[derive(Deserialize)]
@@ -647,16 +664,21 @@ pub async fn run_chat_turn(
                 }
                 let mut buffers = state_fwd.event_buffers.write().await;
                 if let Some(buf) = buffers.get_mut(&sid_fwd) {
-                    buf.push(event_for_stream(&event));
+                    push_chat_stream_event(buf, event_for_stream(&event));
                 }
+            }
+
+            // event_tx 只会在 Agent 返回、消息链持久化完成后关闭。将终态放在
+            // 这里可保证客户端看到 TurnComplete 后立即回复也能恢复完整历史。
+            let mut buffers = state_fwd.event_buffers.write().await;
+            if let Some(buf) = buffers.get_mut(&sid_fwd) {
+                finish_chat_stream(buf);
             }
         }
         .instrument(fwd_span),
     );
 
     // Agent task with fallback loop
-    let state_for_buffer2 = state.clone();
-    let sid_for_buffer2 = session_id.clone();
     let agent_span = tracing::info_span!("chat_agent", session_id = %session_id);
     tokio::spawn(async move {
         let max_attempts = fallback_list.len().min(3);
@@ -866,14 +888,6 @@ pub async fn run_chat_turn(
         {
             let mut tasks = state_for_cleanup.active_tasks.write().await;
             tasks.remove(&sid_for_cleanup);
-        }
-
-        // Mark buffer as completed
-        {
-            let mut buffers = state_for_buffer2.event_buffers.write().await;
-            if let Some(buf) = buffers.get_mut(&sid_for_buffer2) {
-                buf.completed = true;
-            }
         }
     }.instrument(agent_span));
 
@@ -1454,6 +1468,43 @@ mod tests {
             prompt.contains("S1 | 用户停止 / 会话结束"),
             "prompt should contain stop condition S1"
         );
+        assert!(
+            prompt.contains("不得先调用通用 `ask_user`"),
+            "prompt should route high-cost confirmation through the runtime gate"
+        );
+        assert!(
+            prompt.contains("不得为了满足落表步骤而编造 finding"),
+            "prompt should keep inconclusive results out of the gap table"
+        );
+    }
+
+    #[test]
+    fn test_chat_turn_complete_waits_for_message_persistence() {
+        let mut buffer = EventBuffer::new();
+        push_chat_stream_event(
+            &mut buffer,
+            AgentEvent::TextDelta {
+                text: "waiting".to_string(),
+            },
+        );
+        push_chat_stream_event(&mut buffer, AgentEvent::TurnComplete);
+
+        assert_eq!(buffer.events.len(), 1);
+        assert!(!buffer.completed);
+        assert!(
+            !buffer
+                .events
+                .iter()
+                .any(|entry| matches!(entry.event, AgentEvent::TurnComplete)),
+            "消息持久化前不得向客户端暴露 TurnComplete"
+        );
+
+        finish_chat_stream(&mut buffer);
+        assert!(buffer.completed);
+        assert!(matches!(
+            buffer.events.last().map(|entry| &entry.event),
+            Some(AgentEvent::TurnComplete)
+        ));
     }
 
     #[test]

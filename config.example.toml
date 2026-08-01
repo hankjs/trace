@@ -36,7 +36,7 @@ approval_ttl_secs = 600
 # 是否在所有已登录会话注册 quant_* 工具（默认 false）。
 # 开启后每个会话都会挂载 19 个 quant 工具 schema 并向系统提示注入 quant-research skill。
 enabled = false
-# quant A2A Server 地址；留空或省略时默认 http://127.0.0.1:8100
+# quant A2A Server 根地址（也可直接填 .../a2a）；省略时默认 http://127.0.0.1:8100
 base_url = "http://127.0.0.1:8100"
 
 # 飞书渠道：应用凭证不走配置文件，由 admin REST 管理（见 docs/feishu.md）：

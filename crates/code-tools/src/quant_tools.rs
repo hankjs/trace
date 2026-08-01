@@ -41,11 +41,24 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_catalog",
                 skill: "catalog.get",
-                description: "获取 quant 研究目录（过滤字段、算子片段等）。新建策略 Spec 前应先调用。",
+                description: "获取 quant 研究目录。编写 StrategySpec 前必须请求 strategy_authoring 段，复用完整示例并按精确操作符形状修改，禁止猜 schema。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "sections": { "type": "array", "items": { "type": "string" }, "description": "可选，如 [\"filter_fields\", \"snippets\"]" }
+                        "sections": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "enum": [
+                                    "product_boundary", "factors", "indicators",
+                                    "filter_fields", "strategy_templates", "signals",
+                                    "signal_sides", "manual_trade_sides",
+                                    "signal_reason_types", "backtest_metrics",
+                                    "strategy_authoring"
+                                ]
+                            },
+                            "description": "编写 Spec 时使用 [\"strategy_authoring\", \"product_boundary\"]；省略则返回全部。"
+                        }
                     }
                 }),
                 high_cost: false,
@@ -162,7 +175,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_run_trial",
                 skill: "experiment.trial",
-                description: "在冻结 spec 上应用 param_patch 执行一次 trial 回测。长任务，须用户确认；默认优先 experiment 路径。",
+                description: "在冻结 spec 上应用 param_patch 执行一次 trial 回测。默认优先 experiment 路径；模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -192,7 +205,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_run_trial_batch",
                 skill: "experiment.trial_batch",
-                description: "顺序执行多组 param_patch trial（硬上限 8 组）。长任务，须用户确认；按实际执行条数消耗授权。",
+                description: "顺序执行多组 param_patch trial（硬上限 8 组），按实际条数消耗授权；模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -222,7 +235,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_run_backtest",
                 skill: "backtest.run",
-                description: "对已保存 strategy_id 执行模拟回测（路径 S）。长任务，须用户确认；多轮提炼应优先 experiment.trial。",
+                description: "对已保存 strategy_id 执行模拟回测（路径 S）；多轮提炼应优先 experiment.trial。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -352,7 +365,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_evaluate_factor",
                 skill: "factor.evaluate",
-                description: "全市场（或指定池）因子有效性评估：IC/RankIC/ICIR/分层多空收益。长任务，须用户确认。",
+                description: "全市场（或指定池）因子有效性评估：IC/RankIC/ICIR/分层多空收益。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -425,12 +438,13 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_report_finding",
                 skill: "system.report_finding",
-                description: "将研究结论中的系统缺口/假说失败落表，供 gap_summary 聚合。",
+                description: "将真实系统缺口或工具明确判定的假说失败落表，供 gap_summary 聚合。仅证据不足、假说尚未被拒绝且无系统缺口时也要调用，但 findings 必须传空数组。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "findings": {
                             "type": "array",
+                            "description": "仅真实系统缺口或明确 hypothesis_rejected；证据不足但未拒绝时传 []。",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -887,6 +901,69 @@ mod tests {
             |_| "summary".to_string(),
         );
         assert!(tool.needs_confirmation(&json!({})).is_none());
+    }
+
+    #[test]
+    fn test_catalog_schema_exposes_exact_authoring_section() {
+        let tools = quant_tools(
+            "http://x",
+            "token",
+            "s1",
+            "trace_chat",
+            Arc::new(QuantGrantStore::new()),
+        );
+        let catalog = tools
+            .iter()
+            .find(|tool| tool.name() == "quant_catalog")
+            .unwrap();
+        let schema = catalog.input_schema();
+        let values = schema["properties"]["sections"]["items"]["enum"]
+            .as_array()
+            .unwrap();
+        assert!(values.contains(&json!("strategy_authoring")));
+        assert!(!values.contains(&json!("snippets")));
+        assert!(!values.contains(&json!("operators")));
+    }
+
+    #[test]
+    fn test_high_cost_tools_delegate_confirmation_to_runtime_gate() {
+        let tools = quant_tools(
+            "http://x",
+            "token",
+            "s1",
+            "trace_chat",
+            Arc::new(QuantGrantStore::new()),
+        );
+        for name in [
+            "quant_run_trial",
+            "quant_run_trial_batch",
+            "quant_run_backtest",
+            "quant_evaluate_factor",
+        ] {
+            let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
+            assert!(tool.description().contains("模型应直接调用"), "{name}");
+            assert!(tool.description().contains("不要先调用 ask_user"), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_report_finding_description_keeps_inconclusive_results_out_of_gap_table() {
+        let tools = quant_tools(
+            "http://x",
+            "token",
+            "s1",
+            "trace_chat",
+            Arc::new(QuantGrantStore::new()),
+        );
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name() == "quant_report_finding")
+            .unwrap();
+        assert!(tool.description().contains("findings 必须传空数组"));
+        assert_eq!(
+            tool.input_schema()["properties"]["findings"]["description"],
+            "仅真实系统缺口或明确 hypothesis_rejected；证据不足但未拒绝时传 []。"
+        );
     }
 
     #[test]

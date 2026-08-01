@@ -627,7 +627,55 @@ def _ordered_items(items: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
     return [deepcopy(item) for item in items.values()]
 
 
-def catalog_payload(db=None) -> dict[str, Any]:
+BASE_CATALOG_SECTIONS = (
+    "product_boundary",
+    "factors",
+    "indicators",
+    "filter_fields",
+    "strategy_templates",
+    "signals",
+    "signal_sides",
+    "manual_trade_sides",
+    "signal_reason_types",
+    "backtest_metrics",
+)
+A2A_CATALOG_SECTIONS = (*BASE_CATALOG_SECTIONS, "strategy_authoring")
+
+
+def _strategy_authoring_catalog() -> dict[str, Any]:
+    """给 Agent 的紧凑 StrategySpec 编写契约，全部来自运行时真源。"""
+    from .strategy.operators import OPERATORS
+    from .strategy.presets import SYSTEM_STRATEGY_SPECS
+    from .strategy.spec import (
+        MAX_AST_DEPTH, MAX_AST_NODES, MAX_WINDOW, SCHEMA_VERSION,
+        SUPPORTED_FIELDS,
+    )
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "supported_fields": sorted(SUPPORTED_FIELDS),
+        "operators": [
+            {
+                "op": op,
+                "required_keys": sorted(spec.fields),
+                "argument_types": deepcopy(spec.arg_types),
+                "result_type": spec.result_type,
+                "version": spec.version,
+            }
+            for op, spec in sorted(OPERATORS.items())
+        ],
+        "limits": {
+            "max_ast_depth": MAX_AST_DEPTH,
+            "max_ast_nodes": MAX_AST_NODES,
+            "max_window": MAX_WINDOW,
+        },
+        # 完整示例比脱离上下文的 AST 片段更适合 Agent：复制后只改假说、
+        # 窗口和池即可，所有必填壳字段仍来自已通过回归的系统规格。
+        "examples": deepcopy(SYSTEM_STRATEGY_SPECS),
+    }
+
+
+def catalog_payload(db=None, *, include_strategy_authoring: bool = False) -> dict[str, Any]:
     """返回可直接 JSON 序列化的完整目录副本。
 
     `db` 用于拉取动态因子目录;无 db 时因子部分为空(生产 API 始终会传 db)。
@@ -635,7 +683,7 @@ def catalog_payload(db=None) -> dict[str, Any]:
     from .factors import factor_catalog_fields
 
     dynamic_factors = factor_catalog_fields(db) if db is not None else {}
-    return {
+    payload = {
         "version": 1,
         "product_boundary": {
             "frequency": "daily",
@@ -656,6 +704,9 @@ def catalog_payload(db=None) -> dict[str, Any]:
         "signal_reason_types": _ordered_items(SIGNAL_REASON_TYPES),
         "backtest_metrics": _ordered_items(BACKTEST_METRICS),
     }
+    if include_strategy_authoring:
+        payload["strategy_authoring"] = _strategy_authoring_catalog()
+    return payload
 
 
 def template_name(key: str) -> str:

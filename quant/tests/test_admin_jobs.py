@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import job_log
 from app import scheduler as sched
+from app import scheduler_lock
 from app.api import admin
 from app.db import Base
 
@@ -38,6 +39,7 @@ def log_db(monkeypatch, tmp_path):
     testing_session = sessionmaker(bind=engine)
     monkeypatch.setattr(job_log, "SessionLocal", testing_session)
     monkeypatch.setattr(admin, "SessionLocal", testing_session)
+    monkeypatch.setattr(scheduler_lock, "engine", engine)
     return testing_session
 
 

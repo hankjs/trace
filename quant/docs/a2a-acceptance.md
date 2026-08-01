@@ -3,8 +3,8 @@
 | 属性 | 内容 |
 |------|------|
 | 关联设计 | `quant/docs/a2a-design.md`（DESIGN-A2A-2026-07） |
-| 验收日期 | 2026-07-31 |
-| 验收方式 | 自动化测试（quant pytest 799 / Rust workspace 98 / web pnpm build）+ 本地真实冒烟（uvicorn + MySQL，curl/httpx 驱动 JSON-RPC 与 SSE） |
+| 验收日期 | 2026-08-01 |
+| 验收方式 | 自动化测试（quant pytest 802；Rust hank-a2a-client 14 + code-tools 36 + hank-server 85，另 2 ignored；hank-server build；web pnpm build）+ 本地真实 LLM 端到端（Trace + quant + MySQL，SSE 驱动确认恢复） |
 
 ## 交付落点（回填 §18）
 
@@ -30,7 +30,7 @@
 | 5 | ✅（代码层） | skill 话术约束 + 工具摘要不产交易措辞；最终措辞依赖 LLM 遵守，建议首次微信联调时人工抽查 |
 | 6 | ✅ | 仅 text → failed 并列出全部 skill id；冒烟 + test_text_only |
 | 7 | ✅ | 冒烟 Card：streaming=true, pushNotifications=false, 19 skills |
-| 8 | ✅ | quant pytest 799 全绿（含既有回归）；web pnpm build 通过 |
+| 8 | ✅ | quant pytest 802 全绿（含既有回归）；web pnpm build 通过 |
 | 9 | ✅ | 互斥 409 → Task failed（可等待/可先 Cancel 文案）；复用 quant_task 单任务互斥 |
 | 10 | ✅ | Rust 侧模型自填 confirmed 无条件剥离（quant_tools）；quant 二次校验（冒烟：无 confirmed → failed）；微信白名单单测 |
 | 11 | ✅ | 缺 strategy_id / initial_cash / fees / slippage_bps / params / 裸 spec → 可操作文案；冒烟 + 3 个测试 |
@@ -56,7 +56,12 @@
 
 | # | 结果 | 证据 |
 |---|------|------|
-| 22–25, 29, 30 | ⚠️ 代码就绪，待 LLM 端到端 | quant-research SKILL.md 全量注入（注入断言测试）；19 工具 + 确认闸门 + 停止条件/findings 规格齐备；`quant_report_finding` 落表链路冒烟验证（inserted/skipped 去重）。端到端需真实 LLM 会话走一遍验收脚本，建议作为上线前人工验收项 |
+| 22 | ✅（真实 LLM） | 会话 `27d7040b-049d-49e6-b8f3-650ea62e67b6`：一句话意图后 `catalog → data_quality → validate → save_draft → create_experiment → 系统确认 → trial → get → report_finding → Conclude`；strategy_id=20、experiment_id=3、trial_id=4、run_id=23 |
+| 23 | ✅（真实 LLM） | 同会话默认走路径 E，全程未调用 `quant_run_backtest`；单次 trial 只表述为样本内结果与证据不足，不称科学验证通过 |
+| 24 | ⚠️ 待真实 LLM | S3/S5 停止条件与「停止后禁高成本」已写入 skill；尚缺分别触发 S3、S5 的真实会话证据 |
+| 25 | ✅（真实 LLM） | 会话 `f5dfe829-334d-4bb2-95dd-decd99c92102`：分钟 K 线 + 实时盘口请求仅调用 `quant_catalog → quant_report_finding`，0 次确认、0 个高成本工具；S6 `product_gap` inserted=1，补强建议保持日频边界并改用外部专用系统 |
+| 29 | ⚠️ 待真实 LLM | 因子 validate/preview/evaluate/save_draft 的确定性链路与测试已就绪；尚缺一次带真实确认、样本期 / n_periods / 多重检验措辞的真实 LLM 会话 |
+| 30 | ✅（真实 LLM） | S6 会话的 `quant_report_finding` payload 与最终展示逐字段一致并落表 inserted=1；路径 E 也实际调用了 report_finding。新增规则禁止把「证据不足但未拒绝」伪记为 `hypothesis_rejected`，此时必须上报空数组 |
 
 ## §15.4 缺口闭环
 
@@ -77,7 +82,11 @@
 7. trial outcome=error 未写缺口列 → `_audit_info` 增加运行期失败提取。
 8. trial/trial_batch/factor.evaluate 等待循环忙轮询（无 sleep）→ 统一 `_common.wait_for_task`（0.5s 间隔 + 协作取消等待状态翻转）。
 9. Trace 侧多个 agent 的 `cargo fmt --all` 噪音 → 已全部还原，diff 仅保留实质改动。
+10. Trace A2A client 把配置的服务根地址 POST 到 `/`，quant RPC 实际为 `/a2a` → client 统一规范化根地址与完整 endpoint，并以真实 uvicorn 日志确认请求全部命中 `POST /a2a`。
+11. `quant_catalog` 工具提示模型请求不存在的 `snippets/operators`，backend 又静默忽略未知 section → 新增运行时真源生成的 `strategy_authoring`（字段、精确算子形状、限制、完整合法示例），section 改为枚举并对未知值返回可纠错错误。
+12. ask_user 发出 TurnComplete 后、消息链持久化前客户端可立即回复，导致确认 tool_result 脱离历史 → chat SSE 将 TurnComplete 延迟到 Agent 返回且消息保存完成后广播；真实会话确认后成功继续 trial。
+13. 真实 trial 暴露「证据不足但未拒绝」被误记 `hypothesis_rejected` → skill + tool schema 明确仅工具给出 rejected/verdict 拒绝时可用该 kind；无缺口的证据不足结论调用 report_finding 传空数组。
 
 ## 冒烟残留（开发库）
 
-本地 MySQL 中留有少量冒烟产物（strategy `a2a_smoke_%` 2 行、experiment `a2a-smoke-%` 1 行及其 trial/run、对应 audit 行），为真实引擎执行的合法研究数据，未自动删除。如需清理请明示后执行。
+本地 MySQL 中保留此前协议冒烟产物，以及本轮真实 LLM 验收记录：strategy_id=19/20、experiment_id=2/3、trial_id=3/4、run_id=23、对应 audit/findings 与 Trace 会话。strategy 20 / experiment 3 / trial 4 / run 23 是成功回测；trial 3 是数据不足错误；路径 E 首次结论还留有一条语义错误的 `hypothesis_rejected` finding，规则已修复但未擅自改写历史记录。以上均未自动删除。

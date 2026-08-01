@@ -13,16 +13,13 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# 在导入 app.main 之前禁用 Alembic 版本校验
-from app import migrations as migrations_mod  # noqa: E402
-
-migrations_mod.check_schema_version = lambda engine, *, strict=None: True
-
 from app import db as app_db  # noqa: E402
+from app import tasks as tasks_mod  # noqa: E402
 from app.api import admin  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import Base  # noqa: E402
 from app.main import app  # noqa: E402
+import app.main as app_main  # noqa: E402
 from app.models import A2aAudit, ResearchFinding  # noqa: E402
 
 ADMIN_CLAIMS = {
@@ -53,6 +50,9 @@ def client(monkeypatch, tmp_path):
 
     monkeypatch.setattr(app_db, "SessionLocal", SessionLocal)
     monkeypatch.setattr(admin, "SessionLocal", SessionLocal)
+    monkeypatch.setattr(tasks_mod, "SessionLocal", SessionLocal)
+    # app.main 在模块导入时绑定了函数别名，必须替换该绑定而非 migrations 模块属性。
+    monkeypatch.setattr(app_main, "check_schema_version", lambda engine: True)
 
     with TestClient(app) as c:
         yield c

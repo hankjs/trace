@@ -144,6 +144,8 @@ def test_sync_defaults_to_bulk_daily_path(db, monkeypatch):
                             {"date": date(2026, 7, 25), "is_open": False},
                             {"date": date(2026, 7, 26), "is_open": True},
                         ]))
+    monkeypatch.setattr(ingest.baostock_client, "login_session",
+                        lambda: _nullcontext())
     monkeypatch.setattr(ingest, "sync_adjust_factors_for_day",
                         _fake_sync_day)
 

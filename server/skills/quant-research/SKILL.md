@@ -13,24 +13,26 @@ description: Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experime
 - 不替代 quant 做撮合、前视规则、多重检验或 capability 判定。
 - 不把 `promotion.eligible` 表述为「已验证可交易」或「可买入」；promotion 只是待办提示，用户需在看板确认。
 - 发现系统能力/数据缺口是一等结果，必须写入 findings 并落表。
+- quant 的产品边界是 A 股日频研究。分钟级 K 线、Level-2 盘口、日内/高频撮合属于明确不做的范围：记为 `product_gap` 并停止，但 `suggested_system_work` 只能说明保持边界或改用外部专用系统，不得建议 quant 接入或建设这些能力。
 
 ## 强制行为约束
 
-1. **写 Spec 前必须先 `quant_catalog`**（或本会话未过期缓存）。禁止凭记忆编造字段、算子或片段名。
+1. **写 Spec 前必须先 `quant_catalog` 请求 `sections=["strategy_authoring","product_boundary"]`**（或本会话未过期缓存）。从 `strategy_authoring.examples` 复制最接近的完整规格，再按 `operators[].required_keys` 修改；禁止凭记忆编造字段、算子或 Spec 壳。
 2. **高成本执行前优先查 `quant_data_quality` 与 `quant_validate_strategy`**（工具未全时至少 validate）。
 3. **仅当 `capability.status == supported` 且 `valid == true` 时才调用高成本工具**（`quant_run_backtest`、`quant_run_trial`、`quant_run_trial_batch`、`quant_evaluate_factor`）。
 4. **多轮提炼默认走路径 E**（`experiment.*`）。路径 S（`quant_run_backtest`）仅在用户明确要求「先随便跑一下 / 冒烟」或 experiment 前置条件不满足时使用。
 5. **新策略必须带谱系**：`quant_save_strategy_draft` 时尽量带上 `parent_strategy_id`；小参数迭代用 `param_patch`，不要每轮新建 strategy 行。
-6. **高成本工具的 `confirmed` 只能由 Trace 拦截层注入**，模型自身输出不得直接置位；遇到需确认时暂停并等待用户授权。
+6. **高成本工具的 `confirmed` 只能由 Trace 拦截层注入**，模型自身输出不得直接置位。前置条件满足后直接调用目标高成本 `quant_*` 工具，由 runtime 自动拦截并询问用户；不得先调用通用 `ask_user`，也不得只用文字索取确认。用户确认后重新调用同一高成本工具。
 7. **迭代前先查记忆**：调用 `quant_list_experiments` / `quant_get_experiment`（必要时 `quant_list_backtests`），对比本轮假设与已有 trial/run，避免重复烧配额。
 8. **所有结果必须带可复现引用**：`experiment_id`、trial id、`run_id`、`evaluation_id`、`strategy_id`。
 9. **文案禁忌**：研究模拟，非投资建议，不下单；不把单次漂亮回测说成科学验证通过。
-10. **区分假说失败与系统缺口**：假说失败记 `hypothesis_rejected`；缺算子/字段记 `missing_engine`/`missing_data`；覆盖不足记 `low_coverage`；能力不在 Agent Card 记 `product_gap`；体验/反复失败记 `ux_friction`。
+10. **区分假说失败、证据不足与系统缺口**：仅当 validation/trial 明确给出 rejected/verdict 拒绝时才记 `hypothesis_rejected`；单次结果、证据不足或「尚未被拒绝」不得归为拒绝，且无系统缺口时调用 `quant_report_finding` 传 `findings=[]`。缺算子/字段记 `missing_engine`/`missing_data`；覆盖不足记 `low_coverage`；能力不在 Agent Card 记 `product_gap`；体验/反复失败记 `ux_friction`。
 11. **费用白名单**：只使用 `costs.commission`、`costs.stamp_tax`、`costs.slippage`（价格比例）。禁止编造 `initial_cash`、`slippage_bps`、`fees`、`params` 等字段。
 12. **因子提炼必须走完整链路**：`quant_validate_factor` → `quant_preview_factor`（≤5 标的抽查）→ `quant_evaluate_factor`（IC/RankIC/ICIR/分层，高成本须授权）→ 可选 `quant_save_factor_draft`（admin）。evaluate 摘要必须带样本期、`n_periods`、覆盖率与多重检验提示，禁止说「未来持续有效」。
 13. **遵守停止条件 S1-S6**（见下），任一触发立即 Conclude，禁止继续高成本执行。
 14. **遵守验证纪律**：可检验假设、失败保留、一次漂亮回测 ≠ 验证通过。
 15. **重启兜底**：`Get Task` not found 时，用 `quant_get_experiment` / `quant_get_backtest` / `quant_list_backtests` 恢复终态，不得盲目重发；确需重发必须复用同一 `client_request_id`。
+16. **边界缺口不进路线图**：分钟级/实时盘口/高频等明确不做的请求触发 S6 后，finding 只记录边界事实；不得把建设对应数据源或引擎写进系统补强建议。
 
 ## 状态机
 
@@ -45,7 +47,7 @@ description: Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experime
         ▼
 [Register]     quant_save_strategy_draft（带 parent_strategy_id）→ quant_create_experiment
    ▼
-[Authorize]    高成本前等待用户确认；优先会话级批量授权
+[Authorize]    直接调用高成本工具 → runtime 自动暂停确认；禁止手工 ask_user
    ▼
 [Execute]      quant_run_trial | quant_run_trial_batch（或路径 S: quant_run_backtest）
    │            串行等待互斥；批量授权下展示 i/N
@@ -103,7 +105,7 @@ description: Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experime
   suggested_system_work: <可选>
 ```
 
-`findings` 数组为空时必须显式写「无系统缺口，假说被验证/拒绝/需更多证据」。
+`findings` 数组为空时仍必须调用 `quant_report_finding` 传空数组，并在对话中显式写「无系统缺口，假说被验证/拒绝/需更多证据」。不得为了满足落表步骤而编造 finding。
 
 ## 串行等待与批量授权 UX
 

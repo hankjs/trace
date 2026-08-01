@@ -573,11 +573,13 @@ Authorization: Bearer <user_jwt>
 
 ```json
 {
-  "sections": ["filter_fields", "snippets"]
+  "sections": ["strategy_authoring", "product_boundary"]
 }
 ```
 
-- `sections` 省略 = 返回实现支持的全部目录段  
+- `sections` 是枚举；未知值返回模型可纠错错误并列出可用值，不得静默忽略。
+- `strategy_authoring` 返回运行时真源生成的支持字段、操作符精确 JSON 形状、限制，以及完整合法系统 Spec 示例；Agent 应复制最近示例后修改，禁止猜 schema。
+- `sections` 省略 = 返回实现支持的全部目录段。
 
 **artifact `catalog`**：与现有 `GET /api/catalog` 语义对齐的 JSON（可裁剪体积）。
 
@@ -1180,6 +1182,7 @@ Orchestrator Conclude 的 findings（§10.5）落表通道。免确认，计入�
 | 规则 | 说明 |
 |------|------|
 | `kind` 枚举 | 与 §10.5 一致：`missing_engine` / `missing_data` / `low_coverage` / `product_gap` / `ux_friction` / `hypothesis_rejected`；未知 kind → 校验错误 |
+| 空数组 | 单次结果或证据不足、假说未被明确拒绝且无系统缺口时仍调用本 skill，但传 `findings: []`；不得为满足落表步骤伪造 `hypothesis_rejected` |
 | 落库 | **`quant_research_finding`** 表：`user_id`, `kind`, `detail`, `evidence`, `suggested_system_work`, `experiment_id`, `run_id`, `session_ref`, `source`, `created_at` |
 | 聚合 | `system.gap_summary` 与 admin REST 把 findings 与审计缺口列合并排行（§8.14） |
 | 授权 | `can_client`；仅写本人 findings |
@@ -1279,16 +1282,17 @@ Task working → artifact* → completed → close
 3. 仅 `capability.status == supported` 且 `valid == true` 才进高成本 skill。  
 4. **多轮提炼默认路径 E**（`experiment.*`）；路径 S（`backtest.run`）仅冒烟或用户明确要求。  
 5. 新策略：`save_strategy_draft`（带 `parent_strategy_id`）→ `create_experiment`（必填 `strategy_id`）；小参数迭代用 `param_patch`，**不要**每轮新建 strategy 行。  
-6. 高成本须拦截层注入 `confirmed`（§5.4）；优先会话级批量授权。  
+6. 高成本须拦截层注入 `confirmed`（§5.4）；模型在前置条件满足后直接调用目标高成本工具，由 runtime 自动暂停确认，不得先调用通用 `ask_user` 或只用文字索取确认；用户确认后重调同一工具。优先会话级批量授权。
 7. 迭代前先 `list_experiments` / `get_experiment`（必要时 `list_backtests`），对比「本轮假设 vs 已有 trial」。  
 8. 结果必须带 `experiment_id` / trial id / `run_id` 等可复现引用。  
 9. 文案：研究模拟，非投资建议，不下单；不把 promotion 说成已采纳证据。  
-10. 区分 **假说失败** vs **系统缺口**；缺口写入 findings（§10.5 / §13）。  
+10. 区分 **假说失败**、**证据不足** 与 **系统缺口**；只有工具明确给出 rejected/verdict 拒绝时才写 `hypothesis_rejected`。证据不足但未拒绝且无系统缺口时调用 `system.report_finding` 传空数组（§10.5 / §13）。
 11. 费用只用 `costs.*`；勿编造 `initial_cash` / `slippage_bps`。  
 12. **因子提炼**：validate → preview（≤5 标的抽查）→ **evaluate（IC/分层，高成本，须授权）** → 可选 save_draft（admin）；evaluate 摘要必须带样本期、`n_periods` 与多重检验提示，禁止表述为「未来持续有效」。  
 13. 遵守 §10.5 **停止条件**，禁止无限烧配额。  
 14. 遵守 `verification-protocol.md` 精神：可检验假设、失败保留、一次漂亮回测 ≠ 科学验证通过。  
 15. **重启兜底**：Get Task not found（quant 进程重启）时用 `experiment.get` / `backtest.get` / `backtest.list` 恢复终态（§4.6），不得盲目重发；确需重发必须复用同一 `client_request_id`。
+16. **日频产品边界**：分钟级 K 线、Level-2 盘口、日内/高频撮合属于明确不做范围。触发 S6 并落 `product_gap`，但 `suggested_system_work` 只能说明保持边界或改用外部专用系统，不得建议 quant 建设这些能力。
 
 ### 10.3 微信
 
@@ -1322,7 +1326,7 @@ base_url = "http://127.0.0.1:8100"
         ▼
 [Register]  save_draft（parent?）→ experiment.create
    ▼
-[Authorize]  确认或会话批量授权（§5.4）
+[Authorize]  直接调用高成本工具 → runtime 自动确认（§5.4；禁止手工 ask_user）
    ▼
 [Execute]  experiment.trial | trial_batch  （或路径 S: backtest.run）
    │ 互斥：串行等待；勿改参狂重试
@@ -1369,6 +1373,8 @@ base_url = "http://127.0.0.1:8100"
 
 `kind` 枚举：`missing_engine` | `missing_data` | `low_coverage` | `product_gap` | `ux_friction` | `hypothesis_rejected`。  
 **落表为强制步骤**：Conclude 在对话展示 findings 的同时调用 `system.report_finding`（§8.15）写入 `quant_research_finding`；`gap_summary` 跨会话可聚合（§13）。串行等待 UX：互斥时告知并等 SSE / Get Task / Subscribe 续订，批量授权下顺序执行并展示 i/N。
+
+单次结果或证据不足、假说未被明确拒绝且无系统缺口时，`findings` 必须为空数组；仍调用 `system.report_finding` 记录本次 Conclude 已完成，但不得为满足落表步骤伪造 `hypothesis_rejected`。
 
 ---
 

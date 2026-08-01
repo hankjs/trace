@@ -14,16 +14,23 @@ const A2A_VERSION: &str = "0.3";
 /// A2A 客户端；内部复用 reqwest::Client。
 #[derive(Debug, Clone)]
 pub struct A2aClient {
-    base_url: String,
+    rpc_url: String,
     bearer_token: String,
     client: reqwest::Client,
 }
 
 impl A2aClient {
-    /// 创建客户端。base_url 无需以 `/` 结尾。
+    /// 创建客户端。既接受服务根地址，也接受完整 `/a2a` RPC 地址。
     pub fn new(base_url: impl Into<String>, bearer_token: impl Into<String>) -> Self {
+        let base_url = base_url.into();
+        let trimmed = base_url.trim_end_matches('/');
+        let rpc_url = if trimmed.ends_with("/a2a") {
+            trimmed.to_string()
+        } else {
+            format!("{trimmed}/a2a")
+        };
         Self {
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            rpc_url,
             bearer_token: bearer_token.into(),
             client: reqwest::Client::new(),
         }
@@ -99,7 +106,7 @@ impl A2aClient {
         let req = Request::new(id, method, params);
         let resp: Response = self
             .client
-            .post(format!("{}/", self.base_url))
+            .post(&self.rpc_url)
             .headers(self.headers())
             .json(&req)
             .send()
@@ -126,7 +133,7 @@ impl A2aClient {
         let req = Request::new(id, method, params);
         let resp = self
             .client
-            .post(format!("{}/", self.base_url))
+            .post(&self.rpc_url)
             .headers(self.headers())
             .json(&req)
             .send()
@@ -211,6 +218,19 @@ mod tests {
         match &msg.parts[0] {
             Part::Data { data } => assert_eq!(data["skill"], "backtest.run"),
             _ => panic!("expected data part"),
+        }
+    }
+
+    #[test]
+    fn test_rpc_url_accepts_service_root_or_full_endpoint() {
+        for (input, expected) in [
+            ("http://127.0.0.1:8100", "http://127.0.0.1:8100/a2a"),
+            ("http://127.0.0.1:8100/", "http://127.0.0.1:8100/a2a"),
+            ("http://127.0.0.1:8100/a2a", "http://127.0.0.1:8100/a2a"),
+            ("http://127.0.0.1:8100/a2a/", "http://127.0.0.1:8100/a2a"),
+        ] {
+            let client = A2aClient::new(input, "token");
+            assert_eq!(client.rpc_url, expected);
         }
     }
 }

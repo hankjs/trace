@@ -11,11 +11,6 @@ from sqlalchemy.orm import sessionmaker
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# 在导入 app.main 之前禁用 Alembic 版本校验,避免测试库没有 alembic 版本记录
-from app import migrations as migrations_mod  # noqa: E402
-
-migrations_mod.check_schema_version = lambda engine, *, strict=None: True
-
 from app import db as app_db  # noqa: E402
 from app.a2a import server as a2a_server  # noqa: E402
 from app.a2a import tasks as a2a_tasks  # noqa: E402
@@ -69,6 +64,8 @@ def client(monkeypatch, tmp_path):
     monkeypatch.setattr(a2a_tasks, "SessionLocal", SessionLocal)
     monkeypatch.setattr(backtest_jobs, "SessionLocal", SessionLocal)
     monkeypatch.setattr(tasks_mod, "SessionLocal", SessionLocal)
+    # app.main 在模块导入时绑定了函数别名，夹具内替换才能避免测试顺序依赖。
+    monkeypatch.setattr(app_main, "check_schema_version", lambda engine: True)
 
     # 清空内存中的短任务与限速窗口,避免测试间污染
     a2a_server.short_task_store._short.clear()
@@ -219,6 +216,50 @@ def test_catalog_get_success(client):
     data = _artifact_data(result, name="catalog")
     assert "filter_fields" in data["catalog"]
     assert "version" in data["catalog"]
+
+
+def test_catalog_get_strategy_authoring_contract_is_directly_validatable(client):
+    result = _send(
+        client,
+        _token(CLIENT_CLAIMS),
+        "catalog.get",
+        {"sections": ["strategy_authoring", "product_boundary"]},
+    )
+    assert _state(result) == "completed"
+    catalog = _artifact_data(result, name="catalog")["catalog"]
+    assert set(catalog) == {"version", "product_boundary", "strategy_authoring"}
+
+    authoring = catalog["strategy_authoring"]
+    assert "close" in authoring["supported_fields"]
+    operators = {item["op"]: item for item in authoring["operators"]}
+    assert operators["gt"]["required_keys"] == ["left", "op", "right"]
+    assert operators["ma"]["required_keys"] == ["input", "op", "window"]
+
+    example = authoring["examples"]["ma_cross"]
+    validated = _send(
+        client,
+        _token(CLIENT_CLAIMS),
+        "strategy.validate",
+        {"spec": example},
+        message_id="validate-authoring-example",
+    )
+    assert _state(validated) == "completed"
+    validation = _artifact_data(validated, name="validation_result")["validation_result"]
+    assert validation["valid"] is True
+    assert validation["capability"]["status"] == "supported"
+
+
+def test_catalog_get_rejects_unknown_sections_with_available_values(client):
+    result = _send(
+        client,
+        _token(CLIENT_CLAIMS),
+        "catalog.get",
+        {"sections": ["snippets", "operators"]},
+    )
+    assert _state(result) == "failed"
+    text = _fail_text(result)
+    assert "未知 catalog sections" in text
+    assert "strategy_authoring" in text
 
 
 def test_unauthorized_client_is_rejected(client):
