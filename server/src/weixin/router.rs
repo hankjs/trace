@@ -215,10 +215,22 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
                         }
                         None => "server 端".to_string(),
                     };
-                    format!(
+                    let mut text = format!(
                         "会话：{title}\nID：{sid}\n状态：{}\n执行位置：{exec_at}",
                         if running { "执行中" } else { "空闲" }
-                    )
+                    );
+                    // 执行中就把实时进度一并带上，省得再问一次
+                    if running {
+                        if let Some(snapshot) = state.tasks.progress(sid).await {
+                            text.push_str(&format!(
+                                "\n进度：{}%\n当前：{}\n已用时：{}",
+                                snapshot.percent,
+                                snapshot.detail,
+                                crate::task_state::format_elapsed(snapshot.elapsed())
+                            ));
+                        }
+                    }
+                    text
                 }
                 None => "当前没有会话，直接发送消息即可开始".to_string(),
             };
@@ -738,9 +750,15 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
         },
     };
 
-    // 并发控制：同 session 同时只跑一个 turn
+    // 并发控制：同 session 同时只跑一个 turn。
+    // active_tasks 要等 run_chat_turn 走完准备工作才登记，先原子抢派发名额堵住空窗。
+    let Some(dispatch_guard) = state.tasks.try_acquire(&session_id).await else {
+        reply(&running_reply(state, &session_id).await).await;
+        return;
+    };
     if state.active_tasks.read().await.contains_key(&session_id) {
-        reply("正在执行中，/stop 可取消").await;
+        dispatch_guard.release().await;
+        reply(&running_reply(state, &session_id).await).await;
         return;
     }
 
@@ -781,7 +799,10 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
     let content = vec![hank_provider::ContentBlock::Text {
         text: format!("{text}{WEIXIN_FILE_HINT}"),
     }];
-    match run_chat_turn(state, &session_id, content, opts).await {
+    let turn = run_chat_turn(state, &session_id, content, opts).await;
+    // 到这里 active_tasks 已登记（或启动失败），派发名额可以还了。
+    dispatch_guard.release().await;
+    match turn {
         Ok(handle) => {
             pusher::spawn(
                 state.clone(),
@@ -795,8 +816,22 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
         }
         Err(e) => {
             tracing::warn!("weixin: run_chat_turn failed: {e}");
+            state.tasks.clear_progress(&session_id).await;
             reply(&format!("启动失败：{e}")).await;
         }
+    }
+}
+
+/// 任务在跑时的回复：带上 pusher 写入的真实进度快照。
+async fn running_reply(state: &Arc<AppState>, session_id: &str) -> String {
+    match state.tasks.progress(session_id).await {
+        Some(snapshot) => format!(
+            "任务仍在执行中（{}%）\n当前：{}\n已用时：{}\n完成后会自动汇报；/stop 可取消",
+            snapshot.percent,
+            snapshot.detail,
+            crate::task_state::format_elapsed(snapshot.elapsed())
+        ),
+        None => "任务刚开始执行，还没有进度产出；完成后会自动汇报，/stop 可取消".to_string(),
     }
 }
 

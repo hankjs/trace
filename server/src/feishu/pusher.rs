@@ -9,11 +9,13 @@ use crate::feishu::card::{
     build_confirm_card, build_task_card, ConfirmCardOptions, TaskCardOptions, TaskStatus,
     ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
 };
+// 滞后/静默时回 EventBuffer 补齐事件的共享实现，微信 pusher 也用同一套。
+use crate::task_state::{drain_buffer, next_event, Incoming, ProgressSnapshot};
 use crate::AppState;
 use anyhow::{bail, Context, Result};
 use code_agent::AgentEvent;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
@@ -173,145 +175,237 @@ async fn run(
         }));
     };
 
-    loop {
-        let entry = match rx.recv().await {
-            Ok(e) => e,
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                tracing::warn!("feishu pusher lagged by {n} events");
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => break,
+    // 进度快照：让"进度怎样了"这类询问不必等卡片刷新就能读到当前状态。
+    // 直接 await 而不是 spawn，保证写入顺序（spawn 会让旧快照覆盖新快照）。
+    let publish = |progress: &Progress| {
+        let snapshot = ProgressSnapshot {
+            percent: progress.percent(),
+            detail: progress.detail(),
+            activities: progress.activities.iter().rev().take(3).rev().cloned().collect(),
+            started_at: started,
         };
-        match entry.event {
-            AgentEvent::RunStarted { .. } => {}
-            AgentEvent::TextDelta { text } => {
-                final_text.push_str(&text);
-            }
-            AgentEvent::ToolStart { name, .. } => {
-                progress.record_tool(&name);
-                push_running(&progress);
-            }
-            AgentEvent::FileChanged { changes, .. } => {
-                progress.record_files(changes.into_iter().map(|c| c.path).collect());
-                push_running(&progress);
-            }
-            AgentEvent::PlanUpdated { .. } => {
-                progress.plan_count += 1;
-                progress.push_activity("更新执行计划".to_string());
-                push_running(&progress);
-            }
-            AgentEvent::AskUser { question, options, kind, .. } => {
-                let is_quant = kind.as_deref().is_some_and(|k| k.starts_with("quant_confirm:"));
-                let title = if is_quant { "高成本操作确认" } else { "需要你的输入" };
-                let hint = if is_quant {
-                    Some("点击按钮或回复文字作答；回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作".to_string())
-                } else {
-                    Some("点击按钮或直接回复消息作答".to_string())
-                };
-                let card = build_confirm_card(&ConfirmCardOptions {
-                    title: title.to_string(),
-                    question: question.clone(),
-                    choices: options.clone(),
-                    session_id: session_id.clone(),
-                    chat_id: chat_id.clone(),
-                    topic_id: topic_id.clone(),
-                    hint,
-                });
-                if let Err(e) = api.reply_card(&message_id, &card, in_thread).await {
-                    tracing::warn!("feishu: send confirm card failed: {e:#}");
-                    // 降级为纯文本提问
-                    let mut msg = format!("❓ {question}");
-                    if !options.is_empty() {
-                        msg.push_str("\n选项：");
-                        for (i, opt) in options.iter().enumerate() {
-                            msg.push_str(&format!("\n{}. {}", i + 1, opt));
-                        }
+        let state = state.clone();
+        let session_id = session_id.clone();
+        async move {
+            state.tasks.set_progress(&session_id, snapshot).await;
+        }
+    };
+
+    publish(&progress).await;
+
+    // 待处理事件队列：正常从 broadcast 收；滞后或长时间静默时从 EventBuffer 补齐。
+    let mut queue: VecDeque<EventEntry> = VecDeque::new();
+    let mut last_id: u64 = 0;
+    // 终态事件已消费，收尾后跳出外层循环
+    let mut finished = false;
+
+    'outer: while !finished {
+        if queue.is_empty() {
+            match next_event(&mut rx).await {
+                Incoming::Event(entry) => queue.push_back(entry),
+                Incoming::Lagged(n) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "feishu pusher lagged by {n} events, recovering from buffer"
+                    );
+                    let (missed, _) = drain_buffer(&state, &session_id, last_id).await;
+                    queue.extend(missed);
+                }
+                Incoming::Idle | Incoming::Closed => {
+                    let (missed, completed) = drain_buffer(&state, &session_id, last_id).await;
+                    queue.extend(missed);
+                    if queue.is_empty() && completed {
+                        // 事件流已结束却没见到终态事件（滞后丢失或 agent 异常收尾）：
+                        // 不能把卡片永远留在"运行中"，按未完成收尾。
+                        tracing::warn!(
+                            session_id = %session_id,
+                            "feishu pusher: event stream ended without terminal event"
+                        );
+                        updater
+                            .finish(build_task_card(&TaskCardOptions {
+                                title: "Agent 任务".to_string(),
+                                status: TaskStatus::Failed,
+                                progress: progress.percent(),
+                                detail: "任务已结束，但未收到完成事件".to_string(),
+                                activities: vec![progress.summary_line()]
+                                    .into_iter()
+                                    .filter(|s| !s.is_empty())
+                                    .collect(),
+                                footer: None,
+                            }))
+                            .await;
+                        let tail = if final_text.trim().is_empty() {
+                            "任务已结束，但没有收到完成事件，请用 /status 确认结果".to_string()
+                        } else {
+                            let (body, _) = extract_file_markers(final_text.trim());
+                            format!("{}\n\n（未收到完成事件，以上为已产出内容）", truncate_final(&body))
+                        };
+                        let _ = api.reply_text(&message_id, &tail, in_thread).await;
+                        break 'outer;
                     }
-                    let _ = api.reply_text(&message_id, &msg, in_thread).await;
+                    continue;
                 }
             }
-            AgentEvent::Metrics { input_tokens: it, output_tokens: ot, .. } => {
-                llm_calls += 1;
-                input_tokens += it;
-                output_tokens += ot;
+        }
+
+        while let Some(entry) = queue.pop_front() {
+            // 补读与实时流可能重叠，按 id 去重
+            if entry.id <= last_id {
+                continue;
             }
-            AgentEvent::RunCompleted { summary, .. } => {
-                let raw = if final_text.trim().is_empty() {
-                    summary
-                } else {
-                    final_text.trim().to_string()
-                };
-                let (body, files) = extract_file_markers(&raw);
-                let footer = format!(
-                    "—— 耗时 {:.0}s · LLM 调用 {} 次 · token {}/{}",
-                    started.elapsed().as_secs_f32(),
-                    llm_calls,
-                    input_tokens,
-                    output_tokens
-                );
-                updater
-                    .finish(build_task_card(&TaskCardOptions {
-                        title: "Agent 任务".to_string(),
-                        status: TaskStatus::Success,
-                        progress: 100,
-                        detail: "执行完成".to_string(),
-                        activities: vec![progress.summary_line()].into_iter().filter(|s| !s.is_empty()).collect(),
-                        footer: Some(footer.clone()),
-                    }))
+            last_id = entry.id;
+            match entry.event {
+                AgentEvent::RunStarted { .. } => {}
+                AgentEvent::TextDelta { text } => {
+                    final_text.push_str(&text);
+                }
+                AgentEvent::ToolStart { name, .. } => {
+                    progress.record_tool(&name);
+                    push_running(&progress);
+                    publish(&progress).await;
+                }
+                AgentEvent::FileChanged { changes, .. } => {
+                    progress.record_files(changes.into_iter().map(|c| c.path).collect());
+                    push_running(&progress);
+                    publish(&progress).await;
+                }
+                AgentEvent::PlanUpdated { .. } => {
+                    progress.plan_count += 1;
+                    progress.push_activity("更新执行计划".to_string());
+                    push_running(&progress);
+                    publish(&progress).await;
+                }
+                AgentEvent::AskUser { question, options, kind, .. } => {
+                    let is_quant = kind.as_deref().is_some_and(|k| k.starts_with("quant_confirm:"));
+                    let title = if is_quant { "高成本操作确认" } else { "需要你的输入" };
+                    let hint = if is_quant {
+                        Some("点击按钮或回复文字作答；回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作".to_string())
+                    } else {
+                        Some("点击按钮或直接回复消息作答".to_string())
+                    };
+                    let card = build_confirm_card(&ConfirmCardOptions {
+                        title: title.to_string(),
+                        question: question.clone(),
+                        choices: options.clone(),
+                        session_id: session_id.clone(),
+                        chat_id: chat_id.clone(),
+                        topic_id: topic_id.clone(),
+                        hint,
+                    });
+                    if let Err(e) = api.reply_card(&message_id, &card, in_thread).await {
+                        tracing::warn!("feishu: send confirm card failed: {e:#}");
+                        // 降级为纯文本提问
+                        let mut msg = format!("❓ {question}");
+                        if !options.is_empty() {
+                            msg.push_str("\n选项：");
+                            for (i, opt) in options.iter().enumerate() {
+                                msg.push_str(&format!("\n{}. {}", i + 1, opt));
+                            }
+                        }
+                        let _ = api.reply_text(&message_id, &msg, in_thread).await;
+                    }
+                    // ask_user 期间 run 处于暂停：进度停在这里等用户作答，
+                    // 让"进度怎样了"能看出是在等人而不是在算。
+                    progress.push_activity("等待用户确认".to_string());
+                    publish(&progress).await;
+                }
+                AgentEvent::Metrics { input_tokens: it, output_tokens: ot, .. } => {
+                    llm_calls += 1;
+                    input_tokens += it;
+                    output_tokens += ot;
+                }
+                AgentEvent::RunCompleted { summary, .. } => {
+                    let raw = if final_text.trim().is_empty() {
+                        summary
+                    } else {
+                        final_text.trim().to_string()
+                    };
+                    let (body, files) = extract_file_markers(&raw);
+                    let footer = format!(
+                        "—— 耗时 {:.0}s · LLM 调用 {} 次 · token {}/{}",
+                        started.elapsed().as_secs_f32(),
+                        llm_calls,
+                        input_tokens,
+                        output_tokens
+                    );
+                    updater
+                        .finish(build_task_card(&TaskCardOptions {
+                            title: "Agent 任务".to_string(),
+                            status: TaskStatus::Success,
+                            progress: 100,
+                            detail: "执行完成".to_string(),
+                            activities: vec![progress.summary_line()].into_iter().filter(|s| !s.is_empty()).collect(),
+                            footer: Some(footer.clone()),
+                        }))
+                        .await;
+                    send_final_text(
+                        &state,
+                        &session_id,
+                        &api,
+                        &message_id,
+                        &body,
+                        &files,
+                        &footer,
+                        in_thread,
+                    )
                     .await;
-                send_final_text(
-                    &state,
-                    &session_id,
-                    &api,
-                    &message_id,
-                    &body,
-                    &files,
-                    &footer,
-                    in_thread,
-                )
-                .await;
-                break;
+                    finished = true;
+                    break;
+                }
+                AgentEvent::RunFailed { message, .. } => {
+                    updater
+                        .finish(build_task_card(&TaskCardOptions {
+                            title: "Agent 任务".to_string(),
+                            status: TaskStatus::Failed,
+                            progress: 0,
+                            detail: message.clone(),
+                            activities: vec![],
+                            footer: None,
+                        }))
+                        .await;
+                    let _ = api
+                        .reply_text(&message_id, &format!("执行失败：{message}"), in_thread)
+                        .await;
+                    finished = true;
+                    break;
+                }
+                AgentEvent::RunCancelled { .. } => {
+                    updater
+                        .finish(build_task_card(&TaskCardOptions {
+                            title: "Agent 任务".to_string(),
+                            status: TaskStatus::Failed,
+                            progress: progress.percent(),
+                            detail: "任务已取消".to_string(),
+                            activities: vec![],
+                            footer: None,
+                        }))
+                        .await;
+                    let _ = api.reply_text(&message_id, "任务已取消", in_thread).await;
+                    finished = true;
+                    break;
+                }
+                AgentEvent::Error { message } => {
+                    progress.push_activity(format!("出错：{message}"));
+                    push_running(&progress);
+                    publish(&progress).await;
+                }
+                // TurnComplete 在终态事件之后发出。若因滞后先看到它，
+                // 先把 buffer 里剩下的事件补完再收尾，避免丢掉 RunCompleted 的正文。
+                AgentEvent::TurnComplete => {
+                    let (missed, _) = drain_buffer(&state, &session_id, last_id).await;
+                    if missed.is_empty() {
+                        finished = true;
+                        break;
+                    }
+                    queue.extend(missed);
+                }
+                _ => {}
             }
-            AgentEvent::RunFailed { message, .. } => {
-                updater
-                    .finish(build_task_card(&TaskCardOptions {
-                        title: "Agent 任务".to_string(),
-                        status: TaskStatus::Failed,
-                        progress: 0,
-                        detail: message.clone(),
-                        activities: vec![],
-                        footer: None,
-                    }))
-                    .await;
-                let _ = api
-                    .reply_text(&message_id, &format!("执行失败：{message}"), in_thread)
-                    .await;
-                break;
-            }
-            AgentEvent::RunCancelled { .. } => {
-                updater
-                    .finish(build_task_card(&TaskCardOptions {
-                        title: "Agent 任务".to_string(),
-                        status: TaskStatus::Failed,
-                        progress: progress.percent(),
-                        detail: "任务已取消".to_string(),
-                        activities: vec![],
-                        footer: None,
-                    }))
-                    .await;
-                let _ = api.reply_text(&message_id, "任务已取消", in_thread).await;
-                break;
-            }
-            AgentEvent::Error { message } => {
-                progress.push_activity(format!("出错：{message}"));
-                push_running(&progress);
-            }
-            AgentEvent::TurnComplete => break,
-            _ => {}
         }
     }
 
     updater.cancel().await;
+    state.tasks.clear_progress(&session_id).await;
 }
 
 /// 从最终文本中提取 [file:/路径] 标记（与 weixin/pusher.rs 同一约定）。
@@ -341,6 +435,19 @@ fn extract_file_markers(text: &str) -> (String, Vec<String>) {
     (out.trim().to_string(), files)
 }
 
+/// 正文截断到飞书单条文本可接受的长度，超长时提示去 web 端看全文。
+fn truncate_final(body: &str) -> String {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return "已完成".to_string();
+    }
+    let mut t: String = trimmed.chars().take(MAX_FINAL_TEXT_CHARS).collect();
+    if trimmed.chars().count() > MAX_FINAL_TEXT_CHARS {
+        t.push_str("\n…（内容过长已截断，完整结果请到 web 端查看）");
+    }
+    t
+}
+
 async fn send_final_text(
     state: &Arc<AppState>,
     session_id: &str,
@@ -351,15 +458,7 @@ async fn send_final_text(
     footer: &str,
     in_thread: bool,
 ) {
-    let mut msg = if body.trim().is_empty() {
-        "已完成".to_string()
-    } else {
-        let mut t: String = body.trim().chars().take(MAX_FINAL_TEXT_CHARS).collect();
-        if body.trim().chars().count() > MAX_FINAL_TEXT_CHARS {
-            t.push_str("\n…（内容过长已截断，完整结果请到 web 端查看）");
-        }
-        t
-    };
+    let mut msg = truncate_final(body);
     if !files.is_empty() {
         msg.push_str(&format!("\n\n图片将另行发送：{} 张", files.len()));
     }

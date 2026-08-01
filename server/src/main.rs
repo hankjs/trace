@@ -19,6 +19,7 @@ mod routes;
 mod skills;
 mod snap_tools;
 mod specs;
+pub mod task_state;
 mod termshot;
 mod websnap;
 mod feishu;
@@ -71,6 +72,8 @@ pub struct AppState {
     pub quant_grant_store: Arc<code_tools::quant_grant::QuantGrantStore>,
     /// quant 高成本工具待确认单（进程内 map，5 分钟 TTL，重启作废；设计 §5.4.4）
     pub quant_pending_confirms: Arc<code_tools::quant_grant::QuantPendingConfirmStore>,
+    /// 渠道任务闸门与实时进度快照（单任务串行 + 随时可查进度）
+    pub tasks: Arc<task_state::TaskRegistry>,
 }
 
 async fn auth_middleware(
@@ -188,6 +191,7 @@ async fn main() -> Result<()> {
         quant_pending_confirms: Arc::new(
             code_tools::quant_grant::QuantPendingConfirmStore::new(),
         ),
+        tasks: Arc::new(task_state::TaskRegistry::new()),
     });
 
     // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）

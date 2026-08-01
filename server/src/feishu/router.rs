@@ -620,7 +620,8 @@ async fn handle_command(
             let chat = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await?;
             let text = match chat {
                 Some(c) => {
-                    let running = state.active_tasks.read().await.contains_key(&c.session_id);
+                    let running = state.active_tasks.read().await.contains_key(&c.session_id)
+                        || state.tasks.is_dispatching(&c.session_id).await;
                     let work_dir = state
                         .db
                         .get_session(&c.session_id)
@@ -629,13 +630,25 @@ async fn handle_command(
                         .flatten()
                         .and_then(|s| s.work_dir)
                         .unwrap_or_else(|| "未设置".to_string());
-                    format!(
+                    let mut text = format!(
                         "会话：{}\n状态：{}\n话题：{}\n工作区：{}",
                         c.session_id,
                         if running { "执行中" } else { "空闲" },
                         topic,
                         work_dir
-                    )
+                    );
+                    // 执行中就把实时进度一并带上，省得再问一次
+                    if running {
+                        if let Some(snapshot) = state.tasks.progress(&c.session_id).await {
+                            text.push_str(&format!(
+                                "\n进度：{}%\n当前：{}\n已用时：{}",
+                                snapshot.percent,
+                                snapshot.detail,
+                                crate::task_state::format_elapsed(snapshot.elapsed())
+                            ));
+                        }
+                    }
+                    text
                 }
                 None => "当前话题还没有会话，直接发消息即可开始".to_string(),
             };
@@ -992,9 +1005,20 @@ async fn dispatch_task_content(
         tracing::warn!(session_id = %session_id, "feishu: link archived messages to session failed: {e:#}");
     }
 
-    // 并发控制：同 session 同时只跑一个 turn
+    // 并发控制：同 session 同时只跑一个 turn。
+    //
+    // 只查 active_tasks 不够：run_chat_turn 要先做工作区准备/鉴权/git link 才登记，
+    // 这段空窗（秒级）内到达的第二条消息会通过检查、起第二个并发 run（实测表现为
+    // 同一话题冒出两张任务卡片）。所以先原子抢派发名额，拿不到就当作"在执行中"。
+    let dispatch_guard = state.tasks.try_acquire(&session_id).await;
+    let Some(dispatch_guard) = dispatch_guard else {
+        api.reply_text(&msg.message_id, &running_reply(state, &session_id).await, msg.in_thread())
+            .await?;
+        return Ok(());
+    };
     if state.active_tasks.read().await.contains_key(&session_id) {
-        api.reply_text(&msg.message_id, "正在执行中，/stop 可取消", msg.in_thread())
+        dispatch_guard.release().await;
+        api.reply_text(&msg.message_id, &running_reply(state, &session_id).await, msg.in_thread())
             .await?;
         return Ok(());
     }
@@ -1026,7 +1050,11 @@ async fn dispatch_task_content(
         apply_change_id: None,
         auth_token: jwt,
     };
-    match run_chat_turn(state, &session_id, content, opts).await {
+    let turn = run_chat_turn(state, &session_id, content, opts).await;
+    // run_chat_turn 返回时 active_tasks 已登记（或本轮启动失败），
+    // 派发名额可以还了，后续并发由 active_tasks 继续挡。
+    dispatch_guard.release().await;
+    match turn {
         Ok(handle) => {
             pusher::spawn(
                 state.clone(),
@@ -1034,18 +1062,46 @@ async fn dispatch_task_content(
                 msg.message_id.clone(),
                 msg.chat_id.clone(),
                 topic,
-                session_id,
+                session_id.clone(),
                 msg.in_thread(),
                 handle.event_rx,
             );
         }
         Err(e) => {
             tracing::warn!("feishu: run_chat_turn failed: {e}");
+            state.tasks.clear_progress(&session_id).await;
             api.reply_text(&msg.message_id, &format!("启动失败：{e}"), msg.in_thread())
                 .await?;
         }
     }
     Ok(())
+}
+
+/// 任务在跑时的回复：带上真实进度，而不是一句静态提示。
+///
+/// pusher 每次收到事件都会更新 `state.tasks` 里的快照，这里直接读，
+/// 所以用户问"进度怎样了 / 怎么动静"能拿到当前百分比、正在做什么、已用多久。
+async fn running_reply(state: &Arc<AppState>, session_id: &str) -> String {
+    match state.tasks.progress(session_id).await {
+        Some(snapshot) => {
+            let mut text = format!(
+                "任务仍在执行中（{}%）\n当前：{}\n已用时：{}",
+                snapshot.percent,
+                snapshot.detail,
+                crate::task_state::format_elapsed(snapshot.elapsed())
+            );
+            if snapshot.activities.len() > 1 {
+                text.push_str("\n\n最近进展：");
+                for activity in &snapshot.activities {
+                    text.push_str(&format!("\n· {activity}"));
+                }
+            }
+            text.push_str("\n\n完成后会自动汇报；/stop 可取消");
+            text
+        }
+        // 快照还没建立（刚派发出去、第一个事件未到）
+        None => "任务刚开始执行，还没有进度产出；完成后会自动汇报，/stop 可取消".to_string(),
+    }
 }
 
 async fn create_and_map_feishu_session(
