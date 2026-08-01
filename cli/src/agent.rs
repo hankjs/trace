@@ -136,6 +136,11 @@ impl AgentRunner {
         input: AgentRunInput,
     ) -> Result<AgentOutcome, String> {
         let backend = input.backend.trim().to_ascii_lowercase();
+        if !SUPPORTED_BACKENDS.contains(&backend.as_str()) {
+            return Err(format!(
+                "不支持的 Agent 后端: {backend}（允许: codex/claude/grok/kimi）"
+            ));
+        }
         if !self.backends.iter().any(|value| value == &backend) {
             return Err(format!("本节点未启用 Agent 后端: {backend}"));
         }
@@ -717,5 +722,59 @@ mod tests {
             .any(|pair| pair == ["--prompt", "test"]));
         assert!(!spec.args.iter().any(|arg| arg == "--auto"));
         assert!(!spec.args.iter().any(|arg| arg == "--yolo"));
+    }
+
+    #[test]
+    fn resolve_cwd_rejects_paths_outside_work_root() {
+        let root = std::env::temp_dir().join(format!("hank-cli-agent-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let runner = AgentRunner::new(
+            Some(root.display().to_string()),
+            root.join("data"),
+            vec!["codex".into()],
+        );
+        let outside =
+            std::env::temp_dir().join(format!("hank-cli-agent-outside-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let err = runner
+            .resolve_cwd(Some(outside.to_str().unwrap()))
+            .unwrap_err();
+        assert!(err.contains("超出节点工作目录"), "{err}");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn resolve_cwd_defaults_to_work_root_when_null() {
+        let root =
+            std::env::temp_dir().join(format!("hank-cli-agent-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let runner = AgentRunner::new(
+            Some(root.display().to_string()),
+            root.join("data"),
+            vec!["claude".into()],
+        );
+        let cwd = runner.resolve_cwd(None).unwrap();
+        assert_eq!(cwd, std::fs::canonicalize(&root).unwrap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unsupported_backend_is_rejected_by_command_spec() {
+        let result = build_command_spec(
+            "bash",
+            Path::new("/tmp/project"),
+            "req",
+            "hi",
+            None,
+            None,
+            Path::new("/tmp"),
+        );
+        match result {
+            Ok(_) => panic!("bash backend should be rejected"),
+            Err(err) => assert!(err.contains("不支持"), "{err}"),
+        }
     }
 }

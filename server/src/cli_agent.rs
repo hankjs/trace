@@ -334,12 +334,28 @@ pub async fn run_cli_turn(
     if agent_kind == "conversation" {
         bail!("纯对话必须由无工具的 native 后端执行");
     }
-    if let Some(client_id) = session.exec_client_id.clone() {
+    let agent_location = metadata["agent_location"].as_str();
+    let is_client_only = agent_location == Some("client");
+    // client-only 或已绑定 exec_client 的会话必须走远程 agent_run；不得回退 server bubblewrap。
+    if is_client_only || session.exec_client_id.is_some() {
+        let client_id = session
+            .exec_client_id
+            .clone()
+            .or_else(|| {
+                metadata["exec_client_id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| {
+                anyhow!("client-only 会话缺少 exec_client_id，无法在本机 hank-cli 执行")
+            })?;
         return run_remote_cli_turn(
             state, session_id, session, content, backend, &client_id, agent_kind,
         )
         .await;
     }
+    // server-only bubblewrap 路径保留编译与非飞书调用兼容；飞书不再创建此类会话。
     let work_dir = session
         .work_dir
         .as_deref()
@@ -438,17 +454,28 @@ async fn run_remote_cli_turn(
     client_id: &str,
     agent_kind: &str,
 ) -> Result<ChatTurnHandle> {
-    let work_dir = session
-        .work_dir
-        .clone()
-        .ok_or_else(|| anyhow!("hank-cli 节点没有配置工作目录"))?;
     let user_id = session
         .user_id
         .clone()
         .ok_or_else(|| anyhow!("本机 Agent 会话缺少用户"))?;
     if !crate::remote_exec::is_client_online(state, &user_id, client_id).await {
-        bail!("绑定的 hank-cli 节点不在线");
+        bail!("绑定的 hank-cli 节点不在线；请在对应电脑启动 hank-cli 后重试");
     }
+    if !crate::remote_exec::client_reports_backend(state, &user_id, client_id, backend).await {
+        bail!(
+            "绑定的 hank-cli 节点未上报 {backend} 能力；请检查本机 agent_backends 后重试，不会切换节点或回退 server"
+        );
+    }
+    // 展示用节点注册 work_dir；绝不回退 session.work_dir（可能是 wananyun/server worktree）。
+    // 实际 agent_run 下发的 cwd 仍为 JSON null，由 hank-cli 使用本机注册目录。
+    let client_work_dir = state
+        .db
+        .get_client_agent(&user_id, client_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|client| client.work_dir);
+    let display_cwd = client_only_display_cwd(client_work_dir.as_deref());
     let user_text = content_text(&content);
     if user_text.trim().is_empty() {
         bail!("本机 Agent 暂不支持没有文本说明的消息");
@@ -486,7 +513,7 @@ async fn run_remote_cli_turn(
             &backend,
             &client_id,
             &user_id,
-            &work_dir,
+            &display_cwd,
             &user_text,
             &prompt,
             cancel_token.clone(),
@@ -591,23 +618,26 @@ async fn execute_remote_turn(
 
     let metadata = parse_metadata(session.metadata.as_deref());
     let previous_thread = metadata["agent_thread_id"].as_str();
+    // cwd 置 null：由 hank-cli 使用注册 work_dir，避免把 server 绝对路径传到本机。
     let input = serde_json::json!({
         "backend": backend,
         "prompt": prompt,
-        "cwd": work_dir,
+        "cwd": serde_json::Value::Null,
         "thread_id": previous_thread,
         "model": serde_json::Value::Null,
     });
     let mut remote = crate::remote_exec::start_agent_run(state, user_id, client_id, input).await?;
     let remote_request_id = remote.request_id.clone();
     let deadline = tokio::time::sleep(Duration::from_secs(
-        state.config.server_agent.agent_timeout_secs,
+        state.config.server_agent.agent_timeout_secs.max(1),
     ));
     tokio::pin!(deadline);
     let mut run_state = CliRunState::default();
     let auth = CliAuth::default();
     let mut terminal = Terminal::Completed;
-    let mut tool_result = None;
+    let mut tool_result: Option<crate::remote_exec::ToolCallResult> = None;
+    let mut events_closed = false;
+    let mut offline_error: Option<String> = None;
 
     loop {
         tokio::select! {
@@ -620,27 +650,66 @@ async fn execute_remote_turn(
                     &remote_request_id,
                 ).await {
                     tracing::warn!(session_id, client_id, "取消本机 Agent 失败: {error:#}");
+                    // 节点已离线时仍标记取消，终态卡片会说明取消请求可能未送达。
+                    if offline_error.is_none() {
+                        offline_error = Some(format!("取消请求未确认：{error:#}"));
+                    }
                 }
                 break;
             }
             _ = &mut deadline => {
                 terminal = Terminal::TimedOut;
-                let _ = crate::remote_exec::cancel_agent_run(
+                if let Err(error) = crate::remote_exec::cancel_agent_run(
                     state,
                     user_id,
                     client_id,
                     &remote_request_id,
-                ).await;
+                ).await {
+                    tracing::warn!(session_id, client_id, "超时后取消本机 Agent 失败: {error:#}");
+                }
                 break;
             }
-            event = remote.event_rx.recv() => {
-                if let Some(event) = event {
-                    handle_remote_event(state, session_id, backend, &auth, event, &mut run_state).await;
+            event = remote.event_rx.recv(), if !events_closed => {
+                match event {
+                    Some(event) => {
+                        handle_remote_event(state, session_id, backend, &auth, event, &mut run_state).await;
+                    }
+                    None => {
+                        // 事件通道关闭后不再轮询，避免 busy-loop；仍等待 result 或超时。
+                        events_closed = true;
+                    }
                 }
             }
             result = &mut remote.result_rx => {
-                tool_result = Some(result.map_err(|_| anyhow!("hank-cli 结果通道中断"))?);
+                match result {
+                    Ok(value) => tool_result = Some(value),
+                    Err(_) => {
+                        offline_error = Some(
+                            "hank-cli 结果通道中断（节点可能已离线或进程异常退出）".to_string(),
+                        );
+                    }
+                }
                 break;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                if !crate::remote_exec::is_client_online(state, user_id, client_id).await {
+                    offline_error = Some(
+                        "绑定的 hank-cli 节点在任务执行期间离线".to_string(),
+                    );
+                    // 短窗口内若结果已在路上则仍接收；否则明确失败，不静默当成功。
+                    match tokio::time::timeout(Duration::from_secs(8), &mut remote.result_rx)
+                        .await
+                    {
+                        Ok(Ok(value)) => tool_result = Some(value),
+                        Ok(Err(_)) => {
+                            offline_error = Some(
+                                "hank-cli 结果通道中断（节点可能已离线）".to_string(),
+                            );
+                        }
+                        Err(_) => {}
+                    }
+                    break;
+                }
             }
         }
     }
@@ -650,6 +719,18 @@ async fn execute_remote_turn(
         handle_remote_event(state, session_id, backend, &auth, event, &mut run_state).await;
     }
     crate::remote_exec::cleanup_agent_run(state, user_id, &remote_request_id).await;
+
+    if terminal == Terminal::Completed && tool_result.is_none() {
+        let message = offline_error.unwrap_or_else(|| {
+            "hank-cli 未返回 Agent 结果（节点可能已离线或结果超时）".to_string()
+        });
+        emit_failed(state, session_id, &run_id, &message).await;
+        if let Err(error) = state.db.touch_session(session_id).await {
+            tracing::warn!(session_id, "touch remote cli session failed: {error:#}");
+        }
+        emit(state, session_id, AgentEvent::TurnComplete).await;
+        return Ok(());
+    }
 
     let parsed = tool_result
         .as_ref()
@@ -685,9 +766,13 @@ async fn execute_remote_turn(
     let remote_failed = tool_result.as_ref().is_some_and(|result| result.is_error)
         || parsed.as_ref().is_some_and(|result| {
             result.cancelled || result.exit_code.is_some_and(|code| code != 0)
-        });
+        })
+        || offline_error.is_some();
     match terminal {
         Terminal::Cancelled => {
+            if let Some(extra) = offline_error.as_deref() {
+                tracing::warn!(session_id, client_id, "本机 Agent 取消时附加信息: {extra}");
+            }
             emit(
                 state,
                 session_id,
@@ -701,7 +786,10 @@ async fn execute_remote_turn(
             .await;
         }
         Terminal::TimedOut => {
-            emit_failed(state, session_id, &run_id, "本机 Agent 执行超时").await;
+            let message = offline_error
+                .clone()
+                .unwrap_or_else(|| "本机 Agent 执行超时".to_string());
+            emit_failed(state, session_id, &run_id, &message).await;
         }
         Terminal::OutputLimit => {
             emit_failed(state, session_id, &run_id, "本机 Agent 输出超过安全上限").await;
@@ -1783,38 +1871,41 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
     Ok(auth)
 }
 
-/// 新话题未明确指定 CLI 时，优先选择当前确实有可用凭据的后端。
-pub(crate) async fn preferred_backend(state: &AppState) -> &'static str {
-    // admin 里启用的配置与环境变量同权：两处任一可用都算这个后端能跑，
-    // 否则 admin 配好 claude 后新话题仍会被路由到没凭据的 codex。
-    let profiles = state.db.list_agent_cli_profiles().await.unwrap_or_default();
-    let db_ready = |backend: &str| {
-        profiles.iter().any(|profile| {
-            profile.backend == backend && profile.is_active && !profile.api_key.trim().is_empty()
-        })
-    };
-    let codex_env = std::env::var("OPENAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
-    let claude_env = [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ]
-    .iter()
-    .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()));
-    let providers = state.db.list_providers_ordered().await.unwrap_or_default();
-    let codex_provider = providers.iter().any(codex_provider_is_compatible);
-    let claude_provider = providers
-        .iter()
-        .any(|provider| provider.enabled && provider.provider_type == "anthropic");
+/// 外部 Agent 后端的固定优先级（新话题默认选择时使用）。
+const PREFERRED_EXTERNAL_BACKEND_ORDER: [&str; 4] = ["codex", "claude", "grok", "kimi"];
 
-    if db_ready("codex") || codex_env || codex_provider {
-        "codex"
-    } else if db_ready("claude") || claude_env || claude_provider {
-        "claude"
-    } else {
-        // 保留一个确定的失败路径，由 resolve_cli_auth 返回可操作的配置说明。
-        "codex"
+/// 从「当前用户在线节点已上报的 backend 能力」中按固定优先级选默认外部 Agent。
+/// 只认 codex/claude/grok/kimi；未知值忽略。无可用能力时返回 None，由调用方走明确失败路径。
+///
+/// 不读 server DB/env/provider 凭据：client-only 路径能否执行取决于本机 hank-cli 节点能力。
+pub(crate) fn preferred_backend_from_online_capabilities<'a>(
+    available: impl IntoIterator<Item = &'a str>,
+) -> Option<&'static str> {
+    let available: std::collections::HashSet<&str> = available
+        .into_iter()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect();
+    PREFERRED_EXTERNAL_BACKEND_ORDER
+        .into_iter()
+        .find(|backend| available.contains(backend))
+}
+
+/// 新话题未明确指定 CLI 时，优先选择当前用户在线 hank-cli 节点实际具备的后端。
+/// 无在线能力时返回 "codex" 作为确定失败路径（create_feishu_session 会报缺少对应节点）。
+pub(crate) async fn preferred_backend(state: &AppState, user_id: &str) -> &'static str {
+    // 探测在线节点实际具备的 backend；pick_online_agent_client 自身读 hub 读锁，线程安全。
+    let mut available = Vec::new();
+    for backend in PREFERRED_EXTERNAL_BACKEND_ORDER {
+        if crate::remote_exec::pick_online_agent_client(state, user_id, backend)
+            .await
+            .is_some()
+        {
+            available.push(backend);
+        }
     }
+    // 统一走 helper：codex → claude → grok → kimi；无能力时仍回落 codex 明确失败路径。
+    preferred_backend_from_online_capabilities(available).unwrap_or("codex")
 }
 
 /// 计算某后端当前实际生效的凭据来源，供 admin 页展示「库里的配置是否真的在用」。
@@ -2017,6 +2108,17 @@ fn local_agent_prompt(user_text: &str, agent_kind: &str) -> String {
         prompt.push_str("修改 quant 前必须读取 quant/AGENTS.md，并遵守禁止交易能力的产品边界。");
     }
     prompt
+}
+
+/// client-only 会话 RunStarted 展示 cwd：只用绑定节点注册的 work_dir。
+/// 缺失或空白时返回非路径占位文本；调用方不得传入 session.work_dir 作为 fallback
+///（session 可能残留 wananyun/server worktree 绝对路径）。
+fn client_only_display_cwd(client_work_dir: Option<&str>) -> String {
+    client_work_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "(hank-cli work_dir)".to_string())
 }
 
 fn parse_metadata(raw: Option<&str>) -> serde_json::Value {
@@ -2236,6 +2338,80 @@ mod tests {
         assert!(!overrides
             .iter()
             .any(|value| value.starts_with("openai_base_url=")));
+    }
+
+    #[test]
+    fn local_agent_prompt_does_not_embed_server_workspace_paths() {
+        let prompt = local_agent_prompt("修一下 bug", "trace_code");
+        assert!(prompt.contains("hank-cli"));
+        assert!(!prompt.contains("/opt/hank"));
+        assert!(!prompt.contains("/workspace"));
+    }
+
+    #[test]
+    fn preferred_backend_from_online_capabilities_follows_priority_order() {
+        // 本机只有 claude 时，即使 server 有 codex 凭据，也应选 claude。
+        assert_eq!(
+            preferred_backend_from_online_capabilities(["claude"]),
+            Some("claude")
+        );
+        assert_eq!(
+            preferred_backend_from_online_capabilities(["kimi", "claude", "grok"]),
+            Some("claude")
+        );
+        assert_eq!(
+            preferred_backend_from_online_capabilities(["kimi", "grok"]),
+            Some("grok")
+        );
+        assert_eq!(
+            preferred_backend_from_online_capabilities(["codex", "claude"]),
+            Some("codex")
+        );
+        assert_eq!(
+            preferred_backend_from_online_capabilities(["kimi"]),
+            Some("kimi")
+        );
+        assert_eq!(
+            preferred_backend_from_online_capabilities(std::iter::empty::<&str>()),
+            None
+        );
+        // 未知/非外部 backend 不参与选择；无有效能力时返回 None，走明确失败路径。
+        assert_eq!(
+            preferred_backend_from_online_capabilities(["native", "bash", ""]),
+            None
+        );
+    }
+
+    #[test]
+    fn client_only_metadata_requires_remote_path() {
+        let metadata = serde_json::json!({
+            "agent_location": "client",
+            "agent_backend": "codex",
+            "exec_client_id": "node-1",
+        });
+        assert_eq!(metadata["agent_location"].as_str(), Some("client"));
+        assert!(metadata["exec_client_id"].as_str().is_some());
+    }
+
+    #[test]
+    fn client_only_display_cwd_never_falls_back_to_session_work_dir() {
+        // 节点已注册本机目录时，展示该目录。
+        assert_eq!(
+            client_only_display_cwd(Some("/Users/me/code/trace")),
+            "/Users/me/code/trace"
+        );
+        // 读取失败 / 缺失 / 空白：用明确非路径占位，不接受 session.work_dir 参数，
+        // 从 API 上杜绝把 server/wananyun worktree 路径（如 /opt/hank/...）用于 RunStarted。
+        assert_eq!(client_only_display_cwd(None), "(hank-cli work_dir)");
+        assert_eq!(client_only_display_cwd(Some("")), "(hank-cli work_dir)");
+        assert_eq!(client_only_display_cwd(Some("   ")), "(hank-cli work_dir)");
+        let server_session_work_dir = Some("/opt/hank/worktrees/feishu-abc");
+        // 即便 session 有 server 路径，display 解析也只看节点 work_dir；节点缺失时是占位而非 server 路径。
+        assert_ne!(
+            client_only_display_cwd(None),
+            server_session_work_dir.unwrap()
+        );
+        assert!(!client_only_display_cwd(None).starts_with('/'));
     }
 
     #[test]

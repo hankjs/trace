@@ -79,11 +79,22 @@ impl UserHub {
 
     /// 取走该 client 的全部待执行请求；顺带刷新在线时间
     fn drain_for(&mut self, client_id: &str) -> Vec<ToolCallRequest> {
-        self.last_polls.insert(client_id.to_string(), Instant::now());
-        let (mine, rest): (VecDeque<_>, VecDeque<_>) =
-            self.pending.drain(..).partition(|r| r.client_id == client_id);
+        self.last_polls
+            .insert(client_id.to_string(), Instant::now());
+        let (mine, rest): (VecDeque<_>, VecDeque<_>) = self
+            .pending
+            .drain(..)
+            .partition(|r| r.client_id == client_id);
         self.pending = rest;
         mine.into_iter().collect()
+    }
+
+    /// 按 request_id 从 pending 移除尚未被 poll 取走的请求。
+    /// 已被 drain 的请求不在 pending 中，调用无副作用。
+    fn remove_pending(&mut self, request_id: &str) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|r| r.request_id != request_id);
+        self.pending.len() < before
     }
 
     fn is_online(&self, client_id: &str) -> bool {
@@ -132,7 +143,10 @@ pub async fn dispatch_tool_call(
     match result {
         Ok(Ok(r)) => Ok(r),
         Ok(Err(_)) => Err(anyhow!("client 连接中断")),
-        Err(_) => Err(anyhow!("等待 client 执行结果超时（{}s）", timeout.as_secs())),
+        Err(_) => Err(anyhow!(
+            "等待 client 执行结果超时（{}s）",
+            timeout.as_secs()
+        )),
     }
 }
 
@@ -170,9 +184,11 @@ pub async fn start_agent_run(
 }
 
 /// 释放 Agent 任务的 server 侧通道。迟到事件会被 HTTP handler 拒绝，不会串到其他任务。
+/// 同时从 pending 移除尚未被 hank-cli poll 取走的请求，避免超时/离线后节点重连执行旧任务。
 pub async fn cleanup_agent_run(state: &AppState, user_id: &str, request_id: &str) {
     let mut hubs = state.client_hubs.write().await;
     if let Some(hub) = hubs.get_mut(user_id) {
+        hub.remove_pending(request_id);
         hub.inflight.remove(request_id);
         hub.agent_events.remove(request_id);
     }
@@ -185,6 +201,9 @@ pub async fn cancel_agent_run(
     client_id: &str,
     request_id: &str,
 ) -> Result<()> {
+    if !is_client_online(state, user_id, client_id).await {
+        return Err(anyhow!("hank-cli 节点不在线，无法下发取消"));
+    }
     let result = dispatch_tool_call(
         state,
         user_id,
@@ -253,6 +272,19 @@ pub async fn pick_online_agent_client(
         .map(|(_, client)| client)
 }
 
+/// 指定在线节点是否在最近一次 registration/poll 中上报了该 Agent 后端。
+pub async fn client_reports_backend(
+    state: &AppState,
+    user_id: &str,
+    client_id: &str,
+    backend: &str,
+) -> bool {
+    let hubs = state.client_hubs.read().await;
+    hubs.get(user_id)
+        .and_then(|hub| hub.agent_backends.get(client_id))
+        .is_some_and(|values| values.iter().any(|value| value == backend))
+}
+
 // ─── HTTP 路由（client JWT protected 组）────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -287,8 +319,7 @@ pub async fn register_client(
     match result {
         Ok(()) => {
             let mut hubs = state.client_hubs.write().await;
-            hubs
-                .entry(claims.sub)
+            hubs.entry(claims.sub)
                 .or_default()
                 .agent_backends
                 .insert(body.client_id.clone(), agent_backends.clone());
@@ -388,9 +419,7 @@ pub async fn poll_requests(
             if let Some(backends) = query.agent_backends.as_deref() {
                 hub.agent_backends.insert(
                     client_id.clone(),
-                    sanitize_agent_backends(
-                        backends.split(',').map(str::to_string).collect(),
-                    ),
+                    sanitize_agent_backends(backends.split(',').map(str::to_string).collect()),
                 );
             }
             let requests = hub.drain_for(&client_id);
@@ -436,9 +465,7 @@ pub async fn post_agent_event(
     match sender {
         Some(tx) => match tx.try_send(body.event) {
             Ok(()) => R::ok(serde_json::json!({"request_id": body.request_id})),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                R::bad_request("agent event buffer is full")
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => R::bad_request("agent event buffer is full"),
             Err(mpsc::error::TrySendError::Closed(_)) => {
                 R::bad_request("agent event receiver closed")
             }
@@ -501,6 +528,15 @@ pub async fn list_online(
 mod tests {
     use super::*;
 
+    fn req(request_id: &str, client_id: &str, tool: &str) -> ToolCallRequest {
+        ToolCallRequest {
+            request_id: request_id.to_string(),
+            client_id: client_id.to_string(),
+            tool: tool.to_string(),
+            input: serde_json::json!({}),
+        }
+    }
+
     #[test]
     fn agent_backends_are_allowlisted_and_deduplicated() {
         assert_eq!(
@@ -512,6 +548,62 @@ mod tests {
             ]),
             vec!["codex", "kimi"]
         );
+    }
+
+    #[test]
+    fn agent_backend_allowlist_rejects_unknown_values() {
+        assert!(sanitize_agent_backends(vec!["bash".into(), "native".into()]).is_empty());
+        assert_eq!(
+            sanitize_agent_backends(vec!["grok".into(), "claude".into(), "grok".into()]),
+            vec!["grok", "claude"]
+        );
+    }
+
+    #[test]
+    fn remove_pending_drops_target_and_keeps_other_clients_and_requests() {
+        let mut hub = UserHub::default();
+        hub.pending.push_back(req("a1", "cli-a", "agent_run"));
+        hub.pending.push_back(req("a2", "cli-a", "shell"));
+        hub.pending.push_back(req("b1", "cli-b", "agent_run"));
+
+        assert!(hub.remove_pending("a1"));
+        let ids: Vec<_> = hub.pending.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(ids, vec!["a2", "b1"]);
+    }
+
+    #[test]
+    fn remove_pending_is_noop_when_already_drained() {
+        let mut hub = UserHub::default();
+        hub.pending.push_back(req("keep", "cli-a", "agent_run"));
+
+        // 模拟已被 poll drain：目标不在 pending
+        assert!(!hub.remove_pending("gone"));
+        assert_eq!(hub.pending.len(), 1);
+        assert_eq!(hub.pending[0].request_id, "keep");
+    }
+
+    #[test]
+    fn cleanup_paths_clear_pending_and_channels() {
+        let mut hub = UserHub::default();
+        let rid = "run-1";
+        hub.pending.push_back(req(rid, "cli-a", "agent_run"));
+        hub.pending.push_back(req("other", "cli-b", "shell"));
+
+        let (result_tx, _result_rx) = oneshot::channel();
+        let (event_tx, _event_rx) = mpsc::channel::<Value>(1);
+        hub.inflight.insert(rid.to_string(), result_tx);
+        hub.agent_events.insert(rid.to_string(), event_tx);
+
+        // 与 cleanup_agent_run 相同的同步清理路径（避免构造完整 AppState）
+        hub.remove_pending(rid);
+        hub.inflight.remove(rid);
+        hub.agent_events.remove(rid);
+
+        assert!(!hub.pending.iter().any(|r| r.request_id == rid));
+        assert_eq!(hub.pending.len(), 1);
+        assert_eq!(hub.pending[0].request_id, "other");
+        assert!(!hub.inflight.contains_key(rid));
+        assert!(!hub.agent_events.contains_key(rid));
     }
 }
 

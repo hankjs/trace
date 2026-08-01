@@ -1,6 +1,6 @@
 # 飞书渠道接入指南
 
-飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。入口和生命周期由 Rust server 统一管理（`server/src/feishu/`）；纯对话使用无工具的 native Agent，代码与文件任务可派发到 server 或在线 `hank-cli` 节点上的 Codex、Claude Code、Grok、Kimi Code。
+飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。入口和生命周期由 Rust server 统一管理（`server/src/feishu/`）；纯对话使用无工具的 native Agent，**代码与文件任务的 Codex / Claude Code / Grok / Kimi Code 必须在用户本机在线 `hank-cli` 节点执行（client-only）**，server 不再 bubblewrap 回退执行，也不再由 wananyun 自行修改/部署 Trace 源码。
 
 ## 架构
 
@@ -21,8 +21,8 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
 - **确认闸门升级**：微信是文本白名单（回复"确认"），飞书是按钮卡片；回调文本化后走同一套 `handle_quant_confirmation`，code-agent 零改动
-- **执行模式**：开启 `[server_agent]` 后，新话题同时确定 Agent 类型和执行后端；Trace/quant 使用 Git worktree，普通文件任务使用隔离目录，纯对话不建目录，完全不依赖 `client/`
-- **管理员边界**：server Agent 只接受绑定到 `can_login_admin = true` 用户的飞书消息
+- **执行模式**：开启 `[server_agent]` 后，新话题同时确定 Agent 类型和执行后端。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。纯对话 `native` 仍可在 server 侧无工具运行。
+- **管理员边界**：开启 server_agent 时，飞书消息仍要求绑定用户具备 `can_login_admin = true`
 
 ## 一、飞书开放平台配置
 
@@ -88,15 +88,17 @@ feishu_monitor = false   # 其他实例关掉
 | `/new` | 关闭当前话题会话，下次发消息开新会话 |
 | `/stop` | 取消当前执行中的任务 |
 | `/status` | 查看当前话题的会话 ID 与状态 |
-| `/diff` | 查看当前 worktree 相对生产基线的状态与 diff stat |
-| `/test` | 按变更路径运行固定测试矩阵，可用 `/stop` 取消 |
-| `/deploy` | 固化 commit 并发送部署审批卡；只有发起管理员可批准 |
-| `/rollback` | 对最近一次成功部署发送回滚审批卡，切回 previous release 后健康检查 |
+| `/diff` | **仅 server worktree 会话**：查看相对生产基线的状态与 diff stat。**本机 CLI（client-only）会话会明确拒绝**，不会静默调用 server 部署逻辑 |
+| `/test` | **仅 server worktree 会话**：按变更路径运行固定测试矩阵。**client-only 会话明确拒绝** |
+| `/deploy` | **仅 server worktree 会话**：固化 commit 并发送部署审批卡。**client-only 会话明确拒绝** |
+| `/rollback` | **仅 server worktree 会话**：回滚审批。**client-only 会话明确拒绝** |
 | `/help` | 命令列表 |
 
-### 直接使用电脑上的 Agent CLI
+### 本机 Agent CLI（client-only，默认代码执行路径）
 
-`hank-cli` 启动时会探测本机 PATH 中的 `codex`、`claude`、`grok`、`kimi` 并把能力上报给 server。飞书新话题明确写“用 Codex / Claude Code / Grok / Kimi”时，如果绑定用户有具备对应能力的在线节点，整个话题会固定在该电脑执行；凭据和 CLI 配置不会上传到 server。飞书并不直接入站连接家庭网络，而是经现有 server 转发到 `hank-cli` 的出站长轮询连接，因此不需要给电脑开放公网端口。
+`hank-cli` 启动时会探测本机 PATH 中的 `codex`、`claude`、`grok`、`kimi` 并把能力上报给 server。飞书新话题只要路由到这些外部后端（用户点名或任务分类为代码/文件任务），**必须**绑定一台在线且上报了对应 backend 的 `hank-cli` 节点；否则返回明确错误（例如「没有在线且支持 claude 的 hank-cli 节点」），**不会**回退到 server bubblewrap 或 native Agent。
+
+凭据和 CLI 配置留在本机，不上传 server。飞书不直连家庭网络，而是经 server 转发到 `hank-cli` 的出站长轮询，因此无需给电脑开公网端口。
 
 `~/.hank-cli/config.toml` 建议显式指定允许访问的目录和后端：
 
@@ -114,11 +116,12 @@ agent_backends = ["codex", "claude", "grok", "kimi"]
 hank-cli
 ```
 
-- `work_dir` 是任务目录边界：server 下发的 cwd 必须位于该目录内；省略时使用 `hank-cli` 的启动目录。Codex 另以 `workspace-write` 沙箱限制写入，Claude/Grok/Kimi 的具体文件权限由各自 CLI 权限模式负责。
-- `agent_backends` 是 allowlist；省略时自动探测，设为 `[]` 可禁用本机 Agent、只保留终端能力。
-- Codex 固定使用 `workspace-write + never`，Claude/Grok 使用 `dontAsk`；Kimi 的 headless `--prompt` 模式会自动使用 `auto` 权限。所有命令均由固定参数模板生成，不接受飞书传入任意可执行文件或 shell 片段。
-- `/stop` 会向同一节点下发取消请求并终止对应进程组。同一话题不会在节点离线后静默切换到 server。
-- 同一话题固定复用首次选择的后端、节点和 CLI thread/session；切换后端需使用 `/new` 或新建话题。
+- **client-only 元数据**：会话写入 `agent_location=client`、`agent_backend`、`exec_client_id`；同一话题固定复用首次选择的 backend、节点和 CLI `thread_id`/`session_id`。切换后端或节点必须 `/new` 或新开话题。
+- **节点离线 / 能力不匹配**：续聊时若绑定节点不在线，或 poll 上报的 `agent_backends` 不再包含该 backend，任务立即失败并提示用户在本机启动/修复 `hank-cli`，**不会**解绑后换节点，也**不会**落到 server 执行。
+- **历史 server-agent 会话**：若话题仍映射到旧的 `server_agent=true` 且 backend 为 codex/claude/grok/kimi，server **拒绝静默复用**，要求发送 `/new` 转为 client-only 会话。
+- **路径边界**：server **不会**把 wananyun 上的 worktree 绝对路径下发给本机；`hank-cli` 只在注册 `work_dir` 内解析 cwd（缺省即 work_dir 根）。Codex 另以 `workspace-write` 限制写入；Claude/Grok/Kimi 权限模式由各自 CLI 负责。`agent_backends` 是严格 allowlist，未知值会被丢弃。
+- **取消与终态**：`/stop` 向同一节点下发 `agent_cancel` 并终止进程组；节点离线、结果通道中断或超时时卡片/回复会标失败，不吞错、不误报成功。
+- **命令边界**：client-only 会话不支持 `/diff` `/test` `/deploy` `/rollback`（这些命令面向 server worktree 部署流程）。请在本机工作目录自行查看变更、跑测试或部署。
 
 ## 四、wananyun server Agent
 
@@ -173,16 +176,18 @@ deploy_use_sudo = true
 approval_ttl_secs = 600
 ```
 
-### 工作区路由
+### 工作区路由（迁移后）
 
 - `/help`、`help`、`?help`、`？help`、`帮助` 等命令不创建会话工作区。
-- 同一飞书话题已有 `feishu_chats` 映射时，始终复用原 session 和原工作区，不重新分类。
-- 新话题会先由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex`、`claude`、`grok` 或 `kimi` 后端，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。`conversation` 被强制归一为 `native`；其他任务若错误返回 `native` 会归一为当前有可用凭据的 CLI 后端（优先 Codex，否则 Claude）。用户明确点名后端时保留其选择。
-- 在线 `hank-cli` 明确上报目标后端能力时优先绑定本机节点；否则 Codex/Claude 继续使用 server bubblewrap，Grok/Kimi 因 server 没有安装对应 runner 而返回明确的节点离线/不可用错误。
-- `trace_code`/`quant_code` 从 `trace-production` 创建 Git worktree，`general_task` 创建普通隔离目录，`conversation` 不创建目录。同一飞书话题后续固定复用 backend、workspace 和 `agent_thread_id`，不会重新分类或重复创建 worktree。
-- 只有 Git worktree 会注入 Trace/quant/同步协议，并支持 `/diff`、`/test`、`/deploy`、`/rollback`；普通隔离目录不能部署。
-- 外部 CLI 以 `hank-build` 运行，每个话题有独立 HOME，并由 bubblewrap 只挂载当前 `/workspace`；`client/` 叠加为只读，`/opt/hank/config.toml`、其他 worktree 和其他话题状态目录不可见。凭据经固定启动器的 stdin 前导协议注入，不进入 sudo 参数、环境审计或 Agent 文件视图。bubblewrap 或安全启动器缺失时外部后端拒绝启动，不做无沙箱降级。
-- Codex/Claude/Grok/Kimi 的 stdout 按 JSONL 解析，线程 ID 写回 metadata；server 统一处理 30 分钟超时、2 MiB 输出上限、`/stop` 取消、进程组清理和飞书终态卡片。
+- 同一飞书话题已有 `feishu_chats` 映射时：
+  - **client-only**（`agent_location=client`）：固定复用 backend / `exec_client_id` / `agent_thread_id`，不重新分类、不换节点。
+  - **历史 server-agent + 外部 backend**：拒绝复用，要求 `/new`。
+  - **native conversation** 等非外部后端 managed 会话：可继续复用。
+- 新话题由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex`、`claude`、`grok` 或 `kimi`。`conversation` 强制 `native`；其他任务若误返回 `native` 会归一为默认 CLI 后端（优先 Codex，否则 Claude）。用户点名后端时保留选择。
+- **外部 backend（codex/claude/grok/kimi）只走 client-only**：必须命中在线且上报该能力的 `hank-cli`；否则用户可见失败。**飞书不再创建 server bubblewrap / worktree 代码会话**（server-only 实现仍保留编译兼容，但不由飞书入口创建）。
+- `native` 对话不创建代码工作区；client-only 会话的工作目录是节点 `work_dir`，不在 wananyun 上建 worktree。
+- `/diff`、`/test`、`/deploy`、`/rollback` 仅适用于仍存在的 server worktree 管理会话；对 client-only 会话返回「本机 CLI 会话不支持该命令 / 请在本机执行」，**不会误报成功或静默操作 server 部署**。
+- 本机 CLI 的 stdout 按 JSONL 解析，线程 ID 写回 metadata；server 处理超时、输出上限、`/stop` 取消与飞书终态卡片。节点离线或结果超时时明确失败。
 
 ### 离线安装 Codex 与 Claude Code
 

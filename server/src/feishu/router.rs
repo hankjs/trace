@@ -129,7 +129,9 @@ pub fn extract_text(message_type: &str, content: &str) -> String {
             };
             let mut out = String::new();
             for para in paragraphs {
-                let Some(elements) = para.as_array() else { continue };
+                let Some(elements) = para.as_array() else {
+                    continue;
+                };
                 for el in elements {
                     match el["tag"].as_str() {
                         Some("text") => {
@@ -277,9 +279,7 @@ impl NewTopicDecision {
     fn normalized(mut self, default_backend: AgentBackend) -> Self {
         match self.agent_kind {
             AgentKind::Conversation => self.agent_backend = AgentBackend::Native,
-            _ if self.agent_backend == AgentBackend::Native => {
-                self.agent_backend = default_backend
-            }
+            _ if self.agent_backend == AgentBackend::Native => self.agent_backend = default_backend,
             _ => {}
         }
         self
@@ -336,7 +336,11 @@ pub(crate) fn parse_feishu_timestamp(value: Option<&str>) -> Option<chrono::Date
 
 // ── 事件入口 ──
 
-pub async fn handle_event(state: Arc<AppState>, account: FeishuAccount, payload: &[u8]) -> Result<()> {
+pub async fn handle_event(
+    state: Arc<AppState>,
+    account: FeishuAccount,
+    payload: &[u8],
+) -> Result<()> {
     // 先只取 header.event_type，避免无关事件被完整反序列化卡住
     let header: serde_json::Value = serde_json::from_slice(payload)?;
     let event_type = header["header"]["event_type"].as_str().unwrap_or("");
@@ -370,7 +374,10 @@ async fn handle_message(
         .mentions
         .unwrap_or_default()
         .into_iter()
-        .map(|me| Mention { key: me.key, name: me.name })
+        .map(|me| Mention {
+            key: me.key,
+            name: me.name,
+        })
         .collect();
     let image_key = extract_image_key(&m.message_type, &m.content);
     let raw_text = extract_text(&m.message_type, &m.content);
@@ -442,8 +449,12 @@ async fn handle_message(
 
     if state.config.server_agent.enabled {
         if let Err(e) = crate::deployment::ensure_server_agent_admin(&state, &user_id).await {
-            api.reply_text(&msg.message_id, &format!("无权使用 server Agent：{e}"), msg.in_thread())
-                .await?;
+            api.reply_text(
+                &msg.message_id,
+                &format!("无权使用 server Agent：{e}"),
+                msg.in_thread(),
+            )
+            .await?;
             return Ok(());
         }
     }
@@ -464,7 +475,10 @@ async fn handle_message(
     }
 
     if let Some(image_key) = image_key {
-        let bytes = match api.download_message_image(&msg.message_id, &image_key).await {
+        let bytes = match api
+            .download_message_image(&msg.message_id, &image_key)
+            .await
+        {
             Ok(bytes) => bytes,
             Err(e) => {
                 api.reply_text(
@@ -515,8 +529,7 @@ fn extract_image_key(message_type: &str, content: &str) -> Option<String> {
     if message_type != "image" {
         return None;
     }
-    serde_json::from_str::<serde_json::Value>(content)
-        .ok()?["image_key"]
+    serde_json::from_str::<serde_json::Value>(content).ok()?["image_key"]
         .as_str()
         .filter(|key| !key.is_empty())
         .map(str::to_string)
@@ -616,13 +629,16 @@ async fn handle_command(
         SlashCommand::Help => {
             api.reply_text(
                 &msg.message_id,
-                "/new 开启新话题工作区\n/stop 停止当前任务\n/status 查看当前会话\n/diff 查看代码变更\n/test 运行受影响项目测试\n/deploy 创建部署审批\n/rollback 创建回滚审批\n/help 查看命令",
+                "/new 开启新话题\n/stop 停止当前任务\n/status 查看当前会话\n/diff 查看 server worktree 变更（本机 CLI 会话不支持）\n/test 运行 server worktree 测试（本机 CLI 会话不支持）\n/deploy 创建 server 部署审批（本机 CLI 会话不支持）\n/rollback 创建 server 回滚审批（本机 CLI 会话不支持）\n/help 查看命令",
                 msg.in_thread(),
             )
             .await?;
         }
         SlashCommand::Status => {
-            let chat = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await?;
+            let chat = state
+                .db
+                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+                .await?;
             let text = match chat {
                 Some(c) => {
                     let running = state.active_tasks.read().await.contains_key(&c.session_id)
@@ -657,21 +673,36 @@ async fn handle_command(
                 }
                 None => "当前话题还没有会话，直接发消息即可开始".to_string(),
             };
-            api.reply_text(&msg.message_id, &text, msg.in_thread()).await?;
+            api.reply_text(&msg.message_id, &text, msg.in_thread())
+                .await?;
         }
         SlashCommand::New => {
             // 先停旧任务再删映射（顺序反了会停不到）
-            if let Some(old) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? {
+            if let Some(old) = state
+                .db
+                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+                .await?
+            {
                 if let Some(t) = state.active_tasks.read().await.get(&old.session_id) {
                     t.cancel();
                 }
             }
-            state.db.delete_feishu_chat(&account.id, &msg.chat_id, &topic).await?;
-            api.reply_text(&msg.message_id, "已开启新会话，请直接发任务", msg.in_thread())
+            state
+                .db
+                .delete_feishu_chat(&account.id, &msg.chat_id, &topic)
                 .await?;
+            api.reply_text(
+                &msg.message_id,
+                "已开启新会话，请直接发任务",
+                msg.in_thread(),
+            )
+            .await?;
         }
         SlashCommand::Stop => {
-            let chat = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await?;
+            let chat = state
+                .db
+                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+                .await?;
             let stopped = match chat {
                 Some(c) => state
                     .active_tasks
@@ -687,36 +718,88 @@ async fn handle_command(
             } else {
                 "当前没有正在执行的任务"
             };
-            api.reply_text(&msg.message_id, text, msg.in_thread()).await?;
+            api.reply_text(&msg.message_id, text, msg.in_thread())
+                .await?;
         }
         SlashCommand::Diff => {
-            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
+            let Some(chat) = state
+                .db
+                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+                .await?
+            else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
+                    .await?;
                 return Ok(());
             };
-            let diff = match crate::deployment::workspace_diff(state, &chat.session_id, &chat.user_id).await {
-                Ok(diff) => diff,
-                Err(e) => format!("读取变更失败：{e:#}"),
-            };
-            api.reply_text(&msg.message_id, &diff, msg.in_thread()).await?;
-        }
-        SlashCommand::Test => {
-            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
-                return Ok(());
-            };
-            if state.active_tasks.read().await.contains_key(&chat.session_id) {
-                api.reply_text(&msg.message_id, "当前 Agent 仍在执行，请完成或 /stop 后再测试", msg.in_thread()).await?;
+            if session_is_client_only(state, &chat.session_id).await? {
+                api.reply_text(
+                    &msg.message_id,
+                    &client_only_command_unsupported_message("/diff"),
+                    msg.in_thread(),
+                )
+                .await?;
                 return Ok(());
             }
-            api.reply_text(&msg.message_id, "已开始运行受影响项目的测试", msg.in_thread()).await?;
+            let diff =
+                match crate::deployment::workspace_diff(state, &chat.session_id, &chat.user_id)
+                    .await
+                {
+                    Ok(diff) => diff,
+                    Err(e) => format!("读取变更失败：{e:#}"),
+                };
+            api.reply_text(&msg.message_id, &diff, msg.in_thread())
+                .await?;
+        }
+        SlashCommand::Test => {
+            let Some(chat) = state
+                .db
+                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+                .await?
+            else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
+                    .await?;
+                return Ok(());
+            };
+            if session_is_client_only(state, &chat.session_id).await? {
+                api.reply_text(
+                    &msg.message_id,
+                    &client_only_command_unsupported_message("/test"),
+                    msg.in_thread(),
+                )
+                .await?;
+                return Ok(());
+            }
+            if state
+                .active_tasks
+                .read()
+                .await
+                .contains_key(&chat.session_id)
+            {
+                api.reply_text(
+                    &msg.message_id,
+                    "当前 Agent 仍在执行，请完成或 /stop 后再测试",
+                    msg.in_thread(),
+                )
+                .await?;
+                return Ok(());
+            }
+            api.reply_text(
+                &msg.message_id,
+                "已开始运行受影响项目的测试",
+                msg.in_thread(),
+            )
+            .await?;
             let state = state.clone();
             let api = api.clone();
             let message_id = msg.message_id.clone();
             let in_thread = msg.in_thread();
             let session_id = chat.session_id.clone();
             let cancel = tokio_util::sync::CancellationToken::new();
-            state.active_tasks.write().await.insert(session_id.clone(), cancel.clone());
+            state
+                .active_tasks
+                .write()
+                .await
+                .insert(session_id.clone(), cancel.clone());
             tokio::spawn(async move {
                 let text = match crate::deployment::test_workspace(
                     &state,
@@ -736,12 +819,36 @@ async fn handle_command(
             });
         }
         SlashCommand::Deploy => {
-            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
+            let Some(chat) = state
+                .db
+                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+                .await?
+            else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
+                    .await?;
                 return Ok(());
             };
-            if state.active_tasks.read().await.contains_key(&chat.session_id) {
-                api.reply_text(&msg.message_id, "当前 Agent 仍在执行，请完成或 /stop 后再部署", msg.in_thread()).await?;
+            if session_is_client_only(state, &chat.session_id).await? {
+                api.reply_text(
+                    &msg.message_id,
+                    &client_only_command_unsupported_message("/deploy"),
+                    msg.in_thread(),
+                )
+                .await?;
+                return Ok(());
+            }
+            if state
+                .active_tasks
+                .read()
+                .await
+                .contains_key(&chat.session_id)
+            {
+                api.reply_text(
+                    &msg.message_id,
+                    "当前 Agent 仍在执行，请完成或 /stop 后再部署",
+                    msg.in_thread(),
+                )
+                .await?;
                 return Ok(());
             }
             let prepared = match crate::deployment::prepare_deployment(
@@ -756,7 +863,12 @@ async fn handle_command(
             {
                 Ok(prepared) => prepared,
                 Err(e) => {
-                    api.reply_text(&msg.message_id, &format!("无法创建部署：{e:#}"), msg.in_thread()).await?;
+                    api.reply_text(
+                        &msg.message_id,
+                        &format!("无法创建部署：{e:#}"),
+                        msg.in_thread(),
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -766,21 +878,54 @@ async fn handle_command(
                 chat_id: msg.chat_id.clone(),
                 topic_id: topic.clone(),
                 summary: prepared.record.summary.clone(),
-                targets: prepared.targets.iter().map(|target| target.label().to_string()).collect(),
+                targets: prepared
+                    .targets
+                    .iter()
+                    .map(|target| target.label().to_string())
+                    .collect(),
                 diff_stat: prepared.diff_stat,
                 expires_at: prepared.record.approval_expires_at.to_rfc3339(),
                 approve_label: prepared.approval_label.to_string(),
             });
-            let card_message_id = api.reply_card(&msg.message_id, &card, msg.in_thread()).await?;
-            state.db.set_deployment_card(&prepared.record.id, &card_message_id).await?;
+            let card_message_id = api
+                .reply_card(&msg.message_id, &card, msg.in_thread())
+                .await?;
+            state
+                .db
+                .set_deployment_card(&prepared.record.id, &card_message_id)
+                .await?;
         }
         SlashCommand::Rollback => {
-            let Some(chat) = state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await? else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread()).await?;
+            let Some(chat) = state
+                .db
+                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+                .await?
+            else {
+                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
+                    .await?;
                 return Ok(());
             };
-            if state.active_tasks.read().await.contains_key(&chat.session_id) {
-                api.reply_text(&msg.message_id, "当前 Agent 仍在执行，请完成或 /stop 后再回滚", msg.in_thread()).await?;
+            if session_is_client_only(state, &chat.session_id).await? {
+                api.reply_text(
+                    &msg.message_id,
+                    &client_only_command_unsupported_message("/rollback"),
+                    msg.in_thread(),
+                )
+                .await?;
+                return Ok(());
+            }
+            if state
+                .active_tasks
+                .read()
+                .await
+                .contains_key(&chat.session_id)
+            {
+                api.reply_text(
+                    &msg.message_id,
+                    "当前 Agent 仍在执行，请完成或 /stop 后再回滚",
+                    msg.in_thread(),
+                )
+                .await?;
                 return Ok(());
             }
             let prepared = match crate::deployment::prepare_rollback(
@@ -795,7 +940,12 @@ async fn handle_command(
             {
                 Ok(prepared) => prepared,
                 Err(e) => {
-                    api.reply_text(&msg.message_id, &format!("无法创建回滚：{e:#}"), msg.in_thread()).await?;
+                    api.reply_text(
+                        &msg.message_id,
+                        &format!("无法创建回滚：{e:#}"),
+                        msg.in_thread(),
+                    )
+                    .await?;
                     return Ok(());
                 }
             };
@@ -805,13 +955,22 @@ async fn handle_command(
                 chat_id: msg.chat_id.clone(),
                 topic_id: topic.clone(),
                 summary: prepared.record.summary.clone(),
-                targets: prepared.targets.iter().map(|target| target.label().to_string()).collect(),
+                targets: prepared
+                    .targets
+                    .iter()
+                    .map(|target| target.label().to_string())
+                    .collect(),
                 diff_stat: prepared.diff_stat,
                 expires_at: prepared.record.approval_expires_at.to_rfc3339(),
                 approve_label: prepared.approval_label.to_string(),
             });
-            let card_message_id = api.reply_card(&msg.message_id, &card, msg.in_thread()).await?;
-            state.db.set_deployment_card(&prepared.record.id, &card_message_id).await?;
+            let card_message_id = api
+                .reply_card(&msg.message_id, &card, msg.in_thread())
+                .await?;
+            state
+                .db
+                .set_deployment_card(&prepared.record.id, &card_message_id)
+                .await?;
         }
     }
     Ok(())
@@ -821,9 +980,10 @@ async fn handle_command(
 
 /// 新话题先判断是否真的需要工作区，以及工作区是否属于 Trace monorepo。
 /// 分类失败时降级到普通隔离目录，绝不误创建仓库 worktree。
-async fn decide_new_topic(state: &AppState, text: &str) -> NewTopicDecision {
+/// 默认外部 Agent 后端按当前用户在线 hank-cli 节点能力选择，不看 server 侧凭据。
+async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTopicDecision {
     let default_backend =
-        AgentBackend::preferred(crate::cli_agent::preferred_backend(state).await);
+        AgentBackend::preferred(crate::cli_agent::preferred_backend(state, user_id).await);
     match try_decide_new_topic(state, text, default_backend).await {
         Ok(decision) => {
             let decision = decision.normalized(default_backend);
@@ -893,8 +1053,7 @@ fn parse_new_topic_decision(output: &str) -> Result<NewTopicDecision> {
         .and_then(|value| value.strip_suffix("```"))
         .unwrap_or(trimmed)
         .trim();
-    serde_json::from_str(json)
-        .map_err(|e| anyhow!("无法解析工作区分类: {e}; output={trimmed}"))
+    serde_json::from_str(json).map_err(|e| anyhow!("无法解析工作区分类: {e}; output={trimmed}"))
 }
 
 fn classification_text(content: &[ContentBlock]) -> String {
@@ -914,7 +1073,11 @@ fn classification_text(content: &[ContentBlock]) -> String {
 }
 
 fn sign_internal_jwt(state: &AppState, user_id: &str, username: &str) -> Result<String> {
-    Ok(crate::auth::sign_internal_jwt(&state.jwt_secret, user_id, username)?)
+    Ok(crate::auth::sign_internal_jwt(
+        &state.jwt_secret,
+        user_id,
+        username,
+    )?)
 }
 
 /// 派发任务：找/建话题会话，跑一轮 chat，事件流交给 pusher 刷新卡片。
@@ -951,29 +1114,23 @@ async fn dispatch_task_content(
 
     // 找/建 feishu_chats 映射的 session。任何初始化错误都要转成用户可见回复，
     // 不能只让 WS 后台任务记一条日志后静默结束。
-    let session_result = match state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await {
-        Ok(Some(c)) if state.config.server_agent.enabled => {
-            let is_managed_session = state
-                .db
-                .get_session(&c.session_id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|session| session.metadata)
-                .is_some_and(|metadata| is_managed_session_metadata(&metadata));
-            if is_managed_session {
-                Ok(Some(c.session_id))
-            } else {
-                match state.db.delete_feishu_chat(&account.id, &msg.chat_id, &topic).await {
-                    Ok(()) => create_and_map_feishu_session(
-                        state, account, msg, &topic, user_id, &content,
-                    )
-                    .await,
-                    Err(e) => Err(anyhow!("重置旧飞书话题会话失败: {e:#}")),
-                }
-            }
+    let session_result = match state
+        .db
+        .get_feishu_chat(&account.id, &msg.chat_id, &topic)
+        .await
+    {
+        Ok(Some(c)) => {
+            resolve_existing_feishu_session(
+                state,
+                account,
+                msg,
+                &topic,
+                user_id,
+                &content,
+                c.session_id,
+            )
+            .await
         }
-        Ok(Some(c)) => Ok(Some(c.session_id)),
         Ok(None) => {
             create_and_map_feishu_session(state, account, msg, &topic, user_id, &content).await
         }
@@ -984,25 +1141,16 @@ async fn dispatch_task_content(
         Ok(None) => return Ok(()),
         Err(e) => {
             tracing::warn!("feishu: create session workspace failed: {e:#}");
-            api.reply_text(
-                &msg.message_id,
-                "创建工作区失败，已记录日志，请稍后重试",
-                msg.in_thread(),
-            )
-            .await?;
+            // 节点缺失、旧 server 会话等错误需要原文回传，不能吞成模糊提示。
+            api.reply_text(&msg.message_id, &format!("{e:#}"), msg.in_thread())
+                .await?;
             return Ok(());
         }
     };
 
     if let Err(e) = state
         .db
-        .link_channel_message_session(
-            "feishu",
-            &account.id,
-            &msg.message_id,
-            &session_id,
-            user_id,
-        )
+        .link_channel_message_session("feishu", &account.id, &msg.message_id, &session_id, user_id)
         .await
     {
         tracing::warn!(session_id = %session_id, "feishu: link archived messages to session failed: {e:#}");
@@ -1015,39 +1163,40 @@ async fn dispatch_task_content(
     // 同一话题冒出两张任务卡片）。所以先原子抢派发名额，拿不到就当作"在执行中"。
     let dispatch_guard = state.tasks.try_acquire(&session_id).await;
     let Some(dispatch_guard) = dispatch_guard else {
-        api.reply_text(&msg.message_id, &running_reply(state, &session_id).await, msg.in_thread())
-            .await?;
+        api.reply_text(
+            &msg.message_id,
+            &running_reply(state, &session_id).await,
+            msg.in_thread(),
+        )
+        .await?;
         return Ok(());
     };
     if state.active_tasks.read().await.contains_key(&session_id) {
         dispatch_guard.release().await;
-        api.reply_text(&msg.message_id, &running_reply(state, &session_id).await, msg.in_thread())
-            .await?;
+        api.reply_text(
+            &msg.message_id,
+            &running_reply(state, &session_id).await,
+            msg.in_thread(),
+        )
+        .await?;
         return Ok(());
     }
 
-    // 普通远程工具会话离线后可解除绑定；本机 Agent 会话必须固定在原节点，避免
-    // 在用户不知情时改到 server 的另一套凭据和文件系统继续执行。
+    // 普通远程工具会话离线后可解除绑定；本机 Agent（client-only）会话在
+    // resolve_existing_feishu_session 已强制失败，此处不再解绑或换节点。
     if let Ok(Some(session)) = state.db.get_session(&session_id).await {
         if let Some(ref cid) = session.exec_client_id {
-            if !crate::remote_exec::is_client_online(state, user_id, cid).await {
-                let local_agent = session
-                    .metadata
-                    .as_deref()
-                    .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
-                    .is_some_and(|metadata| metadata["agent_location"].as_str() == Some("client"));
-                if local_agent {
-                    dispatch_guard.release().await;
-                    api.reply_text(
-                        &msg.message_id,
-                        "绑定的 hank-cli 节点不在线；请在对应电脑启动 hank-cli 后重试。",
-                        msg.in_thread(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
+            let local_agent = session
+                .metadata
+                .as_deref()
+                .and_then(parse_session_metadata_json)
+                .is_some_and(|metadata| is_client_only_metadata(&metadata));
+            if !local_agent && !crate::remote_exec::is_client_online(state, user_id, cid).await {
                 tracing::info!(session_id = %session_id, client_id = %cid, "feishu: exec client offline, unbind");
-                let _ = state.db.set_session_exec_client(&session_id, None, None).await;
+                let _ = state
+                    .db
+                    .set_session_exec_client(&session_id, None, None)
+                    .await;
             }
         }
     }
@@ -1123,6 +1272,93 @@ async fn running_reply(state: &Arc<AppState>, session_id: &str) -> String {
     }
 }
 
+async fn resolve_existing_feishu_session(
+    state: &Arc<AppState>,
+    account: &FeishuAccount,
+    msg: &IncomingMessage,
+    topic: &str,
+    user_id: &str,
+    content: &[ContentBlock],
+    session_id: String,
+) -> Result<Option<String>> {
+    let metadata = state
+        .db
+        .get_session(&session_id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|session| session.metadata);
+    let policy = metadata
+        .as_deref()
+        .map(reuse_policy_for_session_metadata)
+        .unwrap_or(SessionReusePolicy::Recreate);
+
+    match policy {
+        SessionReusePolicy::ReuseClientOnly { backend, client_id } => {
+            // 同一话题固定 backend/client_id；离线或能力不匹配时明确失败，绝不换节点。
+            if is_external_agent_backend(&backend) {
+                let bound_client_id = match client_id {
+                    Some(id) => id,
+                    None => state
+                        .db
+                        .get_session(&session_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|session| session.exec_client_id)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "本机 CLI 会话缺少绑定节点（backend={backend}）。请 /new 后重试。"
+                            )
+                        })?,
+                };
+                if !crate::remote_exec::is_client_online(state, user_id, &bound_client_id).await {
+                    bail!(
+                        "绑定的 hank-cli 节点不在线（client={bound_client_id}, backend={backend}）。请在对应电脑启动 hank-cli 后重试；不会切换到其他节点或 server。"
+                    );
+                }
+                if !crate::remote_exec::client_reports_backend(
+                    state,
+                    user_id,
+                    &bound_client_id,
+                    &backend,
+                )
+                .await
+                {
+                    bail!(
+                        "绑定的 hank-cli 节点未上报 {backend} 能力（client={bound_client_id}）。请检查本机 agent_backends 后重试；不会回退 server 或其他节点。"
+                    );
+                }
+            }
+            Ok(Some(session_id))
+        }
+        SessionReusePolicy::ReuseManaged => Ok(Some(session_id)),
+        SessionReusePolicy::RequireNew { backend, .. } => {
+            bail!("{}", legacy_server_agent_require_new_message(&backend))
+        }
+        SessionReusePolicy::Recreate => {
+            state
+                .db
+                .delete_feishu_chat(&account.id, &msg.chat_id, topic)
+                .await
+                .map_err(|e| anyhow!("重置旧飞书话题会话失败: {e:#}"))?;
+            create_and_map_feishu_session(state, account, msg, topic, user_id, content).await
+        }
+    }
+}
+
+async fn session_is_client_only(state: &Arc<AppState>, session_id: &str) -> Result<bool> {
+    let metadata = state
+        .db
+        .get_session(session_id)
+        .await?
+        .and_then(|session| session.metadata);
+    Ok(metadata
+        .as_deref()
+        .and_then(parse_session_metadata_json)
+        .is_some_and(|value| is_client_only_metadata(&value)))
+}
+
 async fn create_and_map_feishu_session(
     state: &Arc<AppState>,
     account: &FeishuAccount,
@@ -1132,9 +1368,13 @@ async fn create_and_map_feishu_session(
     content: &[ContentBlock],
 ) -> Result<Option<String>> {
     let decision = if state.config.server_agent.enabled {
-        decide_new_topic(state, &classification_text(content)).await
+        decide_new_topic(state, user_id, &classification_text(content)).await
     } else {
-        NewTopicDecision::fallback(AgentBackend::Codex)
+        // server_agent 关闭时不做代码 Agent 路由；native + 可选远程工具节点。
+        NewTopicDecision {
+            agent_kind: AgentKind::GeneralTask,
+            agent_backend: AgentBackend::Native,
+        }
     };
     let session = create_feishu_session(
         state,
@@ -1162,13 +1402,85 @@ fn archive_account_name(account: &FeishuAccount) -> &str {
     }
 }
 
-fn is_managed_session_metadata(metadata: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(metadata)
-        .ok()
-        .is_some_and(|metadata| {
-            metadata["server_agent"].as_bool().unwrap_or(false)
-                || metadata["agent_location"].as_str() == Some("client")
-        })
+fn is_external_agent_backend(backend: &str) -> bool {
+    matches!(backend, "codex" | "claude" | "grok" | "kimi")
+}
+
+fn parse_session_metadata_json(metadata: &str) -> Option<serde_json::Value> {
+    serde_json::from_str(metadata).ok()
+}
+
+fn is_client_only_metadata(metadata: &serde_json::Value) -> bool {
+    metadata["agent_location"].as_str() == Some("client")
+}
+
+/// 历史 server bubblewrap / worktree 会话：`server_agent=true` 且未声明 client-only。
+fn is_legacy_server_agent_metadata(metadata: &serde_json::Value) -> bool {
+    metadata["server_agent"].as_bool().unwrap_or(false) && !is_client_only_metadata(metadata)
+}
+
+/// 外部代码 Agent 会话必须固定在首次绑定的 hank-cli 节点；历史 server-agent 会话不得静默复用。
+fn reuse_policy_for_session_metadata(metadata: &str) -> SessionReusePolicy {
+    let Some(value) = parse_session_metadata_json(metadata) else {
+        return SessionReusePolicy::Recreate;
+    };
+    let backend = value["agent_backend"].as_str().unwrap_or("native");
+    if is_client_only_metadata(&value) {
+        return SessionReusePolicy::ReuseClientOnly {
+            backend: backend.to_string(),
+            client_id: value["exec_client_id"]
+                .as_str()
+                .map(str::to_string)
+                .filter(|id| !id.is_empty()),
+        };
+    }
+    if is_legacy_server_agent_metadata(&value) && is_external_agent_backend(backend) {
+        return SessionReusePolicy::RequireNew {
+            backend: backend.to_string(),
+            reason: "legacy_server_agent",
+        };
+    }
+    if is_legacy_server_agent_metadata(&value) {
+        // native conversation 等仍可复用原 server 会话。
+        return SessionReusePolicy::ReuseManaged;
+    }
+    SessionReusePolicy::Recreate
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionReusePolicy {
+    /// client-only：固定 backend/client_id/thread_id，节点离线时失败而不是换节点。
+    ReuseClientOnly {
+        backend: String,
+        client_id: Option<String>,
+    },
+    /// 非外部后端的 managed 会话（如 native conversation）。
+    ReuseManaged,
+    /// 历史 server-agent + 外部后端：禁止静默复用，要求 /new。
+    RequireNew {
+        backend: String,
+        reason: &'static str,
+    },
+    /// 未管理会话：删除映射后重建。
+    Recreate,
+}
+
+fn client_only_command_unsupported_message(command: &str) -> String {
+    format!(
+        "本机 CLI 会话不支持 {command}；该命令面向 server worktree 部署流程。请在本机工作目录自行查看变更、跑测试或部署，或使用 /new 开启新话题。"
+    )
+}
+
+fn legacy_server_agent_require_new_message(backend: &str) -> String {
+    format!(
+        "该话题仍绑定已废弃的 server Agent 工作区（backend={backend}），不会再在 wananyun 上执行或修改 Trace。请发送 /new 开启本机 hank-cli 会话，并确保对应电脑在线且已上报 {backend} 能力。"
+    )
+}
+
+fn missing_agent_node_message(backend: &str) -> String {
+    format!(
+        "没有在线且支持 {backend} 的 hank-cli 节点。请在目标电脑启动 hank-cli，确认 work_dir 有效且 agent_backends 包含 {backend} 后重试；不会回退到 server bubblewrap 或其他节点。"
+    )
 }
 
 fn archive_inbound_content(msg: &IncomingMessage) -> String {
@@ -1194,55 +1506,53 @@ async fn create_feishu_session(
     agent_backend: &str,
     workspace_kind: WorkspaceKind,
 ) -> Result<hank_db::Session> {
-    if agent_backend != "native" {
-        if let Some(client) =
+    // codex/claude/grok/kimi：必须绑定在线且能力匹配的 hank-cli；绝不回退 server bubblewrap。
+    if is_external_agent_backend(agent_backend) {
+        let Some(client) =
             crate::remote_exec::pick_online_agent_client(state, user_id, agent_backend).await
-        {
-            let metadata = serde_json::json!({
-                "source": "feishu",
-                "agent_backend": agent_backend,
-                "agent_kind": agent_kind,
-                "agent_location": "client",
-                "workspace_kind": "client",
-                "exec_client_id": client.id,
-            })
-            .to_string();
-            let mut session = state
-                .db
-                .create_session(
-                    agent_backend,
-                    "",
-                    client.work_dir.as_deref(),
-                    Some(user_id),
-                    Some("remote"),
-                    Some("chat"),
-                    Some(&metadata),
-                )
-                .await
-                .map_err(|e| anyhow!("create local agent session: {e:#}"))?;
-            state
-                .db
-                .set_session_exec_client(
-                    &session.id,
-                    Some(&client.id),
-                    client.work_dir.as_deref(),
-                )
-                .await?;
-            tracing::info!(
-                session_id = %session.id,
-                client_id = %client.id,
-                backend = agent_backend,
-                "feishu session bound to hank-cli agent"
-            );
-            session.exec_client_id = Some(client.id);
-            session.work_dir = client.work_dir;
-            return Ok(session);
-        }
-        if matches!(agent_backend, "grok" | "kimi") {
-            bail!("没有在线且支持 {agent_backend} 的 hank-cli 节点");
-        }
+        else {
+            bail!("{}", missing_agent_node_message(agent_backend));
+        };
+        let metadata = serde_json::json!({
+            "source": "feishu",
+            "agent_backend": agent_backend,
+            "agent_kind": agent_kind,
+            "agent_location": "client",
+            "workspace_kind": "client",
+            "exec_client_id": client.id,
+        })
+        .to_string();
+        let mut session = state
+            .db
+            .create_session(
+                agent_backend,
+                "",
+                client.work_dir.as_deref(),
+                Some(user_id),
+                Some("remote"),
+                Some("chat"),
+                Some(&metadata),
+            )
+            .await
+            .map_err(|e| anyhow!("create local agent session: {e:#}"))?;
+        state
+            .db
+            .set_session_exec_client(&session.id, Some(&client.id), client.work_dir.as_deref())
+            .await?;
+        tracing::info!(
+            session_id = %session.id,
+            client_id = %client.id,
+            backend = agent_backend,
+            "feishu session bound to hank-cli agent"
+        );
+        session.exec_client_id = Some(client.id);
+        session.work_dir = client.work_dir;
+        return Ok(session);
     }
-    if state.config.server_agent.enabled {
+
+    // native 对话：server-agent 开启时仍可建无 worktree 的 server 会话（不含代码 Agent）。
+    // 飞书不再为外部后端创建 server-only / bubblewrap 会话。
+    if state.config.server_agent.enabled && agent_backend == "native" {
         crate::deployment::ensure_server_agent_admin(state, user_id).await?;
         let metadata = serde_json::json!({
             "source": "feishu",
@@ -1253,11 +1563,9 @@ async fn create_feishu_session(
             "client_excluded": true,
         })
         .to_string();
-        let mut session = state
+        let session = state
             .db
             .create_session(
-                // provider 记录实际执行后端（codex / claude / native），admin 列表据此区分；
-                // model 建会话时还未确定，由 cli_agent 首轮解析出真实模型名后回写。
                 agent_backend,
                 "",
                 None,
@@ -1268,39 +1576,25 @@ async fn create_feishu_session(
             )
             .await
             .map_err(|e| anyhow!("create server session: {e:#}"))?;
-        let workspace = match workspace_kind {
-            WorkspaceKind::None => Ok(None),
-            WorkspaceKind::Repository => {
-                crate::deployment::prepare_repository_workspace(state, &session.id)
-                    .await
-                    .map(Some)
-            }
-            WorkspaceKind::General => {
-                crate::deployment::prepare_general_workspace(state, &session.id)
-                    .await
-                    .map(Some)
-            }
-        };
-        match workspace {
-            Ok(work_dir) => {
-                if let Some(work_dir) = work_dir {
-                    state
-                        .db
-                        .update_session_work_dir(&session.id, Some(&work_dir))
-                        .await?;
-                    session.work_dir = Some(work_dir);
-                }
-                return Ok(session);
-            }
-            Err(e) => {
-                let _ = state.db.delete_session(&session.id).await;
-                return Err(e);
-            }
+        // conversation 的 workspace_kind 为 None，不创建目录。
+        if workspace_kind != WorkspaceKind::None {
+            // 防御：native 非 conversation 理论上已被 normalize 掉；若落到此路径不建 worktree。
+            tracing::warn!(
+                session_id = %session.id,
+                ?workspace_kind,
+                "feishu native session unexpectedly requested workspace; skipped"
+            );
         }
+        return Ok(session);
     }
 
-    let metadata = serde_json::json!({ "source": "feishu" }).to_string();
-    // 有在线且接受远程任务的桌面 client 时，会话绑定到该 client 本地执行
+    let metadata = serde_json::json!({
+        "source": "feishu",
+        "agent_backend": "native",
+        "agent_kind": agent_kind,
+    })
+    .to_string();
+    // 有在线且接受远程任务的桌面 client 时，会话绑定到该 client 本地执行（普通远程工具，非 Agent CLI）
     let client = crate::remote_exec::pick_online_client(state, user_id).await;
     let work_dir = client.as_ref().and_then(|c| c.work_dir.clone());
     let mut session = state
@@ -1366,15 +1660,24 @@ mod tests {
             extract_image_key("image", r#"{"image_key":"img_v3_x"}"#).as_deref(),
             Some("img_v3_x")
         );
-        assert_eq!(detect_image_media_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(
+            detect_image_media_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
         assert_eq!(detect_image_media_type(b"not-an-image"), None);
     }
 
     #[test]
     fn resolve_mentions_replaces_placeholders() {
         let mentions = vec![
-            Mention { key: "@_user_1".into(), name: Some("MyBot".into()) },
-            Mention { key: "@_user_2".into(), name: Some("运营专家".into()) },
+            Mention {
+                key: "@_user_1".into(),
+                name: Some("MyBot".into()),
+            },
+            Mention {
+                key: "@_user_2".into(),
+                name: Some("运营专家".into()),
+            },
         ];
         assert_eq!(
             resolve_mentions("@_user_1 帮我看看 @_user_2 的代码", &mentions),
@@ -1384,8 +1687,14 @@ mod tests {
 
     #[test]
     fn resolve_mentions_skips_nameless() {
-        let mentions = vec![Mention { key: "@_user_1".into(), name: None }];
-        assert_eq!(resolve_mentions("@_user_1 你好", &mentions), "@_user_1 你好");
+        let mentions = vec![Mention {
+            key: "@_user_1".into(),
+            name: None,
+        }];
+        assert_eq!(
+            resolve_mentions("@_user_1 你好", &mentions),
+            "@_user_1 你好"
+        );
     }
 
     #[test]
@@ -1405,7 +1714,10 @@ mod tests {
         assert_eq!(parse_command("帮助"), Some(SlashCommand::Help));
         assert_eq!(parse_command("@Agent OS ？help"), Some(SlashCommand::Help));
         assert_eq!(parse_command("@MyBot /status"), Some(SlashCommand::Status));
-        assert_eq!(parse_command("@Agent OS /status"), Some(SlashCommand::Status));
+        assert_eq!(
+            parse_command("@Agent OS /status"),
+            Some(SlashCommand::Status)
+        );
         assert_eq!(parse_command("帮我运行 /status"), None);
         assert_eq!(parse_command("怎么使用 help"), None);
         assert_eq!(parse_command("/unknown"), None);
@@ -1415,10 +1727,8 @@ mod tests {
     #[test]
     fn parses_new_topic_workspace_decisions() {
         assert_eq!(
-            parse_new_topic_decision(
-                r#"{"agent_kind":"trace_code","agent_backend":"codex"}"#
-            )
-            .unwrap(),
+            parse_new_topic_decision(r#"{"agent_kind":"trace_code","agent_backend":"codex"}"#)
+                .unwrap(),
             NewTopicDecision {
                 agent_kind: AgentKind::TraceCode,
                 agent_backend: AgentBackend::Codex,
@@ -1435,26 +1745,20 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_new_topic_decision(
-                r#"{"agent_kind":"general_task","agent_backend":"grok"}"#
-            )
-            .unwrap()
-            .agent_backend,
+            parse_new_topic_decision(r#"{"agent_kind":"general_task","agent_backend":"grok"}"#)
+                .unwrap()
+                .agent_backend,
             AgentBackend::Grok
         );
         assert_eq!(
-            parse_new_topic_decision(
-                r#"{"agent_kind":"general_task","agent_backend":"kimi"}"#
-            )
-            .unwrap()
-            .agent_backend,
+            parse_new_topic_decision(r#"{"agent_kind":"general_task","agent_backend":"kimi"}"#)
+                .unwrap()
+                .agent_backend,
             AgentBackend::Kimi
         );
         assert_eq!(
-            parse_new_topic_decision(
-                r#"{"agent_kind":"conversation","agent_backend":"native"}"#
-            )
-            .unwrap(),
+            parse_new_topic_decision(r#"{"agent_kind":"conversation","agent_backend":"native"}"#)
+                .unwrap(),
             NewTopicDecision {
                 agent_kind: AgentKind::Conversation,
                 agent_backend: AgentBackend::Native,
@@ -1489,12 +1793,76 @@ mod tests {
     }
 
     #[test]
-    fn local_agent_session_is_reused_when_server_agent_is_enabled() {
-        assert!(is_managed_session_metadata(
-            r#"{"agent_location":"client","agent_backend":"grok"}"#
-        ));
-        assert!(is_managed_session_metadata(r#"{"server_agent":true}"#));
-        assert!(!is_managed_session_metadata(r#"{"source":"feishu"}"#));
+    fn client_only_session_reuses_fixed_backend_and_client() {
+        let policy = reuse_policy_for_session_metadata(
+            r#"{"agent_location":"client","agent_backend":"codex","exec_client_id":"cli-1"}"#,
+        );
+        assert_eq!(
+            policy,
+            SessionReusePolicy::ReuseClientOnly {
+                backend: "codex".into(),
+                client_id: Some("cli-1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_server_agent_external_session_requires_new() {
+        for backend in ["codex", "claude", "grok", "kimi"] {
+            let metadata = format!(
+                r#"{{"server_agent":true,"agent_backend":"{backend}","workspace_kind":"repository"}}"#
+            );
+            let policy = reuse_policy_for_session_metadata(&metadata);
+            assert_eq!(
+                policy,
+                SessionReusePolicy::RequireNew {
+                    backend: backend.into(),
+                    reason: "legacy_server_agent",
+                },
+                "backend={backend}"
+            );
+            assert!(legacy_server_agent_require_new_message(backend).contains("/new"));
+            assert!(legacy_server_agent_require_new_message(backend).contains(backend));
+        }
+    }
+
+    #[test]
+    fn legacy_server_native_conversation_can_reuse() {
+        assert_eq!(
+            reuse_policy_for_session_metadata(
+                r#"{"server_agent":true,"agent_backend":"native","agent_kind":"conversation"}"#
+            ),
+            SessionReusePolicy::ReuseManaged
+        );
+    }
+
+    #[test]
+    fn missing_agent_node_message_never_mentions_server_fallback() {
+        let text = missing_agent_node_message("claude");
+        assert!(text.contains("hank-cli"));
+        assert!(text.contains("claude"));
+        assert!(text.contains("不会回退"));
+        assert!(!text.contains("bubblewrap 继续"));
+    }
+
+    #[test]
+    fn client_only_commands_are_explicitly_unsupported() {
+        for command in ["/diff", "/test", "/deploy", "/rollback"] {
+            let text = client_only_command_unsupported_message(command);
+            assert!(text.contains(command), "{text}");
+            assert!(text.contains("本机 CLI 会话不支持"), "{text}");
+            assert!(text.contains("请在本机"), "{text}");
+        }
+    }
+
+    #[test]
+    fn external_backends_are_exactly_four_clis() {
+        assert!(is_external_agent_backend("codex"));
+        assert!(is_external_agent_backend("claude"));
+        assert!(is_external_agent_backend("grok"));
+        assert!(is_external_agent_backend("kimi"));
+        assert!(!is_external_agent_backend("native"));
+        assert!(!is_external_agent_backend("shell"));
     }
 
     #[test]
@@ -1571,8 +1939,17 @@ mod tests {
             thread_id: String::new(),
             sender_open_id: "ou_1".into(),
         };
-        assert_eq!(archive_inbound_content(&message("text", "bind 123456")), "bind ******");
-        assert_eq!(archive_inbound_content(&message("text", "绑定需求")), "绑定需求");
-        assert_eq!(archive_inbound_content(&message("image", "")), "[image message]");
+        assert_eq!(
+            archive_inbound_content(&message("text", "bind 123456")),
+            "bind ******"
+        );
+        assert_eq!(
+            archive_inbound_content(&message("text", "绑定需求")),
+            "绑定需求"
+        );
+        assert_eq!(
+            archive_inbound_content(&message("image", "")),
+            "[image message]"
+        );
     }
 }
