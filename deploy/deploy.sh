@@ -185,6 +185,16 @@ log "注册并重启 systemd 服务..."
 scp -q "$PROJECT_ROOT/deploy/hank-server.service" "$SSH_HOST:/etc/systemd/system/$SERVICE_NAME.service"
 ssh "$SSH_HOST" bash -s <<REMOTE
 set -euo pipefail
+cat > /etc/sudoers.d/hank-deploy <<'EOF'
+hank ALL=(root) NOPASSWD: /usr/local/libexec/hank-deploy *
+EOF
+cat > /etc/sudoers.d/hank-agent-cli <<'EOF'
+hank ALL=(hank-build) NOPASSWD: NOLOG_INPUT: NOLOG_OUTPUT: /opt/hank/current/hank-server --agent-sandbox-launcher /usr/bin/bwrap *
+EOF
+chmod 440 /etc/sudoers.d/hank-deploy
+chmod 440 /etc/sudoers.d/hank-agent-cli
+visudo -cf /etc/sudoers.d/hank-deploy
+visudo -cf /etc/sudoers.d/hank-agent-cli
 systemctl daemon-reload
 systemctl enable $SERVICE_NAME
 systemctl restart $SERVICE_NAME

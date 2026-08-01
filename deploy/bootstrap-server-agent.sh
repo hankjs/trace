@@ -235,10 +235,14 @@ install -d -o root -g root -m 755 /usr/local/libexec
 install -o root -g root -m 755 "$STAGE/hank-deploy" /usr/local/libexec/hank-deploy
 cat > /etc/sudoers.d/hank-deploy <<'EOF'
 hank ALL=(root) NOPASSWD: /usr/local/libexec/hank-deploy *
-hank ALL=(hank-build) NOPASSWD:SETENV: ALL
+EOF
+cat > /etc/sudoers.d/hank-agent-cli <<'EOF'
+hank ALL=(hank-build) NOPASSWD: NOLOG_INPUT: NOLOG_OUTPUT: /opt/hank/current/hank-server --agent-sandbox-launcher /usr/bin/bwrap *
 EOF
 chmod 440 /etc/sudoers.d/hank-deploy
+chmod 440 /etc/sudoers.d/hank-agent-cli
 visudo -cf /etc/sudoers.d/hank-deploy
+visudo -cf /etc/sudoers.d/hank-agent-cli
 
 install -o root -g root -m 644 "$STAGE/hank-server.service" /etc/systemd/system/hank-server.service
 install -o root -g root -m 644 "$STAGE/hank-cli.service" /etc/systemd/system/hank-cli.service

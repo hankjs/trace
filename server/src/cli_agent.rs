@@ -8,6 +8,14 @@ use hank_db::Session;
 use hank_provider::ContentBlock;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::ffi::OsStr;
+#[cfg(unix)]
+use std::fs::File;
+use std::io::Read;
+#[cfg(unix)]
+use std::mem::ManuallyDrop;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
@@ -29,6 +37,173 @@ const AUTH_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_BASE_URL",
     "OPENAI_BASE_URL",
 ];
+
+pub(crate) const SANDBOX_LAUNCHER_ARG: &str = "--agent-sandbox-launcher";
+const SANDBOX_LAUNCHER_BIN: &str = "/opt/hank/current/hank-server";
+const SANDBOX_BIN: &str = "/usr/bin/bwrap";
+const LAUNCHER_MAGIC: &[u8] = b"HANK_AGENT_ENV_V1\0";
+const MAX_LAUNCHER_ENV_COUNT: usize = 32;
+const MAX_LAUNCHER_ENV_KEY_BYTES: usize = 128;
+const MAX_LAUNCHER_ENV_VALUE_BYTES: usize = 128 * 1024;
+
+const SANDBOX_BASE_ENV_KEYS: &[&str] = &[
+    "HOME",
+    "CODEX_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CARGO_HOME",
+    "GIT_OPTIONAL_LOCKS",
+    "PATH",
+    "RUSTUP_HOME",
+    "UV_CACHE_DIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+];
+
+pub(crate) fn sandbox_launcher_requested() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(OsStr::new(SANDBOX_LAUNCHER_ARG))
+}
+
+/// sudo 只看到固定启动命令；本轮凭据从 stdin 前导段读取，剩余 stdin 原样留给 CLI prompt。
+#[cfg(unix)]
+pub(crate) fn run_sandbox_launcher() -> Result<()> {
+    let mut args = std::env::args_os().skip(2);
+    let executable = args
+        .next()
+        .ok_or_else(|| anyhow!("Agent 沙箱启动器缺少可执行文件"))?;
+    if executable != OsStr::new(SANDBOX_BIN) {
+        bail!("Agent 沙箱启动器只允许执行 {SANDBOX_BIN}");
+    }
+
+    // 直接读 fd 0，避免 BufReader 预读并吞掉紧随凭据后的 prompt。
+    let mut input = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+    let environment = read_launcher_environment(&mut *input)?;
+
+    // sudo 继承的环境不进入 Agent；只保留服务端通过白名单协议显式传入的键。
+    let inherited: Vec<_> = std::env::vars_os().map(|(key, _)| key).collect();
+    for key in inherited {
+        std::env::remove_var(key);
+    }
+    for (key, value) in environment {
+        std::env::set_var(key, value);
+    }
+
+    let error = std::process::Command::new(&executable).args(args).exec();
+    Err(anyhow!("启动 bubblewrap 失败: {error}"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn run_sandbox_launcher() -> Result<()> {
+    bail!("Agent 沙箱启动器只支持 Unix")
+}
+
+fn launcher_env_key_allowed(key: &str) -> bool {
+    SANDBOX_BASE_ENV_KEYS.contains(&key)
+        || CLAUDE_AUTH_KINDS.contains(&key)
+        || CODEX_AUTH_KINDS.contains(&key)
+        || CLAUDE_EXTRA_ENV_KEYS.contains(&key)
+        || CODEX_EXTRA_ENV_KEYS.contains(&key)
+        || matches!(key, "ANTHROPIC_BASE_URL" | "ANTHROPIC_MODEL")
+}
+
+fn read_launcher_environment<R: Read>(input: &mut R) -> Result<Vec<(String, String)>> {
+    let mut magic = vec![0; LAUNCHER_MAGIC.len()];
+    input
+        .read_exact(&mut magic)
+        .context("读取 Agent 凭据协议头")?;
+    if magic != LAUNCHER_MAGIC {
+        bail!("Agent 凭据协议头无效");
+    }
+
+    let count = read_u16(input)? as usize;
+    if count > MAX_LAUNCHER_ENV_COUNT {
+        bail!("Agent 凭据变量数量超过上限");
+    }
+    let mut seen = HashSet::new();
+    let mut environment = Vec::with_capacity(count);
+    for _ in 0..count {
+        let key_len = read_u16(input)? as usize;
+        let value_len = read_u32(input)? as usize;
+        if key_len == 0 || key_len > MAX_LAUNCHER_ENV_KEY_BYTES {
+            bail!("Agent 凭据变量名长度无效");
+        }
+        if value_len > MAX_LAUNCHER_ENV_VALUE_BYTES {
+            bail!("Agent 凭据变量值超过上限");
+        }
+
+        let mut key = vec![0; key_len];
+        let mut value = vec![0; value_len];
+        input
+            .read_exact(&mut key)
+            .context("读取 Agent 凭据变量名")?;
+        input
+            .read_exact(&mut value)
+            .context("读取 Agent 凭据变量值")?;
+        let key = String::from_utf8(key).context("Agent 凭据变量名不是 UTF-8")?;
+        let value = String::from_utf8(value).context("Agent 凭据变量值不是 UTF-8")?;
+        if !launcher_env_key_allowed(&key) {
+            bail!("Agent 启动环境不允许变量 {key}");
+        }
+        if !seen.insert(key.clone()) {
+            bail!("Agent 启动环境包含重复变量 {key}");
+        }
+        if value.contains('\0') {
+            bail!("Agent 启动环境变量 {key} 包含 NUL");
+        }
+        environment.push((key, value));
+    }
+    Ok(environment)
+}
+
+fn read_u16<R: Read>(input: &mut R) -> Result<u16> {
+    let mut bytes = [0; 2];
+    input
+        .read_exact(&mut bytes)
+        .context("读取 Agent 凭据长度")?;
+    Ok(u16::from_be_bytes(bytes))
+}
+
+fn read_u32<R: Read>(input: &mut R) -> Result<u32> {
+    let mut bytes = [0; 4];
+    input
+        .read_exact(&mut bytes)
+        .context("读取 Agent 凭据长度")?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn encode_launcher_environment(environment: &[(String, String)]) -> Result<Vec<u8>> {
+    if environment.len() > MAX_LAUNCHER_ENV_COUNT {
+        bail!("Agent 启动环境变量数量超过上限");
+    }
+    let count = u16::try_from(environment.len()).context("编码 Agent 启动环境数量")?;
+    let mut encoded = Vec::new();
+    encoded.extend_from_slice(LAUNCHER_MAGIC);
+    encoded.extend_from_slice(&count.to_be_bytes());
+    let mut seen = HashSet::new();
+    for (key, value) in environment {
+        if !launcher_env_key_allowed(key) {
+            bail!("Agent 启动环境不允许变量 {key}");
+        }
+        if !seen.insert(key.as_str()) {
+            bail!("Agent 启动环境包含重复变量 {key}");
+        }
+        if key.is_empty() || key.len() > MAX_LAUNCHER_ENV_KEY_BYTES {
+            bail!("Agent 启动环境变量名长度无效");
+        }
+        if value.len() > MAX_LAUNCHER_ENV_VALUE_BYTES || value.contains('\0') {
+            bail!("Agent 启动环境变量 {key} 的值无效");
+        }
+        let key_len = u16::try_from(key.len()).context("编码 Agent 启动环境变量名")?;
+        let value_len = u32::try_from(value.len()).context("编码 Agent 启动环境变量值")?;
+        encoded.extend_from_slice(&key_len.to_be_bytes());
+        encoded.extend_from_slice(&value_len.to_be_bytes());
+        encoded.extend_from_slice(key.as_bytes());
+        encoded.extend_from_slice(value.as_bytes());
+    }
+    Ok(encoded)
+}
 
 /// 各后端允许的凭据环境变量名。第三方 Anthropic 中转通常只认 ANTHROPIC_AUTH_TOKEN，
 /// 官方 key 用 ANTHROPIC_API_KEY，订阅登录用 CLAUDE_CODE_OAUTH_TOKEN，三者不可混用。
@@ -95,10 +270,7 @@ struct CliAuth {
 /// 把 admin 存在库里的配置行翻译成 CliAuth。纯函数，不碰环境变量和数据库，
 /// 便于单测优先级与白名单过滤。返回 None 表示这行不可用（没有凭据），
 /// 调用方据此继续往下走 env / provider 兜底。
-fn auth_from_db_config(
-    backend: &str,
-    config: &hank_db::AgentCliProfileRecord,
-) -> Option<CliAuth> {
+fn auth_from_db_config(backend: &str, config: &hank_db::AgentCliProfileRecord) -> Option<CliAuth> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
         return None;
@@ -118,7 +290,7 @@ fn auth_from_db_config(
     let base_url = config.base_url.trim();
     if !base_url.is_empty() {
         match backend {
-            // Codex 0.146 不读 OPENAI_BASE_URL，要转成 -c openai_base_url 配置。
+            // Codex 第三方端点通过命令行组装完整 custom Responses provider。
             "codex" => auth.base_url = Some(base_url.to_string()),
             _ => auth.env.push(("ANTHROPIC_BASE_URL", base_url.to_string())),
         }
@@ -311,7 +483,10 @@ async fn execute_turn(
 
     let metadata = parse_metadata(session.metadata.as_deref());
     let previous_thread = metadata["agent_thread_id"].as_str();
-    let mut command = build_command(
+    let CliCommand {
+        mut command,
+        launcher_environment,
+    } = build_command(
         state,
         backend,
         work_dir,
@@ -327,6 +502,11 @@ async fn execute_turn(
         .kill_on_drop(true);
     let mut child = command.spawn().context("启动外部 Agent 进程")?;
     let mut stdin = child.stdin.take().context("外部 Agent stdin 不可用")?;
+    let launcher_header = encode_launcher_environment(&launcher_environment)?;
+    stdin
+        .write_all(&launcher_header)
+        .await
+        .context("发送外部 Agent 凭据")?;
     stdin
         .write_all(prompt.as_bytes())
         .await
@@ -410,7 +590,11 @@ async fn execute_turn(
             .update_session_provider_model(session_id, backend, &resolved_model)
             .await
         {
-            tracing::warn!(session_id, backend, "回写外部 Agent provider/model 失败: {error:#}");
+            tracing::warn!(
+                session_id,
+                backend,
+                "回写外部 Agent provider/model 失败: {error:#}"
+            );
         }
     }
 
@@ -523,6 +707,11 @@ struct GitLink {
     common_dir: PathBuf,
 }
 
+struct CliCommand {
+    command: Command,
+    launcher_environment: Vec<(String, String)>,
+}
+
 fn build_command(
     state: &Arc<AppState>,
     backend: &str,
@@ -531,56 +720,53 @@ fn build_command(
     git_link: Option<&GitLink>,
     auth: &CliAuth,
     previous_thread: Option<&str>,
-) -> Result<Command> {
+) -> Result<CliCommand> {
     let cfg = &state.config.server_agent;
     let executable = match backend {
         "codex" => Path::new(&cfg.agent_cli_root).join("codex/current/bin/codex"),
         "claude" => Path::new(&cfg.agent_cli_root).join("claude/current/bin/claude"),
         _ => bail!("不支持的外部 Agent 后端: {backend}"),
     };
-    let mut command = Command::new("sudo");
-    command.env_clear();
-    let mut preserved = vec![
-        "HOME",
-        "CODEX_HOME",
-        "CLAUDE_CONFIG_DIR",
-        "CARGO_HOME",
-        "GIT_OPTIONAL_LOCKS",
-        "PATH",
-        "RUSTUP_HOME",
-        "UV_CACHE_DIR",
-    ];
-    command.env("HOME", "/agent-home");
-    command.env("CODEX_HOME", "/agent-home/.codex");
-    command.env("CLAUDE_CONFIG_DIR", "/agent-home/.claude");
-    command.env("CARGO_HOME", "/agent-home/.cargo-cache");
-    command.env("GIT_OPTIONAL_LOCKS", "0");
-    command.env(
-        "RUSTUP_HOME",
-        format!("/home/{}/.rustup", cfg.execution_user),
-    );
-    command.env("UV_CACHE_DIR", "/agent-home/.uv-cache");
-    command.env(
-        "PATH",
-        format!(
-            "{}/codex/current/bin:{}/claude/current/bin:/home/{}/.cargo/bin:/home/{}/.local/bin:/usr/local/bin:/usr/bin:/bin",
-            cfg.agent_cli_root, cfg.agent_cli_root, cfg.execution_user, cfg.execution_user
+    let mut launcher_environment = vec![
+        ("HOME".to_string(), "/agent-home".to_string()),
+        ("CODEX_HOME".to_string(), "/agent-home/.codex".to_string()),
+        (
+            "CLAUDE_CONFIG_DIR".to_string(),
+            "/agent-home/.claude".to_string(),
         ),
+        (
+            "CARGO_HOME".to_string(),
+            "/agent-home/.cargo-cache".to_string(),
+        ),
+        ("GIT_OPTIONAL_LOCKS".to_string(), "0".to_string()),
+        (
+            "RUSTUP_HOME".to_string(),
+            format!("/home/{}/.rustup", cfg.execution_user),
+        ),
+        (
+            "UV_CACHE_DIR".to_string(),
+            "/agent-home/.uv-cache".to_string(),
+        ),
+        (
+            "PATH".to_string(),
+            format!(
+                "{}/codex/current/bin:{}/claude/current/bin:/home/{}/.cargo/bin:/home/{}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+                cfg.agent_cli_root, cfg.agent_cli_root, cfg.execution_user, cfg.execution_user
+            ),
+        ),
+        ("USER".to_string(), cfg.execution_user.clone()),
+        ("LOGNAME".to_string(), cfg.execution_user.clone()),
+        ("SHELL".to_string(), "/bin/bash".to_string()),
+        ("LANG".to_string(), "C.UTF-8".to_string()),
+        ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+    ];
+    launcher_environment.extend(
+        auth.env
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), value.clone())),
     );
-    for (key, value) in &auth.env {
-        command.env(key, value);
-        if !preserved.contains(key) {
-            preserved.push(key);
-        }
-    }
-    let preserve_arg = format!("--preserve-env={}", preserved.join(","));
-    command.args([
-        "-n",
-        &preserve_arg,
-        "-u",
-        &cfg.execution_user,
-        &cfg.agent_sandbox_bin,
-    ]);
+
+    let mut command = sandbox_launcher_command(&cfg.execution_user, &cfg.agent_sandbox_bin);
     command.args([
         "--die-with-parent",
         "--new-session",
@@ -650,8 +836,9 @@ fn build_command(
     match backend {
         "codex" => {
             if let Some(base_url) = auth.base_url.as_deref() {
-                let value = serde_json::to_string(base_url).context("编码 Codex base URL")?;
-                command.args(["-c", &format!("openai_base_url={value}")]);
+                for value in codex_provider_overrides(base_url)? {
+                    command.args(["-c", &value]);
+                }
             }
             command.args([
                 "-c",
@@ -716,7 +903,36 @@ fn build_command(
     }
     #[cfg(unix)]
     command.as_std_mut().process_group(0);
-    Ok(command)
+    Ok(CliCommand {
+        command,
+        launcher_environment,
+    })
+}
+
+/// 凭据经 stdin 前导协议传给切换用户后的隐藏启动器，不能进入 sudo 环境或参数日志。
+fn sandbox_launcher_command(execution_user: &str, sandbox_bin: &str) -> Command {
+    let mut command = Command::new("/usr/bin/sudo");
+    command.env_clear();
+    command.args([
+        "-n",
+        "-u",
+        execution_user,
+        SANDBOX_LAUNCHER_BIN,
+        SANDBOX_LAUNCHER_ARG,
+        sandbox_bin,
+    ]);
+    command
+}
+
+fn codex_provider_overrides(base_url: &str) -> Result<Vec<String>> {
+    let base_url = serde_json::to_string(base_url).context("编码 Codex base URL")?;
+    Ok(vec![
+        r#"model_provider="trace_cli""#.to_string(),
+        r#"model_providers.trace_cli.name="trace-cli""#.to_string(),
+        format!("model_providers.trace_cli.base_url={base_url}"),
+        r#"model_providers.trace_cli.wire_api="responses""#.to_string(),
+        "model_providers.trace_cli.requires_openai_auth=true".to_string(),
+    ])
 }
 
 async fn handle_json_line(
@@ -961,7 +1177,7 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
         if let Ok(value) = std::env::var(key) {
             if !value.is_empty() {
                 if *key == "OPENAI_BASE_URL" {
-                    // Codex 0.146 不直接读取该环境变量，要转成 openai_base_url 配置。
+                    // Codex 第三方端点通过命令行组装完整 custom Responses provider。
                     auth.base_url = Some(value);
                 } else if matches!(*key, "OPENAI_MODEL" | "ANTHROPIC_MODEL") {
                     auth.model = Some(value.clone());
@@ -1034,9 +1250,7 @@ pub(crate) async fn preferred_backend(state: &AppState) -> &'static str {
     let profiles = state.db.list_agent_cli_profiles().await.unwrap_or_default();
     let db_ready = |backend: &str| {
         profiles.iter().any(|profile| {
-            profile.backend == backend
-                && profile.is_active
-                && !profile.api_key.trim().is_empty()
+            profile.backend == backend && profile.is_active && !profile.api_key.trim().is_empty()
         })
     };
     let codex_env = std::env::var("OPENAI_API_KEY").is_ok_and(|value| !value.trim().is_empty());
@@ -1117,6 +1331,9 @@ async fn validate_runtime(state: &Arc<AppState>, backend: &str) -> Result<()> {
     }
     if !Path::new(&cfg.agent_sandbox_bin).is_file() {
         bail!("外部 Agent 文件沙箱未安装: {}", cfg.agent_sandbox_bin);
+    }
+    if !Path::new(SANDBOX_LAUNCHER_BIN).is_file() {
+        bail!("外部 Agent 安全启动器不可用: {SANDBOX_LAUNCHER_BIN}");
     }
     for mountpoint in ["/workspace", "/agent-home", "/git-common"] {
         if !Path::new(mountpoint).is_dir() {
@@ -1420,6 +1637,80 @@ fn as_u32(value: &serde_json::Value) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn launcher_protocol_round_trips_without_consuming_prompt() {
+        let environment = vec![
+            ("HOME".to_string(), "/agent-home".to_string()),
+            ("OPENAI_API_KEY".to_string(), "provider-secret".to_string()),
+        ];
+        let mut input = encode_launcher_environment(&environment).unwrap();
+        input.extend_from_slice(b"prompt remains on stdin");
+
+        let mut cursor = Cursor::new(input);
+        let decoded = read_launcher_environment(&mut cursor).unwrap();
+        let mut prompt = String::new();
+        std::io::Read::read_to_string(&mut cursor, &mut prompt).unwrap();
+
+        assert_eq!(decoded, environment);
+        assert_eq!(prompt, "prompt remains on stdin");
+    }
+
+    #[test]
+    fn launcher_protocol_rejects_unapproved_or_duplicate_environment() {
+        let unapproved = vec![("LD_PRELOAD".to_string(), "/tmp/inject.so".to_string())];
+        assert!(encode_launcher_environment(&unapproved).is_err());
+
+        let duplicate = vec![
+            ("OPENAI_API_KEY".to_string(), "first".to_string()),
+            ("OPENAI_API_KEY".to_string(), "second".to_string()),
+        ];
+        assert!(encode_launcher_environment(&duplicate).is_err());
+    }
+
+    #[test]
+    fn codex_relay_uses_explicit_responses_provider() {
+        let overrides = codex_provider_overrides("https://relay.example.com/v1").unwrap();
+        assert!(overrides
+            .iter()
+            .any(|value| value == r#"model_provider="trace_cli""#));
+        assert!(overrides
+            .iter()
+            .any(|value| value == r#"model_providers.trace_cli.wire_api="responses""#));
+        assert!(overrides
+            .iter()
+            .any(|value| value == "model_providers.trace_cli.requires_openai_auth=true"));
+        assert!(overrides
+            .iter()
+            .any(|value| value.contains("https://relay.example.com/v1")));
+        assert!(!overrides
+            .iter()
+            .any(|value| value.starts_with("openai_base_url=")));
+    }
+
+    #[test]
+    fn sudo_command_contains_only_fixed_launcher_arguments() {
+        let command = sandbox_launcher_command("hank-build", SANDBOX_BIN);
+        let args = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            vec![
+                "-n",
+                "-u",
+                "hank-build",
+                SANDBOX_LAUNCHER_BIN,
+                SANDBOX_LAUNCHER_ARG,
+                SANDBOX_BIN,
+            ]
+        );
+        assert!(command.as_std().get_envs().next().is_none());
+        assert!(!args.iter().any(|arg| arg.contains("preserve-env")));
+    }
 
     /// 回写 sessions.model 时优先用 CLI 自报的模型名（claude 的 init 事件带 model），
     /// 拿不到时退回 agent-cli.env 里配置的模型（codex 只有这一个来源）。
@@ -1563,25 +1854,25 @@ mod tests {
             .any(|(key, _)| *key == "AWS_SECRET_ACCESS_KEY"));
     }
 
-    /// Codex 0.146 不读 OPENAI_BASE_URL，base_url 必须走 -c openai_base_url；
-    /// Claude 则相反，用环境变量。
+    /// Codex 的 base_url 进入显式 custom provider；Claude 则通过环境变量读取。
     #[test]
     fn base_url_routing_differs_between_backends() {
         let mut codex = db_config("codex");
         codex.base_url = "https://relay.example.com/v1".to_string();
         let auth = auth_from_db_config("codex", &codex).expect("配置可用");
-        assert_eq!(auth.base_url.as_deref(), Some("https://relay.example.com/v1"));
+        assert_eq!(
+            auth.base_url.as_deref(),
+            Some("https://relay.example.com/v1")
+        );
         assert!(!auth.env.iter().any(|(key, _)| *key == "OPENAI_BASE_URL"));
 
         let mut claude = db_config("claude");
         claude.base_url = "https://relay.example.com".to_string();
         let auth = auth_from_db_config("claude", &claude).expect("配置可用");
         assert!(auth.base_url.is_none());
-        assert!(auth
-            .env
-            .iter()
-            .any(|(key, value)| *key == "ANTHROPIC_BASE_URL"
-                && value == "https://relay.example.com"));
+        assert!(auth.env.iter().any(
+            |(key, value)| *key == "ANTHROPIC_BASE_URL" && value == "https://relay.example.com"
+        ));
     }
 
     /// extra_env 由 admin 填写，只能放行白名单键，其他一律丢弃。
@@ -1596,10 +1887,12 @@ mod tests {
         })
         .to_string();
         let auth = auth_from_db_config("claude", &config).expect("配置可用");
-        assert!(auth
-            .env
-            .iter()
-            .any(|(key, value)| *key == "ANTHROPIC_DEFAULT_OPUS_MODEL" && value == "claude-opus-5"));
+        assert!(
+            auth.env
+                .iter()
+                .any(|(key, value)| *key == "ANTHROPIC_DEFAULT_OPUS_MODEL"
+                    && value == "claude-opus-5")
+        );
         assert!(auth
             .env
             .iter()

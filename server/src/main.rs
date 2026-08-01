@@ -150,8 +150,15 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
+fn main() -> Result<()> {
+    if cli_agent::sandbox_launcher_requested() {
+        return cli_agent::run_sandbox_launcher();
+    }
+    run_server()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn run_server() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("安装 Rustls ring CryptoProvider 失败"))?;

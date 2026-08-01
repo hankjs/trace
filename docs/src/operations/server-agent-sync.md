@@ -1,6 +1,6 @@
 # Server Agent 双向 Git 同步协议
 
-> 协议版本：3
+> 协议版本：4
 >
 > 本文件是本机、wananyun 和飞书 server Agent 共同维护的唯一同步流程。
 > `AGENTS.md`、飞书指南和脚本只引用本文件，不复制另一套流程。
@@ -159,7 +159,16 @@ GitHub `origin` 在 wananyun 只保留为 break-glass 元数据。禁止把 GitH
 
 页面上「当前生效」一行显示实际来源，用来区分「存了几份但都没启用，其实还在用环境文件」。「测试」按钮用那份配置的凭据向端点发一次最小推理请求，不要求先启用，所以能在切换前先验证；Codex 走 Responses API，与真实调用同协议，能暴露「Chat Completions 通但 Responses 不支持」的中转。
 
-凭据只在服务端注入子进程环境，GET 接口从不回传明文，只回传是否已设置。admin 可配置的附加环境变量限定在模型与输出上限白名单内，其他键一律拒绝。改端点或模型时凭据留空即保留原值。
+凭据由服务端编码成有长度上限的 stdin 二进制前导段，切换到 `hank-build` 后由
+`hank-server --agent-sandbox-launcher` 读取；启动器清空继承环境，只注入白名单字段，
+然后原地 `exec bubblewrap`，剩余 stdin 原样交给 CLI prompt。sudo 命令参数、sudo 环境、
+session metadata 和日志中均不得出现凭据，sudoers 对该入口显式使用 `NOLOG_INPUT` / `NOLOG_OUTPUT`。
+GET 接口从不回传明文，只回传是否已设置。admin 可配置的附加环境变量限定在模型与输出上限
+白名单内，其他键一律拒绝。改端点或模型时凭据留空即保留原值。
+
+Codex 使用第三方 Responses 中转时必须显式组装独立的 custom provider（`wire_api=responses`、
+`requires_openai_auth=true`），不能只覆盖内置 OpenAI provider 的 base URL。后者会保留 OpenAI
+专属的 WebSocket/认证行为，可能出现裸 HTTP 探测成功但 CLI 任务返回误导性 `401 Invalid token`。
 
 注意「停用」与「删除」不同：停用只是该后端不再用库里的配置、回退到环境文件，凭据仍存在库里；轮换掉泄露的 key 要用「删除」真正删掉那份配置。
 

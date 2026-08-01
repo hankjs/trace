@@ -118,8 +118,15 @@ ln -sfn /opt/hank-agent-cli/claude/current/bin/claude /usr/local/bin/claude
 
 install -d -o hank -g hank-workspace -m 2770 /opt/hank-agent-state
 install -d -o root -g root -m 755 /workspace /agent-home /git-common
+if [[ -x /usr/local/libexec/hank-deploy ]]; then
+  cat > /etc/sudoers.d/hank-deploy <<'EOF'
+hank ALL=(root) NOPASSWD: /usr/local/libexec/hank-deploy *
+EOF
+  chmod 440 /etc/sudoers.d/hank-deploy
+  visudo -cf /etc/sudoers.d/hank-deploy
+fi
 cat > /etc/sudoers.d/hank-agent-cli <<'EOF'
-hank ALL=(hank-build) NOPASSWD:SETENV: /usr/bin/bwrap *
+hank ALL=(hank-build) NOPASSWD: NOLOG_INPUT: NOLOG_OUTPUT: /opt/hank/current/hank-server --agent-sandbox-launcher /usr/bin/bwrap *
 EOF
 chmod 440 /etc/sudoers.d/hank-agent-cli
 visudo -cf /etc/sudoers.d/hank-agent-cli
