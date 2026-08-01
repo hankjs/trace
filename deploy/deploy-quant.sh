@@ -100,7 +100,8 @@ else
 fi
 
 # 不执行 Alembic；有迁移时必须先走维护窗口。每个 release 拥有独立 venv。
-log "服务器 uv sync --frozen + pytest (不执行数据库迁移)..."
+# 发布阶段只做 uv sync + 构建部署，不执行测试（测试由提交前负责）。
+log "服务器 uv sync --frozen (不执行测试/数据库迁移)..."
 ssh "$SSH_HOST" bash -s -- "$REMOTE_RELEASE" "$REMOTE_APP" <<'REMOTE'
 set -euo pipefail
 release="$1"
@@ -108,7 +109,7 @@ app="$2"
 install -o root -g hank -m 640 "$app/config.toml" "$release/config.toml"
 chown -R hank-build:hank-build "$release"
 runuser --user hank-build -- env HOME=/home/hank-build PATH=/home/hank-build/.local/bin:/usr/local/bin:/usr/bin:/bin \
-  bash -c "cd '$release' && UV_HTTP_TIMEOUT=300 uv sync --frozen && uv run pytest tests/"
+  bash -c "cd '$release' && UV_HTTP_TIMEOUT=300 uv sync --frozen"
 chown -R root:root "$release"
 chown root:hank "$release/config.toml"
 REMOTE

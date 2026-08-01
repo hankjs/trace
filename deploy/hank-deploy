@@ -376,7 +376,7 @@ for target in "${TARGETS[@]}"; do
   case "$target" in
     core)
       mkdir -p "$CORE_ROOT/releases/$JOB_ID"
-      as_builder cargo test --workspace --locked --manifest-path "$BUILD_SOURCE/Cargo.toml"
+      # 发布不执行测试（测试由提交前负责）
       as_builder cargo build --release --locked --manifest-path "$BUILD_SOURCE/Cargo.toml" -p hank-server
       as_builder bash -c "cd '$BUILD_SOURCE/admin' && pnpm install --frozen-lockfile && pnpm build"
       [[ -f "$BUILD_SOURCE/target/release/hank-server" && ! -L "$BUILD_SOURCE/target/release/hank-server" ]]
@@ -393,7 +393,7 @@ for target in "${TARGETS[@]}"; do
       ;;
     cli)
       mkdir -p "$CLI_ROOT/releases/$JOB_ID"
-      as_builder cargo test --locked --manifest-path "$BUILD_SOURCE/cli/Cargo.toml"
+      # 发布不执行测试（测试由提交前负责）
       as_builder cargo build --release --locked --manifest-path "$BUILD_SOURCE/cli/Cargo.toml"
       [[ -f "$BUILD_SOURCE/cli/target/release/hank-cli" && ! -L "$BUILD_SOURCE/cli/target/release/hank-cli" ]]
       install -m 755 "$BUILD_SOURCE/cli/target/release/hank-cli" "$CLI_ROOT/releases/$JOB_ID/hank-cli"
@@ -405,7 +405,8 @@ for target in "${TARGETS[@]}"; do
       ;;
     quant)
       mkdir -p "$QUANT_ROOT/releases/$JOB_ID"
-      as_builder bash -c "cd '$BUILD_SOURCE/quant/web' && pnpm install --frozen-lockfile && pnpm test && pnpm build"
+      # 发布不执行测试（测试由提交前负责）
+      as_builder bash -c "cd '$BUILD_SOURCE/quant/web' && pnpm install --frozen-lockfile && pnpm build"
       reject_symlinks "$BUILD_SOURCE/quant/web/dist"
       rsync -a --delete \
         --safe-links \
@@ -415,7 +416,7 @@ for target in "${TARGETS[@]}"; do
       rsync -a --delete --no-links "$BUILD_SOURCE/quant/web/dist/" "$QUANT_ROOT/releases/$JOB_ID/web/dist/"
       install -o root -g "$HANK_USER" -m 640 "$QUANT_ROOT/config.toml" "$QUANT_ROOT/releases/$JOB_ID/config.toml"
       chown -R "$BUILD_USER:$BUILD_USER" "$QUANT_ROOT/releases/$JOB_ID"
-      as_builder bash -c "cd '$QUANT_ROOT/releases/$JOB_ID' && UV_HTTP_TIMEOUT=300 uv sync --frozen && uv run pytest tests/"
+      as_builder bash -c "cd '$QUANT_ROOT/releases/$JOB_ID' && UV_HTTP_TIMEOUT=300 uv sync --frozen"
       chown -R root:root "$QUANT_ROOT/releases/$JOB_ID"
       chown root:"$HANK_USER" "$QUANT_ROOT/releases/$JOB_ID/config.toml"
       [[ -n "$PREV_QUANT" ]] && atomic_link "$PREV_QUANT" "$QUANT_ROOT/previous"
