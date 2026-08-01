@@ -2,6 +2,7 @@
 //! 不依赖 Tauri app，独立向 server 暴露本机终端能力：
 //! login → registration → 长轮询取工具调用 → 执行 → 回传结果。
 
+mod agent;
 mod api;
 mod config;
 mod notify;
@@ -42,15 +43,41 @@ async fn main() {
     tracing::info!("登录成功");
 
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
+    let valid_work_dir = cfg.work_dir.as_deref().is_some_and(|work_dir| {
+        std::fs::canonicalize(work_dir).is_ok_and(|path| path.is_dir())
+    });
+    let agent_backends = if valid_work_dir {
+        agent::detect_backends(cfg.agent_backends.as_deref())
+    } else {
+        tracing::warn!(work_dir = ?cfg.work_dir, "工作目录无效，不上报本机 Agent 能力");
+        Vec::new()
+    };
     if let Err(e) = api
-        .register(&cfg.client_id, Some(&hostname), cfg.work_dir.as_deref())
+        .register(
+            &cfg.client_id,
+            Some(&hostname),
+            cfg.work_dir.as_deref(),
+            &agent_backends,
+        )
         .await
     {
         eprintln!("注册失败: {e}");
         exit(1);
     }
-    tracing::info!(hostname, work_dir = ?cfg.work_dir, "注册成功，进入 poll 循环");
+    tracing::info!(hostname, work_dir = ?cfg.work_dir, ?agent_backends, "注册成功，进入 poll 循环");
 
     let term = Arc::new(terminal::TermManager::new(cfg.data_dir.clone()));
-    worker::run(api, term, cfg.client_id.clone()).await;
+    let agent_runner = Arc::new(agent::AgentRunner::new(
+        cfg.work_dir.clone(),
+        cfg.data_dir.clone(),
+        agent_backends.clone(),
+    ));
+    worker::run(
+        api,
+        term,
+        agent_runner,
+        agent_backends,
+        cfg.client_id.clone(),
+    )
+    .await;
 }

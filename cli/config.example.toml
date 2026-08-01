@@ -9,5 +9,8 @@ password = "your-password"
 # 可选：注册用工作目录（server 侧记录，远程工具默认上下文）
 # work_dir = "/Users/xxx"
 
+# 飞书可调用的本机 Agent CLI。省略时自动探测；设为空数组可完全禁用。
+# agent_backends = ["codex", "claude", "grok", "kimi"]
+
 # 可选：本节点 ID。缺省时首次运行自动生成 uuid 并写回本文件。
 # client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"

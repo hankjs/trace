@@ -1,6 +1,6 @@
 # 飞书渠道接入指南
 
-飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。入口和生命周期由 Rust server 统一管理（`server/src/feishu/`）；纯对话使用无工具的 native Agent，代码与文件任务可派发到离线安装的 Codex 或 Claude Code。
+飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。入口和生命周期由 Rust server 统一管理（`server/src/feishu/`）；纯对话使用无工具的 native Agent，代码与文件任务可派发到 server 或在线 `hank-cli` 节点上的 Codex、Claude Code、Grok、Kimi Code。
 
 ## 架构
 
@@ -94,6 +94,32 @@ feishu_monitor = false   # 其他实例关掉
 | `/rollback` | 对最近一次成功部署发送回滚审批卡，切回 previous release 后健康检查 |
 | `/help` | 命令列表 |
 
+### 直接使用电脑上的 Agent CLI
+
+`hank-cli` 启动时会探测本机 PATH 中的 `codex`、`claude`、`grok`、`kimi` 并把能力上报给 server。飞书新话题明确写“用 Codex / Claude Code / Grok / Kimi”时，如果绑定用户有具备对应能力的在线节点，整个话题会固定在该电脑执行；凭据和 CLI 配置不会上传到 server。飞书并不直接入站连接家庭网络，而是经现有 server 转发到 `hank-cli` 的出站长轮询连接，因此不需要给电脑开放公网端口。
+
+`~/.hank-cli/config.toml` 建议显式指定允许访问的目录和后端：
+
+```toml
+server = "https://your-hank-server"
+username = "admin"
+password = "..."
+work_dir = "/Users/you/projects"
+agent_backends = ["codex", "claude", "grok", "kimi"]
+```
+
+在该目录或任意位置启动已安装的 `hank-cli`：
+
+```bash
+hank-cli
+```
+
+- `work_dir` 是任务目录边界：server 下发的 cwd 必须位于该目录内；省略时使用 `hank-cli` 的启动目录。Codex 另以 `workspace-write` 沙箱限制写入，Claude/Grok/Kimi 的具体文件权限由各自 CLI 权限模式负责。
+- `agent_backends` 是 allowlist；省略时自动探测，设为 `[]` 可禁用本机 Agent、只保留终端能力。
+- Codex 固定使用 `workspace-write + never`，Claude/Grok 使用 `dontAsk`；Kimi 的 headless `--prompt` 模式会自动使用 `auto` 权限。所有命令均由固定参数模板生成，不接受飞书传入任意可执行文件或 shell 片段。
+- `/stop` 会向同一节点下发取消请求并终止对应进程组。同一话题不会在节点离线后静默切换到 server。
+- 同一话题固定复用首次选择的后端、节点和 CLI thread/session；切换后端需使用 `/new` 或新建话题。
+
 ## 四、wananyun server Agent
 
 不需要在 wananyun 维护两份手工同步的源码。目录职责如下：
@@ -151,11 +177,12 @@ approval_ttl_secs = 600
 
 - `/help`、`help`、`?help`、`？help`、`帮助` 等命令不创建会话工作区。
 - 同一飞书话题已有 `feishu_chats` 映射时，始终复用原 session 和原工作区，不重新分类。
-- 新话题会先由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex` 或 `claude` 后端，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。`conversation` 被强制归一为 `native`；其他任务若错误返回 `native` 会归一为当前有可用凭据的 CLI 后端（优先 Codex，否则 Claude）。用户明确点名后端时保留其选择。
+- 新话题会先由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex`、`claude`、`grok` 或 `kimi` 后端，并把 `agent_backend`、`agent_kind`、`workspace_kind` 写入 session metadata。`conversation` 被强制归一为 `native`；其他任务若错误返回 `native` 会归一为当前有可用凭据的 CLI 后端（优先 Codex，否则 Claude）。用户明确点名后端时保留其选择。
+- 在线 `hank-cli` 明确上报目标后端能力时优先绑定本机节点；否则 Codex/Claude 继续使用 server bubblewrap，Grok/Kimi 因 server 没有安装对应 runner 而返回明确的节点离线/不可用错误。
 - `trace_code`/`quant_code` 从 `trace-production` 创建 Git worktree，`general_task` 创建普通隔离目录，`conversation` 不创建目录。同一飞书话题后续固定复用 backend、workspace 和 `agent_thread_id`，不会重新分类或重复创建 worktree。
 - 只有 Git worktree 会注入 Trace/quant/同步协议，并支持 `/diff`、`/test`、`/deploy`、`/rollback`；普通隔离目录不能部署。
 - 外部 CLI 以 `hank-build` 运行，每个话题有独立 HOME，并由 bubblewrap 只挂载当前 `/workspace`；`client/` 叠加为只读，`/opt/hank/config.toml`、其他 worktree 和其他话题状态目录不可见。凭据经固定启动器的 stdin 前导协议注入，不进入 sudo 参数、环境审计或 Agent 文件视图。bubblewrap 或安全启动器缺失时外部后端拒绝启动，不做无沙箱降级。
-- Codex/Claude 的 stdout 按 JSONL 解析，线程 ID 写回 metadata；server 统一处理 30 分钟超时、2 MiB 输出上限、`/stop` 取消、进程组清理和飞书终态卡片。
+- Codex/Claude/Grok/Kimi 的 stdout 按 JSONL 解析，线程 ID 写回 metadata；server 统一处理 30 分钟超时、2 MiB 输出上限、`/stop` 取消、进程组清理和飞书终态卡片。
 
 ### 离线安装 Codex 与 Claude Code
 

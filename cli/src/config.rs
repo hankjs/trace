@@ -36,6 +36,8 @@ struct FileConfig {
     work_dir: Option<String>,
     /// 本节点 ID，首次运行自动生成 uuid 并写回
     client_id: Option<String>,
+    /// 允许飞书调用的本机 Agent。缺省时自动探测全部受支持 CLI，空数组表示禁用。
+    agent_backends: Option<Vec<String>>,
 }
 
 /// 合并 CLI 覆盖后的最终配置
@@ -45,6 +47,7 @@ pub struct Config {
     pub password: String,
     pub work_dir: Option<String>,
     pub client_id: String,
+    pub agent_backends: Option<Vec<String>>,
     /// 数据目录（~/.hank-cli），shell-integration 等运行时文件放这里
     pub data_dir: PathBuf,
 }
@@ -106,8 +109,13 @@ pub fn load(args: &CliArgs) -> Result<Config, String> {
         server: server.trim_end_matches('/').to_string(),
         username,
         password,
-        work_dir: file.work_dir.filter(|s| !s.trim().is_empty()),
+        // 未显式配置时使用 hank-cli 启动目录。Agent runner 仍会把所有 cwd 约束在该目录下。
+        work_dir: file
+            .work_dir
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| std::env::current_dir().ok().map(|path| path.display().to_string())),
         client_id: file.client_id.unwrap(),
+        agent_backends: file.agent_backends,
         data_dir,
     })
 }

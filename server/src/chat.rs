@@ -204,7 +204,7 @@ pub async fn run_chat_turn(
         .as_ref()
         .and_then(|metadata| metadata["agent_backend"].as_str())
         .unwrap_or("native");
-    if matches!(agent_backend, "codex" | "claude") {
+    if matches!(agent_backend, "codex" | "claude" | "grok" | "kimi") {
         return crate::cli_agent::run_cli_turn(
             state,
             &session_id,

@@ -367,6 +367,11 @@ async fn run_server() -> Result<()> {
         )
         .route("/api/client/notify", post(remote_exec::post_notification))
         .route("/api/client/poll", get(remote_exec::poll_requests))
+        .route(
+            "/api/client/agent-event",
+            post(remote_exec::post_agent_event)
+                .route_layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         // tool-result 可能携带媒体文件 base64 回传（20MB 文件约 27MB），放宽 body 上限
         .route(
             "/api/client/tool-result",

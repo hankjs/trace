@@ -9,6 +9,7 @@ use base64::Engine;
 use tokio::sync::mpsc;
 
 use crate::api::{ApiClient, PollOutcome, ToolCallRequest};
+use crate::agent::{AgentRunInput, AgentRunner};
 use crate::notify::{self, NotifyTx};
 use crate::terminal::TermManager;
 
@@ -98,6 +99,42 @@ async fn execute_tool(term: &Arc<TermManager>, notify_tx: &NotifyTx, req: &ToolC
     }
 }
 
+async fn execute_request(
+    api: Arc<ApiClient>,
+    agent: Arc<AgentRunner>,
+    term: &Arc<TermManager>,
+    notify_tx: &NotifyTx,
+    req: &ToolCallRequest,
+) -> ToolOutput {
+    match req.tool.as_str() {
+        "agent_run" => {
+            let input = match serde_json::from_value::<AgentRunInput>(req.input.clone()) {
+                Ok(input) => input,
+                Err(error) => return ToolOutput::err(format!("Invalid agent_run input: {error}")),
+            };
+            let outcome = agent.run(api, &req.request_id, input).await;
+            ToolOutput {
+                content: outcome.content,
+                is_error: outcome.is_error,
+            }
+        }
+        "agent_cancel" => {
+            let request_id = req
+                .input
+                .get("request_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if request_id.is_empty() {
+                ToolOutput::err("agent_cancel 缺少 request_id".into())
+            } else {
+                agent.cancel(request_id).await;
+                ToolOutput::ok("ok".into())
+            }
+        }
+        _ => execute_tool(term, notify_tx, req).await,
+    }
+}
+
 /// 读文件（≤20MB）base64 编码返回，超限/读失败返回 is_error（对齐 src-tauri tool_read_file_base64）
 fn read_file_base64(path: &str) -> ToolOutput {
     let result = (|| -> Result<String, String> {
@@ -122,23 +159,30 @@ fn read_file_base64(path: &str) -> ToolOutput {
 }
 
 /// 长轮询主循环：错误指数退避 1s→30s，401 重新登录
-pub async fn run(api: Arc<ApiClient>, term: Arc<TermManager>, client_id: String) {
+pub async fn run(
+    api: Arc<ApiClient>,
+    term: Arc<TermManager>,
+    agent: Arc<AgentRunner>,
+    agent_backends: Vec<String>,
+    client_id: String,
+) {
     let (notify_tx, notify_rx) = mpsc::unbounded_channel();
     // 通知上报任务：消费各终端 reader 线程捕获的 OSC/BEL 事件
     tokio::spawn(notify::run(api.clone(), client_id.clone(), notify_rx));
 
     let mut backoff = BACKOFF_INIT;
     loop {
-        match api.poll(&client_id).await {
+        match api.poll(&client_id, &agent_backends).await {
             PollOutcome::Ok(requests) => {
                 // 正常返回（含空 requests）立即进入下一轮
                 backoff = BACKOFF_INIT;
                 for req in requests {
                     let api = api.clone();
                     let term = term.clone();
+                    let agent = agent.clone();
                     let notify_tx = notify_tx.clone();
                     tokio::spawn(async move {
-                        let out = execute_tool(&term, &notify_tx, &req).await;
+                        let out = execute_request(api.clone(), agent, &term, &notify_tx, &req).await;
                         if let Err(e) = api.post_result(&req.request_id, &out.content, out.is_error).await {
                             tracing::warn!(request_id = %req.request_id, "回传工具结果失败: {e}");
                         }

@@ -11,7 +11,7 @@ use crate::feishu::card::{build_deployment_card, DeploymentCardOptions};
 use crate::feishu::pusher;
 use crate::provider_registry;
 use crate::AppState;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use base64::Engine as _;
 use futures::StreamExt;
 use hank_db::FeishuAccount;
@@ -227,6 +227,8 @@ enum AgentBackend {
     Native,
     Codex,
     Claude,
+    Grok,
+    Kimi,
 }
 
 impl AgentBackend {
@@ -235,14 +237,17 @@ impl AgentBackend {
             Self::Native => "native",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Grok => "grok",
+            Self::Kimi => "kimi",
         }
     }
 
     fn preferred(value: &str) -> Self {
-        if value == "claude" {
-            Self::Claude
-        } else {
-            Self::Codex
+        match value {
+            "claude" => Self::Claude,
+            "grok" => Self::Grok,
+            "kimi" => Self::Kimi,
+            _ => Self::Codex,
         }
     }
 }
@@ -848,8 +853,8 @@ async fn try_decide_new_topic(
         - general_task：具体任务与 Trace/quant 无关，但需要文件、代码、命令、下载、分析产物或持续迭代工作区。\n\
         - conversation：用户在问候、讨论、咨询、分析问题，或者尚未给出需要文件和命令的事项。\
           后续对话 Agent 会负责正式回答；路由器不要回答用户问题。\n\
-        输出字段 agent_backend 可选值：native、codex、claude。conversation 必须选 native；\
-        其他任务默认选 {default_backend}；用户明确要求 Codex 时选 codex，明确要求 Claude/Claude Code，或任务明确是 Claude Code 配置与插件维护时选 claude。\n\
+        输出字段 agent_backend 可选值：native、codex、claude、grok、kimi。conversation 必须选 native；\
+        其他任务默认选 {default_backend}；用户明确要求 Codex、Claude/Claude Code、Grok 或 Kimi/Kimi Code 时，分别选择对应后端，且 agent_kind 至少为 general_task，不能选 conversation。\n\
         示例：{{\"agent_kind\":\"trace_code\",\"agent_backend\":\"{default_backend}\"}}。\n\
         判断 Agent 必须看语义，不只看是否出现项目名。拿不准是否属于 Trace/quant 时选择 general_task；\
         拿不准是否需要文件或命令时选择 conversation。",
@@ -948,17 +953,15 @@ async fn dispatch_task_content(
     // 不能只让 WS 后台任务记一条日志后静默结束。
     let session_result = match state.db.get_feishu_chat(&account.id, &msg.chat_id, &topic).await {
         Ok(Some(c)) if state.config.server_agent.enabled => {
-            let is_server_session = state
+            let is_managed_session = state
                 .db
                 .get_session(&c.session_id)
                 .await
                 .ok()
                 .flatten()
                 .and_then(|session| session.metadata)
-                .and_then(|metadata| serde_json::from_str::<serde_json::Value>(&metadata).ok())
-                .and_then(|metadata| metadata["server_agent"].as_bool())
-                .unwrap_or(false);
-            if is_server_session {
+                .is_some_and(|metadata| is_managed_session_metadata(&metadata));
+            if is_managed_session {
                 Ok(Some(c.session_id))
             } else {
                 match state.db.delete_feishu_chat(&account.id, &msg.chat_id, &topic).await {
@@ -1023,10 +1026,26 @@ async fn dispatch_task_content(
         return Ok(());
     }
 
-    // 会话绑定的桌面 client 已离线时解除绑定，退化为 server 本地执行
+    // 普通远程工具会话离线后可解除绑定；本机 Agent 会话必须固定在原节点，避免
+    // 在用户不知情时改到 server 的另一套凭据和文件系统继续执行。
     if let Ok(Some(session)) = state.db.get_session(&session_id).await {
         if let Some(ref cid) = session.exec_client_id {
             if !crate::remote_exec::is_client_online(state, user_id, cid).await {
+                let local_agent = session
+                    .metadata
+                    .as_deref()
+                    .and_then(|metadata| serde_json::from_str::<serde_json::Value>(metadata).ok())
+                    .is_some_and(|metadata| metadata["agent_location"].as_str() == Some("client"));
+                if local_agent {
+                    dispatch_guard.release().await;
+                    api.reply_text(
+                        &msg.message_id,
+                        "绑定的 hank-cli 节点不在线；请在对应电脑启动 hank-cli 后重试。",
+                        msg.in_thread(),
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 tracing::info!(session_id = %session_id, client_id = %cid, "feishu: exec client offline, unbind");
                 let _ = state.db.set_session_exec_client(&session_id, None, None).await;
             }
@@ -1143,6 +1162,15 @@ fn archive_account_name(account: &FeishuAccount) -> &str {
     }
 }
 
+fn is_managed_session_metadata(metadata: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(metadata)
+        .ok()
+        .is_some_and(|metadata| {
+            metadata["server_agent"].as_bool().unwrap_or(false)
+                || metadata["agent_location"].as_str() == Some("client")
+        })
+}
+
 fn archive_inbound_content(msg: &IncomingMessage) -> String {
     let text = msg.text.trim();
     if text
@@ -1166,6 +1194,54 @@ async fn create_feishu_session(
     agent_backend: &str,
     workspace_kind: WorkspaceKind,
 ) -> Result<hank_db::Session> {
+    if agent_backend != "native" {
+        if let Some(client) =
+            crate::remote_exec::pick_online_agent_client(state, user_id, agent_backend).await
+        {
+            let metadata = serde_json::json!({
+                "source": "feishu",
+                "agent_backend": agent_backend,
+                "agent_kind": agent_kind,
+                "agent_location": "client",
+                "workspace_kind": "client",
+                "exec_client_id": client.id,
+            })
+            .to_string();
+            let mut session = state
+                .db
+                .create_session(
+                    agent_backend,
+                    "",
+                    client.work_dir.as_deref(),
+                    Some(user_id),
+                    Some("remote"),
+                    Some("chat"),
+                    Some(&metadata),
+                )
+                .await
+                .map_err(|e| anyhow!("create local agent session: {e:#}"))?;
+            state
+                .db
+                .set_session_exec_client(
+                    &session.id,
+                    Some(&client.id),
+                    client.work_dir.as_deref(),
+                )
+                .await?;
+            tracing::info!(
+                session_id = %session.id,
+                client_id = %client.id,
+                backend = agent_backend,
+                "feishu session bound to hank-cli agent"
+            );
+            session.exec_client_id = Some(client.id);
+            session.work_dir = client.work_dir;
+            return Ok(session);
+        }
+        if matches!(agent_backend, "grok" | "kimi") {
+            bail!("没有在线且支持 {agent_backend} 的 hank-cli 节点");
+        }
+    }
     if state.config.server_agent.enabled {
         crate::deployment::ensure_server_agent_admin(state, user_id).await?;
         let metadata = serde_json::json!({
@@ -1360,6 +1436,22 @@ mod tests {
         );
         assert_eq!(
             parse_new_topic_decision(
+                r#"{"agent_kind":"general_task","agent_backend":"grok"}"#
+            )
+            .unwrap()
+            .agent_backend,
+            AgentBackend::Grok
+        );
+        assert_eq!(
+            parse_new_topic_decision(
+                r#"{"agent_kind":"general_task","agent_backend":"kimi"}"#
+            )
+            .unwrap()
+            .agent_backend,
+            AgentBackend::Kimi
+        );
+        assert_eq!(
+            parse_new_topic_decision(
                 r#"{"agent_kind":"conversation","agent_backend":"native"}"#
             )
             .unwrap(),
@@ -1394,6 +1486,15 @@ mod tests {
             .agent_backend,
             AgentBackend::Claude
         );
+    }
+
+    #[test]
+    fn local_agent_session_is_reused_when_server_agent_is_enabled() {
+        assert!(is_managed_session_metadata(
+            r#"{"agent_location":"client","agent_backend":"grok"}"#
+        ));
+        assert!(is_managed_session_metadata(r#"{"server_agent":true}"#));
+        assert!(!is_managed_session_metadata(r#"{"source":"feishu"}"#));
     }
 
     #[test]

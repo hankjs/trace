@@ -1,4 +1,4 @@
-//! 飞书外部 Agent 后端：在逐话题 bubblewrap 沙箱中运行 Codex / Claude Code。
+//! 飞书外部 Agent 后端：可在 server bubblewrap 或绑定的 hank-cli 节点运行。
 
 use crate::chat::{ChatTurnHandle, EventBuffer};
 use crate::AppState;
@@ -6,7 +6,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use code_agent::{AgentEvent, FileChange, FileChangeKind, RunStatus};
 use hank_db::Session;
 use hank_provider::ContentBlock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 #[cfg(unix)]
@@ -334,6 +334,12 @@ pub async fn run_cli_turn(
     if agent_kind == "conversation" {
         bail!("纯对话必须由无工具的 native 后端执行");
     }
+    if let Some(client_id) = session.exec_client_id.clone() {
+        return run_remote_cli_turn(
+            state, session_id, session, content, backend, &client_id, agent_kind,
+        )
+        .await;
+    }
     let work_dir = session
         .work_dir
         .as_deref()
@@ -421,6 +427,390 @@ pub async fn run_cli_turn(
     });
 
     Ok(ChatTurnHandle { event_rx })
+}
+
+async fn run_remote_cli_turn(
+    state: &Arc<AppState>,
+    session_id: &str,
+    session: Session,
+    content: Vec<ContentBlock>,
+    backend: &str,
+    client_id: &str,
+    agent_kind: &str,
+) -> Result<ChatTurnHandle> {
+    let work_dir = session
+        .work_dir
+        .clone()
+        .ok_or_else(|| anyhow!("hank-cli 节点没有配置工作目录"))?;
+    let user_id = session
+        .user_id
+        .clone()
+        .ok_or_else(|| anyhow!("本机 Agent 会话缺少用户"))?;
+    if !crate::remote_exec::is_client_online(state, &user_id, client_id).await {
+        bail!("绑定的 hank-cli 节点不在线");
+    }
+    let user_text = content_text(&content);
+    if user_text.trim().is_empty() {
+        bail!("本机 Agent 暂不支持没有文本说明的消息");
+    }
+    let prompt = local_agent_prompt(&user_text, agent_kind);
+
+    {
+        let mut buffers = state.event_buffers.write().await;
+        buffers.insert(session_id.to_string(), EventBuffer::new());
+    }
+    let event_rx = {
+        let buffers = state.event_buffers.read().await;
+        buffers
+            .get(session_id)
+            .expect("event buffer just inserted")
+            .tx
+            .subscribe()
+    };
+    let cancel_token = CancellationToken::new();
+    state
+        .active_tasks
+        .write()
+        .await
+        .insert(session_id.to_string(), cancel_token.clone());
+
+    let state_task = state.clone();
+    let session_id_task = session_id.to_string();
+    let backend = backend.to_string();
+    let client_id = client_id.to_string();
+    tokio::spawn(async move {
+        let result = execute_remote_turn(
+            &state_task,
+            &session_id_task,
+            &session,
+            &backend,
+            &client_id,
+            &user_id,
+            &work_dir,
+            &user_text,
+            &prompt,
+            cancel_token.clone(),
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::error!(session_id = %session_id_task, backend, "remote cli agent failed: {error:#}");
+            emit(
+                &state_task,
+                &session_id_task,
+                AgentEvent::RunFailed {
+                    run_id: session_id_task.clone(),
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    message: format!("{error:#}"),
+                },
+            )
+            .await;
+            emit(&state_task, &session_id_task, AgentEvent::TurnComplete).await;
+        }
+        state_task
+            .active_tasks
+            .write()
+            .await
+            .remove(&session_id_task);
+        if let Some(buffer) = state_task
+            .event_buffers
+            .write()
+            .await
+            .get_mut(&session_id_task)
+        {
+            buffer.completed = true;
+        }
+    });
+
+    Ok(ChatTurnHandle { event_rx })
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteAgentResult {
+    #[serde(default)]
+    exit_code: Option<i32>,
+    #[serde(default)]
+    cancelled: bool,
+    #[serde(default)]
+    output_limited: bool,
+    #[serde(default)]
+    stdout: String,
+    #[serde(default)]
+    stderr: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_remote_turn(
+    state: &Arc<AppState>,
+    session_id: &str,
+    session: &Session,
+    backend: &str,
+    client_id: &str,
+    user_id: &str,
+    work_dir: &str,
+    user_text: &str,
+    prompt: &str,
+    cancel_token: CancellationToken,
+) -> Result<()> {
+    let run_id = Uuid::new_v4().to_string();
+    emit(
+        state,
+        session_id,
+        AgentEvent::RunStarted {
+            run_id: run_id.clone(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            cwd: Some(work_dir.to_string()),
+            model: format!("{backend}@hank-cli"),
+            permission_mode: "client-workspace".to_string(),
+            tools: vec![backend.to_string()],
+        },
+    )
+    .await;
+
+    let parent_id = session.active_leaf_id.as_deref();
+    let user_content = serde_json::json!([{"type":"text","text":user_text}]);
+    let user_message_id = state
+        .db
+        .save_message(
+            session_id,
+            "user",
+            &user_content,
+            chrono::Utc::now(),
+            parent_id,
+        )
+        .await
+        .context("保存本机 Agent 用户消息")?;
+    state
+        .db
+        .update_active_leaf(session_id, &user_message_id)
+        .await
+        .context("更新本机 Agent 用户消息游标")?;
+    if session.title.trim().is_empty() {
+        let title: String = user_text.chars().take(50).collect();
+        let _ = state.db.update_session_title(session_id, &title).await;
+    }
+
+    let metadata = parse_metadata(session.metadata.as_deref());
+    let previous_thread = metadata["agent_thread_id"].as_str();
+    let input = serde_json::json!({
+        "backend": backend,
+        "prompt": prompt,
+        "cwd": work_dir,
+        "thread_id": previous_thread,
+        "model": serde_json::Value::Null,
+    });
+    let mut remote = crate::remote_exec::start_agent_run(state, user_id, client_id, input).await?;
+    let remote_request_id = remote.request_id.clone();
+    let deadline = tokio::time::sleep(Duration::from_secs(
+        state.config.server_agent.agent_timeout_secs,
+    ));
+    tokio::pin!(deadline);
+    let mut run_state = CliRunState::default();
+    let auth = CliAuth::default();
+    let mut terminal = Terminal::Completed;
+    let mut tool_result = None;
+
+    loop {
+        tokio::select! {
+            _ = cancel_token.cancelled() => {
+                terminal = Terminal::Cancelled;
+                if let Err(error) = crate::remote_exec::cancel_agent_run(
+                    state,
+                    user_id,
+                    client_id,
+                    &remote_request_id,
+                ).await {
+                    tracing::warn!(session_id, client_id, "取消本机 Agent 失败: {error:#}");
+                }
+                break;
+            }
+            _ = &mut deadline => {
+                terminal = Terminal::TimedOut;
+                let _ = crate::remote_exec::cancel_agent_run(
+                    state,
+                    user_id,
+                    client_id,
+                    &remote_request_id,
+                ).await;
+                break;
+            }
+            event = remote.event_rx.recv() => {
+                if let Some(event) = event {
+                    handle_remote_event(state, session_id, backend, &auth, event, &mut run_state).await;
+                }
+            }
+            result = &mut remote.result_rx => {
+                tool_result = Some(result.map_err(|_| anyhow!("hank-cli 结果通道中断"))?);
+                break;
+            }
+        }
+    }
+    // hank-cli 会在所有逐行事件上报完成后才回传 tool-result；当两类通道同时
+    // ready 时，先收到终态也必须消费已入队事件，避免漏掉 thread_id/model。
+    while let Ok(event) = remote.event_rx.try_recv() {
+        handle_remote_event(state, session_id, backend, &auth, event, &mut run_state).await;
+    }
+    crate::remote_exec::cleanup_agent_run(state, user_id, &remote_request_id).await;
+
+    let parsed = tool_result
+        .as_ref()
+        .and_then(|result| serde_json::from_str::<RemoteAgentResult>(&result.content).ok());
+    if terminal == Terminal::Completed
+        && parsed.as_ref().is_some_and(|result| result.output_limited)
+    {
+        terminal = Terminal::OutputLimit;
+    }
+    if run_state.final_text.trim().is_empty() {
+        if let Some(parsed) = parsed.as_ref() {
+            run_state.final_text = extract_final_text(&parsed.stdout);
+        }
+    }
+    if let Some(thread_id) = run_state.thread_id.as_deref() {
+        persist_thread_id(state, session_id, thread_id).await?;
+    }
+    let resolved_model = run_state.model.clone().unwrap_or_default();
+    if session.provider != backend || session.model != resolved_model {
+        if let Err(error) = state
+            .db
+            .update_session_provider_model(session_id, backend, &resolved_model)
+            .await
+        {
+            tracing::warn!(
+                session_id,
+                backend,
+                "回写本机 Agent provider/model 失败: {error:#}"
+            );
+        }
+    }
+
+    let remote_failed = tool_result.as_ref().is_some_and(|result| result.is_error)
+        || parsed.as_ref().is_some_and(|result| {
+            result.cancelled || result.exit_code.is_some_and(|code| code != 0)
+        });
+    match terminal {
+        Terminal::Cancelled => {
+            emit(
+                state,
+                session_id,
+                AgentEvent::RunCancelled {
+                    run_id,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    file_changes: file_changes(&run_state),
+                    permission_denials: vec![],
+                },
+            )
+            .await;
+        }
+        Terminal::TimedOut => {
+            emit_failed(state, session_id, &run_id, "本机 Agent 执行超时").await;
+        }
+        Terminal::OutputLimit => {
+            emit_failed(state, session_id, &run_id, "本机 Agent 输出超过安全上限").await;
+        }
+        Terminal::Completed if !remote_failed && run_state.failed_message.is_none() => {
+            let final_text = if run_state.final_text.trim().is_empty() {
+                "任务已完成，本机 Agent 未返回文本摘要。".to_string()
+            } else {
+                run_state.final_text.trim().to_string()
+            };
+            let assistant_content = serde_json::json!([{"type":"text","text":final_text}]);
+            let assistant_id = state
+                .db
+                .save_message(
+                    session_id,
+                    "assistant",
+                    &assistant_content,
+                    chrono::Utc::now(),
+                    Some(&user_message_id),
+                )
+                .await?;
+            state
+                .db
+                .update_active_leaf(session_id, &assistant_id)
+                .await?;
+            emit(
+                state,
+                session_id,
+                AgentEvent::Metrics {
+                    input_tokens: run_state.input_tokens,
+                    output_tokens: run_state.output_tokens,
+                    latency_ms: 0,
+                    model: if resolved_model.is_empty() {
+                        backend.to_string()
+                    } else {
+                        resolved_model
+                    },
+                    provider: backend.to_string(),
+                    phase: Some("remote_cli".to_string()),
+                },
+            )
+            .await;
+            emit(
+                state,
+                session_id,
+                AgentEvent::RunCompleted {
+                    run_id,
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    status: RunStatus::Success,
+                    input_tokens: run_state.input_tokens,
+                    output_tokens: run_state.output_tokens,
+                    summary: final_text,
+                    permission_denials: vec![],
+                    file_changes: file_changes(&run_state),
+                },
+            )
+            .await;
+        }
+        Terminal::Completed => {
+            let message = run_state
+                .failed_message
+                .filter(|message| !message.trim().is_empty())
+                .or_else(|| {
+                    parsed.as_ref().and_then(|result| {
+                        let stderr = result.stderr.trim();
+                        (!stderr.is_empty()).then(|| stderr.to_string())
+                    })
+                })
+                .or_else(|| {
+                    parsed.is_none().then(|| {
+                        tool_result
+                            .as_ref()
+                            .map(|result| result.content.trim().to_string())
+                            .unwrap_or_default()
+                    })
+                })
+                .filter(|message| !message.is_empty())
+                .unwrap_or_else(|| {
+                    parsed
+                        .as_ref()
+                        .and_then(|result| result.exit_code)
+                        .map(|code| format!("本机 {backend} 异常退出，状态码 {code}"))
+                        .unwrap_or_else(|| format!("本机 {backend} 执行失败"))
+                });
+            emit_failed(state, session_id, &run_id, &truncate(&message, 4000)).await;
+        }
+    }
+    if let Err(error) = state.db.touch_session(session_id).await {
+        tracing::warn!(session_id, "touch remote cli session failed: {error:#}");
+    }
+    emit(state, session_id, AgentEvent::TurnComplete).await;
+    Ok(())
+}
+
+async fn handle_remote_event(
+    state: &Arc<AppState>,
+    session_id: &str,
+    backend: &str,
+    auth: &CliAuth,
+    event: serde_json::Value,
+    run_state: &mut CliRunState,
+) {
+    let Some(line) = event["line"].as_str() else {
+        return;
+    };
+    let stream = event["stream"].as_str().unwrap_or("stdout");
+    if stream != "stderr" {
+        handle_json_line(state, session_id, backend, auth, line, run_state).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -693,7 +1083,7 @@ async fn execute_turn(
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Terminal {
     Completed,
     Cancelled,
@@ -951,10 +1341,160 @@ async fn handle_json_line(
         );
         return;
     };
-    if backend == "codex" {
-        handle_codex_event(state, session_id, auth, &value, run).await;
+    match backend {
+        "codex" => handle_codex_event(state, session_id, auth, &value, run).await,
+        "claude" | "grok" => handle_claude_event(state, session_id, auth, &value, run).await,
+        "kimi" => handle_generic_event(state, session_id, auth, &value, run).await,
+        _ => {}
+    }
+}
+
+async fn handle_generic_event(
+    state: &Arc<AppState>,
+    session_id: &str,
+    auth: &CliAuth,
+    value: &serde_json::Value,
+    run: &mut CliRunState,
+) {
+    if let Some(thread_id) = value["session_id"]
+        .as_str()
+        .or_else(|| value["thread_id"].as_str())
+        .or_else(|| value["message"]["session_id"].as_str())
+    {
+        if run.thread_id.as_deref() != Some(thread_id) {
+            run.thread_id = Some(thread_id.to_string());
+            let _ = persist_thread_id(state, session_id, thread_id).await;
+        }
+    }
+    if run.model.is_none() {
+        run.model = value["model"]
+            .as_str()
+            .or_else(|| value["message"]["model"].as_str())
+            .map(ToOwned::to_owned);
+    }
+    collect_paths(value, &mut run.changed_files);
+
+    let event_type = value["type"].as_str().unwrap_or_default();
+    if matches!(event_type, "result" | "final" | "agent_result") {
+        if let Some(text) = value["result"]
+            .as_str()
+            .or_else(|| value["text"].as_str())
+            .or_else(|| value["content"].as_str())
+        {
+            run.final_text = text.to_string();
+        }
+    }
+    if matches!(event_type, "assistant" | "message" | "assistant_message") {
+        let text = content_text_from_json(&value["message"]["content"])
+            .or_else(|| content_text_from_json(&value["content"]));
+        if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+            run.final_text = text;
+        }
+    }
+    if matches!(event_type, "content_block_delta" | "stream_event") {
+        if let Some(text) = value["delta"]["text"]
+            .as_str()
+            .or_else(|| value["event"]["delta"]["text"].as_str())
+            .or_else(|| value["text"].as_str())
+        {
+            run.final_text.push_str(text);
+        }
+    }
+
+    let tool = if event_type == "content_block_start" {
+        Some(&value["content_block"])
+    } else if value["tool_use"].is_object() {
+        Some(&value["tool_use"])
     } else {
-        handle_claude_event(state, session_id, auth, &value, run).await;
+        None
+    };
+    if let Some(tool) = tool.filter(|tool| tool["type"].as_str() == Some("tool_use")) {
+        emit(
+            state,
+            session_id,
+            AgentEvent::ToolStart {
+                id: tool["id"].as_str().unwrap_or("remote-tool").to_string(),
+                name: tool["name"].as_str().unwrap_or("remote_tool").to_string(),
+                input: truncate(&redact_secrets(&tool["input"].to_string(), auth), 2000),
+                run_id: None,
+                turn_id: None,
+                call_id: None,
+                risk: None,
+                timeout_ms: None,
+            },
+        )
+        .await;
+    }
+
+    let usage = if value["usage"].is_object() {
+        &value["usage"]
+    } else {
+        &value["message"]["usage"]
+    };
+    run.input_tokens = run.input_tokens.max(as_u32(&usage["input_tokens"]));
+    run.output_tokens = run.output_tokens.max(as_u32(&usage["output_tokens"]));
+    if event_type.contains("error") || value["is_error"].as_bool() == Some(true) {
+        run.failed_message = value["error"]["message"]
+            .as_str()
+            .or_else(|| value["message"].as_str())
+            .or_else(|| value["result"].as_str())
+            .map(ToOwned::to_owned);
+    }
+}
+
+fn content_text_from_json(value: &serde_json::Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    let blocks = value.as_array()?;
+    let text = blocks
+        .iter()
+        .filter_map(|block| {
+            if block["type"].as_str().is_some_and(|kind| kind == "text") {
+                block["text"].as_str()
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    (!text.is_empty()).then_some(text)
+}
+
+fn extract_final_text(output: &str) -> String {
+    let mut complete = String::new();
+    let mut deltas = String::new();
+    let mut plain = String::new();
+    for line in output.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            if !line.trim().is_empty() {
+                plain = line.trim().to_string();
+            }
+            continue;
+        };
+        if let Some(text) = value["result"].as_str().or_else(|| value["final"].as_str()) {
+            complete = text.to_string();
+        }
+        if let Some(text) = content_text_from_json(&value["message"]["content"])
+            .or_else(|| content_text_from_json(&value["content"]))
+        {
+            complete = text;
+        }
+        if let Some(text) = value["delta"]["text"]
+            .as_str()
+            .or_else(|| value["event"]["delta"]["text"].as_str())
+        {
+            deltas.push_str(text);
+        }
+    }
+    if complete.trim().is_empty() {
+        if deltas.trim().is_empty() {
+            plain
+        } else {
+            deltas
+        }
+    } else {
+        complete
     }
 }
 
@@ -1470,6 +2010,15 @@ fn agent_prompt(user_text: &str, agent_kind: &str) -> String {
     prompt
 }
 
+fn local_agent_prompt(user_text: &str, agent_kind: &str) -> String {
+    let mut prompt = user_text.to_string();
+    prompt.push_str("\n\n运行约束：只操作 hank-cli 提供的当前工作目录及其子目录；遵循目录中的 AGENTS.md/CLAUDE.md 等项目规则；不要读取或修改凭据、密钥或本机 Agent 认证配置。完成后用中文给出结果和验证情况。");
+    if agent_kind == "quant_code" {
+        prompt.push_str("修改 quant 前必须读取 quant/AGENTS.md，并遵守禁止交易能力的产品边界。");
+    }
+    prompt
+}
+
 fn parse_metadata(raw: Option<&str>) -> serde_json::Value {
     raw.and_then(|value| serde_json::from_str(value).ok())
         .unwrap_or_else(|| serde_json::json!({}))
@@ -1754,6 +2303,21 @@ mod tests {
         state.final_text = item["item"]["text"].as_str().unwrap().to_string();
         assert_eq!(state.thread_id.as_deref(), Some("thread-1"));
         assert_eq!(state.final_text, "完成");
+    }
+
+    #[test]
+    fn generic_streaming_output_extracts_final_text() {
+        let grok = concat!(
+            "{\"type\":\"content_block_delta\",\"delta\":{\"text\":\"已\"}}\n",
+            "{\"type\":\"content_block_delta\",\"delta\":{\"text\":\"完成\"}}\n"
+        );
+        assert_eq!(extract_final_text(grok), "已完成");
+
+        let kimi = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"处理中\"}]}}\n",
+            "{\"type\":\"result\",\"result\":\"处理完成\"}\n"
+        );
+        assert_eq!(extract_final_text(kimi), "处理完成");
     }
 
     #[test]

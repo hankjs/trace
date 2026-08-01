@@ -21,7 +21,7 @@ use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 /// 长轮询单次挂起时长
 const POLL_TIMEOUT: Duration = Duration::from_secs(25);
@@ -59,6 +59,17 @@ pub struct UserHub {
     pub inflight: HashMap<String, oneshot::Sender<ToolCallResult>>,
     /// 每个 client 最近一次 poll 的时间（在线判定依据）
     pub last_polls: HashMap<String, Instant>,
+    /// client 注册时上报的本机 Agent CLI 能力。
+    pub agent_backends: HashMap<String, Vec<String>>,
+    /// Agent JSONL 流（request_id → server 消费通道）。
+    pub agent_events: HashMap<String, mpsc::Sender<Value>>,
+}
+
+/// 已下发到 hank-cli、等待事件与终态的 Agent 任务。
+pub struct RemoteAgentRun {
+    pub request_id: String,
+    pub event_rx: mpsc::Receiver<Value>,
+    pub result_rx: oneshot::Receiver<ToolCallResult>,
 }
 
 impl UserHub {
@@ -125,6 +136,71 @@ pub async fn dispatch_tool_call(
     }
 }
 
+/// 下发长时 Agent 任务。与普通工具不同，stdout/stderr 会通过 agent-event 独立流式回传。
+pub async fn start_agent_run(
+    state: &AppState,
+    user_id: &str,
+    client_id: &str,
+    input: Value,
+) -> Result<RemoteAgentRun> {
+    if !is_client_online(state, user_id, client_id).await {
+        return Err(anyhow!("hank-cli 节点不在线"));
+    }
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let (result_tx, result_rx) = oneshot::channel();
+    let (event_tx, event_rx) = mpsc::channel(256);
+    {
+        let mut hubs = state.client_hubs.write().await;
+        let hub = hubs.entry(user_id.to_string()).or_default();
+        hub.pending.push_back(ToolCallRequest {
+            request_id: request_id.clone(),
+            client_id: client_id.to_string(),
+            tool: "agent_run".to_string(),
+            input,
+        });
+        hub.inflight.insert(request_id.clone(), result_tx);
+        hub.agent_events.insert(request_id.clone(), event_tx);
+        hub.notify.notify_one();
+    }
+    Ok(RemoteAgentRun {
+        request_id,
+        event_rx,
+        result_rx,
+    })
+}
+
+/// 释放 Agent 任务的 server 侧通道。迟到事件会被 HTTP handler 拒绝，不会串到其他任务。
+pub async fn cleanup_agent_run(state: &AppState, user_id: &str, request_id: &str) {
+    let mut hubs = state.client_hubs.write().await;
+    if let Some(hub) = hubs.get_mut(user_id) {
+        hub.inflight.remove(request_id);
+        hub.agent_events.remove(request_id);
+    }
+}
+
+/// 通知 hank-cli 终止指定 Agent 进程组。
+pub async fn cancel_agent_run(
+    state: &AppState,
+    user_id: &str,
+    client_id: &str,
+    request_id: &str,
+) -> Result<()> {
+    let result = dispatch_tool_call(
+        state,
+        user_id,
+        client_id,
+        "agent_cancel",
+        serde_json::json!({ "request_id": request_id }),
+        Duration::from_secs(8),
+    )
+    .await?;
+    if result.is_error {
+        Err(anyhow!(result.content))
+    } else {
+        Ok(())
+    }
+}
+
 /// 指定 client 是否在线（60s 内有 poll）
 pub async fn is_client_online(state: &AppState, user_id: &str, client_id: &str) -> bool {
     let hubs = state.client_hubs.read().await;
@@ -150,6 +226,33 @@ pub async fn pick_online_client(state: &AppState, user_id: &str) -> Option<Clien
         .map(|(_, c)| c)
 }
 
+/// 挑选一台在线、允许远程执行且明确上报了目标 Agent CLI 的 hank-cli 节点。
+pub async fn pick_online_agent_client(
+    state: &AppState,
+    user_id: &str,
+    backend: &str,
+) -> Option<ClientAgent> {
+    let candidates = state.db.list_client_agents(user_id).await.ok()?;
+    let hubs = state.client_hubs.read().await;
+    let hub = hubs.get(user_id)?;
+    candidates
+        .into_iter()
+        .filter(|client| client.accept_remote && client.work_dir.is_some())
+        .filter(|client| {
+            hub.agent_backends
+                .get(&client.id)
+                .is_some_and(|values| values.iter().any(|value| value == backend))
+        })
+        .filter_map(|client| {
+            hub.last_polls
+                .get(&client.id)
+                .filter(|seen| seen.elapsed() < ONLINE_WINDOW)
+                .map(|seen| (*seen, client))
+        })
+        .max_by_key(|(seen, _)| *seen)
+        .map(|(_, client)| client)
+}
+
 // ─── HTTP 路由（client JWT protected 组）────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -158,6 +261,8 @@ pub struct RegistrationRequest {
     pub hostname: Option<String>,
     pub work_dir: Option<String>,
     pub accept_remote: bool,
+    #[serde(default)]
+    pub agent_backends: Vec<String>,
 }
 
 pub async fn register_client(
@@ -168,7 +273,8 @@ pub async fn register_client(
     if body.client_id.trim().is_empty() {
         return R::bad_request("client_id is required");
     }
-    match state
+    let agent_backends = sanitize_agent_backends(body.agent_backends);
+    let result = state
         .db
         .upsert_client_agent(
             &body.client_id,
@@ -177,11 +283,34 @@ pub async fn register_client(
             body.work_dir.as_deref(),
             body.accept_remote,
         )
-        .await
-    {
-        Ok(()) => R::ok(serde_json::json!({"client_id": body.client_id})),
+        .await;
+    match result {
+        Ok(()) => {
+            let mut hubs = state.client_hubs.write().await;
+            hubs
+                .entry(claims.sub)
+                .or_default()
+                .agent_backends
+                .insert(body.client_id.clone(), agent_backends.clone());
+            R::ok(serde_json::json!({
+                "client_id": body.client_id,
+                "agent_backends": agent_backends,
+            }))
+        }
         Err(e) => R::internal_error(e),
     }
+}
+
+fn sanitize_agent_backends(backends: Vec<String>) -> Vec<String> {
+    const ALLOWED: [&str; 4] = ["codex", "claude", "grok", "kimi"];
+    let mut clean = Vec::new();
+    for backend in backends {
+        let backend = backend.trim().to_ascii_lowercase();
+        if ALLOWED.contains(&backend.as_str()) && !clean.contains(&backend) {
+            clean.push(backend);
+        }
+    }
+    clean
 }
 
 // ─── 终端通知上报 ────────────────────────────────────────────────────────────
@@ -235,6 +364,7 @@ pub async fn post_notification(
 #[derive(Deserialize)]
 pub struct PollQuery {
     pub client_id: String,
+    pub agent_backends: Option<String>,
 }
 
 /// 长轮询：挂起最长 25s 等待该 client 的待执行请求，超时返回空列表。
@@ -255,6 +385,14 @@ pub async fn poll_requests(
         let (notify, requests) = {
             let mut hubs = state.client_hubs.write().await;
             let hub = hubs.entry(user_id.clone()).or_default();
+            if let Some(backends) = query.agent_backends.as_deref() {
+                hub.agent_backends.insert(
+                    client_id.clone(),
+                    sanitize_agent_backends(
+                        backends.split(',').map(str::to_string).collect(),
+                    ),
+                );
+            }
             let requests = hub.drain_for(&client_id);
             (hub.notify_handle(), requests)
         };
@@ -275,6 +413,38 @@ pub struct ToolResultRequest {
     pub request_id: String,
     pub content: String,
     pub is_error: bool,
+}
+
+#[derive(Deserialize)]
+pub struct AgentEventRequest {
+    pub request_id: String,
+    pub event: Value,
+}
+
+/// hank-cli 在本机 Agent 运行期间逐行上报 stdout/stderr。
+pub async fn post_agent_event(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    Json(body): Json<AgentEventRequest>,
+) -> impl IntoResponse {
+    let sender = {
+        let hubs = state.client_hubs.read().await;
+        hubs.get(&claims.sub)
+            .and_then(|hub| hub.agent_events.get(&body.request_id))
+            .cloned()
+    };
+    match sender {
+        Some(tx) => match tx.try_send(body.event) {
+            Ok(()) => R::ok(serde_json::json!({"request_id": body.request_id})),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                R::bad_request("agent event buffer is full")
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                R::bad_request("agent event receiver closed")
+            }
+        },
+        None => R::bad_request(format!("unknown agent request_id: {}", body.request_id)),
+    }
 }
 
 pub async fn post_tool_result(
@@ -320,10 +490,29 @@ pub async fn list_online(
                 "work_dir": c.work_dir,
                 "accept_remote": c.accept_remote,
                 "online": hub.is_online(&c.id),
+                "agent_backends": hub.agent_backends.get(&c.id).cloned().unwrap_or_default(),
             })
         })
         .collect();
     R::ok(serde_json::json!({ "clients": list }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_backends_are_allowlisted_and_deduplicated() {
+        assert_eq!(
+            sanitize_agent_backends(vec![
+                " Codex ".to_string(),
+                "codex".to_string(),
+                "KIMI".to_string(),
+                "shell".to_string(),
+            ]),
+            vec!["codex", "kimi"]
+        );
+    }
 }
 
 #[derive(Deserialize)]

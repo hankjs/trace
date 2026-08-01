@@ -138,6 +138,7 @@ impl ApiClient {
         client_id: &str,
         hostname: Option<&str>,
         work_dir: Option<&str>,
+        agent_backends: &[String],
     ) -> Result<(), String> {
         let res = self
             .authed(
@@ -149,6 +150,7 @@ impl ApiClient {
                     "hostname": hostname,
                     "work_dir": work_dir,
                     "accept_remote": true,
+                    "agent_backends": agent_backends,
                 })),
             )
             .await?;
@@ -158,14 +160,42 @@ impl ApiClient {
         Ok(())
     }
 
+    /// POST /api/client/agent-event：流式上报本机 Agent 的一行 stdout/stderr。
+    pub async fn post_agent_event(
+        &self,
+        request_id: &str,
+        event: &serde_json::Value,
+    ) -> Result<(), String> {
+        let res = self
+            .authed(
+                reqwest::Method::POST,
+                "/api/client/agent-event",
+                None::<&[(&str, &str)]>,
+                Some(&serde_json::json!({
+                    "request_id": request_id,
+                    "event": event,
+                })),
+            )
+            .await?;
+        let status = res.status();
+        let body = res.text().await.map_err(|e| e.to_string())?;
+        Self::parse_envelope(&body)
+            .map_err(|e| format!("agent-event 失败（{status}）: {e}"))?;
+        Ok(())
+    }
+
     /// GET /api/client/poll：长轮询待执行请求（server 挂起最长 25s）
-    pub async fn poll(&self, client_id: &str) -> PollOutcome {
+    pub async fn poll(&self, client_id: &str, agent_backends: &[String]) -> PollOutcome {
         let token = self.token.read().await.clone();
+        let agent_backends = agent_backends.join(",");
         let res = self
             .http
             .get(format!("{}/api/client/poll", self.server))
             .bearer_auth(token)
-            .query(&[("client_id", client_id)])
+            .query(&[
+                ("client_id", client_id),
+                ("agent_backends", agent_backends.as_str()),
+            ])
             .timeout(POLL_TIMEOUT)
             .send()
             .await;
