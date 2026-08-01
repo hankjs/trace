@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import AgentTracePanel from '../components/AgentTracePanel.vue'
 import { api, type AgentEventRecord, type ChannelConversation, type ChannelMessage } from '../composables/api'
+import { backendSummary, backendTone } from '../utils/agentBackend'
 
 const conversations = ref<ChannelConversation[]>([])
 const selected = ref<ChannelConversation | null>(null)
@@ -219,6 +220,9 @@ onMounted(loadConversations)
               <span class="truncate">{{ topicLabel(item) }} · {{ item.account_name }}</span>
               <span class="shrink-0">{{ formatTime(item.last_message_at) }}</span>
             </div>
+            <div v-if="item.session_id" class="mt-1 text-[11px]" :class="backendTone(item.agent_provider)">
+              {{ backendSummary(item.agent_provider, item.agent_model) }}
+            </div>
             <p class="mt-1 truncate text-xs text-text-secondary">{{ item.last_content || '—' }}</p>
           </button>
         </div>
@@ -236,6 +240,9 @@ onMounted(loadConversations)
               <div class="min-w-0">
                 <h2 class="truncate text-[13px] font-semibold text-text-primary">{{ conversationLabel(selected) }}</h2>
                 <p class="mt-1 truncate font-mono text-[11px] text-text-tertiary">{{ selected.conversation_id }} · {{ topicLabel(selected) }}</p>
+                <p v-if="selected.session_id" class="mt-1 truncate text-[11px]" :class="backendTone(selected.agent_provider)">
+                  执行后端：{{ backendSummary(selected.agent_provider, selected.agent_model) }}
+                </p>
               </div>
               <div class="flex shrink-0 items-center gap-2">
                 <div class="flex h-7 items-center rounded border border-border-subtle bg-surface" role="tablist" aria-label="记录视图">

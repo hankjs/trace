@@ -224,6 +224,20 @@ pub async fn run_chat_turn(
         None => provider_registry::resolve_default_model(first_record),
     };
 
+    // 渠道会话（飞书 / 微信）建表时不知道会落到哪个 provider，这里把实际解析结果回写，
+    // admin 才能看出这轮是 native 的哪个 provider/model 在跑。
+    if let Some(session) = session_record.as_ref() {
+        if session.provider != first_record.name || session.model != model {
+            if let Err(error) = state
+                .db
+                .update_session_provider_model(&session_id, &first_record.name, &model)
+                .await
+            {
+                tracing::warn!(session_id = %session_id, "回写会话 provider/model 失败: {error:#}");
+            }
+        }
+    }
+
     let work_dir = session_record.as_ref().and_then(|s| s.work_dir.clone());
     let work_dir_for_checkpoint = work_dir.clone();
     let work_dir_for_agent = work_dir.clone();

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
 import { api, type Session, type PaginatedResponse } from '../composables/api'
+import { backendLabel, backendTone } from '../utils/agentBackend'
 
 const sessions = ref<Session[]>([])
 const total = ref(0)
@@ -46,8 +47,8 @@ watch([page, search], load)
       >
         <RouterLink :to="`/sessions/${s.id}`" class="text-[13px] text-text-primary truncate hover:text-accent transition-colors">{{ s.title || s.id.slice(0, 8) }}</RouterLink>
         <span class="text-[12px] text-text-tertiary truncate">{{ s.username || '-' }}</span>
-        <span class="text-[12px] text-text-tertiary">{{ s.provider }}</span>
-        <span class="text-[12px] text-text-tertiary truncate">{{ s.model }}</span>
+        <span class="text-[12px] truncate" :class="backendTone(s.provider)" :title="s.provider || '未记录'">{{ backendLabel(s.provider) }}</span>
+        <span class="text-[12px] text-text-tertiary truncate" :title="s.model">{{ s.model || '-' }}</span>
         <span class="text-[12px] text-text-tertiary text-right">{{ new Date(s.updated_at).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }) }}</span>
         <RouterLink :to="`/sessions/${s.id}/timeline`" class="text-[11px] text-accent hover:text-accent-hover transition-colors text-right" @click.stop>Timeline</RouterLink>
       </div>

@@ -206,6 +206,10 @@ pub struct ChannelConversation {
     pub last_direction: String,
     pub last_message_type: String,
     pub last_content: String,
+    /// 该会话实际执行的后端（codex / claude / native provider 名），取自 sessions.provider。
+    pub agent_provider: Option<String>,
+    /// 实际使用的模型名，取自 sessions.model；旧会话没有记录时为空。
+    pub agent_model: Option<String>,
 }
 
 /// 定时任务执行记录（job_runs 表，镜像 quant_job_run 模型）
@@ -1192,6 +1196,20 @@ impl Database {
         .execute(&pool)
         .await;
 
+        // 旧飞书会话建表时 provider/model 写的是空串，实际后端只存在
+        // metadata.agent_backend 里，admin 列表因此分不出 codex / claude。
+        // 这里按 metadata 回填 provider；model 无从追溯，留空由前端回退展示。
+        for backend in ["codex", "claude"] {
+            let _ = sqlx::query(
+                "UPDATE sessions SET provider = ? \
+                 WHERE provider = '' AND metadata LIKE ?",
+            )
+            .bind(backend)
+            .bind(format!("%\"agent_backend\":\"{backend}\"%"))
+            .execute(&pool)
+            .await;
+        }
+
         Ok(Self { pool })
     }
 
@@ -1311,6 +1329,26 @@ impl Database {
                 .bind(work_dir)
                 .bind(id)
                 .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 回写会话实际使用的 provider 与 model。外部 CLI Agent（codex / claude）建会话时
+    /// 还不知道 CLI 最终选用哪个模型，首轮拿到模型名后用这个方法补上，admin 才能区分后端。
+    pub async fn update_session_provider_model(
+        &self,
+        id: &str,
+        provider: &str,
+        model: &str,
+    ) -> Result<()> {
+        db_retry!(
+            sqlx::query(
+                "UPDATE sessions SET provider = ?, model = ?, updated_at = NOW() WHERE id = ?"
+            )
+            .bind(provider)
+            .bind(model)
+            .bind(id)
+            .execute(&self.pool)
         )?;
         Ok(())
     }
@@ -3782,7 +3820,9 @@ impl Database {
                     g.message_count, g.first_message_at, g.last_message_at,
                     (SELECT m.direction FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_direction,
                     (SELECT m.message_type FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_message_type,
-                    (SELECT m.content FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_content
+                    (SELECT m.content FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS last_content,
+                    (SELECT s.provider FROM sessions s WHERE s.id = (SELECT m.session_id FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id AND m.session_id IS NOT NULL ORDER BY m.created_at DESC, m.id DESC LIMIT 1)) AS agent_provider,
+                    (SELECT s.model FROM sessions s WHERE s.id = (SELECT m.session_id FROM channel_messages m WHERE m.channel = g.channel AND m.account_id = g.account_id AND m.conversation_id = g.conversation_id AND m.topic_id = g.topic_id AND m.session_id IS NOT NULL ORDER BY m.created_at DESC, m.id DESC LIMIT 1)) AS agent_model
                  FROM (
                     SELECT channel, account_id, conversation_id, topic_id,
                         COUNT(*) AS message_count, MIN(created_at) AS first_message_at, MAX(created_at) AS last_message_at

@@ -37,6 +37,9 @@ struct CliRunState {
     thread_id: Option<String>,
     changed_files: HashSet<String>,
     failed_message: Option<String>,
+    /// CLI 自报的实际模型名。第三方端点下由 CLI 决定默认模型，环境变量里不一定有，
+    /// 只能从流式事件里拿；用于回写 sessions.model 让 admin 能看出跑的是哪个模型。
+    model: Option<String>,
 }
 
 #[derive(Default)]
@@ -164,6 +167,12 @@ async fn execute_turn(
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let run_id = Uuid::new_v4().to_string();
+    // 已知模型名时优先展示 "claude/claude-opus-4-6" 这种形式，让 trace 里能看出后端和模型；
+    // 未显式配置模型时只能先报后端名，等 CLI 首个事件自报模型后再回写 sessions.model。
+    let display_model = match auth.model.as_deref() {
+        Some(model) => format!("{backend}/{model}"),
+        None => backend.to_string(),
+    };
     emit(
         state,
         session_id,
@@ -171,7 +180,7 @@ async fn execute_turn(
             run_id: run_id.clone(),
             timestamp: chrono::Utc::now().to_rfc3339(),
             cwd: Some(work_dir.display().to_string()),
-            model: backend.to_string(),
+            model: display_model,
             permission_mode: "external-bwrap".to_string(),
             tools: vec![backend.to_string()],
         },
@@ -289,6 +298,23 @@ async fn execute_turn(
         .and_then(|read| read.ok())
         .unwrap_or_default();
 
+    // 回写实际执行的后端与模型：provider 固定为后端名（codex / claude），model 取 CLI
+    // 自报值，拿不到时退回环境变量里配置的模型。终止方式不影响这次记录。
+    let resolved_model = run_state
+        .model
+        .clone()
+        .or_else(|| auth.model.clone())
+        .unwrap_or_default();
+    if session.provider != backend || session.model != resolved_model {
+        if let Err(error) = state
+            .db
+            .update_session_provider_model(session_id, backend, &resolved_model)
+            .await
+        {
+            tracing::warn!(session_id, backend, "回写外部 Agent provider/model 失败: {error:#}");
+        }
+    }
+
     match terminal {
         Terminal::Cancelled => {
             emit(
@@ -343,7 +369,11 @@ async fn execute_turn(
                     input_tokens: run_state.input_tokens,
                     output_tokens: run_state.output_tokens,
                     latency_ms: 0,
-                    model: backend.to_string(),
+                    model: if resolved_model.is_empty() {
+                        backend.to_string()
+                    } else {
+                        resolved_model.clone()
+                    },
                     provider: backend.to_string(),
                     phase: Some("external_cli".to_string()),
                 },
@@ -626,6 +656,8 @@ async fn handle_codex_event(
                 run.thread_id = Some(thread_id.to_string());
                 let _ = persist_thread_id(state, session_id, thread_id).await;
             }
+            // codex exec --json 的 thread.started 只有 thread_id，不自报模型（已实测确认），
+            // 所以 codex 的模型名只能取 auth.model（来自 agent-cli.env 的 OPENAI_MODEL）。
         }
         "item.started" => {
             let item = &value["item"];
@@ -714,8 +746,17 @@ async fn handle_claude_event(
                 run.thread_id = Some(thread_id.to_string());
                 let _ = persist_thread_id(state, session_id, thread_id).await;
             }
+            // claude --output-format stream-json 的 init 事件带实际模型名。
+            if let Some(model) = value["model"].as_str() {
+                run.model = Some(model.to_string());
+            }
         }
         "assistant" => {
+            if run.model.is_none() {
+                if let Some(model) = value["message"]["model"].as_str() {
+                    run.model = Some(model.to_string());
+                }
+            }
             if let Some(blocks) = value["message"]["content"].as_array() {
                 for block in blocks {
                     if block["type"].as_str() == Some("tool_use") {
@@ -1235,6 +1276,39 @@ fn as_u32(value: &serde_json::Value) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回写 sessions.model 时优先用 CLI 自报的模型名（claude 的 init 事件带 model），
+    /// 拿不到时退回 agent-cli.env 里配置的模型（codex 只有这一个来源）。
+    #[test]
+    fn resolved_model_prefers_cli_reported_over_env() {
+        fn resolve(reported: Option<&str>, configured: Option<&str>) -> String {
+            reported
+                .map(ToOwned::to_owned)
+                .or_else(|| configured.map(ToOwned::to_owned))
+                .unwrap_or_default()
+        }
+
+        assert_eq!(
+            resolve(Some("claude-opus-5[1m]"), Some("claude-sonnet-5")),
+            "claude-opus-5[1m]"
+        );
+        assert_eq!(resolve(None, Some("gpt-5.6-sol")), "gpt-5.6-sol");
+        assert_eq!(resolve(None, None), "");
+    }
+
+    #[test]
+    fn claude_init_event_reports_model() {
+        let init = serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": "sess-1",
+            "model": "claude-opus-5[1m]",
+        });
+        assert_eq!(init["model"].as_str(), Some("claude-opus-5[1m]"));
+        // codex 的 thread.started 没有 model 字段，只能靠 auth.model。
+        let codex_started = serde_json::json!({"type":"thread.started","thread_id":"t-1"});
+        assert!(codex_started["model"].as_str().is_none());
+    }
 
     #[test]
     fn codex_thread_and_final_message_are_parsed() {

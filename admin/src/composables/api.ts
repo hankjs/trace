@@ -186,6 +186,10 @@ export interface ChannelConversation {
   last_direction: 'inbound' | 'outbound'
   last_message_type: string
   last_content: string
+  /** 实际执行后端：codex / claude / native provider 名；旧会话为空 */
+  agent_provider: string | null
+  /** 实际使用的模型名；旧会话为空 */
+  agent_model: string | null
 }
 
 export interface ChannelMessage {

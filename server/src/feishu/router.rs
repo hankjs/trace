@@ -1124,7 +1124,9 @@ async fn create_feishu_session(
         let mut session = state
             .db
             .create_session(
-                "",
+                // provider 记录实际执行后端（codex / claude / native），admin 列表据此区分；
+                // model 建会话时还未确定，由 cli_agent 首轮解析出真实模型名后回写。
+                agent_backend,
                 "",
                 None,
                 Some(user_id),
