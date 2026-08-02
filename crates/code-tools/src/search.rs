@@ -116,7 +116,11 @@ impl Tool for SearchTool {
 
                 let lines: Vec<&str> = stdout.lines().collect();
                 let total = lines.len();
-                let display: String = lines.into_iter().take(MAX_RESULTS).collect::<Vec<_>>().join("\n");
+                let display: String = lines
+                    .into_iter()
+                    .take(MAX_RESULTS)
+                    .collect::<Vec<_>>()
+                    .join("\n");
 
                 let summary = if total > MAX_RESULTS {
                     format!("{display}\n\n... ({total} matches, showing first {MAX_RESULTS})")
@@ -130,7 +134,9 @@ impl Tool for SearchTool {
                 })
             }
             Ok(Err(e)) => Ok(ToolOutput {
-                content: format!("Error running search: {e}. Make sure 'rg' (ripgrep) is installed."),
+                content: format!(
+                    "Error running search: {e}. Make sure 'rg' (ripgrep) is installed."
+                ),
                 is_error: true,
             }),
             Err(_) => Ok(ToolOutput {

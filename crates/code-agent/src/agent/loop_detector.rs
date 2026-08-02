@@ -1,6 +1,6 @@
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use serde_json::Value;
 
 /// warning 阈值：无进展 streak ≥ 5 时注入 nudge（【SA 03】【AF 08】）
 pub const LOOP_WARNING_THRESHOLD: usize = 5;
@@ -165,7 +165,12 @@ mod tests {
     use super::*;
 
     /// 辅助：记录一次调用并回填结果
-    fn record_call(detector: &mut LoopDetector, tool: &str, input: &Value, result: &str) -> LoopLevel {
+    fn record_call(
+        detector: &mut LoopDetector,
+        tool: &str,
+        input: &Value,
+        result: &str,
+    ) -> LoopLevel {
         let level = detector.record_and_check(tool, input);
         detector.record_result(tool, input, result);
         level

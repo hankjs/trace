@@ -5,10 +5,10 @@ use crate::retry::{consume_stream_with_retry, LlmTraceContext};
 use crate::runtime::{RunState, ToolCallContext, ToolRuntime};
 use crate::AgentEvent;
 use anyhow::Result;
+use code_tools::{PermissionGuard, Tool};
 use hank_provider::{
     CompletionRequest, ContentBlock, LlmProvider, Message, Role, StopReason, ToolDefinition,
 };
-use code_tools::{PermissionGuard, Tool};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -252,7 +252,10 @@ impl WorkerAgent {
                     || (continuation_count >= MAX_CONTINUATIONS && small_output_streak >= 2)
                 {
                     // ③ 认栽：发事件告知输出被截断
-                    warn!("Worker MaxTokens recovery exhausted for task {}, output truncated", task.id);
+                    warn!(
+                        "Worker MaxTokens recovery exhausted for task {}, output truncated",
+                        task.id
+                    );
                     let _ = event_tx
                         .send(AgentEvent::Error {
                             message: "Output truncated: the response hit the output token limit repeatedly and could not be completed. The partial output above is kept as-is.".to_string(),
@@ -292,7 +295,7 @@ impl WorkerAgent {
                                 task_id: task.id.clone(),
                                 status: TaskStatus::Failed,
                                 summary: "Cancelled".to_string(),
-                                        file_changes: run_state.file_changes.clone(),
+                                file_changes: run_state.file_changes.clone(),
                                 permission_denials: run_state.permission_denials.clone(),
                             });
                         }
@@ -309,10 +312,7 @@ impl WorkerAgent {
                                 .await;
 
                             if loop_level == LoopLevel::Breaker {
-                                warn!(
-                                    "Worker loop detection: terminating task {}",
-                                    task.id
-                                );
+                                warn!("Worker loop detection: terminating task {}", task.id);
                                 // 终止前给本条 assistant 消息中所有 tool_use 补全
                                 // tool_result（含当前及未执行的），保持配对，避免
                                 // 上层持久化 messages 再恢复时下一轮请求 400
@@ -350,7 +350,10 @@ impl WorkerAgent {
                                 return Ok(TaskResult {
                                     task_id: task.id.clone(),
                                     status: TaskStatus::Failed,
-                                    summary: format!("Loop detected: {}. Task terminated.", pattern),
+                                    summary: format!(
+                                        "Loop detected: {}. Task terminated.",
+                                        pattern
+                                    ),
                                     file_changes: run_state.file_changes.clone(),
                                     permission_denials: run_state.permission_denials.clone(),
                                 });

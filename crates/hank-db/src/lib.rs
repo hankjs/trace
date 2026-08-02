@@ -18,7 +18,13 @@ macro_rules! db_retry {
                 Err(e) if attempts < MAX_RETRIES && is_connection_error(&e) => {
                     attempts += 1;
                     let delay_ms = 200u64 * (1u64 << (attempts - 1)); // 200, 400, 800, 1600ms
-                    tracing::warn!("DB connection error (attempt {}/{}), retrying in {}ms: {}", attempts, MAX_RETRIES, delay_ms, e);
+                    tracing::warn!(
+                        "DB connection error (attempt {}/{}), retrying in {}ms: {}",
+                        attempts,
+                        MAX_RETRIES,
+                        delay_ms,
+                        e
+                    );
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                 }
                 Err(e) => break Err(anyhow::Error::from(e)),
@@ -1195,8 +1201,10 @@ impl Database {
             "ALTER TABLE prompt_templates ADD COLUMN category VARCHAR(32) NOT NULL DEFAULT 'prompt' AFTER content"
         ).execute(&pool).await;
         let _ = sqlx::query(
-            "ALTER TABLE prompt_templates ADD INDEX idx_prompt_templates_category (category)"
-        ).execute(&pool).await;
+            "ALTER TABLE prompt_templates ADD INDEX idx_prompt_templates_category (category)",
+        )
+        .execute(&pool)
+        .await;
         // Add requirement_path and tasks_path to changes if not exists
         let _ = sqlx::query(
             "ALTER TABLE changes ADD COLUMN requirement_path VARCHAR(512) DEFAULT NULL AFTER explore_summary"
@@ -1302,7 +1310,16 @@ impl Database {
     }
 
     // Sessions
-    pub async fn create_session(&self, provider: &str, model: &str, work_dir: Option<&str>, user_id: Option<&str>, environment: Option<&str>, session_type: Option<&str>, metadata: Option<&str>) -> Result<Session> {
+    pub async fn create_session(
+        &self,
+        provider: &str,
+        model: &str,
+        work_dir: Option<&str>,
+        user_id: Option<&str>,
+        environment: Option<&str>,
+        session_type: Option<&str>,
+        metadata: Option<&str>,
+    ) -> Result<Session> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let env = environment.unwrap_or("remote");
@@ -1378,11 +1395,9 @@ impl Database {
     }
 
     pub async fn delete_session(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM sessions WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM sessions WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
@@ -1397,12 +1412,12 @@ impl Database {
     }
 
     pub async fn update_session_work_dir(&self, id: &str, work_dir: Option<&str>) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE sessions SET work_dir = ?, updated_at = NOW() WHERE id = ?")
-                .bind(work_dir)
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET work_dir = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(work_dir)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -1414,29 +1429,32 @@ impl Database {
         provider: &str,
         model: &str,
     ) -> Result<()> {
-        db_retry!(
-            sqlx::query(
-                "UPDATE sessions SET provider = ?, model = ?, updated_at = NOW() WHERE id = ?"
-            )
-            .bind(provider)
-            .bind(model)
-            .bind(id)
-            .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET provider = ?, model = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(provider)
+        .bind(model)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
     pub async fn update_session_metadata(&self, id: &str, metadata: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE sessions SET metadata = ?, updated_at = NOW() WHERE id = ?")
-                .bind(metadata)
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET metadata = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(metadata)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
-    pub async fn update_session_local_agent(&self, id: &str, local_agent: Option<&str>, local_work_dir: Option<&str>) -> Result<()> {
+    pub async fn update_session_local_agent(
+        &self,
+        id: &str,
+        local_agent: Option<&str>,
+        local_work_dir: Option<&str>,
+    ) -> Result<()> {
         db_retry!(
             sqlx::query("UPDATE sessions SET local_agent = ?, local_work_dir = ?, updated_at = NOW() WHERE id = ?")
                 .bind(local_agent)
@@ -1494,7 +1512,11 @@ impl Database {
     }
 
     /// Walk from leaf_id up to root via parent_id, return messages in root-first order.
-    pub async fn get_branch_messages(&self, session_id: &str, leaf_id: &str) -> Result<Vec<DbMessage>> {
+    pub async fn get_branch_messages(
+        &self,
+        session_id: &str,
+        leaf_id: &str,
+    ) -> Result<Vec<DbMessage>> {
         // Load all messages for the session into a map
         let all = self.get_messages(session_id).await?;
         let map: std::collections::HashMap<&str, &DbMessage> =
@@ -1551,19 +1573,19 @@ impl Database {
     }
 
     pub async fn update_active_leaf(&self, session_id: &str, leaf_id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE sessions SET active_leaf_id = ?, updated_at = NOW() WHERE id = ?")
-                .bind(leaf_id)
-                .bind(session_id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET active_leaf_id = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(leaf_id)
+        .bind(session_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
     pub async fn truncate_messages(&self, session_id: &str, keep_count: u32) -> Result<u64> {
         // Get IDs of messages to keep (first N by ordering)
         let kept_ids: Vec<(String,)> = sqlx::query_as(
-            "SELECT id FROM messages WHERE session_id = ? ORDER BY seq ASC, created_at ASC LIMIT ?"
+            "SELECT id FROM messages WHERE session_id = ? ORDER BY seq ASC, created_at ASC LIMIT ?",
         )
         .bind(session_id)
         .bind(keep_count)
@@ -1596,13 +1618,11 @@ impl Database {
 
     // Settings
     pub async fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let row = db_retry!(
-            sqlx::query_as::<_, Setting>(
-                "SELECT `key`, value FROM settings WHERE `key` = ?"
-            )
-            .bind(key)
-            .fetch_optional(&self.pool)
-        )?;
+        let row = db_retry!(sqlx::query_as::<_, Setting>(
+            "SELECT `key`, value FROM settings WHERE `key` = ?"
+        )
+        .bind(key)
+        .fetch_optional(&self.pool))?;
         Ok(row.map(|s| s.value))
     }
 
@@ -1627,7 +1647,8 @@ impl Database {
             "SELECT {} FROM agent_cli_profiles ORDER BY backend, name",
             Self::AGENT_CLI_COLUMNS
         );
-        let rows = db_retry!(sqlx::query_as::<_, AgentCliProfileRecord>(&sql).fetch_all(&self.pool))?;
+        let rows =
+            db_retry!(sqlx::query_as::<_, AgentCliProfileRecord>(&sql).fetch_all(&self.pool))?;
         Ok(rows)
     }
 
@@ -1829,7 +1850,10 @@ impl Database {
         Ok(id)
     }
 
-    pub async fn get_session_tool_executions(&self, session_id: &str) -> Result<Vec<ToolExecution>> {
+    pub async fn get_session_tool_executions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<ToolExecution>> {
         let rows = db_retry!(
             sqlx::query_as::<_, ToolExecution>(
                 "SELECT id, session_id, message_id, tool_name, duration_ms, is_error, created_at FROM tool_executions WHERE session_id = ? ORDER BY created_at ASC"
@@ -1875,25 +1899,29 @@ impl Database {
     }
 
     pub async fn get_last_agent_event_seq(&self, session_id: &str) -> Result<u64> {
-        let row: (Option<u64>,) = db_retry!(
-            sqlx::query_as("SELECT MAX(seq) FROM agent_events WHERE session_id = ?")
-                .bind(session_id)
-                .fetch_one(&self.pool)
-        )?;
+        let row: (Option<u64>,) = db_retry!(sqlx::query_as(
+            "SELECT MAX(seq) FROM agent_events WHERE session_id = ?"
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool))?;
         Ok(row.0.unwrap_or(0))
     }
 
     // Prompt Templates
-    pub async fn save_prompt_template(&self, name: &str, content: &str, category: Option<&str>) -> Result<String> {
+    pub async fn save_prompt_template(
+        &self,
+        name: &str,
+        content: &str,
+        category: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let cat = category.unwrap_or("prompt");
         // Get next version for this name
-        let max_version: Option<(i32,)> = sqlx::query_as(
-            "SELECT COALESCE(MAX(version), 0) FROM prompt_templates WHERE name = ?"
-        )
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
+        let max_version: Option<(i32,)> =
+            sqlx::query_as("SELECT COALESCE(MAX(version), 0) FROM prompt_templates WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
         let version = max_version.map(|r| r.0).unwrap_or(0) + 1;
 
         db_retry!(
@@ -1943,11 +1971,9 @@ impl Database {
     }
 
     pub async fn delete_prompt_template(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM prompt_templates WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM prompt_templates WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
@@ -1984,7 +2010,13 @@ impl Database {
         Ok(rows)
     }
 
-    pub async fn create_user(&self, username: &str, password: &str, can_admin: bool, can_client: bool) -> Result<User> {
+    pub async fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        can_admin: bool,
+        can_client: bool,
+    ) -> Result<User> {
         let id = Uuid::new_v4().to_string();
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)
             .map_err(|e| anyhow::anyhow!("bcrypt error: {}", e))?;
@@ -2001,17 +2033,29 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
         )?;
-        Ok(User { id, username: username.to_string(), password_hash: hash, can_login_admin: can_admin, can_login_client: can_client, created_at: now })
+        Ok(User {
+            id,
+            username: username.to_string(),
+            password_hash: hash,
+            can_login_admin: can_admin,
+            can_login_client: can_client,
+            created_at: now,
+        })
     }
 
-    pub async fn update_user_permissions(&self, id: &str, can_admin: bool, can_client: bool) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE users SET can_login_admin = ?, can_login_client = ? WHERE id = ?")
-                .bind(can_admin)
-                .bind(can_client)
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+    pub async fn update_user_permissions(
+        &self,
+        id: &str,
+        can_admin: bool,
+        can_client: bool,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE users SET can_login_admin = ?, can_login_client = ? WHERE id = ?"
+        )
+        .bind(can_admin)
+        .bind(can_client)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -2028,11 +2072,9 @@ impl Database {
     }
 
     pub async fn delete_user(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM users WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
@@ -2088,10 +2130,16 @@ impl Database {
             .execute(&self.pool)
         )?;
         Ok(ProviderRecord {
-            id, name: name.to_string(), provider_type: provider_type.to_string(),
-            api_key: api_key.to_string(), base_url: base_url.to_string(),
-            default_model: default_model.to_string(), models: models.to_string(),
-            priority, enabled, created_at: now,
+            id,
+            name: name.to_string(),
+            provider_type: provider_type.to_string(),
+            api_key: api_key.to_string(),
+            base_url: base_url.to_string(),
+            default_model: default_model.to_string(),
+            models: models.to_string(),
+            priority,
+            enabled,
+            created_at: now,
         })
     }
 
@@ -2126,11 +2174,9 @@ impl Database {
     }
 
     pub async fn delete_provider(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM providers WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM providers WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
@@ -2146,8 +2192,15 @@ impl Database {
     }
 
     pub async fn create_image_provider(
-        &self, name: &str, provider_type: &str, api_key: &str,
-        base_url: &str, default_model: &str, models: &str, priority: i32, enabled: bool,
+        &self,
+        name: &str,
+        provider_type: &str,
+        api_key: &str,
+        base_url: &str,
+        default_model: &str,
+        models: &str,
+        priority: i32,
+        enabled: bool,
     ) -> Result<ProviderRecord> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
@@ -2160,16 +2213,30 @@ impl Database {
             .execute(&self.pool)
         )?;
         Ok(ProviderRecord {
-            id, name: name.to_string(), provider_type: provider_type.to_string(),
-            api_key: api_key.to_string(), base_url: base_url.to_string(),
-            default_model: default_model.to_string(), models: models.to_string(),
-            priority, enabled, created_at: now,
+            id,
+            name: name.to_string(),
+            provider_type: provider_type.to_string(),
+            api_key: api_key.to_string(),
+            base_url: base_url.to_string(),
+            default_model: default_model.to_string(),
+            models: models.to_string(),
+            priority,
+            enabled,
+            created_at: now,
         })
     }
 
     pub async fn update_image_provider(
-        &self, id: &str, name: &str, provider_type: &str, api_key: &str,
-        base_url: &str, default_model: &str, models: &str, priority: i32, enabled: bool,
+        &self,
+        id: &str,
+        name: &str,
+        provider_type: &str,
+        api_key: &str,
+        base_url: &str,
+        default_model: &str,
+        models: &str,
+        priority: i32,
+        enabled: bool,
     ) -> Result<()> {
         db_retry!(
             sqlx::query(
@@ -2183,19 +2250,15 @@ impl Database {
     }
 
     pub async fn delete_image_provider(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM image_providers WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM image_providers WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
     pub async fn provider_count(&self) -> Result<i64> {
-        let count: (i64,) = db_retry!(
-            sqlx::query_as("SELECT COUNT(*) FROM providers")
-                .fetch_one(&self.pool)
-        )?;
+        let count: (i64,) =
+            db_retry!(sqlx::query_as("SELECT COUNT(*) FROM providers").fetch_one(&self.pool))?;
         Ok(count.0)
     }
 
@@ -2266,7 +2329,11 @@ impl Database {
 
         tracing::info!(
             "MySQL proxy tunnel: 127.0.0.1:{} -> {}:{} via {}:{}",
-            local_port, db_host, db_port, proxy_host, proxy_port
+            local_port,
+            db_host,
+            db_port,
+            proxy_host,
+            proxy_port
         );
 
         // Spawn the tunnel forwarder
@@ -2285,7 +2352,8 @@ impl Database {
                 let target_h = target_host.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        Self::handle_tunnel(client, &proxy_h, proxy_port, &target_h, target_port).await
+                        Self::handle_tunnel(client, &proxy_h, proxy_port, &target_h, target_port)
+                            .await
                     {
                         tracing::error!("Tunnel connection error: {}", e);
                     }
@@ -2296,7 +2364,9 @@ impl Database {
         // Rewrite the database URL to connect through the local tunnel
         let mut new_url = parsed.clone();
         new_url.set_host(Some("127.0.0.1"))?;
-        new_url.set_port(Some(local_port)).map_err(|_| anyhow::anyhow!("failed to set port"))?;
+        new_url
+            .set_port(Some(local_port))
+            .map_err(|_| anyhow::anyhow!("failed to set port"))?;
 
         Ok(new_url.to_string())
     }
@@ -2366,7 +2436,13 @@ impl Database {
 
     // ─── Specs ───────────────────────────────────────────────────────────
 
-    pub async fn create_spec(&self, capability: &str, title: &str, content: &str, metadata: Option<&str>) -> Result<Spec> {
+    pub async fn create_spec(
+        &self,
+        capability: &str,
+        title: &str,
+        content: &str,
+        metadata: Option<&str>,
+    ) -> Result<Spec> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         db_retry!(
@@ -2382,7 +2458,16 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
         )?;
-        Ok(Spec { id, capability: capability.to_string(), title: title.to_string(), content: content.to_string(), metadata: metadata.map(|s| s.to_string()), version: 1, created_at: now, updated_at: now })
+        Ok(Spec {
+            id,
+            capability: capability.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            metadata: metadata.map(|s| s.to_string()),
+            version: 1,
+            created_at: now,
+            updated_at: now,
+        })
     }
 
     pub async fn list_specs(&self) -> Result<Vec<Spec>> {
@@ -2417,16 +2502,22 @@ impl Database {
         Ok(spec)
     }
 
-    pub async fn update_spec(&self, id: &str, content: Option<&str>, metadata: Option<&str>, title: Option<&str>) -> Result<()> {
+    pub async fn update_spec(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        metadata: Option<&str>,
+        title: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now();
         if let Some(c) = content {
-            db_retry!(
-                sqlx::query("UPDATE specs SET content = ?, updated_at = ?, version = version + 1 WHERE id = ?")
-                    .bind(c)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE specs SET content = ?, updated_at = ?, version = version + 1 WHERE id = ?"
+            )
+            .bind(c)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         if let Some(m) = metadata {
             db_retry!(
@@ -2450,17 +2541,22 @@ impl Database {
     }
 
     pub async fn delete_spec(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM specs WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM specs WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
     // ─── Spec Versions ───────────────────────────────────────────────────
 
-    pub async fn create_spec_version(&self, spec_id: &str, version: i32, content: &str, metadata: Option<&str>, change_id: Option<&str>) -> Result<String> {
+    pub async fn create_spec_version(
+        &self,
+        spec_id: &str,
+        version: i32,
+        content: &str,
+        metadata: Option<&str>,
+        change_id: Option<&str>,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         db_retry!(
             sqlx::query(
@@ -2490,7 +2586,13 @@ impl Database {
 
     // ─── Changes ─────────────────────────────────────────────────────────
 
-    pub async fn create_change(&self, name: &str, work_dir: Option<&str>, requirement_path: Option<&str>, tasks_path: Option<&str>) -> Result<Change> {
+    pub async fn create_change(
+        &self,
+        name: &str,
+        work_dir: Option<&str>,
+        requirement_path: Option<&str>,
+        tasks_path: Option<&str>,
+    ) -> Result<Change> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         db_retry!(
@@ -2506,7 +2608,18 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
         )?;
-        Ok(Change { id, name: name.to_string(), status: "draft".to_string(), work_dir: work_dir.map(|s| s.to_string()), explore_summary: None, requirement_path: requirement_path.map(|s| s.to_string()), tasks_path: tasks_path.map(|s| s.to_string()), created_at: now, updated_at: now, archived_at: None })
+        Ok(Change {
+            id,
+            name: name.to_string(),
+            status: "draft".to_string(),
+            work_dir: work_dir.map(|s| s.to_string()),
+            explore_summary: None,
+            requirement_path: requirement_path.map(|s| s.to_string()),
+            tasks_path: tasks_path.map(|s| s.to_string()),
+            created_at: now,
+            updated_at: now,
+            archived_at: None,
+        })
     }
 
     pub async fn list_changes(&self, status: Option<&str>) -> Result<Vec<Change>> {
@@ -2540,7 +2653,12 @@ impl Database {
         Ok(change)
     }
 
-    pub async fn update_change(&self, id: &str, name: Option<&str>, status: Option<&str>) -> Result<()> {
+    pub async fn update_change(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now();
         if let Some(n) = name {
             db_retry!(
@@ -2553,33 +2671,31 @@ impl Database {
         }
         if let Some(s) = status {
             if s == "archived" {
-                db_retry!(
-                    sqlx::query("UPDATE changes SET status = ?, updated_at = ?, archived_at = ? WHERE id = ?")
-                        .bind(s)
-                        .bind(now)
-                        .bind(now)
-                        .bind(id)
-                        .execute(&self.pool)
-                )?;
+                db_retry!(sqlx::query(
+                    "UPDATE changes SET status = ?, updated_at = ?, archived_at = ? WHERE id = ?"
+                )
+                .bind(s)
+                .bind(now)
+                .bind(now)
+                .bind(id)
+                .execute(&self.pool))?;
             } else {
-                db_retry!(
-                    sqlx::query("UPDATE changes SET status = ?, updated_at = ? WHERE id = ?")
-                        .bind(s)
-                        .bind(now)
-                        .bind(id)
-                        .execute(&self.pool)
-                )?;
+                db_retry!(sqlx::query(
+                    "UPDATE changes SET status = ?, updated_at = ? WHERE id = ?"
+                )
+                .bind(s)
+                .bind(now)
+                .bind(id)
+                .execute(&self.pool))?;
             }
         }
         Ok(())
     }
 
     pub async fn delete_change(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM changes WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM changes WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
@@ -2594,43 +2710,47 @@ impl Database {
         Ok(changes)
     }
 
-    pub async fn update_change_explore_summary(&self, change_id: &str, summary: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE changes SET explore_summary = ?, updated_at = NOW() WHERE id = ?")
-                .bind(summary)
-                .bind(change_id)
-                .execute(&self.pool)
-        )?;
+    pub async fn update_change_explore_summary(
+        &self,
+        change_id: &str,
+        summary: &str,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE changes SET explore_summary = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(summary)
+        .bind(change_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
     // ─── Session: pending_ask_user & change_id ──────────────────────────
 
     pub async fn get_session_pending_ask_user(&self, session_id: &str) -> Result<Option<String>> {
-        let row: Option<(Option<String>,)> = db_retry!(
-            sqlx::query_as("SELECT pending_ask_user FROM sessions WHERE id = ?")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-        )?;
+        let row: Option<(Option<String>,)> = db_retry!(sqlx::query_as(
+            "SELECT pending_ask_user FROM sessions WHERE id = ?"
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool))?;
         Ok(row.and_then(|r| r.0))
     }
 
     pub async fn set_session_pending_ask_user(&self, session_id: &str, json: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE sessions SET pending_ask_user = ?, updated_at = NOW() WHERE id = ?")
-                .bind(json)
-                .bind(session_id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET pending_ask_user = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(json)
+        .bind(session_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
     pub async fn clear_session_pending_ask_user(&self, session_id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE sessions SET pending_ask_user = NULL, updated_at = NOW() WHERE id = ?")
-                .bind(session_id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET pending_ask_user = NULL, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(session_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -2646,18 +2766,26 @@ impl Database {
     }
 
     pub async fn set_session_change_id(&self, session_id: &str, change_id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE sessions SET change_id = ?, updated_at = NOW() WHERE id = ?")
-                .bind(change_id)
-                .bind(session_id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET change_id = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(change_id)
+        .bind(session_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
     // ─── Change Artifacts ────────────────────────────────────────────────
 
-    pub async fn create_artifact(&self, change_id: &str, artifact_type: &str, capability: Option<&str>, content: &str, metadata: Option<&str>, status: Option<&str>) -> Result<ChangeArtifact> {
+    pub async fn create_artifact(
+        &self,
+        change_id: &str,
+        artifact_type: &str,
+        capability: Option<&str>,
+        content: &str,
+        metadata: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<ChangeArtifact> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         let st = status.unwrap_or("confirmed");
@@ -2676,7 +2804,17 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
         )?;
-        Ok(ChangeArtifact { id, change_id: change_id.to_string(), artifact_type: artifact_type.to_string(), capability: capability.map(|s| s.to_string()), content: content.to_string(), metadata: metadata.map(|s| s.to_string()), status: st.to_string(), created_at: now, updated_at: now })
+        Ok(ChangeArtifact {
+            id,
+            change_id: change_id.to_string(),
+            artifact_type: artifact_type.to_string(),
+            capability: capability.map(|s| s.to_string()),
+            content: content.to_string(),
+            metadata: metadata.map(|s| s.to_string()),
+            status: st.to_string(),
+            created_at: now,
+            updated_at: now,
+        })
     }
 
     pub async fn list_artifacts(&self, change_id: &str) -> Result<Vec<ChangeArtifact>> {
@@ -2701,44 +2839,48 @@ impl Database {
         Ok(artifact)
     }
 
-    pub async fn update_artifact(&self, id: &str, content: Option<&str>, metadata: Option<&str>, status: Option<&str>) -> Result<()> {
+    pub async fn update_artifact(
+        &self,
+        id: &str,
+        content: Option<&str>,
+        metadata: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now();
         if let Some(c) = content {
-            db_retry!(
-                sqlx::query("UPDATE change_artifacts SET content = ?, updated_at = ? WHERE id = ?")
-                    .bind(c)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE change_artifacts SET content = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(c)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         if let Some(m) = metadata {
-            db_retry!(
-                sqlx::query("UPDATE change_artifacts SET metadata = ?, updated_at = ? WHERE id = ?")
-                    .bind(m)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE change_artifacts SET metadata = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(m)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         if let Some(s) = status {
-            db_retry!(
-                sqlx::query("UPDATE change_artifacts SET status = ?, updated_at = ? WHERE id = ?")
-                    .bind(s)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE change_artifacts SET status = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(s)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         Ok(())
     }
 
     pub async fn delete_artifact(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM change_artifacts WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM change_artifacts WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
@@ -2753,7 +2895,11 @@ impl Database {
 
     // ─── Change Tasks ────────────────────────────────────────────────────
 
-    pub async fn batch_create_tasks(&self, change_id: &str, tasks: &[(String, i32, i32, String, Option<String>)]) -> Result<Vec<ChangeTask>> {
+    pub async fn batch_create_tasks(
+        &self,
+        change_id: &str,
+        tasks: &[(String, i32, i32, String, Option<String>)],
+    ) -> Result<Vec<ChangeTask>> {
         let now = Utc::now();
         let mut created = Vec::new();
         for (group_name, group_order, task_order, title, description) in tasks {
@@ -2774,10 +2920,17 @@ impl Database {
                 .execute(&self.pool)
             )?;
             created.push(ChangeTask {
-                id, change_id: change_id.to_string(), group_name: group_name.clone(),
-                group_order: *group_order, task_order: *task_order, title: title.clone(),
-                description: description.clone(), status: "pending".to_string(),
-                session_id: None, created_at: now, updated_at: now,
+                id,
+                change_id: change_id.to_string(),
+                group_name: group_name.clone(),
+                group_order: *group_order,
+                task_order: *task_order,
+                title: title.clone(),
+                description: description.clone(),
+                status: "pending".to_string(),
+                session_id: None,
+                created_at: now,
+                updated_at: now,
             });
         }
         Ok(created)
@@ -2794,72 +2947,77 @@ impl Database {
         Ok(tasks)
     }
 
-    pub async fn update_task(&self, id: &str, status: Option<&str>, title: Option<&str>, description: Option<&str>, session_id: Option<&str>) -> Result<()> {
+    pub async fn update_task(
+        &self,
+        id: &str,
+        status: Option<&str>,
+        title: Option<&str>,
+        description: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<()> {
         let now = Utc::now();
         if let Some(s) = status {
-            db_retry!(
-                sqlx::query("UPDATE change_tasks SET status = ?, updated_at = ? WHERE id = ?")
-                    .bind(s)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE change_tasks SET status = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(s)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         if let Some(t) = title {
-            db_retry!(
-                sqlx::query("UPDATE change_tasks SET title = ?, updated_at = ? WHERE id = ?")
-                    .bind(t)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE change_tasks SET title = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(t)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         if let Some(d) = description {
-            db_retry!(
-                sqlx::query("UPDATE change_tasks SET description = ?, updated_at = ? WHERE id = ?")
-                    .bind(d)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE change_tasks SET description = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(d)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         if let Some(sid) = session_id {
-            db_retry!(
-                sqlx::query("UPDATE change_tasks SET session_id = ?, updated_at = ? WHERE id = ?")
-                    .bind(sid)
-                    .bind(now)
-                    .bind(id)
-                    .execute(&self.pool)
-            )?;
+            db_retry!(sqlx::query(
+                "UPDATE change_tasks SET session_id = ?, updated_at = ? WHERE id = ?"
+            )
+            .bind(sid)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool))?;
         }
         Ok(())
     }
 
     pub async fn delete_task(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM change_tasks WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM change_tasks WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
     pub async fn get_change_task_counts(&self, change_id: &str) -> Result<(i64, i64, i64, i64)> {
-        let total: (i64,) = db_retry!(
-            sqlx::query_as("SELECT COUNT(*) FROM change_tasks WHERE change_id = ?")
-                .bind(change_id)
-                .fetch_one(&self.pool)
-        )?;
-        let done: (i64,) = db_retry!(
-            sqlx::query_as("SELECT COUNT(*) FROM change_tasks WHERE change_id = ? AND status = 'done'")
-                .bind(change_id)
-                .fetch_one(&self.pool)
-        )?;
-        let in_progress: (i64,) = db_retry!(
-            sqlx::query_as("SELECT COUNT(*) FROM change_tasks WHERE change_id = ? AND status = 'in_progress'")
-                .bind(change_id)
-                .fetch_one(&self.pool)
-        )?;
+        let total: (i64,) = db_retry!(sqlx::query_as(
+            "SELECT COUNT(*) FROM change_tasks WHERE change_id = ?"
+        )
+        .bind(change_id)
+        .fetch_one(&self.pool))?;
+        let done: (i64,) = db_retry!(sqlx::query_as(
+            "SELECT COUNT(*) FROM change_tasks WHERE change_id = ? AND status = 'done'"
+        )
+        .bind(change_id)
+        .fetch_one(&self.pool))?;
+        let in_progress: (i64,) = db_retry!(sqlx::query_as(
+            "SELECT COUNT(*) FROM change_tasks WHERE change_id = ? AND status = 'in_progress'"
+        )
+        .bind(change_id)
+        .fetch_one(&self.pool))?;
         let pending = total.0 - done.0 - in_progress.0;
         Ok((total.0, done.0, in_progress.0, pending))
     }
@@ -2925,7 +3083,11 @@ impl Database {
         Ok(cp)
     }
 
-    pub async fn delete_checkpoints_after(&self, session_id: &str, created_at: DateTime<Utc>) -> Result<()> {
+    pub async fn delete_checkpoints_after(
+        &self,
+        session_id: &str,
+        created_at: DateTime<Utc>,
+    ) -> Result<()> {
         db_retry!(
             sqlx::query("DELETE FROM checkpoints WHERE session_id = ? AND created_at > ?")
                 .bind(session_id)
@@ -2937,7 +3099,14 @@ impl Database {
 
     // ─── Requirement Docs ───────────────────────────────────────────────
 
-    pub async fn create_requirement_doc(&self, change_id: &str, session_id: Option<&str>, name: &str, content: &str, progress_json: Option<&str>) -> Result<RequirementDoc> {
+    pub async fn create_requirement_doc(
+        &self,
+        change_id: &str,
+        session_id: Option<&str>,
+        name: &str,
+        content: &str,
+        progress_json: Option<&str>,
+    ) -> Result<RequirementDoc> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         db_retry!(
@@ -2966,10 +3135,28 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
         )?;
-        Ok(RequirementDoc { id, change_id: change_id.to_string(), session_id: session_id.map(|s| s.to_string()), name: name.to_string(), content: content.to_string(), version: 1, progress_json: progress_json.map(|s| s.to_string()), status: "draft".to_string(), created_at: now, updated_at: now })
+        Ok(RequirementDoc {
+            id,
+            change_id: change_id.to_string(),
+            session_id: session_id.map(|s| s.to_string()),
+            name: name.to_string(),
+            content: content.to_string(),
+            version: 1,
+            progress_json: progress_json.map(|s| s.to_string()),
+            status: "draft".to_string(),
+            created_at: now,
+            updated_at: now,
+        })
     }
 
-    pub async fn update_requirement_doc(&self, id: &str, content: &str, progress_json: Option<&str>, status: Option<&str>, source: &str) -> Result<()> {
+    pub async fn update_requirement_doc(
+        &self,
+        id: &str,
+        content: &str,
+        progress_json: Option<&str>,
+        status: Option<&str>,
+        source: &str,
+    ) -> Result<()> {
         let now = Utc::now();
         // Increment version
         db_retry!(
@@ -2984,11 +3171,11 @@ impl Database {
             .execute(&self.pool)
         )?;
         // Get new version number
-        let row: (i32,) = db_retry!(
-            sqlx::query_as("SELECT version FROM requirement_docs WHERE id = ?")
-                .bind(id)
-                .fetch_one(&self.pool)
-        )?;
+        let row: (i32,) = db_retry!(sqlx::query_as(
+            "SELECT version FROM requirement_docs WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_one(&self.pool))?;
         // Save version snapshot
         let vid = Uuid::new_v4().to_string();
         db_retry!(
@@ -3017,7 +3204,10 @@ impl Database {
         Ok(doc)
     }
 
-    pub async fn get_requirement_doc_by_change(&self, change_id: &str) -> Result<Option<RequirementDoc>> {
+    pub async fn get_requirement_doc_by_change(
+        &self,
+        change_id: &str,
+    ) -> Result<Option<RequirementDoc>> {
         let doc = db_retry!(
             sqlx::query_as::<_, RequirementDoc>(
                 "SELECT id, change_id, session_id, name, content, version, progress_json, status, created_at, updated_at FROM requirement_docs WHERE change_id = ? ORDER BY created_at DESC LIMIT 1"
@@ -3028,50 +3218,95 @@ impl Database {
         Ok(doc)
     }
 
-    pub async fn list_requirement_docs(&self, search: Option<&str>, status: Option<&str>, page: u32, page_size: u32) -> Result<(Vec<RequirementDoc>, u64)> {
+    pub async fn list_requirement_docs(
+        &self,
+        search: Option<&str>,
+        status: Option<&str>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<RequirementDoc>, u64)> {
         let offset = (page.saturating_sub(1)) * page_size;
         let mut where_clauses = Vec::new();
-        if search.is_some() { where_clauses.push("(name LIKE CONCAT('%', ?, '%') OR content LIKE CONCAT('%', ?, '%'))"); }
-        if status.is_some() { where_clauses.push("status = ?"); }
-        let where_sql = if where_clauses.is_empty() { String::new() } else { format!("WHERE {}", where_clauses.join(" AND ")) };
+        if search.is_some() {
+            where_clauses
+                .push("(name LIKE CONCAT('%', ?, '%') OR content LIKE CONCAT('%', ?, '%'))");
+        }
+        if status.is_some() {
+            where_clauses.push("status = ?");
+        }
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
 
         let count_sql = format!("SELECT COUNT(*) FROM requirement_docs {}", where_sql);
         let list_sql = format!("SELECT id, change_id, session_id, name, content, version, progress_json, status, created_at, updated_at FROM requirement_docs {} ORDER BY updated_at DESC LIMIT ? OFFSET ?", where_sql);
 
         // Build count query
         let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql);
-        if let Some(s) = search { count_q = count_q.bind(s).bind(s); }
-        if let Some(st) = status { count_q = count_q.bind(st); }
+        if let Some(s) = search {
+            count_q = count_q.bind(s).bind(s);
+        }
+        if let Some(st) = status {
+            count_q = count_q.bind(st);
+        }
         let (total,): (i64,) = count_q.fetch_one(&self.pool).await?;
 
         // Build list query
         let mut list_q = sqlx::query_as::<_, RequirementDoc>(&list_sql);
-        if let Some(s) = search { list_q = list_q.bind(s).bind(s); }
-        if let Some(st) = status { list_q = list_q.bind(st); }
+        if let Some(s) = search {
+            list_q = list_q.bind(s).bind(s);
+        }
+        if let Some(st) = status {
+            list_q = list_q.bind(st);
+        }
         list_q = list_q.bind(page_size).bind(offset);
         let docs = list_q.fetch_all(&self.pool).await?;
 
         Ok((docs, total as u64))
     }
 
-    pub async fn list_all_tasks(&self, status: Option<&str>, change_id: Option<&str>, page: u32, page_size: u32) -> Result<(Vec<ChangeTask>, u64)> {
+    pub async fn list_all_tasks(
+        &self,
+        status: Option<&str>,
+        change_id: Option<&str>,
+        page: u32,
+        page_size: u32,
+    ) -> Result<(Vec<ChangeTask>, u64)> {
         let offset = (page.saturating_sub(1)) * page_size;
         let mut where_clauses = Vec::new();
-        if status.is_some() { where_clauses.push("status = ?"); }
-        if change_id.is_some() { where_clauses.push("change_id = ?"); }
-        let where_sql = if where_clauses.is_empty() { String::new() } else { format!("WHERE {}", where_clauses.join(" AND ")) };
+        if status.is_some() {
+            where_clauses.push("status = ?");
+        }
+        if change_id.is_some() {
+            where_clauses.push("change_id = ?");
+        }
+        let where_sql = if where_clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", where_clauses.join(" AND "))
+        };
 
         let count_sql = format!("SELECT COUNT(*) FROM change_tasks {}", where_sql);
         let list_sql = format!("SELECT id, change_id, group_name, group_order, task_order, title, description, status, session_id, created_at, updated_at FROM change_tasks {} ORDER BY created_at DESC LIMIT ? OFFSET ?", where_sql);
 
         let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql);
-        if let Some(s) = status { count_q = count_q.bind(s); }
-        if let Some(c) = change_id { count_q = count_q.bind(c); }
+        if let Some(s) = status {
+            count_q = count_q.bind(s);
+        }
+        if let Some(c) = change_id {
+            count_q = count_q.bind(c);
+        }
         let (total,): (i64,) = count_q.fetch_one(&self.pool).await?;
 
         let mut list_q = sqlx::query_as::<_, ChangeTask>(&list_sql);
-        if let Some(s) = status { list_q = list_q.bind(s); }
-        if let Some(c) = change_id { list_q = list_q.bind(c); }
+        if let Some(s) = status {
+            list_q = list_q.bind(s);
+        }
+        if let Some(c) = change_id {
+            list_q = list_q.bind(c);
+        }
         list_q = list_q.bind(page_size).bind(offset);
         let tasks = list_q.fetch_all(&self.pool).await?;
 
@@ -3079,7 +3314,13 @@ impl Database {
     }
 
     // Weixin accounts
-    pub async fn create_weixin_account(&self, ilink_bot_id: &str, bot_token: &str, base_url: &str, bot_user_id: Option<&str>) -> Result<String> {
+    pub async fn create_weixin_account(
+        &self,
+        ilink_bot_id: &str,
+        bot_token: &str,
+        base_url: &str,
+        bot_user_id: Option<&str>,
+    ) -> Result<String> {
         // 兼容尚未有 bot 唯一键的旧库，避免重复登录再次插入账号；新库由唯一键保护并发插入。
         let existing: Option<(String,)> = db_retry!(
             sqlx::query_as(
@@ -3151,14 +3392,19 @@ impl Database {
         Ok(row)
     }
 
-    pub async fn update_weixin_token(&self, id: &str, bot_token: &str, base_url: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE weixin_accounts SET bot_token = ?, base_url = ? WHERE id = ?")
-                .bind(bot_token)
-                .bind(base_url)
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+    pub async fn update_weixin_token(
+        &self,
+        id: &str,
+        bot_token: &str,
+        base_url: &str,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE weixin_accounts SET bot_token = ?, base_url = ? WHERE id = ?"
+        )
+        .bind(bot_token)
+        .bind(base_url)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -3193,16 +3439,19 @@ impl Database {
     }
 
     pub async fn delete_weixin_account(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM weixin_accounts WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM weixin_accounts WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
     // Weixin bindings
-    pub async fn create_weixin_binding(&self, account_id: &str, ilink_user_id: &str, user_id: &str) -> Result<String> {
+    pub async fn create_weixin_binding(
+        &self,
+        account_id: &str,
+        ilink_user_id: &str,
+        user_id: &str,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         db_retry!(
@@ -3219,7 +3468,11 @@ impl Database {
         Ok(id)
     }
 
-    pub async fn get_weixin_binding(&self, account_id: &str, ilink_user_id: &str) -> Result<Option<WeixinBinding>> {
+    pub async fn get_weixin_binding(
+        &self,
+        account_id: &str,
+        ilink_user_id: &str,
+    ) -> Result<Option<WeixinBinding>> {
         let row = db_retry!(
             sqlx::query_as::<_, WeixinBinding>(
                 "SELECT id, account_id, ilink_user_id, user_id, context_token, created_at FROM weixin_bindings WHERE account_id = ? AND ilink_user_id = ?"
@@ -3232,19 +3485,21 @@ impl Database {
     }
 
     /// 按 bot 身份查绑定，兼容历史上同一个 bot 被重复落库的账号记录。
-    pub async fn get_weixin_binding_by_bot(&self, ilink_bot_id: &str, ilink_user_id: &str) -> Result<Option<WeixinBinding>> {
-        let row = db_retry!(
-            sqlx::query_as::<_, WeixinBinding>(
-                "SELECT b.id, b.account_id, b.ilink_user_id, b.user_id, b.context_token, b.created_at
+    pub async fn get_weixin_binding_by_bot(
+        &self,
+        ilink_bot_id: &str,
+        ilink_user_id: &str,
+    ) -> Result<Option<WeixinBinding>> {
+        let row = db_retry!(sqlx::query_as::<_, WeixinBinding>(
+            "SELECT b.id, b.account_id, b.ilink_user_id, b.user_id, b.context_token, b.created_at
                  FROM weixin_bindings b
                  JOIN weixin_accounts a ON a.id = b.account_id
                  WHERE a.ilink_bot_id = ? AND b.ilink_user_id = ?
                  ORDER BY b.created_at DESC LIMIT 1"
-            )
-            .bind(ilink_bot_id)
-            .bind(ilink_user_id)
-            .fetch_optional(&self.pool)
-        )?;
+        )
+        .bind(ilink_bot_id)
+        .bind(ilink_user_id)
+        .fetch_optional(&self.pool))?;
         Ok(row)
     }
 
@@ -3292,46 +3547,45 @@ impl Database {
 
     /// 原子领取一条微信入站消息。重复投递或重复 monitor 只允许首个调用继续处理。
     pub async fn claim_weixin_message(&self, ilink_bot_id: &str, message_id: u64) -> Result<bool> {
-        let res = db_retry!(
-            sqlx::query(
-                "INSERT IGNORE INTO weixin_inbound_messages (ilink_bot_id, message_id) VALUES (?, ?)"
-            )
-            .bind(ilink_bot_id)
-            .bind(message_id)
-            .execute(&self.pool)
-        )?;
+        let res = db_retry!(sqlx::query(
+            "INSERT IGNORE INTO weixin_inbound_messages (ilink_bot_id, message_id) VALUES (?, ?)"
+        )
+        .bind(ilink_bot_id)
+        .bind(message_id)
+        .execute(&self.pool))?;
         Ok(res.rows_affected() == 1)
     }
 
     /// 入站消息只用于短期去重，定期删除过期 claim 避免表无限增长。
     pub async fn purge_old_weixin_messages(&self) -> Result<u64> {
-        let res = db_retry!(
-            sqlx::query(
-                "DELETE FROM weixin_inbound_messages WHERE created_at < NOW() - INTERVAL 30 DAY"
-            )
-            .execute(&self.pool)
-        )?;
+        let res = db_retry!(sqlx::query(
+            "DELETE FROM weixin_inbound_messages WHERE created_at < NOW() - INTERVAL 30 DAY"
+        )
+        .execute(&self.pool))?;
         Ok(res.rows_affected())
     }
 
     pub async fn delete_weixin_binding(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM weixin_bindings WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM weixin_bindings WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
     // Weixin bind codes
-    pub async fn create_weixin_bind_code(&self, code: &str, user_id: &str, expires_at: i64) -> Result<()> {
-        db_retry!(
-            sqlx::query("INSERT INTO weixin_bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)")
-                .bind(code)
-                .bind(user_id)
-                .bind(expires_at)
-                .execute(&self.pool)
-        )?;
+    pub async fn create_weixin_bind_code(
+        &self,
+        code: &str,
+        user_id: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "INSERT INTO weixin_bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)"
+        )
+        .bind(code)
+        .bind(user_id)
+        .bind(expires_at)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -3348,21 +3602,21 @@ impl Database {
         if res.rows_affected() == 0 {
             return Ok(None);
         }
-        let row: Option<(String,)> = db_retry!(
-            sqlx::query_as("SELECT user_id FROM weixin_bind_codes WHERE code = ?")
-                .bind(code)
-                .fetch_optional(&self.pool)
-        )?;
+        let row: Option<(String,)> = db_retry!(sqlx::query_as(
+            "SELECT user_id FROM weixin_bind_codes WHERE code = ?"
+        )
+        .bind(code)
+        .fetch_optional(&self.pool))?;
         Ok(row.map(|r| r.0))
     }
 
     // Weixin chats
     pub async fn get_weixin_chat(&self, binding_id: &str) -> Result<Option<String>> {
-        let row: Option<(String,)> = db_retry!(
-            sqlx::query_as("SELECT session_id FROM weixin_chats WHERE binding_id = ?")
-                .bind(binding_id)
-                .fetch_optional(&self.pool)
-        )?;
+        let row: Option<(String,)> = db_retry!(sqlx::query_as(
+            "SELECT session_id FROM weixin_chats WHERE binding_id = ?"
+        )
+        .bind(binding_id)
+        .fetch_optional(&self.pool))?;
         Ok(row.map(|r| r.0))
     }
 
@@ -3383,7 +3637,12 @@ impl Database {
     }
 
     // Feishu accounts
-    pub async fn create_feishu_account(&self, name: &str, app_id: &str, app_secret: &str) -> Result<String> {
+    pub async fn create_feishu_account(
+        &self,
+        name: &str,
+        app_id: &str,
+        app_secret: &str,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         db_retry!(
@@ -3423,16 +3682,21 @@ impl Database {
     }
 
     pub async fn set_feishu_account_enabled(&self, id: &str, enabled: bool) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE feishu_accounts SET enabled = ?, updated_at = NOW() WHERE id = ?")
-                .bind(enabled)
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE feishu_accounts SET enabled = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(enabled)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
-    pub async fn update_feishu_account(&self, id: &str, name: &str, app_secret: Option<&str>) -> Result<()> {
+    pub async fn update_feishu_account(
+        &self,
+        id: &str,
+        name: &str,
+        app_secret: Option<&str>,
+    ) -> Result<()> {
         match app_secret {
             Some(secret) => {
                 db_retry!(
@@ -3444,28 +3708,31 @@ impl Database {
                 )?;
             }
             None => {
-                db_retry!(
-                    sqlx::query("UPDATE feishu_accounts SET name = ?, updated_at = NOW() WHERE id = ?")
-                        .bind(name)
-                        .bind(id)
-                        .execute(&self.pool)
-                )?;
+                db_retry!(sqlx::query(
+                    "UPDATE feishu_accounts SET name = ?, updated_at = NOW() WHERE id = ?"
+                )
+                .bind(name)
+                .bind(id)
+                .execute(&self.pool))?;
             }
         }
         Ok(())
     }
 
     pub async fn delete_feishu_account(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM feishu_accounts WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM feishu_accounts WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
     // Feishu bindings
-    pub async fn create_feishu_binding(&self, account_id: &str, open_id: &str, user_id: &str) -> Result<String> {
+    pub async fn create_feishu_binding(
+        &self,
+        account_id: &str,
+        open_id: &str,
+        user_id: &str,
+    ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
         db_retry!(
@@ -3483,7 +3750,11 @@ impl Database {
         Ok(id)
     }
 
-    pub async fn get_feishu_binding(&self, account_id: &str, open_id: &str) -> Result<Option<FeishuBinding>> {
+    pub async fn get_feishu_binding(
+        &self,
+        account_id: &str,
+        open_id: &str,
+    ) -> Result<Option<FeishuBinding>> {
         let row = db_retry!(
             sqlx::query_as::<_, FeishuBinding>(
                 "SELECT id, account_id, open_id, user_id, created_at FROM feishu_bindings WHERE account_id = ? AND open_id = ?"
@@ -3496,13 +3767,11 @@ impl Database {
     }
 
     pub async fn get_feishu_binding_by_id(&self, id: &str) -> Result<Option<FeishuBinding>> {
-        let row = db_retry!(
-            sqlx::query_as::<_, FeishuBinding>(
-                "SELECT id, account_id, open_id, user_id, created_at FROM feishu_bindings WHERE id = ?"
-            )
-            .bind(id)
-            .fetch_optional(&self.pool)
-        )?;
+        let row = db_retry!(sqlx::query_as::<_, FeishuBinding>(
+            "SELECT id, account_id, open_id, user_id, created_at FROM feishu_bindings WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_optional(&self.pool))?;
         Ok(row)
     }
 
@@ -3528,23 +3797,26 @@ impl Database {
     }
 
     pub async fn delete_feishu_binding(&self, id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM feishu_bindings WHERE id = ?")
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query("DELETE FROM feishu_bindings WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
         Ok(())
     }
 
     // Feishu bind codes
-    pub async fn create_feishu_bind_code(&self, code: &str, user_id: &str, expires_at: i64) -> Result<()> {
-        db_retry!(
-            sqlx::query("INSERT INTO feishu_bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)")
-                .bind(code)
-                .bind(user_id)
-                .bind(expires_at)
-                .execute(&self.pool)
-        )?;
+    pub async fn create_feishu_bind_code(
+        &self,
+        code: &str,
+        user_id: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "INSERT INTO feishu_bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)"
+        )
+        .bind(code)
+        .bind(user_id)
+        .bind(expires_at)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -3561,16 +3833,21 @@ impl Database {
         if res.rows_affected() == 0 {
             return Ok(None);
         }
-        let row: Option<(String,)> = db_retry!(
-            sqlx::query_as("SELECT user_id FROM feishu_bind_codes WHERE code = ?")
-                .bind(code)
-                .fetch_optional(&self.pool)
-        )?;
+        let row: Option<(String,)> = db_retry!(sqlx::query_as(
+            "SELECT user_id FROM feishu_bind_codes WHERE code = ?"
+        )
+        .bind(code)
+        .fetch_optional(&self.pool))?;
         Ok(row.map(|r| r.0))
     }
 
     // Feishu chats（话题=会话映射，账号维度）
-    pub async fn get_feishu_chat(&self, account_id: &str, chat_id: &str, topic_id: &str) -> Result<Option<FeishuChat>> {
+    pub async fn get_feishu_chat(
+        &self,
+        account_id: &str,
+        chat_id: &str,
+        topic_id: &str,
+    ) -> Result<Option<FeishuChat>> {
         let row = db_retry!(
             sqlx::query_as::<_, FeishuChat>(
                 "SELECT id, account_id, chat_id, topic_id, session_id, user_id, created_at, updated_at FROM feishu_chats WHERE account_id = ? AND chat_id = ? AND topic_id = ?"
@@ -3611,14 +3888,19 @@ impl Database {
         Ok(())
     }
 
-    pub async fn delete_feishu_chat(&self, account_id: &str, chat_id: &str, topic_id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query("DELETE FROM feishu_chats WHERE account_id = ? AND chat_id = ? AND topic_id = ?")
-                .bind(account_id)
-                .bind(chat_id)
-                .bind(topic_id)
-                .execute(&self.pool)
-        )?;
+    pub async fn delete_feishu_chat(
+        &self,
+        account_id: &str,
+        chat_id: &str,
+        topic_id: &str,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "DELETE FROM feishu_chats WHERE account_id = ? AND chat_id = ? AND topic_id = ?"
+        )
+        .bind(account_id)
+        .bind(chat_id)
+        .bind(topic_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -3639,74 +3921,66 @@ impl Database {
     ) -> Result<Deployment> {
         let id = Uuid::new_v4().to_string();
         let now = Utc::now();
-        db_retry!(
-            sqlx::query(
-                "INSERT INTO deployments
+        db_retry!(sqlx::query(
+            "INSERT INTO deployments
                  (id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
                   commit_sha, targets, summary, status, approval_expires_at, created_at, updated_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'awaiting_approval', ?, ?, ?)"
-            )
-            .bind(&id)
-            .bind(session_id)
-            .bind(user_id)
-            .bind(account_id)
-            .bind(chat_id)
-            .bind(topic_id)
-            .bind(source_dir)
-            .bind(commit_sha)
-            .bind(targets)
-            .bind(summary)
-            .bind(approval_expires_at)
-            .bind(now)
-            .bind(now)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(&id)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(account_id)
+        .bind(chat_id)
+        .bind(topic_id)
+        .bind(source_dir)
+        .bind(commit_sha)
+        .bind(targets)
+        .bind(summary)
+        .bind(approval_expires_at)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool))?;
         self.get_deployment(&id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("deployment inserted but not found: {id}"))
     }
 
     pub async fn get_deployment(&self, id: &str) -> Result<Option<Deployment>> {
-        let row = db_retry!(
-            sqlx::query_as::<_, Deployment>(
-                "SELECT id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
+        let row = db_retry!(sqlx::query_as::<_, Deployment>(
+            "SELECT id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
                         commit_sha, targets, summary, status, card_message_id, approved_by,
                         approval_expires_at, started_at, finished_at, result, error,
                         created_at, updated_at
                  FROM deployments WHERE id = ?"
-            )
-            .bind(id)
-            .fetch_optional(&self.pool)
-        )?;
+        )
+        .bind(id)
+        .fetch_optional(&self.pool))?;
         Ok(row)
     }
 
     pub async fn set_deployment_card(&self, id: &str, card_message_id: &str) -> Result<()> {
-        db_retry!(
-            sqlx::query(
-                "UPDATE deployments SET card_message_id = ?, updated_at = NOW() WHERE id = ?"
-            )
-            .bind(card_message_id)
-            .bind(id)
-            .execute(&self.pool)
-        )?;
+        db_retry!(sqlx::query(
+            "UPDATE deployments SET card_message_id = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(card_message_id)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
     /// 原子批准部署：仅任务发起人、未过期且尚待审批时能成功。
     pub async fn approve_deployment(&self, id: &str, user_id: &str) -> Result<Option<Deployment>> {
-        let result = db_retry!(
-            sqlx::query(
-                "UPDATE deployments
+        let result = db_retry!(sqlx::query(
+            "UPDATE deployments
                  SET status = 'approved', approved_by = ?, updated_at = NOW()
                  WHERE id = ? AND user_id = ? AND status = 'awaiting_approval'
                    AND approval_expires_at > NOW()"
-            )
-            .bind(user_id)
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool))?;
         if result.rows_affected() == 0 {
             return Ok(None);
         }
@@ -3714,17 +3988,15 @@ impl Database {
     }
 
     pub async fn cancel_deployment(&self, id: &str, user_id: &str) -> Result<bool> {
-        let result = db_retry!(
-            sqlx::query(
-                "UPDATE deployments
+        let result = db_retry!(sqlx::query(
+            "UPDATE deployments
                  SET status = 'cancelled', approved_by = ?, finished_at = NOW(), updated_at = NOW()
                  WHERE id = ? AND user_id = ? AND status = 'awaiting_approval'"
-            )
-            .bind(user_id)
-            .bind(id)
-            .bind(user_id)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(user_id)
+        .bind(id)
+        .bind(user_id)
+        .execute(&self.pool))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -3736,24 +4008,22 @@ impl Database {
         error: Option<&str>,
     ) -> Result<()> {
         let terminal = matches!(status, "succeeded" | "failed" | "rolled_back" | "cancelled");
-        db_retry!(
-            sqlx::query(
-                "UPDATE deployments
+        db_retry!(sqlx::query(
+            "UPDATE deployments
                  SET status = ?,
                      started_at = CASE WHEN ? IN ('starting', 'building', 'installing')
                                        THEN COALESCE(started_at, NOW()) ELSE started_at END,
                      finished_at = CASE WHEN ? THEN NOW() ELSE finished_at END,
                      result = COALESCE(?, result), error = COALESCE(?, error), updated_at = NOW()
                  WHERE id = ?"
-            )
-            .bind(status)
-            .bind(status)
-            .bind(terminal)
-            .bind(result)
-            .bind(error)
-            .bind(id)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(status)
+        .bind(status)
+        .bind(terminal)
+        .bind(result)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -3775,9 +4045,8 @@ impl Database {
 
     /// 最近一次成功发布，用于创建显式回滚审批。
     pub async fn get_latest_successful_deployment(&self) -> Result<Option<Deployment>> {
-        let row = db_retry!(
-            sqlx::query_as::<_, Deployment>(
-                "SELECT id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
+        let row = db_retry!(sqlx::query_as::<_, Deployment>(
+            "SELECT id, session_id, user_id, account_id, chat_id, topic_id, source_dir,
                         commit_sha, targets, summary, status, card_message_id, approved_by,
                         approval_expires_at, started_at, finished_at, result, error,
                         created_at, updated_at
@@ -3785,9 +4054,8 @@ impl Database {
                  WHERE status = 'succeeded'
                  ORDER BY finished_at DESC, created_at DESC
                  LIMIT 1"
-            )
-            .fetch_optional(&self.pool)
-        )?;
+        )
+        .fetch_optional(&self.pool))?;
         Ok(row)
     }
 
@@ -3811,33 +4079,31 @@ impl Database {
         created_at: DateTime<Utc>,
     ) -> Result<bool> {
         let id = Uuid::new_v4().to_string();
-        let result = db_retry!(
-            sqlx::query(
-                "INSERT IGNORE INTO channel_messages
+        let result = db_retry!(sqlx::query(
+            "INSERT IGNORE INTO channel_messages
                  (id, channel, account_id, account_name, conversation_id, topic_id,
                   external_message_id, reply_to_external_id, direction, message_type,
                   content, peer_id, user_id, username, session_id, created_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                     (SELECT username FROM users WHERE id = ? LIMIT 1), ?, ?)"
-            )
-            .bind(&id)
-            .bind(channel)
-            .bind(account_id)
-            .bind(account_name)
-            .bind(conversation_id)
-            .bind(topic_id)
-            .bind(external_message_id)
-            .bind(reply_to_external_id)
-            .bind(direction)
-            .bind(message_type)
-            .bind(content)
-            .bind(peer_id)
-            .bind(user_id)
-            .bind(user_id)
-            .bind(session_id)
-            .bind(created_at)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(&id)
+        .bind(channel)
+        .bind(account_id)
+        .bind(account_name)
+        .bind(conversation_id)
+        .bind(topic_id)
+        .bind(external_message_id)
+        .bind(reply_to_external_id)
+        .bind(direction)
+        .bind(message_type)
+        .bind(content)
+        .bind(peer_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(session_id)
+        .bind(created_at)
+        .execute(&self.pool))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -3854,9 +4120,8 @@ impl Database {
         created_at: DateTime<Utc>,
     ) -> Result<bool> {
         let id = Uuid::new_v4().to_string();
-        let result = db_retry!(
-            sqlx::query(
-                "INSERT IGNORE INTO channel_messages
+        let result = db_retry!(sqlx::query(
+            "INSERT IGNORE INTO channel_messages
                  (id, channel, account_id, account_name, conversation_id, topic_id,
                   external_message_id, reply_to_external_id, direction, message_type,
                   content, peer_id, user_id, username, session_id, created_at)
@@ -3865,18 +4130,17 @@ impl Database {
                  FROM channel_messages
                  WHERE channel = ? AND account_id = ? AND external_message_id = ?
                  ORDER BY created_at DESC, id DESC LIMIT 1"
-            )
-            .bind(&id)
-            .bind(external_message_id)
-            .bind(reply_to_external_id)
-            .bind(message_type)
-            .bind(content)
-            .bind(created_at)
-            .bind(channel)
-            .bind(account_id)
-            .bind(reply_to_external_id)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(&id)
+        .bind(external_message_id)
+        .bind(reply_to_external_id)
+        .bind(message_type)
+        .bind(content)
+        .bind(created_at)
+        .bind(channel)
+        .bind(account_id)
+        .bind(reply_to_external_id)
+        .execute(&self.pool))?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -3924,18 +4188,16 @@ impl Database {
         message_type: &str,
         content: &str,
     ) -> Result<()> {
-        db_retry!(
-            sqlx::query(
-                "UPDATE channel_messages SET message_type = ?, content = ?
+        db_retry!(sqlx::query(
+            "UPDATE channel_messages SET message_type = ?, content = ?
                  WHERE channel = ? AND account_id = ? AND external_message_id = ?"
-            )
-            .bind(message_type)
-            .bind(content)
-            .bind(channel)
-            .bind(account_id)
-            .bind(external_message_id)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(message_type)
+        .bind(content)
+        .bind(channel)
+        .bind(account_id)
+        .bind(external_message_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -3947,19 +4209,17 @@ impl Database {
         external_message_id: &str,
         user_id: &str,
     ) -> Result<()> {
-        db_retry!(
-            sqlx::query(
-                "UPDATE channel_messages
+        db_retry!(sqlx::query(
+            "UPDATE channel_messages
                  SET user_id = ?, username = (SELECT username FROM users WHERE id = ? LIMIT 1)
                  WHERE channel = ? AND account_id = ? AND external_message_id = ?"
-            )
-            .bind(user_id)
-            .bind(user_id)
-            .bind(channel)
-            .bind(account_id)
-            .bind(external_message_id)
-            .execute(&self.pool)
-        )?;
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(channel)
+        .bind(account_id)
+        .bind(external_message_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -3992,9 +4252,8 @@ impl Database {
 
     pub async fn count_channel_conversations(&self, channel: &str, search: &str) -> Result<u64> {
         let pattern = format!("%{search}%");
-        let (count,): (i64,) = db_retry!(
-            sqlx::query_as(
-                "SELECT COUNT(*) FROM (
+        let (count,): (i64,) = db_retry!(sqlx::query_as(
+            "SELECT COUNT(*) FROM (
                     SELECT account_id, conversation_id, topic_id
                     FROM channel_messages
                     WHERE channel = ? AND (
@@ -4003,17 +4262,16 @@ impl Database {
                     )
                     GROUP BY account_id, conversation_id, topic_id
                 ) conversations"
-            )
-            .bind(channel)
-            .bind(search)
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(&pattern)
-            .bind(&pattern)
-            .fetch_one(&self.pool)
-        )?;
+        )
+        .bind(channel)
+        .bind(search)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .fetch_one(&self.pool))?;
         Ok(count.max(0) as u64)
     }
 
@@ -4079,35 +4337,31 @@ impl Database {
         page: u32,
         per_page: u32,
     ) -> Result<(Vec<ChannelMessage>, u64)> {
-        let (count,): (i64,) = db_retry!(
-            sqlx::query_as(
-                "SELECT COUNT(*) FROM channel_messages
+        let (count,): (i64,) = db_retry!(sqlx::query_as(
+            "SELECT COUNT(*) FROM channel_messages
                  WHERE channel = ? AND account_id = ? AND conversation_id = ? AND topic_id = ?"
-            )
-            .bind(channel)
-            .bind(account_id)
-            .bind(conversation_id)
-            .bind(topic_id)
-            .fetch_one(&self.pool)
-        )?;
+        )
+        .bind(channel)
+        .bind(account_id)
+        .bind(conversation_id)
+        .bind(topic_id)
+        .fetch_one(&self.pool))?;
         let offset = ((page.saturating_sub(1)) * per_page) as i64;
-        let rows = db_retry!(
-            sqlx::query_as::<_, ChannelMessage>(
-                "SELECT id, channel, account_id, account_name, conversation_id, topic_id,
+        let rows = db_retry!(sqlx::query_as::<_, ChannelMessage>(
+            "SELECT id, channel, account_id, account_name, conversation_id, topic_id,
                     external_message_id, reply_to_external_id, direction, message_type,
                     content, peer_id, user_id, username, session_id, created_at
                  FROM channel_messages
                  WHERE channel = ? AND account_id = ? AND conversation_id = ? AND topic_id = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-            )
-            .bind(channel)
-            .bind(account_id)
-            .bind(conversation_id)
-            .bind(topic_id)
-            .bind(per_page as i64)
-            .bind(offset)
-            .fetch_all(&self.pool)
-        )?;
+        )
+        .bind(channel)
+        .bind(account_id)
+        .bind(conversation_id)
+        .bind(topic_id)
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(&self.pool))?;
         let mut ordered = rows;
         ordered.reverse();
         Ok((ordered, count.max(0) as u64))
@@ -4115,7 +4369,12 @@ impl Database {
 
     // Job runs（定时任务执行日志）
     /// 写入一条 running 记录，返回行 id
-    pub async fn create_job_run(&self, job_id: &str, trigger: &str, operator: Option<&str>) -> Result<i64> {
+    pub async fn create_job_run(
+        &self,
+        job_id: &str,
+        trigger: &str,
+        operator: Option<&str>,
+    ) -> Result<i64> {
         let now = Utc::now();
         let res = db_retry!(
             sqlx::query(
@@ -4131,16 +4390,22 @@ impl Database {
         Ok(res.last_insert_id() as i64)
     }
 
-    pub async fn finish_job_run(&self, id: i64, status: &str, result: Option<&str>, error: Option<&str>) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE job_runs SET status = ?, finished_at = ?, result = ?, error = ? WHERE id = ?")
-                .bind(status)
-                .bind(Utc::now())
-                .bind(result)
-                .bind(error)
-                .bind(id)
-                .execute(&self.pool)
-        )?;
+    pub async fn finish_job_run(
+        &self,
+        id: i64,
+        status: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE job_runs SET status = ?, finished_at = ?, result = ?, error = ? WHERE id = ?"
+        )
+        .bind(status)
+        .bind(Utc::now())
+        .bind(result)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool))?;
         Ok(())
     }
 
@@ -4182,11 +4447,11 @@ impl Database {
 
     // Job states（启停开关，默认 enabled）
     pub async fn get_job_enabled(&self, job_id: &str) -> Result<bool> {
-        let row: Option<(bool,)> = db_retry!(
-            sqlx::query_as("SELECT enabled FROM job_states WHERE job_id = ?")
-                .bind(job_id)
-                .fetch_optional(&self.pool)
-        )?;
+        let row: Option<(bool,)> = db_retry!(sqlx::query_as(
+            "SELECT enabled FROM job_states WHERE job_id = ?"
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool))?;
         Ok(row.map(|r| r.0).unwrap_or(true))
     }
 
@@ -4204,15 +4469,22 @@ impl Database {
 
     /// 所有显式设置过的开关（job_id → enabled）
     pub async fn list_job_states(&self) -> Result<Vec<(String, bool)>> {
-        let rows: Vec<(String, bool)> = db_retry!(
-            sqlx::query_as("SELECT job_id, enabled FROM job_states")
-                .fetch_all(&self.pool)
-        )?;
+        let rows: Vec<(String, bool)> = db_retry!(sqlx::query_as(
+            "SELECT job_id, enabled FROM job_states"
+        )
+        .fetch_all(&self.pool))?;
         Ok(rows)
     }
 
     // Client agents
-    pub async fn upsert_client_agent(&self, id: &str, user_id: &str, hostname: Option<&str>, work_dir: Option<&str>, accept_remote: bool) -> Result<()> {
+    pub async fn upsert_client_agent(
+        &self,
+        id: &str,
+        user_id: &str,
+        hostname: Option<&str>,
+        work_dir: Option<&str>,
+        accept_remote: bool,
+    ) -> Result<()> {
         db_retry!(
             sqlx::query(
                 "INSERT INTO client_agents (id, user_id, hostname, work_dir, accept_remote) VALUES (?, ?, ?, ?, ?)
@@ -4228,7 +4500,11 @@ impl Database {
         Ok(())
     }
 
-    pub async fn get_client_agent(&self, user_id: &str, client_id: &str) -> Result<Option<ClientAgent>> {
+    pub async fn get_client_agent(
+        &self,
+        user_id: &str,
+        client_id: &str,
+    ) -> Result<Option<ClientAgent>> {
         let agent = db_retry!(
             sqlx::query_as::<_, ClientAgent>(
                 "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents WHERE user_id = ? AND id = ?"
@@ -4302,7 +4578,11 @@ impl Database {
     }
 
     /// 列出某用户最近的终端通知（后续 admin/微信消费用）
-    pub async fn list_client_notifications(&self, user_id: &str, limit: u32) -> Result<Vec<ClientNotification>> {
+    pub async fn list_client_notifications(
+        &self,
+        user_id: &str,
+        limit: u32,
+    ) -> Result<Vec<ClientNotification>> {
         let rows = db_retry!(
             sqlx::query_as::<_, ClientNotification>(
                 "SELECT id, user_id, client_id, term_id, kind, title, body, created_at FROM client_notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT ?"
@@ -4315,7 +4595,10 @@ impl Database {
     }
 
     /// 列出尚未被微信消费方处理的终端通知（全用户，按时间正序）
-    pub async fn list_unpushed_client_notifications(&self, limit: u32) -> Result<Vec<ClientNotification>> {
+    pub async fn list_unpushed_client_notifications(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ClientNotification>> {
         let rows = db_retry!(
             sqlx::query_as::<_, ClientNotification>(
                 "SELECT id, user_id, client_id, term_id, kind, title, body, created_at FROM client_notifications WHERE pushed_at IS NULL ORDER BY created_at LIMIT ?"
@@ -4349,7 +4632,11 @@ impl Database {
     }
 
     /// 记录托管终端的工作目录（对下一次 /kimi 生效），保留已有映射
-    pub async fn upsert_weixin_kimi_work_dir(&self, binding_id: &str, work_dir: &str) -> Result<()> {
+    pub async fn upsert_weixin_kimi_work_dir(
+        &self,
+        binding_id: &str,
+        work_dir: &str,
+    ) -> Result<()> {
         db_retry!(
             sqlx::query(
                 "INSERT INTO weixin_kimi (binding_id, work_dir, created_at, updated_at) VALUES (?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE work_dir = VALUES(work_dir), updated_at = NOW()"
@@ -4362,7 +4649,12 @@ impl Database {
     }
 
     /// 建立/更新 binding → 托管终端映射
-    pub async fn set_weixin_kimi(&self, binding_id: &str, client_id: &str, term_id: &str) -> Result<()> {
+    pub async fn set_weixin_kimi(
+        &self,
+        binding_id: &str,
+        client_id: &str,
+        term_id: &str,
+    ) -> Result<()> {
         db_retry!(
             sqlx::query(
                 "INSERT INTO weixin_kimi (binding_id, client_id, term_id, created_at, updated_at) VALUES (?, ?, ?, NOW(), NOW()) ON DUPLICATE KEY UPDATE client_id = VALUES(client_id), term_id = VALUES(term_id), updated_at = NOW()"
@@ -4386,14 +4678,19 @@ impl Database {
     }
 
     // Switch a session between server-local execution (None) and a remote client
-    pub async fn set_session_exec_client(&self, session_id: &str, exec_client_id: Option<&str>, work_dir: Option<&str>) -> Result<()> {
-        db_retry!(
-            sqlx::query("UPDATE sessions SET exec_client_id = ?, work_dir = ?, updated_at = NOW() WHERE id = ?")
-                .bind(exec_client_id)
-                .bind(work_dir)
-                .bind(session_id)
-                .execute(&self.pool)
-        )?;
+    pub async fn set_session_exec_client(
+        &self,
+        session_id: &str,
+        exec_client_id: Option<&str>,
+        work_dir: Option<&str>,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE sessions SET exec_client_id = ?, work_dir = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(exec_client_id)
+        .bind(work_dir)
+        .bind(session_id)
+        .execute(&self.pool))?;
         Ok(())
     }
 }

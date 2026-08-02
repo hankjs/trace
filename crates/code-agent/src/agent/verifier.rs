@@ -4,11 +4,11 @@ use crate::retry::{emit_llm_request, emit_llm_response, stream_with_retry, LlmTr
 use crate::runtime::now_ts;
 use crate::AgentEvent;
 use anyhow::Result;
+use code_tools::{Tool, ToolOutput};
 use hank_provider::{
     CompletionRequest, ContentBlock, LlmProvider, Message, Role, StopReason, StreamEvent,
     ToolDefinition,
 };
-use code_tools::{Tool, ToolOutput};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -30,11 +30,7 @@ pub struct VerifierAgent {
 }
 
 impl VerifierAgent {
-    pub fn new(
-        provider: Arc<dyn LlmProvider>,
-        tools: Vec<Arc<dyn Tool>>,
-        model: String,
-    ) -> Self {
+    pub fn new(provider: Arc<dyn LlmProvider>, tools: Vec<Arc<dyn Tool>>, model: String) -> Self {
         let tool_definitions = tools
             .iter()
             .map(|t| ToolDefinition {
@@ -43,7 +39,12 @@ impl VerifierAgent {
                 input_schema: t.input_schema(),
             })
             .collect();
-        Self { provider, tools, model, tool_definitions }
+        Self {
+            provider,
+            tools,
+            model,
+            tool_definitions,
+        }
     }
 
     /// Verify a task result against the original request.
@@ -151,7 +152,9 @@ impl VerifierAgent {
                         current_tool_input.push_str(&json);
                     }
                     Ok(StreamEvent::ToolUseEnd) => {
-                        if !in_tool_block { continue; }
+                        if !in_tool_block {
+                            continue;
+                        }
                         in_tool_block = false;
                         let input: serde_json::Value =
                             serde_json::from_str(&current_tool_input).unwrap_or_default();
@@ -215,7 +218,9 @@ impl VerifierAgent {
                 let mut tool_results: Vec<ContentBlock> = Vec::new();
                 for block in &assistant_content {
                     if let ContentBlock::ToolUse { id, name, input } = block {
-                        if cancel.is_cancelled() { break; }
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         let _ = event_tx
                             .send(AgentEvent::ToolStart {
                                 id: id.clone(),

@@ -43,7 +43,10 @@ impl LlmProvider for AnthropicProvider {
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let url = format!("{}/v1/messages", self.base_url);
         let body = build_request_body(&req);
-        debug!("Sending request to Anthropic API: {url}, model={}", req.model);
+        debug!(
+            "Sending request to Anthropic API: {url}, model={}",
+            req.model
+        );
 
         let response = self
             .client
@@ -69,11 +72,14 @@ impl LlmProvider for AnthropicProvider {
         let (tx, rx) = mpsc::channel(1);
         let byte_stream = response.bytes_stream();
 
-        tokio::spawn(async move {
-            if let Err(e) = process_sse_stream(byte_stream, &tx).await {
-                let _ = tx.send(Err(e)).await;
+        tokio::spawn(
+            async move {
+                if let Err(e) = process_sse_stream(byte_stream, &tx).await {
+                    let _ = tx.send(Err(e)).await;
+                }
             }
-        }.instrument(tracing::Span::current()));
+            .instrument(tracing::Span::current()),
+        );
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
@@ -88,7 +94,11 @@ fn build_request_body(req: &CompletionRequest) -> serde_json::Value {
             .content
             .iter()
             .map(|block| match block {
-                ContentBlock::ToolResult { tool_use_id, content, is_error } => {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
                     let mut result = serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": tool_use_id,
@@ -208,12 +218,29 @@ fn parse_sse_event(raw: &str) -> Vec<StreamEvent> {
     match event_type.as_str() {
         "message_start" => {
             if let Some(usage) = parsed.get("message").and_then(|m| m.get("usage")) {
-                let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let input_tokens = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                let output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 // Anthropic 的 cache token 单列（不含在 input_tokens 内，不用减）
-                let cache_read_tokens = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                let cache_write_tokens = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                vec![StreamEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens }]
+                let cache_read_tokens = usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                let cache_write_tokens = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                vec![StreamEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                }]
             } else {
                 Vec::new()
             }
@@ -228,8 +255,16 @@ fn parse_sse_event(raw: &str) -> Vec<StreamEvent> {
                 None => return Vec::new(),
             };
             if block_type == "tool_use" {
-                let id = block.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string();
-                let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                let id = block
+                    .get("id")
+                    .and_then(|i| i.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 vec![StreamEvent::ToolUseStart { id, name }]
             } else {
                 Vec::new()
@@ -269,9 +304,17 @@ fn parse_sse_event(raw: &str) -> Vec<StreamEvent> {
             let mut events = Vec::new();
             // Extract output_tokens from usage field
             if let Some(usage) = parsed.get("usage") {
-                let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let output_tokens = usage
+                    .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
                 if output_tokens > 0 {
-                    events.push(StreamEvent::Usage { input_tokens: 0, output_tokens, cache_read_tokens: 0, cache_write_tokens: 0 });
+                    events.push(StreamEvent::Usage {
+                        input_tokens: 0,
+                        output_tokens,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    });
                 }
             }
             if let Some(delta) = parsed.get("delta") {
@@ -282,7 +325,9 @@ fn parse_sse_event(raw: &str) -> Vec<StreamEvent> {
                         "max_tokens" => StopReason::MaxTokens,
                         _ => StopReason::EndTurn,
                     };
-                    events.push(StreamEvent::MessageEnd { stop_reason: reason });
+                    events.push(StreamEvent::MessageEnd {
+                        stop_reason: reason,
+                    });
                 }
             }
             events

@@ -12,7 +12,11 @@ pub struct GenerateArtifactsTool {
 
 impl GenerateArtifactsTool {
     pub fn new(base_url: String, token: String, change_id: String) -> Self {
-        Self { base_url, token, change_id }
+        Self {
+            base_url,
+            token,
+            change_id,
+        }
     }
 }
 
@@ -65,7 +69,11 @@ impl Tool for GenerateArtifactsTool {
             if let Some(cap) = capability {
                 body["capability"] = json!(cap);
             }
-            client.post(format!("{}/api/changes/{}/artifacts", self.base_url, self.change_id))
+            client
+                .post(format!(
+                    "{}/api/changes/{}/artifacts",
+                    self.base_url, self.change_id
+                ))
                 .header("Authorization", format!("Bearer {}", self.token))
                 .json(&body)
                 .send()
@@ -78,7 +86,9 @@ impl Tool for GenerateArtifactsTool {
                 let content = spec["content"].as_str().unwrap_or_default();
                 if !capability.is_empty() && !content.is_empty() {
                     let resp = create("spec", Some(capability), content).await?;
-                    if resp.status().is_success() { count += 1; }
+                    if resp.status().is_success() {
+                        count += 1;
+                    }
                 }
             }
         }
@@ -87,7 +97,9 @@ impl Tool for GenerateArtifactsTool {
         if let Some(tasks) = input["tasks"].as_str() {
             if !tasks.is_empty() {
                 let resp = create("tasks", None, tasks).await?;
-                if resp.status().is_success() { count += 1; }
+                if resp.status().is_success() {
+                    count += 1;
+                }
             }
         }
 

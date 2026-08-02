@@ -108,7 +108,10 @@ async fn execute_tool(
         }
         "terminal_set_enabled" => {
             let id = input.get("id").and_then(|v| v.as_str()).unwrap_or("");
-            let enabled = input.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            let enabled = input
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             match term.term_set_enabled(id, enabled) {
                 Ok(info) => ToolOutput::ok(serde_json::to_string(&info).unwrap_or_default()),
                 Err(e) => ToolOutput::err(format!("Remote exec error: {e}")),

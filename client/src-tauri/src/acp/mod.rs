@@ -49,8 +49,7 @@ impl AcpState {
             Ok(c) => c,
             Err(_) => return Ok(()), // No config file yet
         };
-        let agents: Vec<AgentConfig> =
-            serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        let agents: Vec<AgentConfig> = serde_json::from_str(&content).map_err(|e| e.to_string())?;
         *self.agents.write().await = agents;
         Ok(())
     }

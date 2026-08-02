@@ -14,11 +14,17 @@ pub struct StrReplaceTool {
 
 impl StrReplaceTool {
     pub fn new(work_dir: Option<String>) -> Self {
-        Self { work_dir, checksum_store: None }
+        Self {
+            work_dir,
+            checksum_store: None,
+        }
     }
 
     pub fn with_checksum_store(work_dir: Option<String>, store: ChecksumStore) -> Self {
-        Self { work_dir, checksum_store: Some(store) }
+        Self {
+            work_dir,
+            checksum_store: Some(store),
+        }
     }
 
     fn resolve_path(&self, path: &str) -> String {

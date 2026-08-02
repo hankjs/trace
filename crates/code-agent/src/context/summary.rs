@@ -125,7 +125,9 @@ pub fn summarize_messages(messages: &[Message]) -> String {
                 hank_provider::ContentBlock::ToolUse { name, .. } => {
                     summary_parts.push(format!("[{role} used tool: {name}]"));
                 }
-                hank_provider::ContentBlock::ToolResult { content, is_error, .. } => {
+                hank_provider::ContentBlock::ToolResult {
+                    content, is_error, ..
+                } => {
                     let status = if *is_error { "error" } else { "ok" };
                     let truncated = if content.chars().count() > 100 {
                         format!("{}...", truncate_chars(content, 100))

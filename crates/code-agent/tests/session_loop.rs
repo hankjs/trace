@@ -567,20 +567,23 @@ async fn test_streaming_tool_output_delta_is_forwarded() {
             ..
         } if id == "t1" && content == "stream complete"
     )));
-    let start_call_id = events.iter().find_map(|event| match event {
-        AgentEvent::ToolStart {
-            id,
-            call_id,
-            run_id,
-            turn_id,
-            ..
-        } if id == "t1" => {
-            assert!(run_id.is_some());
-            assert!(turn_id.is_some());
-            call_id.clone()
-        }
-        _ => None,
-    }).expect("tool_start missing call_id");
+    let start_call_id = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolStart {
+                id,
+                call_id,
+                run_id,
+                turn_id,
+                ..
+            } if id == "t1" => {
+                assert!(run_id.is_some());
+                assert!(turn_id.is_some());
+                call_id.clone()
+            }
+            _ => None,
+        })
+        .expect("tool_start missing call_id");
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::ToolResult {
@@ -727,8 +730,12 @@ async fn test_loop_terminate_pairs_all_tool_results_and_stops() {
         text_end_script("should not reach here"),
     ]));
     let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(StreamingEchoTool)];
-    let mut session =
-        AgentSession::new(provider.clone(), tools, "mock-model".to_string(), "sys".to_string());
+    let mut session = AgentSession::new(
+        provider.clone(),
+        tools,
+        "mock-model".to_string(),
+        "sys".to_string(),
+    );
 
     let (tx, rx) = mpsc::channel(64);
     session
@@ -821,8 +828,12 @@ async fn test_max_tokens_executes_completed_tool_use() {
         text_end_script("done"),
     ]));
     let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(StreamingEchoTool)];
-    let mut session =
-        AgentSession::new(provider.clone(), tools, "mock-model".to_string(), "sys".to_string());
+    let mut session = AgentSession::new(
+        provider.clone(),
+        tools,
+        "mock-model".to_string(),
+        "sys".to_string(),
+    );
 
     let (tx, rx) = mpsc::channel(64);
     session
@@ -867,10 +878,12 @@ async fn test_max_tokens_executes_completed_tool_use() {
 
     // 未注入续写提示
     let has_continuation_prompt = session.messages().iter().any(|msg| {
-        msg.content.iter().any(|b| matches!(
-            b,
-            hank_provider::ContentBlock::Text { text } if text.contains("cut off")
-        ))
+        msg.content.iter().any(|b| {
+            matches!(
+                b,
+                hank_provider::ContentBlock::Text { text } if text.contains("cut off")
+            )
+        })
     });
     assert!(!has_continuation_prompt, "不应注入续写提示");
 }
@@ -889,8 +902,12 @@ async fn test_stream_error_step_retry_discards_partial_state() {
         text_end_script("done").into_iter().map(Ok).collect(),
     ]));
     let tools: Vec<Arc<dyn Tool>> = vec![];
-    let mut session =
-        AgentSession::new(provider.clone(), tools, "mock-model".to_string(), "sys".to_string());
+    let mut session = AgentSession::new(
+        provider.clone(),
+        tools,
+        "mock-model".to_string(),
+        "sys".to_string(),
+    );
 
     let (tx, rx) = mpsc::channel(64);
     session
@@ -927,7 +944,10 @@ async fn test_stream_error_step_retry_discards_partial_state() {
             _ => None,
         })
         .collect();
-    assert!(!assistant_text.contains("partial"), "assistant_text={assistant_text}");
+    assert!(
+        !assistant_text.contains("partial"),
+        "assistant_text={assistant_text}"
+    );
     assert!(assistant_text.contains("done"));
 }
 
@@ -1119,9 +1139,10 @@ async fn test_ask_user_pause_preserves_pairing() {
     assert!(events
         .iter()
         .any(|e| matches!(e, AgentEvent::AskUser { tool_use_id, .. } if tool_use_id == "ask1")));
-    assert!(!events
-        .iter()
-        .any(|e| matches!(e, AgentEvent::RunCompleted { .. } | AgentEvent::RunFailed { .. })));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        AgentEvent::RunCompleted { .. } | AgentEvent::RunFailed { .. }
+    )));
 
     let find_result = |id: &str| {
         session.messages().iter().find_map(|msg| {
@@ -1152,9 +1173,17 @@ async fn test_deferred_tool_first_call_returns_retry_hint() {
     let dir = tempdir_path();
     let provider = Arc::new(MockProvider::new(vec![
         // 第 1 次：空 schema 盲猜调用
-        tool_use_script("t1", "write_file", r#"{"path":"deferred.txt","content":"x"}"#),
+        tool_use_script(
+            "t1",
+            "write_file",
+            r#"{"path":"deferred.txt","content":"x"}"#,
+        ),
         // 第 2 次：拿到完整 schema 后重试
-        tool_use_script("t2", "write_file", r#"{"path":"deferred.txt","content":"x"}"#),
+        tool_use_script(
+            "t2",
+            "write_file",
+            r#"{"path":"deferred.txt","content":"x"}"#,
+        ),
         text_end_script("done"),
     ]));
     let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(WriteFileTool::new(Some(dir.clone())))];

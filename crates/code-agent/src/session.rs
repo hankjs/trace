@@ -430,7 +430,13 @@ impl AgentSession {
         let verifier =
             VerifierAgent::new(self.provider.clone(), readonly_tools, self.model.clone());
         let result = verifier
-            .verify(run_id, &self.original_request, summary, event_tx.clone(), cancel)
+            .verify(
+                run_id,
+                &self.original_request,
+                summary,
+                event_tx.clone(),
+                cancel,
+            )
             .await
             .unwrap_or_else(|e| {
                 warn!("VerifierAgent error: {e}");
@@ -824,7 +830,8 @@ impl AgentSession {
                         // 模型自填的 confirmed 由工具 execute 再次剥离。
                         if let Some(tool) = self.tools.iter().find(|t| t.name() == name) {
                             if let Some(req) = tool.needs_confirmation(input) {
-                                let (question, options) = quant_confirm_prompt(&req.summary, &req.source);
+                                let (question, options) =
+                                    quant_confirm_prompt(&req.summary, &req.source);
                                 let _ = event_tx
                                     .send(AgentEvent::AskUser {
                                         question,

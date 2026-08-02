@@ -60,9 +60,7 @@ impl Tool for ListDirectoryTool {
     }
 
     async fn execute(&self, input: Value) -> Result<ToolOutput> {
-        let path = input["path"]
-            .as_str()
-            .unwrap_or(".");
+        let path = input["path"].as_str().unwrap_or(".");
         let resolved = self.resolve_path(path);
 
         if !Path::new(&resolved).exists() {
@@ -165,7 +163,11 @@ impl ListDirectoryTool {
 
     async fn try_find(&self, path: &str, pattern: &str) -> Result<ToolOutput> {
         let mut cmd = Command::new("find");
-        cmd.arg(path).arg("-name").arg(pattern).arg("-type").arg("f");
+        cmd.arg(path)
+            .arg("-name")
+            .arg(pattern)
+            .arg("-type")
+            .arg("f");
 
         let result = tokio::time::timeout(Duration::from_secs(TIMEOUT_SECS), cmd.output()).await;
 

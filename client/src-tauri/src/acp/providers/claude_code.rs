@@ -191,10 +191,7 @@ async fn parse_claude_line(
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                let content = block
-                                    .get("content")
-                                    .cloned()
-                                    .unwrap_or(Value::Null);
+                                let content = block.get("content").cloned().unwrap_or(Value::Null);
                                 let is_error = block
                                     .get("is_error")
                                     .and_then(|v| v.as_bool())

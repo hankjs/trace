@@ -118,8 +118,7 @@ fn repair_tool_pairing(messages: &mut Vec<Message>) {
                 if !placeholders.is_empty() {
                     if next_is_user {
                         let tail = std::mem::take(&mut messages[i + 1].content);
-                        messages[i + 1].content =
-                            placeholders.into_iter().chain(tail).collect();
+                        messages[i + 1].content = placeholders.into_iter().chain(tail).collect();
                     } else {
                         messages.insert(
                             i + 1,
@@ -173,11 +172,7 @@ impl ContextManager {
     }
 
     /// Create a ContextManager with LLM-based compression support.
-    pub fn with_provider(
-        threshold: usize,
-        provider: Arc<dyn LlmProvider>,
-        model: String,
-    ) -> Self {
+    pub fn with_provider(threshold: usize, provider: Arc<dyn LlmProvider>, model: String) -> Self {
         Self {
             token_threshold: threshold,
             total_budget: TOTAL_BUDGET_DEFAULT,

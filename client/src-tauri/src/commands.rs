@@ -3,10 +3,10 @@ use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::acp::{AcpState, ActiveSession, AgentConfig};
 use crate::acp::events::{AcpEvent, AcpEventPayload};
 use crate::acp::provider::ProviderSession;
 use crate::acp::providers;
+use crate::acp::{AcpState, ActiveSession, AgentConfig};
 
 /// Create a new ACP session: register provider + session state (no process spawned yet).
 #[tauri::command]
@@ -56,9 +56,7 @@ pub async fn acp_prompt(
     message: String,
 ) -> Result<(), String> {
     let sessions = state.sessions.read().await;
-    let active = sessions
-        .get(&session_id)
-        .ok_or("No active session")?;
+    let active = sessions.get(&session_id).ok_or("No active session")?;
 
     // Fresh cancel token for this prompt
     let cancel_token = CancellationToken::new();
@@ -77,10 +75,13 @@ pub async fn acp_prompt(
     let sid_clone = session_id.clone();
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
-            let _ = app_clone.emit("acp-event", &AcpEventPayload {
-                session_id: sid_clone.clone(),
-                event,
-            });
+            let _ = app_clone.emit(
+                "acp-event",
+                &AcpEventPayload {
+                    session_id: sid_clone.clone(),
+                    event,
+                },
+            );
         }
     });
 
@@ -89,16 +90,24 @@ pub async fn acp_prompt(
     tokio::spawn(async move {
         let sessions = state_inner.sessions.read().await;
         let Some(active) = sessions.get(&session_id) else {
-            let _ = event_tx.send(AcpEvent::Error {
-                message: "Session not found".to_string(),
-            }).await;
+            let _ = event_tx
+                .send(AcpEvent::Error {
+                    message: "Session not found".to_string(),
+                })
+                .await;
             return;
         };
 
         let mut session_guard = active.session.lock().await;
         let result = active
             .provider
-            .prompt(&binary_path, &message, &mut session_guard, event_tx.clone(), cancel_token)
+            .prompt(
+                &binary_path,
+                &message,
+                &mut session_guard,
+                event_tx.clone(),
+                cancel_token,
+            )
             .await;
 
         if let Err(e) = result {
@@ -111,10 +120,7 @@ pub async fn acp_prompt(
 
 /// Cancel an in-progress prompt.
 #[tauri::command]
-pub async fn acp_cancel(
-    state: State<'_, Arc<AcpState>>,
-    session_id: String,
-) -> Result<(), String> {
+pub async fn acp_cancel(state: State<'_, Arc<AcpState>>, session_id: String) -> Result<(), String> {
     let sessions = state.sessions.read().await;
     if let Some(active) = sessions.get(&session_id) {
         active.cancel_token.cancel();
@@ -124,10 +130,7 @@ pub async fn acp_cancel(
 
 /// Stop and remove the session.
 #[tauri::command]
-pub async fn acp_stop(
-    state: State<'_, Arc<AcpState>>,
-    session_id: String,
-) -> Result<(), String> {
+pub async fn acp_stop(state: State<'_, Arc<AcpState>>, session_id: String) -> Result<(), String> {
     let mut sessions = state.sessions.write().await;
     if let Some(active) = sessions.remove(&session_id) {
         active.cancel_token.cancel();
@@ -137,9 +140,7 @@ pub async fn acp_stop(
 
 /// Get list of configured agents.
 #[tauri::command]
-pub async fn acp_get_agents(
-    state: State<'_, Arc<AcpState>>,
-) -> Result<Vec<AgentConfig>, String> {
+pub async fn acp_get_agents(state: State<'_, Arc<AcpState>>) -> Result<Vec<AgentConfig>, String> {
     Ok(state.agents.read().await.clone())
 }
 
@@ -166,10 +167,7 @@ pub async fn acp_add_agent(
 
 /// Remove an agent configuration.
 #[tauri::command]
-pub async fn acp_remove_agent(
-    state: State<'_, Arc<AcpState>>,
-    name: String,
-) -> Result<(), String> {
+pub async fn acp_remove_agent(state: State<'_, Arc<AcpState>>, name: String) -> Result<(), String> {
     {
         let mut agents = state.agents.write().await;
         agents.retain(|a| a.name != name);

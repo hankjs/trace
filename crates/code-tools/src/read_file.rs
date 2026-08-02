@@ -14,11 +14,17 @@ pub struct ReadFileTool {
 
 impl ReadFileTool {
     pub fn new(work_dir: Option<String>) -> Self {
-        Self { work_dir, checksum_store: None }
+        Self {
+            work_dir,
+            checksum_store: None,
+        }
     }
 
     pub fn with_checksum_store(work_dir: Option<String>, store: ChecksumStore) -> Self {
-        Self { work_dir, checksum_store: Some(store) }
+        Self {
+            work_dir,
+            checksum_store: Some(store),
+        }
     }
 
     fn resolve_path(&self, path: &str) -> String {
@@ -110,7 +116,11 @@ impl Tool for ReadFileTool {
             .join("\n");
 
         let output = if selected.len() > MAX_READ_BYTES {
-            format!("{}\n\n... [truncated, file has {} lines total]", &selected[..MAX_READ_BYTES], total_lines)
+            format!(
+                "{}\n\n... [truncated, file has {} lines total]",
+                &selected[..MAX_READ_BYTES],
+                total_lines
+            )
         } else {
             format!("{selected}\n\n({total_lines} lines total)")
         };

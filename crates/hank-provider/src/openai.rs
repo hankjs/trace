@@ -75,11 +75,14 @@ impl LlmProvider for OpenAiProvider {
         let (tx, rx) = mpsc::channel(1);
         let byte_stream = response.bytes_stream();
 
-        tokio::spawn(async move {
-            if let Err(e) = process_sse_stream(byte_stream, &tx).await {
-                let _ = tx.send(Err(e)).await;
+        tokio::spawn(
+            async move {
+                if let Err(e) = process_sse_stream(byte_stream, &tx).await {
+                    let _ = tx.send(Err(e)).await;
+                }
             }
-        }.instrument(tracing::Span::current()));
+            .instrument(tracing::Span::current()),
+        );
 
         Ok(Box::pin(ReceiverStream::new(rx)))
     }
@@ -129,7 +132,11 @@ fn build_request_body(req: &CompletionRequest) -> serde_json::Value {
                         }
                     }));
                 }
-                crate::ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                crate::ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
                     tool_results.push(serde_json::json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
@@ -228,9 +235,7 @@ async fn process_sse_stream(
                     }
 
                     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                        if let Some(events) =
-                            parse_chunk(&parsed, &mut current_tool_id)
-                        {
+                        if let Some(events) = parse_chunk(&parsed, &mut current_tool_id) {
                             for event in events {
                                 if tx.send(Ok(event)).await.is_err() {
                                     return Ok(());
@@ -246,13 +251,22 @@ async fn process_sse_stream(
     Ok(())
 }
 
-fn parse_chunk(chunk: &serde_json::Value, current_tool_id: &mut String) -> Option<Vec<StreamEvent>> {
+fn parse_chunk(
+    chunk: &serde_json::Value,
+    current_tool_id: &mut String,
+) -> Option<Vec<StreamEvent>> {
     let mut events = Vec::new();
 
     // OpenAI sends usage in a final chunk with empty choices
     if let Some(usage) = chunk.get("usage") {
-        let prompt_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let prompt_tokens = usage
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let output_tokens = usage
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
         // OpenAI 的 cached 已含在 prompt_tokens 里，归一化时从 input 扣除（【SA 13】）
         let cache_read_tokens = usage
             .get("prompt_tokens_details")
@@ -260,12 +274,21 @@ fn parse_chunk(chunk: &serde_json::Value, current_tool_id: &mut String) -> Optio
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
         let input_tokens = prompt_tokens.saturating_sub(cache_read_tokens);
-        events.push(StreamEvent::Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens: 0 });
+        events.push(StreamEvent::Usage {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_write_tokens: 0,
+        });
     }
 
     let choices = chunk.get("choices")?.as_array()?;
     if choices.is_empty() {
-        return if events.is_empty() { None } else { Some(events) };
+        return if events.is_empty() {
+            None
+        } else {
+            Some(events)
+        };
     }
     let choice = choices.first()?;
     let delta = choice.get("delta")?;

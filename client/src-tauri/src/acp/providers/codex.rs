@@ -165,7 +165,10 @@ async fn parse_codex_line(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let input = v.get("input").cloned().unwrap_or(Value::Object(Default::default()));
+            let input = v
+                .get("input")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default()));
             let _ = event_tx
                 .send(AcpEvent::ToolUse {
                     tool_call_id: id,
@@ -181,10 +184,7 @@ async fn parse_codex_line(
                 .unwrap_or("")
                 .to_string();
             let output = v.get("output").cloned().unwrap_or(Value::Null);
-            let is_error = v
-                .get("is_error")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let is_error = v.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
             let _ = event_tx
                 .send(AcpEvent::ToolResult {
                     tool_call_id: id,

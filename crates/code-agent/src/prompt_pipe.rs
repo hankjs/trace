@@ -97,13 +97,22 @@ impl EnvironmentContext {
             out.push_str(&format!("  <cwd>{}</cwd>\n", cwd));
         }
         out.push_str(&format!("  <shell>{}</shell>\n", self.shell));
-        out.push_str(&format!("  <current_date>{}</current_date>\n", self.current_date));
+        out.push_str(&format!(
+            "  <current_date>{}</current_date>\n",
+            self.current_date
+        ));
         out.push_str(&format!("  <timezone>{}</timezone>\n", self.timezone));
         if let Some(ref root) = self.repo_root {
             out.push_str(&format!("  <repo_root>{}</repo_root>\n", root));
         }
-        out.push_str(&format!("  <sandbox_mode>{}</sandbox_mode>\n", self.sandbox_mode));
-        out.push_str(&format!("  <network_policy>{}</network_policy>\n", self.network_policy));
+        out.push_str(&format!(
+            "  <sandbox_mode>{}</sandbox_mode>\n",
+            self.sandbox_mode
+        ));
+        out.push_str(&format!(
+            "  <network_policy>{}</network_policy>\n",
+            self.network_policy
+        ));
         out.push_str("</environment_context>");
         out
     }
@@ -117,7 +126,11 @@ pub fn build_system_prompt(segments: &[PromptSegment]) -> String {
             PromptSegment::Static(s) => Some(s.to_string()),
             PromptSegment::Dynamic(s) => Some(s.clone()),
             PromptSegment::Conditional { content, condition } => {
-                if *condition { Some(content.clone()) } else { None }
+                if *condition {
+                    Some(content.clone())
+                } else {
+                    None
+                }
             }
         })
         .collect::<Vec<_>>()
@@ -155,17 +168,26 @@ pub fn build_layered_prompt(
     });
 
     if let Some(rt) = runtime {
-        named.push(NamedSegment { name: "developer", content: rt.render() });
+        named.push(NamedSegment {
+            name: "developer",
+            content: rt.render(),
+        });
     }
 
     let project_text = build_system_prompt(project_segments);
     if !project_text.is_empty() {
-        named.push(NamedSegment { name: "project", content: project_text });
+        named.push(NamedSegment {
+            name: "project",
+            content: project_text,
+        });
     }
 
     // environment 含 current_date（动态），放在静态 project 段之后（先静后动）
     if let Some(env) = environment {
-        named.push(NamedSegment { name: "environment", content: env.render() });
+        named.push(NamedSegment {
+            name: "environment",
+            content: env.render(),
+        });
     }
 
     let assembled = named
@@ -192,14 +214,15 @@ pub async fn discover_project_context(work_dir: &str) -> Vec<PromptSegment> {
         let path = format!("{}/{}", work_dir.trim_end_matches('/'), filename);
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
             let truncated = if content.chars().count() > max_chars {
-                let end = content.char_indices().nth(max_chars).map_or(content.len(), |(i, _)| i);
+                let end = content
+                    .char_indices()
+                    .nth(max_chars)
+                    .map_or(content.len(), |(i, _)| i);
                 format!("{}...\n[truncated at {} chars]", &content[..end], max_chars)
             } else {
                 content
             };
-            segments.push(PromptSegment::Dynamic(format!(
-                "# {label}\n\n{truncated}"
-            )));
+            segments.push(PromptSegment::Dynamic(format!("# {label}\n\n{truncated}")));
         }
     }
 

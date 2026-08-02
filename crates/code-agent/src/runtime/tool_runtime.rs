@@ -78,8 +78,14 @@ impl ToolRuntime {
                 };
                 Some(FileChange { path, kind })
             }
-            "str_replace" => Some(FileChange { path, kind: FileChangeKind::Update }),
-            "delete_file" => Some(FileChange { path, kind: FileChangeKind::Delete }),
+            "str_replace" => Some(FileChange {
+                path,
+                kind: FileChangeKind::Update,
+            }),
+            "delete_file" => Some(FileChange {
+                path,
+                kind: FileChangeKind::Delete,
+            }),
             _ => None,
         }
     }

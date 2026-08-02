@@ -14,7 +14,12 @@ pub struct FinalizeExploreTool {
 
 impl FinalizeExploreTool {
     pub fn new(base_url: String, token: String, change_id: String, session_id: String) -> Self {
-        Self { base_url, token, change_id, session_id }
+        Self {
+            base_url,
+            token,
+            change_id,
+            session_id,
+        }
     }
 }
 
@@ -49,10 +54,16 @@ impl Tool for FinalizeExploreTool {
         let summary = input["summary"].as_str().unwrap_or_default();
         let name = input["name"].as_str().unwrap_or_default();
         if summary.is_empty() {
-            return Ok(ToolOutput { content: "summary is required".to_string(), is_error: true });
+            return Ok(ToolOutput {
+                content: "summary is required".to_string(),
+                is_error: true,
+            });
         }
         if name.is_empty() {
-            return Ok(ToolOutput { content: "name is required".to_string(), is_error: true });
+            return Ok(ToolOutput {
+                content: "name is required".to_string(),
+                is_error: true,
+            });
         }
 
         let client = reqwest::Client::new();
@@ -60,24 +71,37 @@ impl Tool for FinalizeExploreTool {
         // Determine change_id: use existing or create a new change
         let change_id = if self.change_id.is_empty() {
             // Create a new change via API
-            let resp = client.post(format!("{}/api/changes", self.base_url))
+            let resp = client
+                .post(format!("{}/api/changes", self.base_url))
                 .header("Authorization", format!("Bearer {}", self.token))
                 .json(&json!({ "name": name }))
-                .send().await?;
+                .send()
+                .await?;
             if !resp.status().is_success() {
-                return Ok(ToolOutput { content: "Failed to create change".to_string(), is_error: true });
+                return Ok(ToolOutput {
+                    content: "Failed to create change".to_string(),
+                    is_error: true,
+                });
             }
             let body: Value = resp.json().await?;
             let cid = body["data"]["id"].as_str().unwrap_or_default().to_string();
             if cid.is_empty() {
-                return Ok(ToolOutput { content: "Failed to get change id from response".to_string(), is_error: true });
+                return Ok(ToolOutput {
+                    content: "Failed to get change id from response".to_string(),
+                    is_error: true,
+                });
             }
 
             // Bind the change to this session
-            let _ = client.put(format!("{}/api/sessions/{}", self.base_url, self.session_id))
+            let _ = client
+                .put(format!(
+                    "{}/api/sessions/{}",
+                    self.base_url, self.session_id
+                ))
                 .header("Authorization", format!("Bearer {}", self.token))
                 .json(&json!({ "change_id": cid }))
-                .send().await;
+                .send()
+                .await;
 
             cid
         } else {
@@ -85,15 +109,26 @@ impl Tool for FinalizeExploreTool {
         };
 
         // Update the change's explore_summary via API
-        let resp = client.put(format!("{}/api/changes/{}", self.base_url, change_id))
+        let resp = client
+            .put(format!("{}/api/changes/{}", self.base_url, change_id))
             .header("Authorization", format!("Bearer {}", self.token))
             .json(&json!({ "explore_summary": summary, "name": name }))
-            .send().await?;
+            .send()
+            .await?;
 
         if resp.status().is_success() {
-            Ok(ToolOutput { content: format!("Explore phase finalized successfully. Change '{}' created.", name), is_error: false })
+            Ok(ToolOutput {
+                content: format!(
+                    "Explore phase finalized successfully. Change '{}' created.",
+                    name
+                ),
+                is_error: false,
+            })
         } else {
-            Ok(ToolOutput { content: "Failed to finalize explore phase".to_string(), is_error: true })
+            Ok(ToolOutput {
+                content: "Failed to finalize explore phase".to_string(),
+                is_error: true,
+            })
         }
     }
 }

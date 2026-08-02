@@ -45,8 +45,14 @@ impl Tool for AskUserTool {
         // This tool's execution is a no-op — the actual interruption logic
         // is handled by the agent loop in session.rs which detects the tool name.
         let question = input["question"].as_str().unwrap_or_default();
-        let options = input["options"].as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+        let options = input["options"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .unwrap_or_default();
         Ok(ToolOutput {
             content: format!("Asked user: {} [{}]", question, options),

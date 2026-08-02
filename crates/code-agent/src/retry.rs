@@ -147,18 +147,28 @@ fn is_retryable(error: &anyhow::Error) -> bool {
         return true;
     }
     // HTTP 5xx Server Errors — 精确匹配（防止 5000/50000 等误命中）
-    if has_http_status(&msg, "500") || has_http_status(&msg, "502")
-        || has_http_status(&msg, "503") || has_http_status(&msg, "504")
+    if has_http_status(&msg, "500")
+        || has_http_status(&msg, "502")
+        || has_http_status(&msg, "503")
+        || has_http_status(&msg, "504")
     {
         return true;
     }
-    if msg.contains("internal server error") || msg.contains("bad gateway")
-        || msg.contains("service unavailable") || msg.contains("gateway timeout") {
+    if msg.contains("internal server error")
+        || msg.contains("bad gateway")
+        || msg.contains("service unavailable")
+        || msg.contains("gateway timeout")
+    {
         return true;
     }
     // 网络错误
-    if msg.contains("connection") || msg.contains("timeout") || msg.contains("timed out")
-        || msg.contains("dns") || msg.contains("reset") || msg.contains("broken pipe") {
+    if msg.contains("connection")
+        || msg.contains("timeout")
+        || msg.contains("timed out")
+        || msg.contains("dns")
+        || msg.contains("reset")
+        || msg.contains("broken pipe")
+    {
         return true;
     }
     if msg.contains("overloaded") {
@@ -260,11 +270,7 @@ pub(crate) async fn stream_with_retry(
                 }
                 // 不可重试或已达最大重试次数
                 if attempt == MAX_RETRIES {
-                    warn!(
-                        "LLM stream failed after {} retries: {}",
-                        MAX_RETRIES + 1,
-                        e
-                    );
+                    warn!("LLM stream failed after {} retries: {}", MAX_RETRIES + 1, e);
                 }
                 emit_failed(
                     event_tx,
@@ -413,15 +419,7 @@ pub(crate) async fn consume_stream_with_retry(
                         continue 'step;
                     }
                     // 不可重试或已达最大重试次数
-                    emit_failed(
-                        event_tx,
-                        trace,
-                        "stream",
-                        attempt + 1,
-                        is_retryable(&e),
-                        &e,
-                    )
-                    .await;
+                    emit_failed(event_tx, trace, "stream", attempt + 1, is_retryable(&e), &e).await;
                     return Err(e);
                 }
             }

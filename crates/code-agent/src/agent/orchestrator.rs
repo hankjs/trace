@@ -1,8 +1,8 @@
+use crate::agent::loop_detector::LoopLevel;
 use crate::agent::traits::{DelegatedTask, TaskStatus, ThinkStrategy};
 use crate::agent::verifier::VerifierAgent;
 use crate::agent::worker::WorkerAgent;
 use crate::agent::LoopDetector;
-use crate::agent::loop_detector::LoopLevel;
 use crate::context::summary::{estimate_tokens, truncate_tool_result_default};
 use crate::context::{BudgetStatus, ContextManager};
 use crate::retry::{
@@ -571,9 +571,11 @@ impl OrchestratorAgent {
                 runtime.stream_timeout.as_secs()
             );
             error!("{message}");
-            let _ = event_tx.send(AgentEvent::Error {
-                message: message.clone(),
-            }).await;
+            let _ = event_tx
+                .send(AgentEvent::Error {
+                    message: message.clone(),
+                })
+                .await;
             return Err(anyhow::anyhow!(message));
         }
 
@@ -937,14 +939,7 @@ impl OrchestratorAgent {
                     }
                     let result = self
                         .execute_single_tool(
-                            id,
-                            name,
-                            input,
-                            &event_tx,
-                            run_state,
-                            runtime,
-                            &turn_id,
-                            &call_id,
+                            id, name, input, &event_tx, run_state, runtime, &turn_id, &call_id,
                         )
                         .await;
                     // 回填结果指纹

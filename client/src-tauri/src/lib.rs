@@ -4,8 +4,8 @@ mod llm_stream;
 mod terminal;
 mod tools;
 
-use std::sync::Arc;
 use acp::AcpState;
+use std::sync::Arc;
 use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -19,9 +19,7 @@ pub fn run() {
                 .app_data_dir()
                 .unwrap_or_else(|_| std::path::PathBuf::from("."));
             let config_path = app_data_dir.join("acp_agents.json");
-            let state = Arc::new(AcpState::new(
-                config_path.to_string_lossy().to_string(),
-            ));
+            let state = Arc::new(AcpState::new(config_path.to_string_lossy().to_string()));
 
             // Load config in background
             let state_clone = state.clone();

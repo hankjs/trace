@@ -693,7 +693,11 @@ async fn run_streaming(
         }
     }
 
-    Ok(streaming_output(terminal_state, last_artifact, terminal_message))
+    Ok(streaming_output(
+        terminal_state,
+        last_artifact,
+        terminal_message,
+    ))
 }
 
 /// 短任务 Task → ToolOutput。终态非 completed（failed/canceled/rejected）时标为错误，
