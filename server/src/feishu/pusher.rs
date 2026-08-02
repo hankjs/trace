@@ -310,20 +310,9 @@ async fn run(
                         .as_ref()
                         .map(|r| r.id.clone())
                         .unwrap_or_default();
-                    let admin_url = state
-                        .config
-                        .server
-                        .admin_base_url
-                        .as_ref()
-                        .filter(|u| !u.trim().is_empty())
-                        .filter(|_| !interaction_id.is_empty())
-                        .map(|base| {
-                            format!(
-                                "{}/#/interactions/{}",
-                                base.trim_end_matches('/'),
-                                interaction_id
-                            )
-                        });
+                    // interaction_id 为空时 admin_interaction_url 返回 None（与原先 filter 语义一致）
+                    let admin_url =
+                        crate::interaction_flow::admin_interaction_url(&state, &interaction_id);
 
                     // task_gate 单独开分支：大卡片结构与 quant_confirm / 普通 ask_user 不同，
                     // 强行复用 build_confirm_card 会弄坏 quant 确认路径。

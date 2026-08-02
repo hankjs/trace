@@ -67,7 +67,7 @@
 
 ## Admin 页面
 
-base path `/admin/`（history 路由）。飞书卡片深链用 hash 兼容：`{admin_base_url}/#/interactions/{id}`。
+base path `/admin/`（history 路由）。飞书卡片深链：`{admin_base_url}/admin/interactions/{id}`。
 
 | 路径 | 组件 | 说明 |
 |------|------|------|

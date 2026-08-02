@@ -11,9 +11,10 @@ database_url = "mysql://user:password@host:3306/dbname"
 # 留空时自动探测常见路径，也可用 CHROME_PATH 环境变量指定
 # chrome_path = "/usr/bin/chromium"
 
-# admin 后台外部可访问地址，用于飞书确认卡片生成交互单详情深链（hash 路由）。
+# admin 后台外部可访问地址，用于飞书确认卡片生成交互单详情深链。
+# admin 是 history 路由，base path `/admin/`（见 admin/src/main.ts）。
 # 留空则卡片不渲染深链行。示例：admin_base_url = "https://your-host"
-# 深链格式：{admin_base_url}/#/interactions/{id}
+# 深链格式：{admin_base_url}/admin/interactions/{id}
 # admin_base_url = "https://your-host"
 
 # 多实例共库时只能一个实例开启长连接 / 调度（默认均为 true）

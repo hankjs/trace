@@ -622,7 +622,7 @@ mod tests {
             session_id: "s1abcdef".into(),
             chat_id: "c1".into(),
             topic_id: "t1".into(),
-            admin_url: Some("https://admin.example/#/interactions/ia-123".into()),
+            admin_url: Some("https://admin.example/admin/interactions/ia-123".into()),
             hint: None,
         });
         // elements: [question, info_block, actions]
@@ -662,7 +662,7 @@ mod tests {
         let info = card["body"]["elements"][1].to_string();
         assert!(info.contains("ia-9"));
         assert!(!info.contains("Admin"));
-        assert!(!info.contains("/#/interactions/"));
+        assert!(!info.contains("/#/"));
     }
 
     #[test]
@@ -685,7 +685,7 @@ mod tests {
             backend: "codex".into(),
             source_label: "飞书派单".into(),
             dirty_files: 0,
-            admin_url: Some("https://admin.example/#/interactions/ia-gate-abcdef012345".into()),
+            admin_url: Some("https://admin.example/admin/interactions/ia-gate-abcdef012345".into()),
         });
         let body = card["body"]["elements"].to_string();
         assert!(body.contains("ia-gate-abcd")); // 前 12 位
@@ -722,7 +722,7 @@ mod tests {
             backend: "claude".into(),
             source_label: "飞书派单".into(),
             dirty_files: 3,
-            admin_url: Some("https://admin.example/#/interactions/ia-dirty".into()),
+            admin_url: Some("https://admin.example/admin/interactions/ia-dirty".into()),
         });
         let body = card["body"]["elements"].to_string();
         assert!(body.contains("第一轮已产生 3 个文件改动"));

@@ -598,13 +598,7 @@ fn task_gate_card_from_interaction(
         serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
     let dirty_files = resume["dirty_files"].as_u64().unwrap_or(0) as usize;
     let backend = resume["backend"].as_str().unwrap_or("cli").to_string();
-    let admin_url = state
-        .config
-        .server
-        .admin_base_url
-        .as_ref()
-        .filter(|u| !u.trim().is_empty())
-        .map(|base| format!("{}/#/interactions/{}", base.trim_end_matches('/'), row.id));
+    let admin_url = admin_interaction_url(state, &row.id);
     let chat = row.chat_id.as_deref().unwrap_or(chat_id);
     let topic = row.topic_id.as_deref().unwrap_or(topic_id);
     build_task_gate_card(&TaskGateCardOptions {
@@ -919,13 +913,7 @@ fn confirm_card_from_interaction(
     } else {
         Some("点击按钮或直接回复消息作答".to_string())
     };
-    let admin_url = state
-        .config
-        .server
-        .admin_base_url
-        .as_ref()
-        .filter(|u| !u.trim().is_empty())
-        .map(|base| format!("{}/#/interactions/{}", base.trim_end_matches('/'), row.id));
+    let admin_url = admin_interaction_url(state, &row.id);
     let chat = row.chat_id.as_deref().unwrap_or(chat_id);
     let topic = row.topic_id.as_deref().unwrap_or(topic_id);
     build_confirm_card(&ConfirmCardOptions {
@@ -939,6 +927,36 @@ fn confirm_card_from_interaction(
         admin_url,
         hint,
     })
+}
+
+/// 交互单 admin 详情深链的纯拼接逻辑（单测用）。
+///
+/// admin 是 history 路由且 base path 为 `/admin/`（见 admin/src/main.ts），
+/// 所以路径必须是 `/admin/interactions/{id}`——写成 hash 形式（`/#/…`）
+/// 不会命中任何路由，链接点开是空白页或 404。
+pub(crate) fn build_admin_interaction_url(base: &str, interaction_id: &str) -> String {
+    format!(
+        "{}/admin/interactions/{}",
+        base.trim_end_matches('/'),
+        interaction_id
+    )
+}
+
+/// 交互单的 admin 详情深链。
+///
+/// 格式只有这一个定义点：`{admin_base_url}/admin/interactions/{id}`。
+/// `admin_base_url` 未配置 / 空白，或 `interaction_id` 为空时返回 None（卡片不渲染深链行）。
+pub(crate) fn admin_interaction_url(state: &AppState, interaction_id: &str) -> Option<String> {
+    if interaction_id.is_empty() {
+        return None;
+    }
+    state
+        .config
+        .server
+        .admin_base_url
+        .as_ref()
+        .filter(|u| !u.trim().is_empty())
+        .map(|base| build_admin_interaction_url(base, interaction_id))
 }
 
 fn card_action_claim_id(
@@ -959,7 +977,7 @@ fn card_action_claim_id(
 
 #[cfg(test)]
 mod tests {
-    use super::card_action_claim_id;
+    use super::{build_admin_interaction_url, card_action_claim_id};
 
     #[test]
     fn card_action_claim_is_scoped_to_the_card() {
@@ -975,5 +993,21 @@ mod tests {
             card_action_claim_id(None, Some("evt_1"), "oc_1", "session_1"),
             "card-action-event:evt_1"
         );
+    }
+
+    #[test]
+    fn admin_interaction_url_uses_history_base_path() {
+        // 曾经错写成 hash 形式导致卡片深链 404，这里锁住 history 路径格式。
+        let url = build_admin_interaction_url("https://example.com", "ia-123");
+        assert_eq!(url, "https://example.com/admin/interactions/ia-123");
+        assert!(!url.contains("/#/"));
+        assert!(url.contains("/admin/interactions/"));
+    }
+
+    #[test]
+    fn admin_interaction_url_trims_trailing_slash_on_base() {
+        let url = build_admin_interaction_url("https://example.com/", "ia-9");
+        assert_eq!(url, "https://example.com/admin/interactions/ia-9");
+        assert!(!url.contains("//admin"));
     }
 }

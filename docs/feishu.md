@@ -91,7 +91,7 @@ feishu_monitor = false   # 其他实例关掉
 admin_base_url = "https://your-host"   # 留空则卡片不渲染深链行
 ```
 
-深链格式 `{admin_base_url}/#/interactions/{id}`（admin 用 hash 路由兼容深链）。
+深链格式 `{admin_base_url}/admin/interactions/{id}`（admin 是 history 路由，base path `/admin/`）。
 本地 dev 通常留空。
 
 ## 三、用法
