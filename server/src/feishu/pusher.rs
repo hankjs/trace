@@ -311,26 +311,73 @@ async fn run(
                     } else {
                         Some("点击按钮或直接回复消息作答".to_string())
                     };
+                    // chat.rs forwarder 在 push 到 buffer 前已 await create_interaction，
+                    // 此处 latest_pending 一定能读到刚落库的那一行（时序正确，无旁路 map）。
+                    let interaction = state
+                        .db
+                        .latest_pending_interaction(&session_id)
+                        .await
+                        .ok()
+                        .flatten();
+                    let interaction_id = interaction
+                        .as_ref()
+                        .map(|r| r.id.clone())
+                        .unwrap_or_default();
+                    let admin_url = state
+                        .config
+                        .server
+                        .admin_base_url
+                        .as_ref()
+                        .filter(|u| !u.trim().is_empty())
+                        .filter(|_| !interaction_id.is_empty())
+                        .map(|base| {
+                            format!(
+                                "{}/#/interactions/{}",
+                                base.trim_end_matches('/'),
+                                interaction_id
+                            )
+                        });
                     let card = build_confirm_card(&ConfirmCardOptions {
                         title: title.to_string(),
                         question: question.clone(),
                         choices: options.clone(),
+                        interaction_id: interaction_id.clone(),
                         session_id: session_id.clone(),
                         chat_id: chat_id.clone(),
                         topic_id: topic_id.clone(),
+                        admin_url,
                         hint,
                     });
-                    if let Err(e) = api.reply_card(&message_id, &card, in_thread).await {
-                        tracing::warn!("feishu: send confirm card failed: {e:#}");
-                        // 降级为纯文本提问
-                        let mut msg = format!("❓ {question}");
-                        if !options.is_empty() {
-                            msg.push_str("\n选项：");
-                            for (i, opt) in options.iter().enumerate() {
-                                msg.push_str(&format!("\n{}. {}", i + 1, opt));
+                    match api.reply_card(&message_id, &card, in_thread).await {
+                        Ok(card_mid) => {
+                            if !interaction_id.is_empty() {
+                                if let Err(e) = state
+                                    .db
+                                    .set_interaction_card(&interaction_id, &card_mid)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        interaction_id = %interaction_id,
+                                        "feishu: set_interaction_card failed: {e:#}"
+                                    );
+                                }
                             }
                         }
-                        let _ = api.reply_text(&message_id, &msg, in_thread).await;
+                        Err(e) => {
+                            tracing::warn!("feishu: send confirm card failed: {e:#}");
+                            // 降级为纯文本提问
+                            let mut msg = format!("❓ {question}");
+                            if !options.is_empty() {
+                                msg.push_str("\n选项：");
+                                for (i, opt) in options.iter().enumerate() {
+                                    msg.push_str(&format!("\n{}. {}", i + 1, opt));
+                                }
+                            }
+                            if !interaction_id.is_empty() {
+                                msg.push_str(&format!("\n任务编号：{interaction_id}"));
+                            }
+                            let _ = api.reply_text(&message_id, &msg, in_thread).await;
+                        }
                     }
                     // ask_user 期间 run 处于暂停：进度停在这里等用户作答，
                     // 让"进度怎样了"能看出是在等人而不是在算。

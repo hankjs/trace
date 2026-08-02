@@ -11,6 +11,11 @@ database_url = "mysql://user:password@host:3306/dbname"
 # 留空时自动探测常见路径，也可用 CHROME_PATH 环境变量指定
 # chrome_path = "/usr/bin/chromium"
 
+# admin 后台外部可访问地址，用于飞书确认卡片生成交互单详情深链（hash 路由）。
+# 留空则卡片不渲染深链行。示例：admin_base_url = "https://your-host"
+# 深链格式：{admin_base_url}/#/interactions/{id}
+# admin_base_url = "https://your-host"
+
 # 飞书驱动的 server-only monorepo Agent（默认关闭）。
 # 开启后，绑定到 can_login_admin 用户的飞书新话题会先判断任务归属：
 # Trace/quant 任务创建 Git worktree，其他任务创建普通隔离目录，命令和问询不建目录。

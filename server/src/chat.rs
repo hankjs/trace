@@ -16,7 +16,6 @@ use code_tools::{
     generate_tools::GenerateArtifactsTool,
     git::GitTool,
     list_directory::ListDirectoryTool,
-    quant_grant::QuantPendingConfirm,
     quant_tools::quant_tools,
     read_file::ReadFileTool,
     search::SearchTool,
@@ -29,6 +28,7 @@ use code_tools::{
     PermissionConfig, PermissionMode, Tool,
 };
 use futures::stream::Stream;
+use hank_db::NewInteraction;
 use serde::Deserialize;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -41,14 +41,6 @@ const QUANT_RESEARCH_SKILL_MD: &str = include_str!("../skills/quant-research/SKI
 const QUANT_RESEARCH_SKILL_NAME: &str = "quant-research";
 const QUANT_RESEARCH_SKILL_DESC: &str = "Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experiment/trial/backtest/factor 工具链上执行可检验假设，遵守停止条件与 findings 强制落表，不输出交易指令。";
 const QUANT_RESEARCH_SKILL_PATH: &str = "skills/quant-research";
-/// 微信入口待确认单 TTL：5 分钟（设计 §5.4.4）。
-/// 注意：该 TTL 只在 handle_quant_confirmation 对 weixin 来源生效；
-/// web 会话的待确认单不设业务 TTL（进程重启即失效），避免用户稍后回复
-/// 「确认」被静默当成新消息。
-const QUANT_CONFIRM_TTL_MS: i64 = 5 * 60 * 1000;
-/// 待确认单 map 的兜底 GC 周期（纯内存卫生，防止永不回复的会话条目无限堆积），
-/// 远大于任何业务 TTL，不影响确认流程语义。
-const QUANT_CONFIRM_GC_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 /// 构造 quant-research skill 索引与 project segment；仅在有 quant 工具的会话注入。
 fn quant_research_prompt_inputs(
@@ -304,13 +296,9 @@ pub async fn run_chat_turn(
         .unwrap_or(false);
     let legacy_repository_agent = repository_workspace && routed_agent_kind.is_none();
 
-    // Check if this session has a pending ask_user state.
-    // quant_confirm 类待确认单优先从进程内 map 读取（设计 §5.4.4），未命中再回退 DB。
-    let db_pending_ask_user = session_record
-        .as_ref()
-        .and_then(|s| s.pending_ask_user.clone());
-    let pending_ask_user =
-        resolve_pending_ask_user(state, &session_id, db_pending_ask_user.clone()).await;
+    // 待确认状态统一从 agent_interactions 表读取（不再读 sessions.pending_ask_user
+    // 或进程内 map）。session 重建也不丢单——交互单有自己的主键。
+    let pending_ask_user = resolve_pending_ask_user(state, &session_id).await;
 
     let parent_id_for_new_msg = match opts.parent_id.as_deref() {
         Some("root") => None,
@@ -507,19 +495,45 @@ pub async fn run_chat_turn(
     let user_content: Vec<hank_provider::ContentBlock> = if let Some(ref pending_json) =
         pending_ask_user
     {
-        // Parse pending state to get tool_use_id
         let pending: serde_json::Value = serde_json::from_str(pending_json).unwrap_or_default();
         let tool_use_id = pending["tool_use_id"]
             .as_str()
             .unwrap_or_default()
             .to_string();
-        // 若 pending 来自 DB（包括旧代码遗留的 quant_confirm），清除 DB 状态；
-        // 纯进程内 map 的 quant_confirm 不写 DB，无需清除。
-        if db_pending_ask_user.is_some() {
-            let _ = state.db.clear_session_pending_ask_user(&session_id).await;
-        }
+        let interaction_id = pending["interaction_id"].as_str().unwrap_or("").to_string();
+        let answered_by = session_user_id.as_deref().unwrap_or("");
 
-        let content = if let Some(kind) = pending["kind"].as_str() {
+        // 文字回复路径：仍为 pending，在此原子应答；按钮回调路径：已是 answered。
+        let answer_blocked = if pending["status"].as_str() == Some("pending")
+            && !interaction_id.is_empty()
+        {
+            match state
+                .db
+                .answer_interaction(&interaction_id, &content_text, answered_by)
+                .await
+            {
+                Ok(Some(_)) => None,
+                Ok(None) => {
+                    // 区分过期与已被抢答，给可读文案
+                    let expired = pending_expires_at_is_past(&pending);
+                    Some(if expired {
+                        "待确认已超时，未执行。如需执行请重新发起。".to_string()
+                    } else {
+                        "这个操作已经提交过了。".to_string()
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!(interaction_id = %interaction_id, "answer_interaction 失败: {e:#}");
+                    Some(format!("确认写入失败：{e:#}"))
+                }
+            }
+        } else {
+            None
+        };
+
+        let content = if let Some(msg) = answer_blocked {
+            msg
+        } else if let Some(kind) = pending["kind"].as_str() {
             if let Some(source) = kind.strip_prefix("quant_confirm:") {
                 handle_quant_confirmation(state, &session_id, source, &pending, &content_text).await
             } else {
@@ -528,6 +542,14 @@ pub async fn run_chat_turn(
         } else {
             content_text.clone()
         };
+
+        // resume 消费后标 done，避免同一交互单被再次当成待确认
+        if !interaction_id.is_empty() {
+            let _ = state
+                .db
+                .update_interaction_status(&interaction_id, "done", Some(&content), None)
+                .await;
+        }
 
         vec![hank_provider::ContentBlock::ToolResult {
             tool_use_id,
@@ -609,6 +631,9 @@ pub async fn run_chat_turn(
     let sid_fwd = session_id.clone();
     let db_fwd = state.db.clone();
     let sid_fwd2 = session_id.clone();
+    // 交互单落表需要 user_id / channel；从会话记录取，避免从 session metadata 现读 resume 上下文
+    let fwd_user_id = session_user_id.clone().unwrap_or_default();
+    let fwd_channel_source = metadata_source.clone();
     let fwd_span = tracing::info_span!("chat_fwd", session_id = %session_id);
     tokio::spawn(
         async move {
@@ -670,43 +695,76 @@ pub async fn run_chat_turn(
                         tool_use_id,
                         kind,
                     } => {
-                        let is_quant_confirm = kind
-                            .as_ref()
-                            .map(|k| k.starts_with("quant_confirm:"))
-                            .unwrap_or(false);
-                        if is_quant_confirm {
-                            // quant_confirm 待确认单写进程内 map，5 分钟 TTL，不落表
-                            // （设计 §5.4.4）。事件仍入 buffer，用户可在当前通道看到确认文案。
-                            let source = kind
-                                .as_ref()
-                                .unwrap()
-                                .strip_prefix("quant_confirm:")
-                                .unwrap_or("")
-                                .to_string();
-                            let summary = question.lines().next().unwrap_or(&question).to_string();
-                            state_fwd.quant_pending_confirms.insert(
-                                &sid_fwd2,
-                                QuantPendingConfirm {
-                                    tool_use_id: tool_use_id.clone(),
-                                    summary,
-                                    question: question.clone(),
-                                    options: options.clone(),
-                                    created_at_ms: chrono::Utc::now().timestamp_millis(),
-                                    source,
+                        // 两类 ask_user 统一落 agent_interactions：此前 quant_confirm 走进程内
+                        // map、普通 ask_user 走 sessions 字段，都以 session_id 为 key，会话重建即丢单。
+                        // 必须在 push 到 event_buffers 之前 await 写完，pusher 才能靠
+                        // latest_pending_interaction 取到已落库的 interaction_id。
+                        let (interaction_kind, source) = match kind.as_deref() {
+                            Some(k) if k.starts_with("quant_confirm:") => (
+                                "quant_confirm",
+                                k.strip_prefix("quant_confirm:").unwrap_or("").to_string(),
+                            ),
+                            _ => ("ask_user", fwd_channel_source.clone()),
+                        };
+                        // 微信 5 分钟 TTL 是渠道特性；飞书/网页不过期。
+                        let expires_at = (source == "weixin")
+                            .then(|| chrono::Utc::now() + chrono::Duration::minutes(5));
+                        let title: String = question
+                            .lines()
+                            .next()
+                            .unwrap_or(question)
+                            .chars()
+                            .take(255)
+                            .collect();
+                        let options_json =
+                            serde_json::to_string(options).unwrap_or_else(|_| "[]".to_string());
+                        let resume_ref = serde_json::json!({
+                            "tool_use_id": tool_use_id,
+                            "source": source,
+                            "question": question,
+                        })
+                        .to_string();
+                        let channel = match source.as_str() {
+                            "weixin" => "weixin",
+                            "feishu" => "feishu",
+                            _ => "trace_chat",
+                        };
+                        match db_fwd
+                            .create_interaction(NewInteraction {
+                                session_id: &sid_fwd2,
+                                user_id: if fwd_user_id.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &fwd_user_id
                                 },
-                            );
-                        } else {
-                            // 其他 ask_user 仍走 DB，支持跨进程恢复
-                            let pending = serde_json::json!({
-                                "tool_use_id": tool_use_id,
-                                "question": question,
-                                "options": options,
-                                "kind": kind,
-                                "created_at_ms": chrono::Utc::now().timestamp_millis(),
-                            });
-                            let _ = db_fwd
-                                .set_session_pending_ask_user(&sid_fwd2, &pending.to_string())
-                                .await;
+                                channel,
+                                account_id: None,
+                                chat_id: None,
+                                topic_id: None,
+                                kind: interaction_kind,
+                                title: &title,
+                                goal: None,
+                                analysis: None,
+                                options: &options_json,
+                                resume_ref: Some(&resume_ref),
+                                expires_at,
+                            })
+                            .await
+                        {
+                            Ok(row) => {
+                                tracing::info!(
+                                    interaction_id = %row.id,
+                                    session_id = %sid_fwd2,
+                                    kind = interaction_kind,
+                                    "交互单已落表"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    session_id = %sid_fwd2,
+                                    "create_interaction 失败: {e:#}"
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -1208,63 +1266,65 @@ pub async fn stop_handler(
 
 // --- Quant confirmation helpers ---
 
-/// 解析并获取待确认的 ask_user 状态。
+/// 从 agent_interactions 表取本会话最近可恢复的交互单，映射为调用方期望的 JSON 形状。
 ///
-/// 设计 §5.4.4：quant_confirm 类待确认单优先从进程内 map 读取；
-/// map 未命中时回退 DB（兼容旧代码遗留或进程重启前的待确认单）。
-/// 这里只做 24h 内存卫生 GC；业务 TTL（微信 5 分钟）在
-/// handle_quant_confirmation 判定，以便给用户明确的超时反馈而不是静默丢失。
-async fn resolve_pending_ask_user(
-    state: &Arc<AppState>,
-    session_id: &str,
-    db_pending: Option<String>,
-) -> Option<String> {
-    state
-        .quant_pending_confirms
-        .cleanup_expired(QUANT_CONFIRM_GC_TTL_MS);
-
-    // 1. DB pending 是 quant_confirm 时，优先读进程内 map；map 未命中则回退 DB。
-    if let Some(ref pending_json) = db_pending {
-        let pending: serde_json::Value = serde_json::from_str(pending_json).unwrap_or_default();
-        if pending["kind"]
-            .as_str()
-            .map(|k| k.starts_with("quant_confirm:"))
-            .unwrap_or(false)
-        {
-            if let Some(p) = state.quant_pending_confirms.take(session_id) {
-                return Some(
-                    serde_json::json!({
-                        "tool_use_id": p.tool_use_id,
-                        "kind": format!("quant_confirm:{}", p.source),
-                        "created_at_ms": p.created_at_ms,
-                    })
-                    .to_string(),
-                );
-            }
-            return db_pending;
+/// 返回字段保持 tool_use_id / question / options / kind，另附 interaction_id /
+/// status / expires_at 供应答与超时判断。不再读 sessions.pending_ask_user。
+async fn resolve_pending_ask_user(state: &Arc<AppState>, session_id: &str) -> Option<String> {
+    let row = match state.db.latest_pending_interaction(session_id).await {
+        Ok(v) => v?,
+        Err(e) => {
+            tracing::warn!(session_id, "latest_pending_interaction 失败: {e:#}");
+            return None;
         }
-        return db_pending;
-    }
-
-    // 2. 无 DB pending 时，仍检查进程内 map（新代码 quant_confirm 不写 DB）。
-    if let Some(p) = state.quant_pending_confirms.take(session_id) {
-        return Some(
-            serde_json::json!({
-                "tool_use_id": p.tool_use_id,
-                "kind": format!("quant_confirm:{}", p.source),
-                "created_at_ms": p.created_at_ms,
-            })
-            .to_string(),
-        );
-    }
-
-    None
+    };
+    let resume: serde_json::Value =
+        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
+    let options: serde_json::Value =
+        serde_json::from_str(&row.options).unwrap_or_else(|_| serde_json::json!([]));
+    let source = resume["source"].as_str().unwrap_or("");
+    let kind = if row.kind == "quant_confirm" {
+        format!("quant_confirm:{source}")
+    } else {
+        row.kind.clone()
+    };
+    let question = resume["question"]
+        .as_str()
+        .unwrap_or(row.title.as_str())
+        .to_string();
+    Some(
+        serde_json::json!({
+            "tool_use_id": resume["tool_use_id"].as_str().unwrap_or(""),
+            "question": question,
+            "options": options,
+            "kind": kind,
+            "interaction_id": row.id,
+            "status": row.status,
+            "answer": row.answer,
+            "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
+            "created_at_ms": row.created_at.timestamp_millis(),
+        })
+        .to_string(),
+    )
 }
 
-/// 微信入口待确认单是否已超 5 分钟 TTL（纯函数便于测试）。
-/// 其它来源不设业务 TTL：进程内 map 重启即失效，无需额外过期。
-fn quant_confirm_expired(source: &str, created_at_ms: i64, now_ms: i64) -> bool {
-    source == "weixin" && now_ms.saturating_sub(created_at_ms) > QUANT_CONFIRM_TTL_MS
+/// 交互单是否已过期：`expires_at` 为 None 永不过期；为过去时刻则过期。
+/// TTL 写在行上（微信 5min / 飞书 NULL），不再按 source 硬编码。
+fn interaction_expired(expires_at: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    match expires_at {
+        None => false,
+        Some(t) => chrono::Utc::now() > t,
+    }
+}
+
+/// 从 pending JSON 的 expires_at 字段判断是否过期（RFC3339 字符串）。
+fn pending_expires_at_is_past(pending: &serde_json::Value) -> bool {
+    let expires = pending["expires_at"].as_str().and_then(|s| {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    });
+    interaction_expired(expires)
 }
 
 /// 处理 quant 高成本工具的恢复确认：解析用户回复，授予授权，并返回给模型的 ToolResult 文案。
@@ -1275,10 +1335,8 @@ async fn handle_quant_confirmation(
     pending: &serde_json::Value,
     text: &str,
 ) -> String {
-    // 微信入口 5 分钟超时作废
-    let created = pending["created_at_ms"].as_i64().unwrap_or(0);
-    let now = chrono::Utc::now().timestamp_millis();
-    if quant_confirm_expired(source, created, now) {
+    // 超时读交互单 expires_at，不再按 source 硬编码 5 分钟
+    if pending_expires_at_is_past(pending) {
         return "待确认单已超时（5 分钟），未执行高成本量化操作。如需执行请重新发起工具调用。"
             .to_string();
     }
@@ -1667,17 +1725,32 @@ mod tests {
     }
 
     #[test]
-    fn test_quant_confirm_expired_only_weixin() {
-        let now = 1_000_000_000i64;
-        let fresh = now - 60 * 1000; // 1 分钟前
-        let stale = now - 10 * 60 * 1000; // 10 分钟前
+    fn test_interaction_expired_from_expires_at() {
+        // expires_at 为 None：永不过期（飞书/网页）
+        assert!(!interaction_expired(None));
 
-        // 微信：5 分钟 TTL
-        assert!(!quant_confirm_expired("weixin", fresh, now));
-        assert!(quant_confirm_expired("weixin", stale, now));
+        // 未来时刻：未过期
+        let future = chrono::Utc::now() + chrono::Duration::minutes(5);
+        assert!(!interaction_expired(Some(future)));
 
-        // web 会话：同样的时间差不设业务 TTL（进程重启才失效），
-        // 用户 10 分钟后回「确认」仍然有效
-        assert!(!quant_confirm_expired("trace_chat", stale, now));
+        // 过去时刻：已过期（微信 5min TTL 写进行后的形态）
+        let past = chrono::Utc::now() - chrono::Duration::minutes(10);
+        assert!(interaction_expired(Some(past)));
+    }
+
+    #[test]
+    fn test_pending_expires_at_is_past_json() {
+        let past = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        assert!(pending_expires_at_is_past(
+            &serde_json::json!({ "expires_at": past })
+        ));
+        assert!(!pending_expires_at_is_past(
+            &serde_json::json!({ "expires_at": future })
+        ));
+        assert!(!pending_expires_at_is_past(&serde_json::json!({})));
+        assert!(!pending_expires_at_is_past(
+            &serde_json::json!({ "expires_at": serde_json::Value::Null })
+        ));
     }
 }

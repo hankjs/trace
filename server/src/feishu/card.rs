@@ -98,16 +98,21 @@ pub fn build_task_card(opts: &TaskCardOptions) -> Value {
 
 /// 确认/问答卡片：question + 一组可点按钮。
 ///
-/// 每个按钮的 callback value 携带 action/session/chat/topic/choice，
-/// 用户点击后飞书下发 card.action.trigger 事件，由 callback.rs 处理。
+/// 每个按钮的 callback value 携带 action/interaction_id/session/chat/topic/choice，
+/// 用户点击后飞书下发 card.action.trigger 事件，由 callback.rs 按 interaction_id
+/// 定位交互单（不再靠 session，避免话题重建后丢单）。
 pub struct ConfirmCardOptions {
     pub title: String,
     pub question: String,
     /// 按钮文案列表（如 ["确认", "否"] 或 ask_user 的 options）
     pub choices: Vec<String>,
+    /// 交互单主键，卡片展示的「任务编号」；回调按此 id 定位
+    pub interaction_id: String,
     pub session_id: String,
     pub chat_id: String,
     pub topic_id: String,
+    /// admin 详情深链；配置缺失时为 None，此时不渲染该行
+    pub admin_url: Option<String>,
     /// 自定义回答提示
     pub hint: Option<String>,
 }
@@ -118,8 +123,6 @@ pub fn build_confirm_card(opts: &ConfirmCardOptions) -> Value {
         .iter()
         .enumerate()
         .map(|(i, choice)| {
-            // question 截断放进 value，回调后终态卡片要展示
-            let question: String = opts.question.chars().take(200).collect();
             json!({
                 "tag": "button",
                 "text": { "tag": "plain_text", "content": choice },
@@ -128,11 +131,11 @@ pub fn build_confirm_card(opts: &ConfirmCardOptions) -> Value {
                     "type": "callback",
                     "value": {
                         "action": "answer",
+                        "interaction_id": opts.interaction_id,
                         "session_id": opts.session_id,
                         "chat_id": opts.chat_id,
                         "topic_id": opts.topic_id,
                         "choice": choice,
-                        "question": question,
                     }
                 }]
             })
@@ -144,6 +147,44 @@ pub fn build_confirm_card(opts: &ConfirmCardOptions) -> Value {
         .as_ref()
         .map(|h| format!("\n\n*{h}*"))
         .unwrap_or_default();
+
+    let session_short: String = opts.session_id.chars().take(8).collect();
+    let admin_line = opts
+        .admin_url
+        .as_ref()
+        .map(|u| format!("\n[在 Admin 查看详情]({u})"))
+        .unwrap_or_default();
+    // 基本信息区：两列 column_set，与部署卡片同一套飞书 schema 2.0 写法
+    let info_block = json!({
+        "tag": "column_set",
+        "flex_mode": "none",
+        "background_style": "grey",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{
+                    "tag": "markdown",
+                    "content": format!(
+                        "**基本信息**\n任务编号 `{}`\n会话 `{}`",
+                        opts.interaction_id, session_short
+                    )
+                }]
+            },
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{
+                    "tag": "markdown",
+                    "content": format!("\n状态 待确认\n来源 飞书{admin_line}")
+                }]
+            }
+        ]
+    });
 
     json!({
         "schema": "2.0",
@@ -162,6 +203,7 @@ pub fn build_confirm_card(opts: &ConfirmCardOptions) -> Value {
                     "tag": "markdown",
                     "content": format!("{}{}", opts.question, hint_text)
                 },
+                info_block,
                 {
                     "tag": "action",
                     "actions": buttons
@@ -172,7 +214,17 @@ pub fn build_confirm_card(opts: &ConfirmCardOptions) -> Value {
 }
 
 /// 确认完成后的终态卡片（按钮替换为结果文本，防止重复点击）。
-pub fn build_confirm_done_card(title: &str, question: &str, choice: &str, operator: &str) -> Value {
+pub fn build_confirm_done_card(
+    title: &str,
+    question: &str,
+    choice: &str,
+    operator: &str,
+    interaction_id: Option<&str>,
+) -> Value {
+    let id_line = interaction_id
+        .filter(|id| !id.is_empty())
+        .map(|id| format!("\n\n任务编号 `{id}`"))
+        .unwrap_or_default();
     json!({
         "schema": "2.0",
         "config": {
@@ -188,7 +240,10 @@ pub fn build_confirm_done_card(title: &str, question: &str, choice: &str, operat
             "elements": [
                 {
                     "tag": "markdown",
-                    "content": format!("{}\n\n**已选择：** {}（{}）", question, choice, operator)
+                    "content": format!(
+                        "{}\n\n**已选择：** {}（{}）{}",
+                        question, choice, operator, id_line
+                    )
                 }
             ]
         }
@@ -433,14 +488,59 @@ mod tests {
             title: "确认".into(),
             question: "执行高成本操作？".into(),
             choices: vec!["确认".into(), "否".into()],
-            session_id: "s1".into(),
+            interaction_id: "ia-123".into(),
+            session_id: "s1abcdef".into(),
             chat_id: "c1".into(),
             topic_id: "t1".into(),
+            admin_url: Some("https://admin.example/#/interactions/ia-123".into()),
             hint: None,
         });
-        let actions = &card["body"]["elements"][1]["actions"];
-        assert_eq!(actions[0]["behaviors"][0]["value"]["session_id"], "s1");
+        // elements: [question, info_block, actions]
+        let actions = &card["body"]["elements"][2]["actions"];
+        assert_eq!(
+            actions[0]["behaviors"][0]["value"]["session_id"],
+            "s1abcdef"
+        );
+        assert_eq!(
+            actions[0]["behaviors"][0]["value"]["interaction_id"],
+            "ia-123"
+        );
         assert_eq!(actions[1]["behaviors"][0]["value"]["choice"], "否");
+        // 不应再塞 question 进 callback payload
+        assert!(actions[0]["behaviors"][0]["value"]
+            .get("question")
+            .is_none());
+        let info = card["body"]["elements"][1].to_string();
+        assert!(info.contains("ia-123"));
+        assert!(info.contains("s1abcdef")); // session 前 8 位（本例即全文）
+        assert!(info.contains("Admin"));
+    }
+
+    #[test]
+    fn confirm_card_hides_admin_link_when_url_missing() {
+        let card = build_confirm_card(&ConfirmCardOptions {
+            title: "确认".into(),
+            question: "q?".into(),
+            choices: vec!["确认".into()],
+            interaction_id: "ia-9".into(),
+            session_id: "sess".into(),
+            chat_id: "c".into(),
+            topic_id: "t".into(),
+            admin_url: None,
+            hint: None,
+        });
+        let info = card["body"]["elements"][1].to_string();
+        assert!(info.contains("ia-9"));
+        assert!(!info.contains("Admin"));
+        assert!(!info.contains("/#/interactions/"));
+    }
+
+    #[test]
+    fn confirm_done_card_shows_interaction_id() {
+        let card = build_confirm_done_card("确认", "q?", "确认", "你", Some("ia-1"));
+        let content = card["body"]["elements"][0]["content"].as_str().unwrap();
+        assert!(content.contains("ia-1"));
+        assert!(content.contains("已选择"));
     }
 
     #[tokio::test(start_paused = true)]

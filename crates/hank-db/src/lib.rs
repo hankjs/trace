@@ -164,6 +164,68 @@ pub struct Deployment {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Agent 交互单：确认闸门 / ask_user / 任务闸门的统一载体。
+///
+/// 为什么不能寄生在 session 上：此前 quant_confirm 存进程内 map、ask_user 存
+/// sessions.pending_ask_user，都以 session_id 为 key。飞书话题一旦因 reuse policy
+/// 判 Recreate 而重建 session，待确认单与授权立刻成为孤儿——用户点了确认却永远
+/// 不会执行。交互单有自己的主键；恢复执行所需上下文冻结在 resume_ref 里，
+/// session 怎么变都不影响定位。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AgentInteraction {
+    /// 交互单主键，即卡片上展示的「任务编号」
+    pub id: String,
+    /// 关联会话，仅用于回溯与派发，不再是身份来源
+    pub session_id: String,
+    pub user_id: String,
+    pub channel: String,
+    pub account_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub topic_id: Option<String>,
+    /// quant_confirm / ask_user（task_gate 留给后续任务闸门）
+    pub kind: String,
+    pub title: String,
+    pub goal: Option<String>,
+    pub analysis: Option<String>,
+    /// 按钮文案数组 JSON，如 `["确认","否"]`（`options` 在部分 MySQL 版本敏感，查询时加反引号）
+    pub options: String,
+    /// pending / answered / executing / done / failed / expired / cancelled
+    pub status: String,
+    pub answer: Option<String>,
+    pub answered_by: Option<String>,
+    pub answered_at: Option<DateTime<Utc>>,
+    /// 恢复执行所需上下文 JSON。quant_confirm / ask_user 存
+    /// `{"tool_use_id":"…","source":"…","question":"…"}`，不从 session metadata 现读。
+    pub resume_ref: Option<String>,
+    pub card_message_id: Option<String>,
+    /// NULL = 不过期。微信写 now+5min；飞书与网页写 NULL（5 分钟 TTL 是微信渠道特性）
+    pub expires_at: Option<DateTime<Utc>>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 创建交互单的入参（字段多，避免位置参数触发 too_many_arguments）。
+#[derive(Debug, Clone)]
+pub struct NewInteraction<'a> {
+    pub session_id: &'a str,
+    pub user_id: &'a str,
+    pub channel: &'a str,
+    pub account_id: Option<&'a str>,
+    pub chat_id: Option<&'a str>,
+    pub topic_id: Option<&'a str>,
+    pub kind: &'a str,
+    pub title: &'a str,
+    pub goal: Option<&'a str>,
+    pub analysis: Option<&'a str>,
+    /// 已序列化的 options JSON 文本
+    pub options: &'a str,
+    /// 已序列化的 resume_ref JSON 文本
+    pub resume_ref: Option<&'a str>,
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
 /// 飞书自建应用账号（feishu_accounts 表，凭证由 admin REST 管理）
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct FeishuAccount {
@@ -1095,6 +1157,45 @@ impl Database {
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 INDEX idx_deployments_status (status, updated_at),
                 INDEX idx_deployments_session (session_id, created_at)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // Agent 交互单：确认闸门 / ask_user / 任务闸门的统一载体。
+        //
+        // 为什么要落表：此前 quant_confirm 存进程内 map、ask_user 存 sessions 字段，
+        // 两者都以 session_id 为 key。飞书话题会话一旦重建（reuse policy 判 Recreate），
+        // 待确认单与授权立刻成为孤儿，用户点了确认却永远不会执行。交互单有自己的主键，
+        // 恢复执行所需上下文冻结在 resume_ref 里，session 怎么变都不影响。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS agent_interactions (
+                id VARCHAR(36) PRIMARY KEY,
+                session_id VARCHAR(36) NOT NULL,
+                user_id VARCHAR(36) NOT NULL,
+                channel VARCHAR(32) NOT NULL,
+                account_id VARCHAR(36) DEFAULT NULL,
+                chat_id VARCHAR(128) DEFAULT NULL,
+                topic_id VARCHAR(128) DEFAULT NULL,
+                kind VARCHAR(32) NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                goal TEXT DEFAULT NULL,
+                analysis MEDIUMTEXT DEFAULT NULL,
+                `options` JSON NOT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                answer VARCHAR(64) DEFAULT NULL,
+                answered_by VARCHAR(36) DEFAULT NULL,
+                answered_at DATETIME DEFAULT NULL,
+                resume_ref JSON DEFAULT NULL,
+                card_message_id VARCHAR(256) DEFAULT NULL,
+                expires_at DATETIME DEFAULT NULL,
+                result MEDIUMTEXT DEFAULT NULL,
+                error TEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                INDEX idx_ai_status (status, updated_at),
+                INDEX idx_ai_session (session_id, created_at),
+                INDEX idx_ai_user (user_id, created_at)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -4085,6 +4186,184 @@ impl Database {
         )
         .fetch_optional(&self.pool))?;
         Ok(row)
+    }
+
+    // ─── Agent 交互单 ────────────────────────────────────────────────────
+
+    pub async fn create_interaction(&self, input: NewInteraction<'_>) -> Result<AgentInteraction> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(sqlx::query(
+            "INSERT INTO agent_interactions
+                 (id, session_id, user_id, channel, account_id, chat_id, topic_id,
+                  kind, title, goal, analysis, `options`, status, resume_ref, expires_at,
+                  created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)"
+        )
+        .bind(&id)
+        .bind(input.session_id)
+        .bind(input.user_id)
+        .bind(input.channel)
+        .bind(input.account_id)
+        .bind(input.chat_id)
+        .bind(input.topic_id)
+        .bind(input.kind)
+        .bind(input.title)
+        .bind(input.goal)
+        .bind(input.analysis)
+        .bind(input.options)
+        .bind(input.resume_ref)
+        .bind(input.expires_at)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool))?;
+        self.get_interaction(&id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("interaction inserted but not found: {id}"))
+    }
+
+    pub async fn get_interaction(&self, id: &str) -> Result<Option<AgentInteraction>> {
+        let row = db_retry!(sqlx::query_as::<_, AgentInteraction>(
+            "SELECT id, session_id, user_id, channel, account_id,
+                        chat_id, topic_id, kind, title, goal, analysis, `options` AS `options`, status,
+                        answer, answered_by, answered_at, resume_ref, card_message_id, expires_at,
+                        result, error, created_at, updated_at
+                 FROM agent_interactions WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    pub async fn set_interaction_card(&self, id: &str, card_message_id: &str) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE agent_interactions SET card_message_id = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(card_message_id)
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 原子应答：仅 pending 且未过期时成功，防重复点击。返回 None 表示已被抢答或过期。
+    ///
+    /// 注意 `expires_at IS NULL` 分支——飞书/网页交互单不过期，不能写成
+    /// `expires_at > NOW()`，否则永远无法应答。
+    pub async fn answer_interaction(
+        &self,
+        id: &str,
+        answer: &str,
+        answered_by: &str,
+    ) -> Result<Option<AgentInteraction>> {
+        let result = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = 'answered', answer = ?, answered_by = ?, answered_at = NOW(), updated_at = NOW()
+                 WHERE id = ? AND status = 'pending'
+                   AND (expires_at IS NULL OR expires_at > NOW())"
+        )
+        .bind(answer)
+        .bind(answered_by)
+        .bind(id)
+        .execute(&self.pool))?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get_interaction(id).await
+    }
+
+    /// 派发失败时把交互单退回 pending，让用户可以重新点确认。
+    ///
+    /// 为什么退回 pending 而不是标 failed：用户的确认意图是真实的，丢掉它等于
+    /// 让用户白点一次且无从得知。只回滚 answered——已 done/expired/cancelled 的
+    /// 不动，避免覆盖终态。
+    pub async fn revert_interaction_to_pending(&self, id: &str) -> Result<bool> {
+        let result = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = 'pending', answer = NULL, answered_by = NULL,
+                     answered_at = NULL, updated_at = NOW()
+                 WHERE id = ? AND status = 'answered'"
+        )
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn update_interaction_status(
+        &self,
+        id: &str,
+        status: &str,
+        result: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = ?,
+                     result = COALESCE(?, result),
+                     error = COALESCE(?, error),
+                     updated_at = NOW()
+                 WHERE id = ?"
+        )
+        .bind(status)
+        .bind(result)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 某会话最近一条可恢复的交互单。
+    ///
+    /// 含 pending（文字回复路径）与 answered（飞书按钮回调已原子应答、等待 agent
+    /// resume）：按钮回调先 answer_interaction 再派发 run_chat_turn，此时状态已是
+    /// answered，若只查 pending 会丢单。resume 消费后应变为 done/executing。
+    pub async fn latest_pending_interaction(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<AgentInteraction>> {
+        let row = db_retry!(sqlx::query_as::<_, AgentInteraction>(
+            "SELECT id, session_id, user_id, channel, account_id,
+                        chat_id, topic_id, kind, title, goal, analysis, `options` AS `options`, status,
+                        answer, answered_by, answered_at, resume_ref, card_message_id, expires_at,
+                        result, error, created_at, updated_at
+                 FROM agent_interactions
+                 WHERE session_id = ? AND status IN ('pending', 'answered')
+                 ORDER BY created_at DESC
+                 LIMIT 1"
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 进程重启收尾：
+    /// 1. 已过期的 pending → expired
+    /// 2. answered 僵尸 → pending（应答已记录但派发未完成，退回让用户重点）
+    ///
+    /// 为什么 answered 要退回而不是标失败：用户的确认意图是真实的，
+    /// 丢掉它等于让用户白点一次且无从得知。退回 pending 可重试。
+    ///
+    /// answered 僵尸加 5 分钟时间窗，避免误伤「正在派发中」的行
+    /// （进程重启时不存在这种行，但手动调用或将来定时清理时这个窗很重要）。
+    /// 返回 `(expired 条数, reverted 条数)`。
+    pub async fn expire_stale_interactions(&self) -> Result<(u64, u64)> {
+        let expired = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = 'expired', updated_at = NOW()
+                 WHERE status = 'pending'
+                   AND expires_at IS NOT NULL
+                   AND expires_at <= NOW()"
+        )
+        .execute(&self.pool))?;
+        let reverted = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = 'pending', answer = NULL, answered_by = NULL,
+                     answered_at = NULL, updated_at = NOW()
+                 WHERE status = 'answered'
+                   AND answered_at IS NOT NULL
+                   AND answered_at < NOW() - INTERVAL 5 MINUTE"
+        )
+        .execute(&self.pool))?;
+        Ok((expired.rows_affected(), reverted.rows_affected()))
     }
 
     // 渠道消息留档

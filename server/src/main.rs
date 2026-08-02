@@ -70,8 +70,6 @@ pub struct AppState {
     pub client_hubs: RwLock<HashMap<String, remote_exec::UserHub>>,
     /// quant 高成本 skill 会话级授权存储（进程内，重启失效）
     pub quant_grant_store: Arc<code_tools::quant_grant::QuantGrantStore>,
-    /// quant 高成本工具待确认单（进程内 map，5 分钟 TTL，重启作废；设计 §5.4.4）
-    pub quant_pending_confirms: Arc<code_tools::quant_grant::QuantPendingConfirmStore>,
     /// 渠道任务闸门与实时进度快照（单任务串行 + 随时可查进度）
     pub tasks: Arc<task_state::TaskRegistry>,
 }
@@ -195,9 +193,25 @@ async fn run_server() -> Result<()> {
         weixin_channel_history: RwLock::new(HashMap::new()),
         client_hubs: RwLock::new(HashMap::new()),
         quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
-        quant_pending_confirms: Arc::new(code_tools::quant_grant::QuantPendingConfirmStore::new()),
         tasks: Arc::new(task_state::TaskRegistry::new()),
     });
+
+    // 一次性收尾：过期 pending → expired；卡住的 answered 僵尸 → pending。
+    // 不进 scheduler——scheduler_enabled=false 时也要跑；与部署恢复同级。
+    match state.db.expire_stale_interactions().await {
+        Ok((expired, reverted)) => {
+            if expired > 0 {
+                tracing::info!(count = expired, "启动收尾：已过期交互单标记为 expired");
+            }
+            if reverted > 0 {
+                tracing::info!(
+                    count = reverted,
+                    "启动收尾：answered 僵尸退回 pending（派发未完成可重试）"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("启动收尾 expire_stale_interactions 失败: {e:#}"),
+    }
 
     // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）
     weixin::monitor::start_monitors(state.clone());

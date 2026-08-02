@@ -173,6 +173,10 @@ pub struct ServerConfig {
     /// Chrome/Chromium 可执行文件路径（/snap 网页截图用）。留空则自动探测常见路径
     #[serde(default)]
     pub chrome_path: Option<String>,
+    /// admin 后台外部可访问地址，用于在渠道卡片里生成交互单详情深链。
+    /// 留空则卡片不渲染深链行（本地 dev 常见）。格式如 `https://admin.example.com`。
+    #[serde(default)]
+    pub admin_base_url: Option<String>,
 }
 
 fn default_true() -> bool {

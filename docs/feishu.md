@@ -20,7 +20,7 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 - **话题 = 会话**：`feishu_chats` 表把 `account_id:chat_id:topic_id`（topic = thread_id || root_id || "main"）映射到 server session，重启不丢
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
-- **确认闸门升级**：微信是文本白名单（回复"确认"），飞书是按钮卡片；回调文本化后走同一套 `handle_quant_confirmation`，code-agent 零改动
+- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）
 - **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。五种 `agent_kind`：`conversation`（纯对话、无工具）、`quant_research`（A 股研究、仅 quant 工具，需 `quant_a2a.enabled`）、`trace_code` / `quant_code` / `general_task`（代码与文件任务）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。`conversation` 与 `quant_research` 强制 `native`：前者无工具，后者只挂 `quant_*` + `ask_user` + `web_fetch`，均无工作区、不绑 `exec_client_id`。
 - **管理员边界**：`can_login_admin` 仅在创建 **server 侧** native / worktree **工作区**时校验；纯对话、`quant_research` 与 client-only hank-cli 用户不要求 admin
 
