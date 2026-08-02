@@ -24,6 +24,7 @@ mod skills;
 mod snap_tools;
 mod specs;
 pub mod task_state;
+mod team_task;
 mod termshot;
 mod websnap;
 mod weixin;

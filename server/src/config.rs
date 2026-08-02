@@ -13,6 +13,9 @@ pub struct Config {
     pub server_agent: ServerAgentConfig,
     #[serde(default)]
     pub quant_a2a: Option<QuantA2aConfig>,
+    /// 团队任务流水线（开发→评审→测试多角色编排）。默认关闭。
+    #[serde(default)]
+    pub team_task: TeamTaskConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +160,59 @@ fn default_quant_a2a_base_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
 
+/// 团队任务流水线配置。所有字段都有默认值，因此 config.toml 不写 [team_task]
+/// 段也能启动（此时 enabled = false，行为与未接入前完全一致）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct TeamTaskConfig {
+    /// 总开关。关闭时 task_gate 走原来的单角色两阶段路径，行为与今天一致。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 参与流水线的角色，按数组顺序流转。可裁剪成 ["developer"] 只跑单角色。
+    /// 未知角色名在启动校验时拒绝（见 validate），不静默丢弃。
+    #[serde(default = "default_team_roles")]
+    pub roles: Vec<String>,
+    /// 需要人工确认的边界。默认只保留现有的开发前闸门，其余自动流转——
+    /// 一上来每个角色边界都弹卡片，四次点击才跑完一个任务，体验会劝退。
+    #[serde(default = "default_team_gates")]
+    pub gates: Vec<String>,
+    /// 评审打回后最多重新开发几轮，超出即 failed。
+    /// 没有上限的话，评审和开发能在一个错误理解上互相打回到 token 烧穿。
+    #[serde(default = "default_max_dev_rounds")]
+    pub max_dev_rounds: i32,
+    /// 看板外部可访问地址，用于飞书卡片深链。留空则卡片不渲染看板链接行，
+    /// 而不是拼出一个坏链接（与 server.admin_base_url 同款约定）。
+    #[serde(default)]
+    pub dashboard_base_url: Option<String>,
+}
+
+impl Default for TeamTaskConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            roles: default_team_roles(),
+            gates: default_team_gates(),
+            max_dev_rounds: default_max_dev_rounds(),
+            dashboard_base_url: None,
+        }
+    }
+}
+
+fn default_team_roles() -> Vec<String> {
+    vec![
+        "developer".to_string(),
+        "reviewer".to_string(),
+        "tester".to_string(),
+    ]
+}
+
+fn default_team_gates() -> Vec<String> {
+    vec!["dev_start".to_string()]
+}
+
+fn default_max_dev_rounds() -> i32 {
+    3
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
@@ -213,5 +269,61 @@ impl Config {
         }
 
         bail!("No config file found. Create config.toml from config.example.toml")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 最小可反序列化的 [server] 段（必填字段）。
+    const MIN_SERVER: &str = r#"
+[server]
+host = "127.0.0.1"
+port = 3000
+jwt_secret = "test-secret"
+database_url = "mysql://u:p@localhost/db"
+"#;
+
+    #[test]
+    fn team_task_absent_uses_defaults() {
+        let cfg: Config = toml::from_str(MIN_SERVER).expect("parse");
+        assert!(!cfg.team_task.enabled);
+        assert_eq!(
+            cfg.team_task.roles,
+            vec!["developer", "reviewer", "tester"]
+        );
+        assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
+        assert_eq!(cfg.team_task.max_dev_rounds, 3);
+        assert!(cfg.team_task.dashboard_base_url.is_none());
+    }
+
+    #[test]
+    fn team_task_enabled_only_keeps_other_defaults() {
+        let toml = format!("{MIN_SERVER}\n[team_task]\nenabled = true\n");
+        let cfg: Config = toml::from_str(&toml).expect("parse");
+        assert!(cfg.team_task.enabled);
+        assert_eq!(
+            cfg.team_task.roles,
+            vec!["developer", "reviewer", "tester"]
+        );
+        assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
+        assert_eq!(cfg.team_task.max_dev_rounds, 3);
+        assert!(cfg.team_task.dashboard_base_url.is_none());
+    }
+
+    #[test]
+    fn team_task_roles_override_leaves_gates_default() {
+        let toml = format!(
+            r#"{MIN_SERVER}
+[team_task]
+roles = ["developer"]
+"#
+        );
+        let cfg: Config = toml::from_str(&toml).expect("parse");
+        assert!(!cfg.team_task.enabled);
+        assert_eq!(cfg.team_task.roles, vec!["developer"]);
+        assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
+        assert_eq!(cfg.team_task.max_dev_rounds, 3);
     }
 }

@@ -226,6 +226,105 @@ pub struct NewInteraction<'a> {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// 团队任务：串起开发/评审/测试多角色轮次的任务主体。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamTask {
+    pub id: String,
+    /// 人类可读短编号 tsk_xxx_xxxx，飞书卡片与看板深链都用它
+    pub task_no: String,
+    pub session_id: String,
+    pub user_id: String,
+    /// feishu / dashboard（后续接 issue 巡检时再加取值）
+    pub source: String,
+    /// 外部 issue 标识，如 IK5MOR；本期不巡检，仅从飞书原文 #KEY 解析或看板手填
+    pub issue_key: Option<String>,
+    pub title: String,
+    pub goal: Option<String>,
+    /// 分析轮产出的四段 markdown。与 agent_interactions.analysis 同源冗余一份，
+    /// 便于看板与后续角色 prompt 直接取用，不必回查交互单。
+    pub analysis: Option<String>,
+    /// pending_confirm / running_developer / pending_review_gate / running_reviewer
+    /// / pending_dev_gate / running_tester / done / failed / cancelled
+    pub status: String,
+    /// developer / reviewer / tester；终态时为 None
+    pub current_role: Option<String>,
+    /// 开发轮已用轮次，用于 max_dev_rounds 上限判定
+    pub dev_rounds: i32,
+    /// 执行后端与节点在整条流水线内固定，中途不换节点
+    pub backend: String,
+    pub exec_client_id: Option<String>,
+    pub agent_kind: String,
+    pub account_id: Option<String>,
+    pub chat_id: Option<String>,
+    pub topic_id: Option<String>,
+    /// 飞书任务主卡：跨角色复用同一张卡片原地刷新
+    pub card_message_id: Option<String>,
+    pub result: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// 角色轮次：一个角色的一次执行。评审打回后重新开发会新增一行（round+1），历史保留。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamTaskRun {
+    pub id: String,
+    pub task_id: String,
+    /// developer / reviewer / tester
+    pub role: String,
+    /// 同一角色的第几轮，从 1 开始
+    pub round: i32,
+    /// 该角色本轮独占的 CLI thread；派发前为空，首个事件回来后写入
+    pub thread_id: Option<String>,
+    /// running / finished / failed / cancelled
+    pub status: String,
+    /// pass / reject / failed / unknown；unknown = 模型输出没解析出结论，需人工介入
+    pub verdict: Option<String>,
+    /// 结构化交接产物 JSON 文本（下一个角色的 prompt 输入）
+    pub handoff: Option<String>,
+    /// 该角色输出的正文摘要（看板展示）
+    pub summary: Option<String>,
+    /// 本轮新增改动文件数；查不到为 None
+    pub dirty_files: Option<i32>,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// 任务级时间线事件：只记角色边界与人工决策，与 agent_events（单 run 细粒度）分开。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct TeamTaskEvent {
+    pub id: i64,
+    pub task_id: String,
+    /// role_started / role_finished / gate_opened / gate_answered
+    /// / rejected / status_changed / cancelled
+    pub kind: String,
+    pub role: Option<String>,
+    pub round: Option<i32>,
+    pub operator: Option<String>,
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// 创建团队任务的入参（字段多，避免位置参数触发 too_many_arguments）。
+#[derive(Debug, Clone)]
+pub struct NewTeamTask<'a> {
+    pub session_id: &'a str,
+    pub user_id: &'a str,
+    pub source: &'a str,
+    pub issue_key: Option<&'a str>,
+    pub title: &'a str,
+    pub goal: Option<&'a str>,
+    pub analysis: Option<&'a str>,
+    pub backend: &'a str,
+    pub exec_client_id: Option<&'a str>,
+    pub agent_kind: &'a str,
+    pub account_id: Option<&'a str>,
+    pub chat_id: Option<&'a str>,
+    pub topic_id: Option<&'a str>,
+}
+
 /// 飞书自建应用账号（feishu_accounts 表，凭证由 admin REST 管理）
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct FeishuAccount {
@@ -1389,6 +1488,89 @@ impl Database {
                 updated_by VARCHAR(128) NOT NULL DEFAULT '',
                 UNIQUE KEY uk_agent_cli_backend_name (backend, name),
                 INDEX idx_agent_cli_active (backend, is_active)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // 团队任务：一个飞书话题任务的主体，串起开发/评审/测试多个角色轮次。
+        // session_id 不加外键——与 channel_messages 同理，session 清理后仍要保留任务审计快照。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS team_tasks (
+                id VARCHAR(36) PRIMARY KEY,
+                task_no VARCHAR(32) NOT NULL,
+                session_id VARCHAR(36) NOT NULL,
+                user_id VARCHAR(36) NOT NULL,
+                source VARCHAR(32) NOT NULL DEFAULT 'feishu',
+                issue_key VARCHAR(64) DEFAULT NULL,
+                title VARCHAR(255) NOT NULL DEFAULT '',
+                goal TEXT DEFAULT NULL,
+                analysis MEDIUMTEXT DEFAULT NULL,
+                status VARCHAR(32) NOT NULL DEFAULT 'pending_confirm',
+                current_role VARCHAR(32) DEFAULT NULL,
+                dev_rounds INT NOT NULL DEFAULT 0,
+                backend VARCHAR(32) NOT NULL,
+                exec_client_id VARCHAR(36) DEFAULT NULL,
+                agent_kind VARCHAR(32) NOT NULL DEFAULT 'general_task',
+                account_id VARCHAR(36) DEFAULT NULL,
+                chat_id VARCHAR(128) DEFAULT NULL,
+                topic_id VARCHAR(128) DEFAULT NULL,
+                card_message_id VARCHAR(256) DEFAULT NULL,
+                result MEDIUMTEXT DEFAULT NULL,
+                error TEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                finished_at DATETIME DEFAULT NULL,
+                UNIQUE KEY uk_team_tasks_no (task_no),
+                INDEX idx_team_tasks_status (status, updated_at),
+                INDEX idx_team_tasks_session (session_id, created_at),
+                INDEX idx_team_tasks_user (user_id, created_at)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // 角色轮次：一个角色的一次执行。评审打回后重新开发会新增一行（round+1），
+        // 历史轮次全部保留，不覆盖。
+        // uk_team_run_role_round 是并发防线：编排器重复派发同一角色同一轮会插入失败，
+        // 而不是起两个并发 run（与进程内 TaskRegistry 名额互补，后者防同 session 并发）。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS team_task_runs (
+                id VARCHAR(36) PRIMARY KEY,
+                task_id VARCHAR(36) NOT NULL,
+                role VARCHAR(32) NOT NULL,
+                round INT NOT NULL DEFAULT 1,
+                thread_id VARCHAR(128) DEFAULT NULL,
+                status VARCHAR(16) NOT NULL DEFAULT 'running',
+                verdict VARCHAR(16) DEFAULT NULL,
+                handoff JSON DEFAULT NULL,
+                summary MEDIUMTEXT DEFAULT NULL,
+                dirty_files INT DEFAULT NULL,
+                error TEXT DEFAULT NULL,
+                started_at DATETIME NOT NULL DEFAULT NOW(),
+                finished_at DATETIME DEFAULT NULL,
+                UNIQUE KEY uk_team_run_role_round (task_id, role, round),
+                INDEX idx_team_runs_task (task_id, started_at),
+                FOREIGN KEY (task_id) REFERENCES team_tasks(id) ON DELETE CASCADE
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // 任务级时间线：只记角色边界与人工决策，一个任务通常十几行。
+        // 与 agent_events（单 run 内的细粒度事件）分开，避免看板读一次时间线拉出上万行。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS team_task_events (
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                task_id VARCHAR(36) NOT NULL,
+                kind VARCHAR(32) NOT NULL,
+                role VARCHAR(32) DEFAULT NULL,
+                round INT DEFAULT NULL,
+                operator VARCHAR(64) DEFAULT NULL,
+                detail TEXT DEFAULT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                INDEX idx_team_events_task (task_id, id),
+                FOREIGN KEY (task_id) REFERENCES team_tasks(id) ON DELETE CASCADE
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -4468,6 +4650,404 @@ impl Database {
         Ok(rows)
     }
 
+    // ─── 团队任务流水线（team_tasks / team_task_runs / team_task_events）────────
+
+    /// SELECT 列清单，与 TeamTask / FromRow 字段顺序一致；不用 SELECT *。
+    const TEAM_TASK_COLS: &'static str = "id, task_no, session_id, user_id, source, issue_key, \
+        title, goal, analysis, status, current_role, dev_rounds, backend, exec_client_id, \
+        agent_kind, account_id, chat_id, topic_id, card_message_id, result, error, \
+        created_at, updated_at, finished_at";
+
+    const TEAM_RUN_COLS: &'static str = "id, task_id, role, round, thread_id, status, verdict, \
+        handoff, summary, dirty_files, error, started_at, finished_at";
+
+    const TEAM_EVENT_COLS: &'static str =
+        "id, task_id, kind, role, round, operator, detail, created_at";
+
+    /// 创建团队任务。task_no 撞唯一键时用新随机种子重试一次；仍失败则返回错误
+    /// （连撞两次说明不是巧合，静默重试到成功会掩盖真实问题）。
+    pub async fn create_team_task(&self, input: NewTeamTask<'_>) -> Result<TeamTask> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let now_ms = now.timestamp_millis().max(0) as u64;
+
+        // 最多两次：首次 + 唯一键冲突后换种子再试一次
+        for attempt in 0u8..2 {
+            let seed = Uuid::new_v4().as_u128() as u64;
+            let task_no = generate_task_no(now_ms, seed);
+            // 不经 db_retry!：需按 Database 错误码区分「task_no 唯一键冲突」与其他错误；
+            // db_retry! 会把 sqlx::Error 转成 anyhow，丢失 code() 判定。
+            let insert = sqlx::query(
+                "INSERT INTO team_tasks
+                     (id, task_no, session_id, user_id, source, issue_key, title, goal, analysis,
+                      status, current_role, dev_rounds, backend, exec_client_id, agent_kind,
+                      account_id, chat_id, topic_id, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_confirm', NULL, 0,
+                             ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&task_no)
+            .bind(input.session_id)
+            .bind(input.user_id)
+            .bind(input.source)
+            .bind(input.issue_key)
+            .bind(input.title)
+            .bind(input.goal)
+            .bind(input.analysis)
+            .bind(input.backend)
+            .bind(input.exec_client_id)
+            .bind(input.agent_kind)
+            .bind(input.account_id)
+            .bind(input.chat_id)
+            .bind(input.topic_id)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await;
+
+            match insert {
+                Ok(_) => {
+                    return self
+                        .get_team_task(&id)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("team_task inserted but not found: {id}"));
+                }
+                Err(sqlx::Error::Database(ref e))
+                    if e.code().as_deref() == Some("23000") && attempt == 0 =>
+                {
+                    // task_no 撞键，换种子重试
+                    continue;
+                }
+                Err(e) => return Err(anyhow::Error::from(e)),
+            }
+        }
+        Err(anyhow::anyhow!(
+            "create_team_task: task_no unique collision after retry"
+        ))
+    }
+
+    pub async fn get_team_task(&self, id: &str) -> Result<Option<TeamTask>> {
+        let sql = format!(
+            "SELECT {} FROM team_tasks WHERE id = ?",
+            Self::TEAM_TASK_COLS
+        );
+        let row = db_retry!(sqlx::query_as::<_, TeamTask>(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 按 task_no 查（看板深链用）。
+    pub async fn get_team_task_by_no(&self, task_no: &str) -> Result<Option<TeamTask>> {
+        let sql = format!(
+            "SELECT {} FROM team_tasks WHERE task_no = ?",
+            Self::TEAM_TASK_COLS
+        );
+        let row = db_retry!(sqlx::query_as::<_, TeamTask>(&sql)
+            .bind(task_no)
+            .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 按 session_id 查最新一条未终态任务。编排器从 run 终态反查任务时用。
+    pub async fn get_team_task_by_session(&self, session_id: &str) -> Result<Option<TeamTask>> {
+        let sql = format!(
+            "SELECT {} FROM team_tasks
+             WHERE session_id = ? AND status NOT IN ('done','failed','cancelled')
+             ORDER BY created_at DESC
+             LIMIT 1",
+            Self::TEAM_TASK_COLS
+        );
+        let row = db_retry!(sqlx::query_as::<_, TeamTask>(&sql)
+            .bind(session_id)
+            .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 分页列表。筛选项均为可选，传 None 表示不限。
+    /// 用 `? IS NULL OR col = ?` 做可选筛选，避免字符串拼 SQL。
+    pub async fn list_team_tasks(
+        &self,
+        status: Option<&str>,
+        user_id: Option<&str>,
+        issue_key: Option<&str>,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<TeamTask>, i64)> {
+        let (count,): (i64,) = db_retry!(sqlx::query_as(
+            "SELECT COUNT(*) FROM team_tasks
+                 WHERE (? IS NULL OR status = ?)
+                   AND (? IS NULL OR user_id = ?)
+                   AND (? IS NULL OR issue_key = ?)"
+        )
+        .bind(status)
+        .bind(status)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(issue_key)
+        .bind(issue_key)
+        .fetch_one(&self.pool))?;
+        let offset = ((page.saturating_sub(1)) * per_page) as i64;
+        let sql = format!(
+            "SELECT {} FROM team_tasks
+             WHERE (? IS NULL OR status = ?)
+               AND (? IS NULL OR user_id = ?)
+               AND (? IS NULL OR issue_key = ?)
+             ORDER BY created_at DESC
+             LIMIT ? OFFSET ?",
+            Self::TEAM_TASK_COLS
+        );
+        let rows = db_retry!(sqlx::query_as::<_, TeamTask>(&sql)
+            .bind(status)
+            .bind(status)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(issue_key)
+            .bind(issue_key)
+            .bind(per_page as i64)
+            .bind(offset)
+            .fetch_all(&self.pool))?;
+        Ok((rows, count))
+    }
+
+    /// 推进任务状态。current_role 传 None 表示清空（终态）。
+    /// 终态（done/failed/cancelled）自动写 finished_at；非终态不动它。
+    pub async fn update_team_task_status(
+        &self,
+        task_id: &str,
+        status: &str,
+        current_role: Option<&str>,
+        result: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE team_tasks
+                 SET status = ?,
+                     current_role = ?,
+                     result = COALESCE(?, result),
+                     error = COALESCE(?, error),
+                     finished_at = IF(? IN ('done','failed','cancelled'), NOW(), finished_at),
+                     updated_at = NOW()
+                 WHERE id = ?"
+        )
+        .bind(status)
+        .bind(current_role)
+        .bind(result)
+        .bind(error)
+        .bind(status)
+        .bind(task_id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 写飞书任务主卡 message_id（跨角色原地刷新同一张卡）。
+    pub async fn set_team_task_card(&self, task_id: &str, card_message_id: &str) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE team_tasks SET card_message_id = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(card_message_id)
+        .bind(task_id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// dev_rounds = dev_rounds + 1，返回递增后的值，供 max_dev_rounds 上限判定。
+    pub async fn bump_team_task_dev_rounds(&self, task_id: &str) -> Result<i32> {
+        db_retry!(
+            sqlx::query(
+                "UPDATE team_tasks SET dev_rounds = dev_rounds + 1, updated_at = NOW() WHERE id = ?"
+            )
+            .bind(task_id)
+            .execute(&self.pool)
+        )?;
+        let (rounds,): (i32,) =
+            db_retry!(sqlx::query_as("SELECT dev_rounds FROM team_tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_one(&self.pool))?;
+        Ok(rounds)
+    }
+
+    /// 插入角色轮次行。唯一键 (task_id, role, round) 冲突时返回 Ok(None)——
+    /// 这是编排器重复派发的正常防线，不是错误，调用方据此跳过派发。
+    ///
+    /// 错误处理与其它方法不同：不经 `db_retry!`。需要按 `sqlx::Error::Database`
+    /// 的 SQLSTATE `23000` 识别唯一键冲突并返回 `Ok(None)`；`db_retry!` 会把错误
+    /// 转成 `anyhow::Error`，丢失 `code()` 判定能力。唯一键冲突也不是连接错误，
+    /// 不应重试。
+    pub async fn insert_team_run(
+        &self,
+        task_id: &str,
+        role: &str,
+        round: i32,
+    ) -> Result<Option<TeamTaskRun>> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let insert = sqlx::query(
+            "INSERT INTO team_task_runs
+                 (id, task_id, role, round, status, started_at)
+                 VALUES (?, ?, ?, ?, 'running', ?)",
+        )
+        .bind(&id)
+        .bind(task_id)
+        .bind(role)
+        .bind(round)
+        .bind(now)
+        .execute(&self.pool)
+        .await;
+
+        match insert {
+            Ok(_) => {
+                let sql = format!(
+                    "SELECT {} FROM team_task_runs WHERE id = ?",
+                    Self::TEAM_RUN_COLS
+                );
+                let row = db_retry!(sqlx::query_as::<_, TeamTaskRun>(&sql)
+                    .bind(&id)
+                    .fetch_optional(&self.pool))?;
+                Ok(row)
+            }
+            Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("23000") => {
+                Ok(None)
+            }
+            Err(e) => Err(anyhow::Error::from(e)),
+        }
+    }
+
+    /// 写某 run 行的 thread_id（run 的首个事件回来后由编排器调用）。
+    pub async fn set_team_run_thread(&self, run_id: &str, thread_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE team_task_runs SET thread_id = ? WHERE id = ?")
+                .bind(thread_id)
+                .bind(run_id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 角色轮次收尾：写状态、verdict、交接产物、摘要、改动文件数、错误与 finished_at。
+    /// status 取 finished / failed / cancelled。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn finish_team_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        verdict: Option<&str>,
+        handoff: Option<&str>,
+        summary: Option<&str>,
+        dirty_files: Option<i32>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE team_task_runs
+                 SET status = ?,
+                     verdict = ?,
+                     handoff = ?,
+                     summary = ?,
+                     dirty_files = ?,
+                     error = ?,
+                     finished_at = NOW()
+                 WHERE id = ?"
+        )
+        .bind(status)
+        .bind(verdict)
+        .bind(handoff)
+        .bind(summary)
+        .bind(dirty_files)
+        .bind(error)
+        .bind(run_id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 按 task_id 查全部轮次，按开始时间升序（看板时间线顺序）。
+    pub async fn list_team_runs(&self, task_id: &str) -> Result<Vec<TeamTaskRun>> {
+        let sql = format!(
+            "SELECT {} FROM team_task_runs WHERE task_id = ? ORDER BY started_at ASC",
+            Self::TEAM_RUN_COLS
+        );
+        let rows = db_retry!(sqlx::query_as::<_, TeamTaskRun>(&sql)
+            .bind(task_id)
+            .fetch_all(&self.pool))?;
+        Ok(rows)
+    }
+
+    /// 按 task_id 查最新一行轮次。
+    pub async fn latest_team_run(&self, task_id: &str) -> Result<Option<TeamTaskRun>> {
+        let sql = format!(
+            "SELECT {} FROM team_task_runs WHERE task_id = ? ORDER BY started_at DESC LIMIT 1",
+            Self::TEAM_RUN_COLS
+        );
+        let row = db_retry!(sqlx::query_as::<_, TeamTaskRun>(&sql)
+            .bind(task_id)
+            .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 记一条任务时间线事件。旁路日志语义：写失败不应影响任务本身，
+    /// 调用方通常 `let _ =` 或只 warn，不向上传播。
+    pub async fn append_team_event(
+        &self,
+        task_id: &str,
+        kind: &str,
+        role: Option<&str>,
+        round: Option<i32>,
+        operator: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "INSERT INTO team_task_events (task_id, kind, role, round, operator, detail, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(task_id)
+        .bind(kind)
+        .bind(role)
+        .bind(round)
+        .bind(operator)
+        .bind(detail)
+        .bind(Utc::now())
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 按 task_id 查时间线，按 id 升序（插入顺序即时间顺序）。
+    pub async fn list_team_events(&self, task_id: &str) -> Result<Vec<TeamTaskEvent>> {
+        let sql = format!(
+            "SELECT {} FROM team_task_events WHERE task_id = ? ORDER BY id ASC",
+            Self::TEAM_EVENT_COLS
+        );
+        let rows = db_retry!(sqlx::query_as::<_, TeamTaskEvent>(&sql)
+            .bind(task_id)
+            .fetch_all(&self.pool))?;
+        Ok(rows)
+    }
+
+    /// 进程启动时收尾遗留的运行中任务：server 重启后 CLI thread 已不可信，
+    /// 一律标失败而不是尝试续跑（仿 scheduler 对遗留 running job_run 的收尾）。
+    /// 返回被收尾的任务数。本方法只提供能力，不在 main.rs 调用——接入放在后续任务。
+    pub async fn fail_stale_team_tasks(&self) -> Result<u64> {
+        // 先收尾这些任务下仍 running 的 run 行，再标任务本身 failed。
+        db_retry!(sqlx::query(
+            "UPDATE team_task_runs r
+                 INNER JOIN team_tasks t ON r.task_id = t.id
+                 SET r.status = 'failed',
+                     r.finished_at = NOW(),
+                     r.error = COALESCE(r.error, 'server 重启，运行中任务已中断')
+                 WHERE t.status LIKE 'running_%' AND r.status = 'running'"
+        )
+        .execute(&self.pool))?;
+        let res = db_retry!(sqlx::query(
+            "UPDATE team_tasks
+                 SET status = 'failed',
+                     error = 'server 重启，运行中任务已中断',
+                     finished_at = NOW(),
+                     current_role = NULL,
+                     updated_at = NOW()
+                 WHERE status LIKE 'running_%'"
+        )
+        .execute(&self.pool))?;
+        Ok(res.rows_affected())
+    }
+
     // 渠道消息留档
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_channel_message(
@@ -5152,4 +5732,81 @@ fn extract_preview(content_json: &str, max_chars: usize) -> String {
         }
     }
     String::new()
+}
+
+/// 生成人类可读的任务短编号：`tsk_{base36 毫秒时间戳}_{4 位 base36 随机}`。
+///
+/// 时间戳部分保证大致有序（便于人眼排序与肉眼判断新旧），随机部分避免同毫秒撞车。
+/// 真正的唯一性由 team_tasks.uk_team_tasks_no 兜底，调用方撞键时重试一次即可。
+pub fn generate_task_no(now_ms: u64, rand_seed: u64) -> String {
+    fn base36(mut n: u64, width: usize) -> String {
+        const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        let mut buf = Vec::new();
+        while n > 0 {
+            buf.push(DIGITS[(n % 36) as usize]);
+            n /= 36;
+        }
+        while buf.len() < width {
+            buf.push(b'0');
+        }
+        buf.reverse();
+        String::from_utf8(buf).expect("base36 digits are ascii")
+    }
+    format!(
+        "tsk_{}_{}",
+        base36(now_ms, 1),
+        base36(rand_seed % (36 * 36 * 36 * 36), 4)
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_task_no;
+
+    #[test]
+    fn task_no_format_and_max_len() {
+        let no = generate_task_no(1_704_067_200_000, 12345);
+        // 形如 tsk_<非空>_<4 位>
+        let parts: Vec<&str> = no.split('_').collect();
+        assert_eq!(parts.len(), 3, "expected tsk_<ts>_<rand>, got {no}");
+        assert_eq!(parts[0], "tsk");
+        assert!(!parts[1].is_empty(), "timestamp segment must be non-empty");
+        assert_eq!(parts[2].len(), 4, "random segment must be 4 base36 chars");
+        assert!(
+            no.len() <= 32,
+            "task_no must fit VARCHAR(32), got len={} ({no})",
+            no.len()
+        );
+        assert!(
+            no.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "task_no should be base36 + underscores: {no}"
+        );
+    }
+
+    #[test]
+    fn task_no_differs_on_rand_seed() {
+        let a = generate_task_no(1_000_000, 1);
+        let b = generate_task_no(1_000_000, 2);
+        assert_ne!(a, b, "same now_ms different rand_seed must differ");
+    }
+
+    #[test]
+    fn task_no_zero_seed_pads_to_four() {
+        let no = generate_task_no(1, 0);
+        assert!(
+            no.ends_with("_0000"),
+            "rand_seed=0 should pad random segment to 0000, got {no}"
+        );
+    }
+
+    #[test]
+    fn task_no_lexicographic_order_with_same_digit_width() {
+        // 同一位数宽度下，时间戳递增 → 编号字典序递增（便于人眼排序）
+        let a = generate_task_no(36u64.pow(5), 0); // 保证足够大、位数相同的区间
+        let b = generate_task_no(36u64.pow(5) + 1, 0);
+        let c = generate_task_no(36u64.pow(5) + 100, 0);
+        assert!(a < b, "{a} should be < {b}");
+        assert!(b < c, "{b} should be < {c}");
+    }
 }
