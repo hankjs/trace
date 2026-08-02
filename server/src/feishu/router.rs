@@ -210,6 +210,8 @@ impl WorkspaceKind {
 #[serde(rename_all = "snake_case")]
 enum AgentKind {
     Conversation,
+    /// A 股研究话题：server 侧 native，只挂 quant_* 工具，无工作区。
+    QuantResearch,
     TraceCode,
     QuantCode,
     GeneralTask,
@@ -219,6 +221,7 @@ impl AgentKind {
     fn agent_kind(&self) -> &'static str {
         match self {
             Self::Conversation => "conversation",
+            Self::QuantResearch => "quant_research",
             Self::TraceCode => "trace_code",
             Self::QuantCode => "quant_code",
             Self::GeneralTask => "general_task",
@@ -227,7 +230,8 @@ impl AgentKind {
 
     fn workspace_kind(&self) -> WorkspaceKind {
         match self {
-            Self::Conversation => WorkspaceKind::None,
+            // quant_research 与 conversation 一样不建目录：只有 REST 研究工具，无 cwd。
+            Self::Conversation | Self::QuantResearch => WorkspaceKind::None,
             Self::TraceCode | Self::QuantCode => WorkspaceKind::Repository,
             Self::GeneralTask => WorkspaceKind::General,
         }
@@ -289,7 +293,11 @@ impl NewTopicDecision {
 
     fn normalized(mut self, default_backend: AgentBackend) -> Self {
         match self.agent_kind {
-            AgentKind::Conversation => self.agent_backend = AgentBackend::Native,
+            // conversation / quant_research 都必须走 server 侧 native，才能挂工具或纯对话；
+            // 落到外部 CLI 会被 chat.rs 提前 return 进 cli_agent，quant 工具永远挂不上。
+            AgentKind::Conversation | AgentKind::QuantResearch => {
+                self.agent_backend = AgentBackend::Native
+            }
             _ if self.agent_backend == AgentBackend::Native => self.agent_backend = default_backend,
             _ => {}
         }
@@ -634,7 +642,7 @@ async fn handle_command(
         SlashCommand::Help => {
             api.reply_text(
                 &msg.message_id,
-                "/new 开启新话题\n/stop 停止当前任务\n/status 查看当前会话\n/nodes 列出本机 hank-cli 节点（在线状态与 backends）\n/diff 查看 server worktree 变更（本机 CLI 会话不支持）\n/test 运行 server worktree 测试（本机 CLI 会话不支持）\n/deploy 创建 server 部署审批（本机 CLI 会话不支持）\n/rollback 创建 server 回滚审批（本机 CLI 会话不支持）\n/help 查看命令",
+                "直接问行情、信号、回测即可（quant 研究话题）\n/new 开启新话题\n/stop 停止当前任务\n/status 查看当前会话\n/nodes 列出本机 hank-cli 节点（在线状态与 backends）\n/diff 查看 server worktree 变更（本机 CLI 会话不支持）\n/test 运行 server worktree 测试（本机 CLI 会话不支持）\n/deploy 创建 server 部署审批（本机 CLI 会话不支持）\n/rollback 创建 server 回滚审批（本机 CLI 会话不支持）\n/help 查看命令",
                 msg.in_thread(),
             )
             .await?;
@@ -999,12 +1007,23 @@ async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTop
     let default_backend =
         AgentBackend::preferred(crate::cli_agent::preferred_backend(state, user_id).await);
     let server_agent_enabled = state.config.server_agent.enabled;
-    match try_decide_new_topic(state, text, default_backend, server_agent_enabled).await {
+    // quant_a2a 关闭时路由 prompt 不得出现 quant_research，避免模型凭常识乱猜该类型。
+    let quant_enabled = state.config.quant_a2a.as_ref().is_some_and(|c| c.enabled);
+    match try_decide_new_topic(
+        state,
+        text,
+        default_backend,
+        server_agent_enabled,
+        quant_enabled,
+    )
+    .await
+    {
         Ok(decision) => {
             let decision = decision.normalized(default_backend);
             tracing::info!(
                 ?decision,
                 server_agent_enabled,
+                quant_enabled,
                 "feishu: new topic workspace decision"
             );
             decision
@@ -1021,14 +1040,31 @@ async fn try_decide_new_topic(
     text: &str,
     default_backend: AgentBackend,
     server_agent_enabled: bool,
+    quant_enabled: bool,
 ) -> Result<NewTopicDecision> {
     let (record, provider) = provider_registry::resolve_default(&state.db)
         .await
         .ok_or_else(|| anyhow!("没有可用的 LLM provider"))?;
     let env_note = if server_agent_enabled {
-        "当前环境已开启 server_agent：conversation 的 native 可在 server 无工具运行；\
-         代码/文件任务（trace_code/quant_code/general_task）仍必须走用户本机 hank-cli（codex/claude/grok/kimi），\
-         不会在 server bubblewrap 执行。"
+        if quant_enabled {
+            "当前环境已开启 server_agent：conversation / quant_research 的 native 可在 server 运行\
+             （conversation 无工具，quant_research 仅 quant 工具）；\
+             代码/文件任务（trace_code/quant_code/general_task）仍必须走用户本机 hank-cli（codex/claude/grok/kimi），\
+             不会在 server bubblewrap 执行。"
+                .to_string()
+        } else {
+            // quant 关闭时保持与历史 prompt 一致，避免无意义的文案漂移。
+            "当前环境已开启 server_agent：conversation 的 native 可在 server 无工具运行；\
+             代码/文件任务（trace_code/quant_code/general_task）仍必须走用户本机 hank-cli（codex/claude/grok/kimi），\
+             不会在 server bubblewrap 执行。"
+                .to_string()
+        }
+    } else if quant_enabled {
+        "当前环境未开启 server_agent，没有 server 侧代码工作区（worktree/bubblewrap）。\
+         凡需要读改代码、跑命令、操作文件的任务（trace_code / quant_code / general_task）\
+         都必须在用户本机在线的 hank-cli 节点上通过 codex/claude/grok/kimi 执行，\
+         agent_backend 不可选 native（仅 conversation / quant_research 可选 native）。\
+         没有匹配在线节点时创建会话会明确失败，这是预期行为。"
             .to_string()
     } else {
         "当前环境未开启 server_agent，没有 server 侧代码工作区（worktree/bubblewrap）。\
@@ -1038,6 +1074,33 @@ async fn try_decide_new_topic(
          没有匹配在线节点时创建会话会明确失败，这是预期行为。"
             .to_string()
     };
+    // quant_research 只在 quant_a2a.enabled 时进入可选列表；关闭时保持与历史 prompt 一致（无回归）。
+    let quant_research_line = if quant_enabled {
+        "- quant_research：用户在问 A 股行情、信号、选股、策略、因子、回测、持仓记账，\
+          或要求验证/研究某个量化想法。这类任务由 quant 研究工具直接回答，不需要\
+          读写代码文件。注意：修改 quant 项目代码本身属于 quant_code，不是 quant_research。\n"
+            .to_string()
+    } else {
+        String::new()
+    };
+    let quant_priority_note = if quant_enabled {
+        "只要用户是在用 quant 的数据和能力做研究（查信号、跑回测、评估因子），\
+         一律选 quant_research；只有当用户要改 quant 的源码、看板或文档时才选 quant_code。\n"
+            .to_string()
+    } else {
+        // enabled=false 时显式禁止，防止模型凭常识乱猜该类型。
+        "本环境没有 quant 研究工具，不得输出 quant_research。\n".to_string()
+    };
+    let backend_native_note = if quant_enabled {
+        "conversation 与 quant_research 必须选 native"
+    } else {
+        "conversation 必须选 native"
+    };
+    let backend_forbid_note = if quant_enabled {
+        "不能选 conversation 或 quant_research"
+    } else {
+        "不能选 conversation"
+    };
     let system = format!("你是飞书任务的路由 Agent。只输出一个 JSON 对象，不要输出 markdown 或其他文字。\n\
         {env_note}\n\
         输出字段 agent_kind 可选值：\n\
@@ -1045,14 +1108,20 @@ async fn try_decide_new_topic(
           crates、admin、cli、docs、飞书/微信渠道或同步流程；不包括 client 和 quant。\n\
         - quant_code：需要读取、修改或测试 monorepo 的 quant 项目代码、策略、看板或文档。\n\
         - general_task：具体任务与 Trace/quant 无关，但需要文件、代码、命令、下载、分析产物或持续迭代工作区。\n\
+        {quant_research_line}\
         - conversation：用户在问候、讨论、咨询、分析问题，或者尚未给出需要文件和命令的事项。\
           后续对话 Agent 会负责正式回答；路由器不要回答用户问题。\n\
-        输出字段 agent_backend 可选值：native、codex、claude、grok、kimi。conversation 必须选 native；\
-        其他任务默认选 {default_backend}；用户明确要求 Codex、Claude/Claude Code、Grok 或 Kimi/Kimi Code 时，分别选择对应后端，且 agent_kind 至少为 general_task，不能选 conversation。\n\
+        输出字段 agent_backend 可选值：native、codex、claude、grok、kimi。{backend_native_note}；\
+        其他任务默认选 {default_backend}；用户明确要求 Codex、Claude/Claude Code、Grok 或 Kimi/Kimi Code 时，分别选择对应后端，且 agent_kind 至少为 general_task，{backend_forbid_note}。\n\
         示例：{{\"agent_kind\":\"trace_code\",\"agent_backend\":\"{default_backend}\"}}。\n\
+        {quant_priority_note}\
         判断 Agent 必须看语义，不只看是否出现项目名。拿不准是否属于 Trace/quant 时选择 general_task；\
         拿不准是否需要文件或命令时选择 conversation。",
         env_note = env_note,
+        quant_research_line = quant_research_line,
+        quant_priority_note = quant_priority_note,
+        backend_native_note = backend_native_note,
+        backend_forbid_note = backend_forbid_note,
         default_backend = default_backend.as_str()
     );
     let request = CompletionRequest {
@@ -1715,6 +1784,34 @@ async fn create_feishu_session(
     agent_backend: &str,
     workspace_kind: WorkspaceKind,
 ) -> Result<hank_db::Session> {
+    // quant 研究话题：server 侧 native 会话，只挂 quant_* 工具，无工作区、
+    // 不绑执行节点，因此不要求 can_login_admin（admin 边界只在创建 server 工作区时校验）。
+    // 必须写 source=feishu：chat.rs 用它决定确认话术与是否允许「确认N次」批量授权。
+    // 不要写 server_agent=true，否则会注入「你正在 wananyun 工作区」的错误说明。
+    if agent_kind == "quant_research" {
+        let metadata = serde_json::json!({
+            "source": "feishu",
+            "agent_backend": "native",
+            "agent_kind": agent_kind,
+            "workspace_kind": "none",
+        })
+        .to_string();
+        let session = state
+            .db
+            .create_session(
+                "",
+                "",
+                None,
+                Some(user_id),
+                Some("remote"),
+                Some("chat"),
+                Some(&metadata),
+            )
+            .await
+            .map_err(|e| anyhow!("create quant research session: {e:#}"))?;
+        return Ok(session);
+    }
+
     // codex/claude/grok/kimi：必须绑定在线且能力匹配的 hank-cli；绝不回退 server bubblewrap。
     if is_external_agent_backend(agent_backend) {
         let Some(client) =
@@ -1842,9 +1939,10 @@ async fn create_feishu_session(
 }
 
 /// native fallback 分支是否应绑定远程执行节点。
-/// conversation 纯对话无工具/无工作区，不得绑定；其余 native 任务可绑桌面 client。
+/// conversation 与 quant_research 都无工作目录，不得绑定；绑了会让 chat.rs 注入
+/// 「工作目录在你本地桌面」的说明，与「只有 quant 工具 / 纯对话无工具」自相矛盾。
 fn should_bind_remote_exec_client(agent_kind: &str) -> bool {
-    agent_kind != "conversation"
+    !matches!(agent_kind, "conversation" | "quant_research")
 }
 
 #[cfg(test)]
@@ -2028,6 +2126,33 @@ mod tests {
         assert!(should_bind_remote_exec_client("general_task"));
         assert!(should_bind_remote_exec_client("trace_code"));
         assert!(should_bind_remote_exec_client("quant_code"));
+    }
+
+    #[test]
+    fn quant_research_decision_parsing_and_normalization() {
+        assert_eq!(
+            parse_new_topic_decision(r#"{"agent_kind":"quant_research","agent_backend":"native"}"#)
+                .unwrap(),
+            NewTopicDecision {
+                agent_kind: AgentKind::QuantResearch,
+                agent_backend: AgentBackend::Native,
+            }
+        );
+        // 模型误填外部 backend 时必须被拉回 native，否则会落到 cli_agent
+        assert_eq!(
+            NewTopicDecision {
+                agent_kind: AgentKind::QuantResearch,
+                agent_backend: AgentBackend::Codex,
+            }
+            .normalized(AgentBackend::Claude)
+            .agent_backend,
+            AgentBackend::Native
+        );
+        assert_eq!(
+            AgentKind::QuantResearch.workspace_kind(),
+            WorkspaceKind::None
+        );
+        assert!(!should_bind_remote_exec_client("quant_research"));
     }
 
     #[test]

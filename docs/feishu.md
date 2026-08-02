@@ -1,6 +1,6 @@
 # 飞书渠道接入指南
 
-飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。入口和生命周期由 Rust server 统一管理（`server/src/feishu/`）；纯对话使用无工具的 native Agent，**代码与文件任务的 Codex / Claude Code / Grok / Kimi Code 必须在用户本机在线 `hank-cli` 节点执行（client-only）**，server 不再 bubblewrap 回退执行，也不再由 wananyun 自行修改/部署 Trace 源码。
+飞书渠道让 server 的 agent 直接挂到飞书群里：话题群里 @机器人 派任务，进度以卡片原地刷新，高成本操作弹确认卡片，点按钮即拍板。入口和生命周期由 Rust server 统一管理（`server/src/feishu/`）；纯对话使用无工具的 native Agent，**quant 研究话题**（`quant_research`）使用 server 侧 native 会话并挂载 `quant_*` 工具（需 `quant_a2a.enabled`），**代码与文件任务的 Codex / Claude Code / Grok / Kimi Code 必须在用户本机在线 `hank-cli` 节点执行（client-only）**，server 不再 bubblewrap 回退执行，也不再由 wananyun 自行修改/部署 Trace 源码。
 
 ## 架构
 
@@ -21,8 +21,8 @@ feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有�
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
 - **确认闸门升级**：微信是文本白名单（回复"确认"），飞书是按钮卡片；回调文本化后走同一套 `handle_quant_confirmation`，code-agent 零改动
-- **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。纯对话 `native` 在 server_agent 开启时走 server 无工具会话，关闭时走普通 remote/native 会话。
-- **管理员边界**：`can_login_admin` 仅在创建 **server 侧** native / worktree 会话时校验；纯对话与 client-only hank-cli 用户不要求 admin
+- **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。五种 `agent_kind`：`conversation`（纯对话、无工具）、`quant_research`（A 股研究、仅 quant 工具，需 `quant_a2a.enabled`）、`trace_code` / `quant_code` / `general_task`（代码与文件任务）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。`conversation` 与 `quant_research` 强制 `native`：前者无工具，后者只挂 `quant_*` + `ask_user` + `web_fetch`，均无工作区、不绑 `exec_client_id`。
+- **管理员边界**：`can_login_admin` 仅在创建 **server 侧** native / worktree **工作区**时校验；纯对话、`quant_research` 与 client-only hank-cli 用户不要求 admin
 
 ## 一、飞书开放平台配置
 
@@ -82,9 +82,10 @@ feishu_monitor = false   # 其他实例关掉
 | 操作 | 说明 |
 |------|------|
 | `@机器人 帮我做 xxx` | 派任务：蓝卡片出现，进度 2s 节流原地刷新，结束变绿/红 |
+| 直接问行情 / 信号 / 回测 | 路由到 `quant_research`（需 `quant_a2a.enabled`）：server 侧 native，挂 `quant_*` 工具，无代码工作区 |
 | 发送截图 | 图片下载后作为多模态输入交给当前话题 Agent |
 | 话题内继续追问 | 同一会话续接（`feishu_chats` 映射），上下文不断 |
-| 高成本 quant 工具 | 弹确认卡片：点「确认」/「否」；文字回复「确认5次」可批量授权（N≤50） |
+| 高成本 quant 工具 | 弹确认卡片：点「确认」/「否」；文字回复「确认5次」可批量授权（N≤50，飞书允许批量，与微信不同） |
 | `/new` | 关闭当前话题会话，下次发消息开新会话 |
 | `/stop` | 取消当前执行中的任务 |
 | `/status` | 查看当前话题的会话 ID 与状态 |
@@ -189,9 +190,9 @@ approval_ttl_secs = 600
   - **client-only**（`agent_location=client`）：固定复用 backend / `exec_client_id` / `agent_thread_id`，不重新分类、不换节点。
   - **历史 server-agent + 外部 backend**：拒绝复用，要求 `/new`。
   - **native conversation** 等非外部后端 managed 会话：可继续复用。
-- 新话题**始终**由路由 Agent 选择 `conversation`、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex`、`claude`、`grok` 或 `kimi`（**即使 `[server_agent].enabled = false`**）。`conversation` 强制 `native`；其他任务若误返回 `native` 会归一为默认 CLI 后端（优先 Codex，否则 Claude）。用户点名后端时保留选择。`server_agent` 关闭时 prompt 会明确告知无 server 工作区，代码任务只能落到 hank-cli。
+- 新话题**始终**由路由 Agent 选择 `conversation`、`quant_research`（仅 `quant_a2a.enabled` 时）、`trace_code`、`quant_code` 或 `general_task`，同时选择 `native`、`codex`、`claude`、`grok` 或 `kimi`（**即使 `[server_agent].enabled = false`**）。`conversation` 与 `quant_research` 强制 `native`；其他任务若误返回 `native` 会归一为默认 CLI 后端（优先 Codex，否则 Claude）。用户点名后端时保留选择。`server_agent` 关闭时 prompt 会明确告知无 server 工作区，代码任务只能落到 hank-cli。`quant_a2a` 关闭时路由**不会**产出 `quant_research`。
 - **外部 backend（codex/claude/grok/kimi）只走 client-only**：必须命中在线且上报该能力的 `hank-cli`；否则用户可见失败。**飞书不再创建 server bubblewrap / worktree 代码会话**（server-only 实现仍保留编译兼容，但不由飞书入口创建）。
-- `native` 对话不创建代码工作区；client-only 会话的工作目录是节点 `work_dir`，不在 wananyun 上建 worktree。conversation 会话会注入链路说明与节点快照（见上文「本机 Agent CLI」），且不绑定 `exec_client_id` / `work_dir`。
+- `native` 对话与 `quant_research` 均不创建代码工作区；client-only 会话的工作目录是节点 `work_dir`，不在 wananyun 上建 worktree。conversation 会话会注入链路说明与节点快照（见上文「本机 Agent CLI」），且不绑定 `exec_client_id` / `work_dir`。`quant_research` 同样不绑定执行节点，只挂 quant 研究工具，高成本操作走确认卡片闸门。
 - `/nodes` 列出当前用户注册的 hank-cli 节点（在线状态、work_dir、backends）；无节点时给出安装/启动提示。
 - `/diff`、`/test`、`/deploy`、`/rollback` 仅适用于仍存在的 server worktree 管理会话；对 client-only 会话返回「本机 CLI 会话不支持该命令 / 请在本机执行」，**不会误报成功或静默操作 server 部署**。
 - 本机 CLI 的 stdout 按 JSONL 解析，线程 ID 写回 metadata；server 处理超时、输出上限、`/stop` 取消与飞书终态卡片。节点离线或结果超时时明确失败。

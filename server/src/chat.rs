@@ -70,6 +70,16 @@ fn quant_research_prompt_inputs(
     (skills, segments)
 }
 
+/// quant_research 话题的 project segment 文案。
+/// 产品口径：只提供研究信息与模拟结果，不得写成交易建议（见 quant/PRODUCT.md）。
+fn quant_research_session_prompt() -> &'static str {
+    "路由 Agent 已将当前话题标记为 quant 研究话题。你没有工作目录，也没有\
+     shell、文件或 Git 工具，只能通过 quant_* 工具读取数据与执行研究操作。\
+     回答用中文，说明结论用了哪一天的数据、命中了什么条件。\
+     quant 只提供研究信息与模拟结果：不要输出买卖指令，也不要暗示自动交易。\
+     若用户想修改 quant 源码或看板，提示用 /new 开启新话题重新路由。"
+}
+
 // --- Event Buffer types ---
 
 #[derive(Clone, Debug)]
@@ -286,6 +296,9 @@ pub async fn run_chat_turn(
     let conversation_agent = routed_agent_kind
         .map(|kind| kind == "conversation")
         .unwrap_or(false);
+    let research_agent = routed_agent_kind
+        .map(|kind| kind == "quant_research")
+        .unwrap_or(false);
     let quant_code_agent = routed_agent_kind
         .map(|kind| kind == "quant_code")
         .unwrap_or(false);
@@ -309,14 +322,48 @@ pub async fn run_chat_turn(
 
     // 标记本会话是否注册了 quant_* 工具，用于后续决定是否注入 quant-research skill 全文。
     let mut quant_tools_added = false;
+    // metadata.source 决定确认话术与是否允许「确认N次」批量授权（weixin 禁止批量）。
+    // 提到 if 之前，research 与全量工具分支共用，避免复制解析。
+    let metadata_source = session_record
+        .as_ref()
+        .and_then(|s| s.metadata.as_deref())
+        .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+        .and_then(|v| v["source"].as_str().map(|s| s.to_string()))
+        .unwrap_or_else(|| "trace_chat".to_string());
+    let token = opts.auth_token.clone();
 
     let tools: Vec<Arc<dyn Tool>> = if conversation_agent {
         // 路由 Agent 已将该话题标记为纯对话：没有文件系统工作区，也不暴露 shell/Git
         // 等工具，避免无 cwd 的会话意外操作 server 进程目录。
         Vec::new()
+    } else if research_agent {
+        // quant 研究话题：只挂 quant_* 工具与 ask_user / web_fetch；没有工作目录，
+        // 不注册 shell/文件/Git/测试工具（挂了必然报错或误导模型）。
+        let mut t: Vec<Arc<dyn Tool>> = vec![Arc::new(AskUserTool::new())];
+        t.push(Arc::new(WebFetchTool::new()));
+        if let Some(ref quant_cfg) = state.config.quant_a2a {
+            if quant_cfg.enabled && !token.is_empty() {
+                let mut quant = quant_tools(
+                    quant_cfg.base_url.clone(),
+                    token.clone(),
+                    session_id.clone(),
+                    metadata_source.clone(),
+                    state.quant_grant_store.clone(),
+                );
+                t.append(&mut quant);
+                quant_tools_added = true;
+            }
+        }
+        if !quant_tools_added {
+            // 路由本应在 quant_a2a 关闭时挡住 quant_research；落到此属防御异常。
+            tracing::warn!(
+                session_id = %session_id,
+                "quant_research session without quant tools (quant_a2a disabled or empty token)"
+            );
+        }
+        t
     } else {
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
-        let token = opts.auth_token.clone();
         let checksum_store = new_checksum_store();
         let execution_user =
             server_agent_session.then(|| state.config.server_agent.execution_user.clone());
@@ -421,17 +468,11 @@ pub async fn run_chat_turn(
         // 注册 quant_* 工具：需 quant_a2a.enabled 显式开启、用户已登录（有 JWT）、且会话来源明确
         if let Some(ref quant_cfg) = state.config.quant_a2a {
             if quant_cfg.enabled && !token.is_empty() {
-                let source = session_record
-                    .as_ref()
-                    .and_then(|s| s.metadata.as_deref())
-                    .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
-                    .and_then(|v| v["source"].as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "trace_chat".to_string());
                 let mut quant = quant_tools(
                     quant_cfg.base_url.clone(),
                     token.clone(),
                     session_id.clone(),
-                    source,
+                    metadata_source.clone(),
                     state.quant_grant_store.clone(),
                 );
                 t.append(&mut quant);
@@ -815,6 +856,10 @@ pub async fn run_chat_turn(
                         直接结合对话上下文回答用户。若用户后续转为需要文件、命令或 Trace/quant 代码的任务，\
                         请提示用户使用 /new 开启新话题，以便重新路由并分配合适工作区。"
                             .to_string(),
+                    ));
+                } else if research_agent {
+                    project_segments.push(code_agent::PromptSegment::Dynamic(
+                        quant_research_session_prompt().to_string(),
                     ));
                 } else if repository_workspace {
                     project_segments.extend(load_server_agent_instructions(
@@ -1579,6 +1624,32 @@ mod tests {
         assert!(
             QUANT_RESEARCH_SKILL_MD.contains("文案禁忌"),
             "SKILL.md should list wording taboos"
+        );
+    }
+
+    #[test]
+    fn test_quant_research_session_prompt_forbids_trading_and_cwd() {
+        let text = quant_research_session_prompt();
+        assert!(
+            text.contains("不要输出买卖指令"),
+            "research session prompt should forbid trading wording"
+        );
+        assert!(
+            text.contains("不要暗示自动交易"),
+            "research session prompt should forbid auto-trading implication"
+        );
+        // 必须明确无工作目录 / 无 shell 文件工具，避免与远程执行 prompt 冲突。
+        assert!(
+            text.contains("没有工作目录"),
+            "research session prompt should state there is no work dir"
+        );
+        assert!(
+            !text.contains("本地桌面"),
+            "research session prompt must not claim desktop work dir"
+        );
+        assert!(
+            !text.contains("远程执行"),
+            "research session prompt must not claim remote exec"
         );
     }
 

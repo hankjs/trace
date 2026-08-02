@@ -35,6 +35,7 @@ approval_ttl_secs = 600
 [quant_a2a]
 # 是否在所有已登录会话注册 quant_* 工具（默认 false）。
 # 开启后每个会话都会挂载 19 个 quant 工具 schema 并向系统提示注入 quant-research skill。
+# 同时：飞书路由才会产出 quant_research 话题类型（关闭时飞书与现在行为一致，无该类型）。
 enabled = false
 # quant A2A Server 根地址（也可直接填 .../a2a）；省略时默认 http://127.0.0.1:8100
 base_url = "http://127.0.0.1:8100"
