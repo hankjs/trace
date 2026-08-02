@@ -12,5 +12,13 @@ password = "your-password"
 # 飞书可调用的本机 Agent CLI。省略时自动探测；设为空数组可完全禁用。
 # agent_backends = ["codex", "claude", "grok", "kimi"]
 
+# 本机 Agent 输出闸门（单位 MiB，省略走默认值）。
+# agent_max_line_mib：单行上限，默认 1。stream-json 里一条 tool_result 可能带整个文件，
+#   超限只丢这一行并继续跑任务，不会终止 Agent。
+# agent_max_stream_mib：整流上限，默认 64，是真正的 runaway 保护，撞到才终止进程组。
+#   实际生效值不会低于 agent_max_line_mib。
+# agent_max_line_mib = 1
+# agent_max_stream_mib = 64
+
 # 可选：本节点 ID。缺省时首次运行自动生成 uuid 并写回本文件。
 # client_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"

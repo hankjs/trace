@@ -59,8 +59,7 @@ impl ApiClient {
 
     /// 解析信封：code != 0 视为错误，返回 msg
     fn parse_envelope(body: &str) -> Result<serde_json::Value, String> {
-        let env: Envelope =
-            serde_json::from_str(body).map_err(|e| format!("响应解析失败: {e}"))?;
+        let env: Envelope = serde_json::from_str(body).map_err(|e| format!("响应解析失败: {e}"))?;
         if env.code != 0 {
             return Err(env.msg.unwrap_or_else(|| format!("code={}", env.code)));
         }
@@ -81,12 +80,15 @@ impl ApiClient {
             .await
             .map_err(|e| format!("login 请求失败: {e}"))?;
         let status = res.status();
-        let body = res.text().await.map_err(|e| format!("login 读取响应失败: {e}"))?;
+        let body = res
+            .text()
+            .await
+            .map_err(|e| format!("login 读取响应失败: {e}"))?;
         if status.as_u16() == 401 {
             return Err("login 失败：用户名或密码错误".into());
         }
-        let data = Self::parse_envelope(&body)
-            .map_err(|e| format!("login 失败（{status}）: {e}"))?;
+        let data =
+            Self::parse_envelope(&body).map_err(|e| format!("login 失败（{status}）: {e}"))?;
         let token = data
             .get("token")
             .and_then(|t| t.as_str())
@@ -122,7 +124,10 @@ impl ApiClient {
             if let Some(b) = body {
                 req = req.json(b);
             }
-            let res = req.send().await.map_err(|e| format!("{method} {path} 请求失败: {e}"))?;
+            let res = req
+                .send()
+                .await
+                .map_err(|e| format!("{method} {path} 请求失败: {e}"))?;
             if res.status().as_u16() == 401 && attempt == 0 {
                 self.relogin().await?;
                 continue;
@@ -179,8 +184,7 @@ impl ApiClient {
             .await?;
         let status = res.status();
         let body = res.text().await.map_err(|e| e.to_string())?;
-        Self::parse_envelope(&body)
-            .map_err(|e| format!("agent-event 失败（{status}）: {e}"))?;
+        Self::parse_envelope(&body).map_err(|e| format!("agent-event 失败（{status}）: {e}"))?;
         Ok(())
     }
 
@@ -227,7 +231,12 @@ impl ApiClient {
     }
 
     /// POST /api/client/tool-result：回传工具执行结果
-    pub async fn post_result(&self, request_id: &str, content: &str, is_error: bool) -> Result<(), String> {
+    pub async fn post_result(
+        &self,
+        request_id: &str,
+        content: &str,
+        is_error: bool,
+    ) -> Result<(), String> {
         let res = self
             .authed(
                 reqwest::Method::POST,
@@ -279,7 +288,12 @@ impl ApiClient {
     #[allow(dead_code)]
     pub async fn list_online<T: DeserializeOwned>(&self) -> Result<T, String> {
         let res = self
-            .authed(reqwest::Method::GET, "/api/client/online", None::<&[(&str, &str)]>, None::<&serde_json::Value>)
+            .authed(
+                reqwest::Method::GET,
+                "/api/client/online",
+                None::<&[(&str, &str)]>,
+                None::<&serde_json::Value>,
+            )
             .await?;
         let body = res.text().await.map_err(|e| e.to_string())?;
         let data = Self::parse_envelope(&body)?;

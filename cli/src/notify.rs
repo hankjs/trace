@@ -25,7 +25,11 @@ pub struct NotifyEvent {
 pub type NotifyTx = mpsc::UnboundedSender<NotifyEvent>;
 
 /// 消费通知事件并上报 server；失败只记日志，不影响主流程
-pub async fn run(api: Arc<ApiClient>, client_id: String, mut rx: mpsc::UnboundedReceiver<NotifyEvent>) {
+pub async fn run(
+    api: Arc<ApiClient>,
+    client_id: String,
+    mut rx: mpsc::UnboundedReceiver<NotifyEvent>,
+) {
     while let Some(ev) = rx.recv().await {
         if let Err(e) = api
             .post_notify(&client_id, Some(&ev.term_id), &ev.kind, &ev.title, &ev.body)
@@ -118,7 +122,9 @@ impl NotifyScanner {
     fn finish_osc(&mut self, out: &mut Vec<(String, String, String)>) {
         let content = String::from_utf8_lossy(&self.buf).to_string();
         self.buf.clear();
-        let Some((ps, pt)) = content.split_once(';') else { return };
+        let Some((ps, pt)) = content.split_once(';') else {
+            return;
+        };
         match ps {
             // iTerm2/kitty 通知；9;4;… 是 ConEmu 进度序列，不是通知文本，过滤
             "9" => {
@@ -157,7 +163,11 @@ impl NotifyScanner {
                             };
                             out.push((
                                 "command".into(),
-                                if failed { "命令失败".into() } else { "命令完成".into() },
+                                if failed {
+                                    "命令失败".into()
+                                } else {
+                                    "命令完成".into()
+                                },
                                 format!("退出码 {exit_code} · 耗时 {dur}"),
                             ));
                         }

@@ -33,7 +33,11 @@ async fn main() {
     };
     tracing::info!(server = %cfg.server, client_id = %cfg.client_id, "hank-cli 启动");
 
-    let api = api::ApiClient::new(cfg.server.clone(), cfg.username.clone(), cfg.password.clone());
+    let api = api::ApiClient::new(
+        cfg.server.clone(),
+        cfg.username.clone(),
+        cfg.password.clone(),
+    );
 
     // 登录失败即退出并提示（账号错误属配置问题，重试无意义）
     if let Err(e) = api.login().await {
@@ -43,9 +47,10 @@ async fn main() {
     tracing::info!("登录成功");
 
     let hostname = gethostname::gethostname().to_string_lossy().to_string();
-    let valid_work_dir = cfg.work_dir.as_deref().is_some_and(|work_dir| {
-        std::fs::canonicalize(work_dir).is_ok_and(|path| path.is_dir())
-    });
+    let valid_work_dir = cfg
+        .work_dir
+        .as_deref()
+        .is_some_and(|work_dir| std::fs::canonicalize(work_dir).is_ok_and(|path| path.is_dir()));
     let agent_backends = if valid_work_dir {
         agent::detect_backends(cfg.agent_backends.as_deref())
     } else {
@@ -67,10 +72,11 @@ async fn main() {
     tracing::info!(hostname, work_dir = ?cfg.work_dir, ?agent_backends, "注册成功，进入 poll 循环");
 
     let term = Arc::new(terminal::TermManager::new(cfg.data_dir.clone()));
-    let agent_runner = Arc::new(agent::AgentRunner::new(
+    let agent_runner = Arc::new(agent::AgentRunner::with_limits(
         cfg.work_dir.clone(),
         cfg.data_dir.clone(),
         agent_backends.clone(),
+        cfg.agent_limits,
     ));
     worker::run(
         api,

@@ -14,7 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::os::unix::{fs::OpenOptionsExt, fs::PermissionsExt};
 
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex, Notify};
 
@@ -22,10 +22,34 @@ use crate::api::ApiClient;
 
 const SUPPORTED_BACKENDS: [&str; 4] = ["codex", "claude", "grok", "kimi"];
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
-const MAX_STDOUT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_STDERR_BYTES: usize = 256 * 1024;
+/// 单行上限：stream-json 里一条 tool_result 可能带整个文件内容。超限只丢这一行，
+/// 不杀进程——探索型任务读几十个文件是常态，不该按异常处理。
+const DEFAULT_MAX_LINE_BYTES: usize = 1024 * 1024;
+/// 整流上限（真正的 runaway 保护）。远高于正常任务量级，撞到才终止进程组。
+const DEFAULT_MAX_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// 回传给 server 的 stdout 只保留尾部：final_text 兜底解析找的 result 事件在流末尾，
+/// 保留头部等于必然拿不到（旧实现的方向错误）。
+const RETAIN_STDOUT_BYTES: usize = 256 * 1024;
+const RETAIN_STDERR_BYTES: usize = 64 * 1024;
+const READ_CHUNK_BYTES: usize = 64 * 1024;
 const STREAM_QUEUE_CAPACITY: usize = 256;
 const MAX_PENDING_CANCELLATIONS: usize = 1024;
+
+/// 输出闸门参数。默认值适用于全仓库通读类任务，可由配置文件覆盖。
+#[derive(Clone, Copy)]
+pub struct AgentLimits {
+    pub max_line_bytes: usize,
+    pub max_stream_bytes: usize,
+}
+
+impl Default for AgentLimits {
+    fn default() -> Self {
+        Self {
+            max_line_bytes: DEFAULT_MAX_LINE_BYTES,
+            max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct AgentRunInput {
@@ -75,11 +99,17 @@ pub struct AgentRunner {
     work_root: Option<PathBuf>,
     data_dir: PathBuf,
     backends: Vec<String>,
+    limits: AgentLimits,
     jobs: Mutex<JobState>,
 }
 
 impl AgentRunner {
-    pub fn new(work_dir: Option<String>, data_dir: PathBuf, backends: Vec<String>) -> Self {
+    pub fn with_limits(
+        work_dir: Option<String>,
+        data_dir: PathBuf,
+        backends: Vec<String>,
+        limits: AgentLimits,
+    ) -> Self {
         let work_root = work_dir
             .map(PathBuf::from)
             .and_then(|path| std::fs::canonicalize(path).ok())
@@ -88,6 +118,7 @@ impl AgentRunner {
             work_root,
             data_dir,
             backends,
+            limits,
             jobs: Mutex::new(JobState::default()),
         }
     }
@@ -276,22 +307,13 @@ impl AgentRunner {
         let stdout = child.stdout.take().ok_or("本机 Agent stdout 不可用")?;
         let stderr = child.stderr.take().ok_or("本机 Agent stderr 不可用")?;
         let (line_tx, mut line_rx) = mpsc::channel(STREAM_QUEUE_CAPACITY);
-        let stdout_task = tokio::spawn(read_lines(
-            stdout,
-            "stdout",
-            MAX_STDOUT_BYTES,
-            line_tx.clone(),
-        ));
-        let stderr_task = tokio::spawn(read_lines(
-            stderr,
-            "stderr",
-            MAX_STDERR_BYTES,
-            line_tx.clone(),
-        ));
+        let stdout_task = tokio::spawn(read_lines(stdout, "stdout", self.limits, line_tx.clone()));
+        let stderr_task = tokio::spawn(read_lines(stderr, "stderr", self.limits, line_tx.clone()));
         drop(line_tx);
 
-        let mut stdout_text = String::new();
-        let mut stderr_text = String::new();
+        let mut stdout_tail = TailBuffer::new(RETAIN_STDOUT_BYTES);
+        let mut stderr_tail = TailBuffer::new(RETAIN_STDERR_BYTES);
+        let mut dropped_lines = 0usize;
         let mut cancelled = false;
         let mut output_limited = false;
         let status: ExitStatus;
@@ -315,20 +337,23 @@ impl AgentRunner {
                 chunk = line_rx.recv() => {
                     match chunk {
                         Some(StreamChunk::Line(stream, line)) => {
-                            append_limited(
-                                if stream == "stdout" { &mut stdout_text } else { &mut stderr_text },
-                                &line,
-                                if stream == "stdout" { MAX_STDOUT_BYTES } else { MAX_STDERR_BYTES },
-                            );
+                            if stream == "stdout" {
+                                stdout_tail.push(&line);
+                            } else {
+                                stderr_tail.push(&line);
+                            }
                             post_event(
                                 &api,
                                 request_id,
                                 serde_json::json!({ "stream": stream, "line": line }),
                             ).await;
                         }
+                        Some(StreamChunk::Dropped) => {
+                            dropped_lines += 1;
+                        }
                         Some(StreamChunk::Limit(stream)) => {
                             output_limited = true;
-                            stderr_text.push_str(&format!("{stream} 超过安全输出上限\n"));
+                            stderr_tail.push(&format!("{stream} 超过整流安全上限"));
                             terminate_process_group(&mut child, pid).await;
                             status = child.wait().await
                                 .map_err(|error| format!("等待输出超限的本机 Agent 失败: {error}"))?;
@@ -344,19 +369,11 @@ impl AgentRunner {
         while let Some(chunk) = line_rx.recv().await {
             match chunk {
                 StreamChunk::Line(stream, line) => {
-                    append_limited(
-                        if stream == "stdout" {
-                            &mut stdout_text
-                        } else {
-                            &mut stderr_text
-                        },
-                        &line,
-                        if stream == "stdout" {
-                            MAX_STDOUT_BYTES
-                        } else {
-                            MAX_STDERR_BYTES
-                        },
-                    );
+                    if stream == "stdout" {
+                        stdout_tail.push(&line);
+                    } else {
+                        stderr_tail.push(&line);
+                    }
                     post_event(
                         &api,
                         request_id,
@@ -364,22 +381,35 @@ impl AgentRunner {
                     )
                     .await;
                 }
+                StreamChunk::Dropped => {
+                    dropped_lines += 1;
+                }
                 StreamChunk::Limit(stream) => {
                     output_limited = true;
-                    stderr_text.push_str(&format!("{stream} 超过安全输出上限\n"));
+                    stderr_tail.push(&format!("{stream} 超过整流安全上限"));
                 }
             }
         }
         let _ = stdout_task.await;
         let _ = stderr_task.await;
 
+        if dropped_lines > 0 {
+            tracing::warn!(
+                request_id,
+                backend,
+                "丢弃 {dropped_lines} 行超长输出（单行上限 {} 字节）",
+                self.limits.max_line_bytes
+            );
+        }
+
         let content = serde_json::json!({
             "backend": backend,
             "exit_code": status.code(),
             "cancelled": cancelled,
             "output_limited": output_limited,
-            "stdout": stdout_text,
-            "stderr": stderr_text,
+            "dropped_lines": dropped_lines,
+            "stdout": stdout_tail.into_string(),
+            "stderr": stderr_tail.into_string(),
         })
         .to_string();
         Ok(AgentOutcome {
@@ -565,44 +595,131 @@ fn write_private_file(path: &Path, content: &str) -> Result<(), String> {
 
 enum StreamChunk {
     Line(&'static str, String),
+    /// 单行超限被丢弃：只影响这一行，任务继续。
+    Dropped,
+    /// 整流超限：runaway 保护，主循环会终止进程组。
     Limit(&'static str),
 }
 
-async fn read_lines<R>(reader: R, stream: &'static str, limit: usize, tx: mpsc::Sender<StreamChunk>)
-where
+/// 只保留尾部若干字节的行缓冲。按行淘汰，不做半行切断。
+struct TailBuffer {
+    lines: VecDeque<String>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl TailBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn push(&mut self, line: &str) {
+        if self.limit == 0 {
+            return;
+        }
+        let mut line = line.to_string();
+        if line.len() + 1 > self.limit {
+            // 单行本身就超过保留窗口：留尾部，按字符边界切。
+            let mut cut = line.len() - (self.limit - 1);
+            while cut < line.len() && !line.is_char_boundary(cut) {
+                cut += 1;
+            }
+            line = line.split_off(cut);
+        }
+        self.bytes = self.bytes.saturating_add(line.len() + 1);
+        self.lines.push_back(line);
+        while self.bytes > self.limit {
+            match self.lines.pop_front() {
+                Some(dropped) => self.bytes = self.bytes.saturating_sub(dropped.len() + 1),
+                None => break,
+            }
+        }
+    }
+
+    fn into_string(self) -> String {
+        let mut out = String::with_capacity(self.bytes);
+        for line in self.lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// 逐行读取子进程输出：单行超 `max_line_bytes` 丢弃该行并继续；整流累计超
+/// `max_stream_bytes` 才上报 Limit（由主循环终止进程组）。
+async fn read_lines<R>(
+    reader: R,
+    stream: &'static str,
+    limits: AgentLimits,
+    tx: mpsc::Sender<StreamChunk>,
+) where
     R: tokio::io::AsyncRead + Unpin,
 {
-    let mut lines = BufReader::new(reader)
-        .take(limit.saturating_add(1) as u64)
-        .lines();
-    let mut bytes = 0usize;
-    while let Ok(Some(line)) = lines.next_line().await {
-        bytes = bytes.saturating_add(line.len() + 1);
-        if bytes > limit {
+    let mut reader = BufReader::with_capacity(READ_CHUNK_BYTES, reader);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut pending_overflow = false;
+    let mut total = 0usize;
+    let mut buf = vec![0u8; READ_CHUNK_BYTES];
+
+    loop {
+        let read = match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(_) => break,
+        };
+        total = total.saturating_add(read);
+        if total > limits.max_stream_bytes {
             let _ = tx.send(StreamChunk::Limit(stream)).await;
-            break;
+            return;
         }
-        if tx.send(StreamChunk::Line(stream, line)).await.is_err() {
-            break;
+        let mut rest = &buf[..read];
+        while let Some(index) = rest.iter().position(|byte| *byte == b'\n') {
+            let (head, tail) = rest.split_at(index);
+            rest = &tail[1..];
+            let overflow = pending_overflow || pending.len() + head.len() > limits.max_line_bytes;
+            if overflow {
+                pending.clear();
+                pending_overflow = false;
+                if tx.send(StreamChunk::Dropped).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            pending.extend_from_slice(head);
+            let line = String::from_utf8_lossy(&pending).into_owned();
+            pending.clear();
+            if tx.send(StreamChunk::Line(stream, line)).await.is_err() {
+                return;
+            }
         }
+        if pending_overflow {
+            continue;
+        }
+        if pending.len() + rest.len() > limits.max_line_bytes {
+            // 半行已超限：丢掉累积部分，等这一行结束再恢复正常。
+            pending.clear();
+            pending_overflow = true;
+            continue;
+        }
+        pending.extend_from_slice(rest);
+    }
+
+    if pending_overflow {
+        let _ = tx.send(StreamChunk::Dropped).await;
+    } else if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending).into_owned();
+        let _ = tx.send(StreamChunk::Line(stream, line)).await;
     }
 }
 
 async fn post_event(api: &ApiClient, request_id: &str, event: serde_json::Value) {
     if let Err(error) = api.post_agent_event(request_id, &event).await {
         tracing::warn!(request_id, "上报本机 Agent 事件失败: {error}");
-    }
-}
-
-fn append_limited(target: &mut String, line: &str, limit: usize) {
-    if target.len() >= limit {
-        return;
-    }
-    let remaining = limit - target.len();
-    let take = line.len().min(remaining);
-    target.push_str(&line[..line.floor_char_boundary(take)]);
-    if target.len() < limit {
-        target.push('\n');
     }
 }
 
@@ -674,6 +791,87 @@ fn executable_on_path(program: &str) -> bool {
 mod tests {
     use super::*;
 
+    async fn collect(input: &str, limits: AgentLimits) -> (Vec<String>, usize, bool) {
+        let (tx, mut rx) = mpsc::channel(1024);
+        let reader = std::io::Cursor::new(input.as_bytes().to_vec());
+        let task = tokio::spawn(read_lines(reader, "stdout", limits, tx));
+        let mut lines = Vec::new();
+        let mut dropped = 0usize;
+        let mut limited = false;
+        while let Some(chunk) = rx.recv().await {
+            match chunk {
+                StreamChunk::Line(_, line) => lines.push(line),
+                StreamChunk::Dropped => dropped += 1,
+                StreamChunk::Limit(_) => limited = true,
+            }
+        }
+        let _ = task.await;
+        (lines, dropped, limited)
+    }
+
+    #[tokio::test]
+    async fn oversized_line_is_dropped_without_stopping_stream() {
+        let limits = AgentLimits {
+            max_line_bytes: 64,
+            max_stream_bytes: 1024 * 1024,
+        };
+        let input = format!("first\n{}\nlast\n", "x".repeat(200));
+        let (lines, dropped, limited) = collect(&input, limits).await;
+        assert_eq!(lines, vec!["first".to_string(), "last".to_string()]);
+        assert_eq!(dropped, 1);
+        // 单行超限不是 runaway：进程必须继续跑完。
+        assert!(!limited);
+    }
+
+    #[tokio::test]
+    async fn stream_limit_reports_runaway() {
+        let limits = AgentLimits {
+            max_line_bytes: 1024,
+            max_stream_bytes: 128,
+        };
+        let input = "abcdefgh\n".repeat(64);
+        let (_, _, limited) = collect(&input, limits).await;
+        assert!(limited);
+    }
+
+    #[tokio::test]
+    async fn reader_handles_missing_trailing_newline() {
+        let (lines, dropped, limited) = collect("a\nb", AgentLimits::default()).await;
+        assert_eq!(lines, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(dropped, 0);
+        assert!(!limited);
+    }
+
+    #[test]
+    fn tail_buffer_keeps_the_end_not_the_head() {
+        // final_text 兜底解析要的 result 事件在流尾部，保留头部等于拿不到。
+        let mut tail = TailBuffer::new(16);
+        for line in ["aaaa", "bbbb", "cccc", "result"] {
+            tail.push(line);
+        }
+        let text = tail.into_string();
+        assert!(text.contains("result"));
+        assert!(!text.contains("aaaa"));
+        assert!(text.len() <= 16);
+    }
+
+    #[test]
+    fn tail_buffer_truncates_single_oversized_line_on_char_boundary() {
+        let mut tail = TailBuffer::new(8);
+        tail.push("中文中文中文");
+        let text = tail.into_string();
+        // 切点必须落在字符边界上，否则 from_utf8 会炸。
+        assert!(text.chars().all(|c| c == '中' || c == '文' || c == '\n'));
+        assert!(text.len() <= 8);
+    }
+
+    #[test]
+    fn config_limits_keep_stream_above_line() {
+        let limits = crate::config::agent_limits_for_test(Some(8), Some(2));
+        assert_eq!(limits.max_line_bytes, 8 * 1024 * 1024);
+        assert_eq!(limits.max_stream_bytes, 8 * 1024 * 1024);
+    }
+
     #[test]
     fn codex_spec_uses_workspace_sandbox_without_bypass() {
         let spec = build_command_spec(
@@ -729,10 +927,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("hank-cli-agent-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::with_limits(
             Some(root.display().to_string()),
             root.join("data"),
             vec!["codex".into()],
+            AgentLimits::default(),
         );
         let outside =
             std::env::temp_dir().join(format!("hank-cli-agent-outside-{}", std::process::id()));
@@ -751,10 +950,11 @@ mod tests {
             std::env::temp_dir().join(format!("hank-cli-agent-default-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let runner = AgentRunner::new(
+        let runner = AgentRunner::with_limits(
             Some(root.display().to_string()),
             root.join("data"),
             vec!["claude".into()],
+            AgentLimits::default(),
         );
         let cwd = runner.resolve_cwd(None).unwrap();
         assert_eq!(cwd, std::fs::canonicalize(&root).unwrap());
