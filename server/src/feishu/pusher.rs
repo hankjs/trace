@@ -324,7 +324,8 @@ async fn run(
                             .and_then(|r| r.resume_ref.as_deref())
                             .and_then(|raw| serde_json::from_str(raw).ok())
                             .unwrap_or_default();
-                        let dirty_files = resume["dirty_files"].as_u64().unwrap_or(0) as usize;
+                        // 缺字段 / null 表示查不到，保持 None（卡片不渲染改动提示）
+                        let dirty_files = resume["dirty_files"].as_u64().map(|n| n as usize);
                         let backend = resume["backend"].as_str().unwrap_or("cli").to_string();
                         let goal = interaction
                             .as_ref()
@@ -415,10 +416,30 @@ async fn run(
                             let _ = api.reply_text(&message_id, &msg, in_thread).await;
                         }
                     }
-                    // ask_user / task_gate 期间 run 处于暂停：进度停在这里等用户作答，
+                    // ask_user / task_gate 期间 run 处于暂停：进度停在这里等人作答，
                     // 让"进度怎样了"能看出是在等人而不是在算。
                     progress.push_activity("等待用户确认".to_string());
                     publish(&progress).await;
+
+                    // 闸门第一轮到此为止（cli_agent 紧接着发 TurnComplete，本 pusher 会退出）。
+                    // 必须把进度卡 finish 掉：cancel() 只关闭 updater、不改卡片，
+                    // 蓝色「运行中」会永久冻在 90% 以下，和闸门大卡并列烂尾。
+                    // 第二轮由 resume_task_gate 另起一个 pusher 和一张新卡，不受影响。
+                    if is_task_gate {
+                        updater
+                            .finish(build_task_card(&TaskCardOptions {
+                                title: "Agent 任务".to_string(),
+                                status: TaskStatus::Waiting,
+                                progress: progress.percent(),
+                                detail: "已完成只读分析，等待你确认是否开始修".to_string(),
+                                activities: vec![progress.summary_line()]
+                                    .into_iter()
+                                    .filter(|s| !s.is_empty())
+                                    .collect(),
+                                footer: None,
+                            }))
+                            .await;
+                    }
                 }
                 AgentEvent::Metrics {
                     input_tokens: it,

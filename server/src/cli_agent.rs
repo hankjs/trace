@@ -496,6 +496,10 @@ async fn run_remote_cli_turn(
         local_agent_prompt(&user_text, agent_kind)
     };
 
+    // 新一轮开始：作废本会话仍挂着的旧闸门单。不作废的话，用户过很久回头点那张
+    // 老卡片的「开始修」，会在一个上下文已经跑偏的 thread 上 resume。
+    supersede_stale_task_gates(state, session_id).await;
+
     {
         let mut buffers = state.event_buffers.write().await;
         buffers.insert(session_id.to_string(), EventBuffer::new());
@@ -538,6 +542,19 @@ async fn run_remote_cli_turn(
         .await;
         if let Err(error) = result {
             tracing::error!(session_id = %session_id_task, backend, "remote cli agent failed: {error:#}");
+            // execute_remote_turn 在落 assistant 消息 / 启动 agent_run 之前就可能失败，
+            // 此时第二轮的闸门单还挂在 executing——不收尾它会永久卡住（重启兜底也只回收
+            // pending/answered），且 active_task_gate_id 残留会污染后续轮次。
+            if !gate_mode {
+                finalize_open_task_gate(
+                    &state_task,
+                    &session_id_task,
+                    "failed",
+                    None,
+                    Some(&format!("{error:#}")),
+                )
+                .await;
+            }
             emit(
                 &state_task,
                 &session_id_task,
@@ -646,6 +663,13 @@ async fn execute_remote_turn(
         "thread_id": previous_thread,
         "model": serde_json::Value::Null,
     });
+    // 闸门第一轮的脏文件基线：必须在 agent_run 启动前取，否则拿不到「本轮之前」的状态。
+    // 只在闸门轮取——非闸门轮不用它，省一次远程 shell 往返。
+    let dirty_baseline = if gate_mode {
+        git_dirty_paths(state, user_id, client_id).await
+    } else {
+        None
+    };
     let mut remote = crate::remote_exec::start_agent_run(state, user_id, client_id, input).await?;
     let remote_request_id = remote.request_id.clone();
     let deadline = tokio::time::sleep(Duration::from_secs(
@@ -744,6 +768,12 @@ async fn execute_remote_turn(
         let message = offline_error.unwrap_or_else(|| {
             "hank-cli 未返回 Agent 结果（节点可能已离线或结果超时）".to_string()
         });
+        // 这条提前返回也必须收尾闸门单：否则第二轮把它永久留在 executing，
+        // 且 active_task_gate_id 残留会让后续无关轮次误标这张陈旧单。
+        if !gate_mode {
+            finalize_open_task_gate(state, session_id, "failed", None, Some(message.as_str()))
+                .await;
+        }
         emit_failed(state, session_id, &run_id, &message).await;
         if let Err(error) = state.db.touch_session(session_id).await {
             tracing::warn!(session_id, "touch remote cli session failed: {error:#}");
@@ -884,8 +914,9 @@ async fn execute_remote_turn(
             )
             .await;
 
-            // 闸门第一轮：有 thread_id 才落 task_gate；没有则无法 resume，退回直接完成。
+            // 闸门第一轮：有 thread_id 才落 task_gate；没有则无法 resume。
             // 绝不 emit RunCompleted——pusher 会把进度卡刷成绿色「已完成」，用户误以为事情做完了。
+            let mut gate_fallback_note: Option<&str> = None;
             let gated = if gate_mode {
                 match run_state.thread_id.as_deref() {
                     Some(thread_id) => {
@@ -899,6 +930,7 @@ async fn execute_remote_turn(
                             user_text,
                             &final_text,
                             thread_id,
+                            dirty_baseline.as_ref(),
                         )
                         .await
                         {
@@ -908,6 +940,7 @@ async fn execute_remote_turn(
                                     session_id,
                                     "task_gate 落单失败，退回直接完成: {error:#}"
                                 );
+                                gate_fallback_note = Some("落交互单失败");
                                 false
                             }
                         }
@@ -915,8 +948,9 @@ async fn execute_remote_turn(
                     None => {
                         tracing::warn!(
                             session_id,
-                            "闸门第一轮未拿到 thread_id，退回直接完成（无法 resume）"
+                            "闸门第一轮未拿到 thread_id，无法 resume（本轮只产出了分析）"
                         );
+                        gate_fallback_note = Some("未能建立可续接的会话");
                         false
                     }
                 }
@@ -928,6 +962,15 @@ async fn execute_remote_turn(
                 // 第二轮（或非闸门轮）正常完成：若有 executing 的 task_gate 交互单，标 done。
                 finalize_open_task_gate(state, session_id, "done", Some(final_text.as_str()), None)
                     .await;
+                // 闸门轮走到这里意味着「prompt 已经是只读分析版，代码一行没改」。
+                // 不加说明的话卡片是绿色「已完成」配一份纯分析，比不拦更误导。
+                let summary = match gate_fallback_note {
+                    Some(reason) => format!(
+                        "{final_text}\n\n---\n⚠️ 本轮只做了只读分析，没有修改代码（{reason}）。\
+                         需要执行请再发一次指令。"
+                    ),
+                    None => final_text,
+                };
                 emit(
                     state,
                     session_id,
@@ -937,7 +980,7 @@ async fn execute_remote_turn(
                         status: RunStatus::Success,
                         input_tokens: run_state.input_tokens,
                         output_tokens: run_state.output_tokens,
-                        summary: final_text,
+                        summary,
                         permission_denials: vec![],
                         file_changes: file_changes(&run_state),
                     },
@@ -2295,8 +2338,13 @@ async fn finish_as_task_gate(
     user_text: &str,
     analysis: &str,
     thread_id: &str,
+    dirty_baseline: Option<&HashSet<String>>,
 ) -> Result<()> {
-    let dirty_files = count_dirty_files_via_remote(state, user_id, client_id).await;
+    // 只报本轮新增的改动；基线或事后快照缺失时不显示（None），不谎报 0。
+    let dirty_files = new_dirty_count(
+        dirty_baseline,
+        git_dirty_paths(state, user_id, client_id).await.as_ref(),
+    );
     let feishu_chat = state
         .db
         .get_feishu_chat_by_session(session_id)
@@ -2352,7 +2400,7 @@ async fn finish_as_task_gate(
     tracing::info!(
         interaction_id = %row.id,
         session_id,
-        dirty_files,
+        ?dirty_files,
         "task_gate 交互单已落表，等待用户确认是否开始修"
     );
 
@@ -2416,6 +2464,82 @@ async fn finalize_open_task_gate(
     }
 }
 
+/// 作废本会话仍 pending 的闸门单，并把它们的卡片改成灰色终态。
+///
+/// 只标库不改卡片是不够的：卡片按钮还在，用户点下去只会收到一句
+/// 「这个操作已经提交过了」，看不出发生了什么。改卡是尽力而为，失败只记日志。
+async fn supersede_stale_task_gates(state: &Arc<AppState>, session_id: &str) {
+    let stale = match state.db.supersede_pending_task_gates(session_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(session_id, "作废旧 task_gate 闸门单失败: {e:#}");
+            return;
+        }
+    };
+    if stale.is_empty() {
+        return;
+    }
+    tracing::info!(
+        session_id,
+        count = stale.len(),
+        "已作废被新一轮取代的 task_gate 闸门单"
+    );
+    for (interaction_id, card_message_id) in stale {
+        let Some(card_id) = card_message_id.filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Err(e) =
+            crate::interaction_flow::close_superseded_gate_card(state, &interaction_id, &card_id)
+                .await
+        {
+            tracing::warn!(
+                interaction_id = %interaction_id,
+                "改写被取代的闸门卡片失败: {e:#}"
+            );
+        }
+    }
+}
+
+/// 闸门第一轮的 thread 与 session 当前 thread 的关系。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateThread {
+    /// session 上的 thread 与闸门记录一致：resume 会接上第一轮的上下文。
+    Match,
+    /// session metadata 丢了 thread（话题会话被重建过），已按闸门记录写回。
+    Restored,
+    /// session 已经跑到别的 thread 上（闸门挂着期间又聊了几轮）。
+    /// 此时 resume 接不到第一轮上下文，调用方必须把 analysis 注入 prompt 兜底。
+    Diverged,
+}
+
+/// 校正第二轮要 resume 的 thread。
+///
+/// 为什么不能只信 `metadata.agent_thread_id`：交互单的设计前提是「恢复执行所需上下文
+/// 冻结在 resume_ref 里，session 怎么变都不影响」。话题会话被判 Recreate 重建后
+/// metadata 里的 thread 就没了，只读 metadata 会让第二轮以全新 thread 跑，而第二轮
+/// prompt 刻意不含分析全文——模型会收到一句没有任何上下文的「按你上一轮的分析执行」。
+pub async fn reconcile_gate_thread(
+    state: &Arc<AppState>,
+    session_id: &str,
+    gate_thread_id: &str,
+) -> Result<GateThread> {
+    let session = state
+        .db
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow!("会话不存在"))?;
+    let metadata = parse_metadata(session.metadata.as_deref());
+    let current = metadata["agent_thread_id"].as_str().unwrap_or_default();
+    if current == gate_thread_id {
+        return Ok(GateThread::Match);
+    }
+    if current.is_empty() {
+        persist_thread_id(state, session_id, gate_thread_id).await?;
+        return Ok(GateThread::Restored);
+    }
+    Ok(GateThread::Diverged)
+}
+
 /// 派发第二轮前把交互单 id 挂到 session，供 cli_agent 终态回调 finalize。
 pub async fn attach_active_task_gate(
     state: &Arc<AppState>,
@@ -2456,16 +2580,19 @@ pub async fn clear_active_task_gate(state: &Arc<AppState>, session_id: &str) -> 
     Ok(())
 }
 
-/// 事后检查：本机节点 git status --porcelain 行数。失败/非 git 目录返回 0，不阻塞闸门。
-async fn count_dirty_files_via_remote(
+/// 事后检查：本机节点 `git status --porcelain` 的脏路径集合。
+///
+/// 返回 None 表示「查不到」（节点离线、非 git 目录、命令失败），调用方据此
+/// 放弃改动提示而不是谎报 0——0 和「不知道」不是一回事。
+async fn git_dirty_paths(
     state: &Arc<AppState>,
     user_id: &str,
     client_id: &str,
-) -> usize {
+) -> Option<HashSet<String>> {
     if !crate::remote_exec::is_client_online(state, user_id, client_id).await {
-        return 0;
+        return None;
     }
-    match crate::remote_exec::dispatch_tool_call(
+    let result = crate::remote_exec::dispatch_tool_call(
         state,
         user_id,
         client_id,
@@ -2474,14 +2601,45 @@ async fn count_dirty_files_via_remote(
         Duration::from_secs(30),
     )
     .await
-    {
-        Ok(result) if !result.is_error => result
+    .ok()?;
+    if result.is_error {
+        return None;
+    }
+    Some(
+        result
             .content
             .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
-        Ok(_) | Err(_) => 0,
+            .filter_map(parse_porcelain_path)
+            .collect(),
+    )
+}
+
+/// 从 `git status --porcelain` 的一行里取出路径。
+/// 格式是 `XY <path>`，重命名为 `R  <old> -> <new>`（取新路径）。
+fn parse_porcelain_path(line: &str) -> Option<String> {
+    // 前两列是状态码，第三列是空格；不足 4 字符的行不是有效条目。
+    let path = line.get(3..)?.trim();
+    if path.is_empty() {
+        return None;
     }
+    let path = match path.split_once(" -> ") {
+        Some((_, new)) => new.trim(),
+        None => path,
+    };
+    Some(path.trim_matches('"').to_string())
+}
+
+/// 第一轮新增的脏文件数：与开跑前的基线做差集。
+///
+/// 为什么必须做差集：用户本机工作目录本来就有未提交改动是常态，直接报全量会把
+/// 别人的改动算到本轮头上，而这行提示的唯一用途就是告诉用户「只读约束没守住」。
+/// 任一侧查不到时返回 None（不显示提示），不猜。
+fn new_dirty_count(
+    baseline: Option<&HashSet<String>>,
+    after: Option<&HashSet<String>>,
+) -> Option<usize> {
+    let (baseline, after) = (baseline?, after?);
+    Some(after.difference(baseline).count())
 }
 
 /// client-only 会话 RunStarted 展示 cwd：只用绑定节点注册的 work_dir。
@@ -2758,6 +2916,41 @@ mod tests {
         assert!(prompt.contains("hank-cli"));
         assert!(!prompt.contains("/opt/hank"));
         assert!(!prompt.contains("/workspace"));
+    }
+
+    #[test]
+    fn new_dirty_count_reports_only_this_turn_additions() {
+        // 用户本机本来就有未提交改动是常态：报全量会把别人的改动算到本轮头上。
+        let baseline: HashSet<String> = ["a.rs", "b.rs"].iter().map(|s| s.to_string()).collect();
+        let after: HashSet<String> = ["a.rs", "b.rs", "c.rs"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(new_dirty_count(Some(&baseline), Some(&after)), Some(1));
+        assert_eq!(new_dirty_count(Some(&baseline), Some(&baseline)), Some(0));
+        // 任一侧查不到就是「不知道」，不能谎报 0。
+        assert_eq!(new_dirty_count(None, Some(&after)), None);
+        assert_eq!(new_dirty_count(Some(&baseline), None), None);
+    }
+
+    #[test]
+    fn parse_porcelain_path_handles_status_codes_and_renames() {
+        assert_eq!(
+            parse_porcelain_path(" M src/a.rs").as_deref(),
+            Some("src/a.rs")
+        );
+        assert_eq!(parse_porcelain_path("?? new.rs").as_deref(), Some("new.rs"));
+        // 重命名取新路径，否则新旧两个路径会被当成两处改动
+        assert_eq!(
+            parse_porcelain_path("R  old.rs -> new.rs").as_deref(),
+            Some("new.rs")
+        );
+        assert_eq!(
+            parse_porcelain_path("A  \"带空格 的.rs\"").as_deref(),
+            Some("带空格 的.rs")
+        );
+        assert_eq!(parse_porcelain_path(""), None);
+        assert_eq!(parse_porcelain_path("   "), None);
     }
 
     #[test]

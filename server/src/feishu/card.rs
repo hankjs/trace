@@ -17,6 +17,8 @@ pub enum TaskStatus {
     Running,
     Success,
     Failed,
+    /// 闸门第一轮收尾：分析完了，在等用户点按钮。不是成功也不是失败。
+    Waiting,
 }
 
 impl TaskStatus {
@@ -25,6 +27,7 @@ impl TaskStatus {
             TaskStatus::Running => ("blue", "运行中"),
             TaskStatus::Success => ("green", "已完成"),
             TaskStatus::Failed => ("red", "执行失败"),
+            TaskStatus::Waiting => ("grey", "等待确认"),
         }
     }
 }
@@ -274,8 +277,12 @@ pub struct TaskGateCardOptions {
     pub backend: String,
     /// 「来源」文案，如「飞书派单」
     pub source_label: String,
-    /// >0 时渲染警示行：第一轮已产生改动（CLI bypass-approvals，只读靠 prompt 约束）
-    pub dirty_files: usize,
+    /// 第一轮**新增**的改动文件数（与开跑前基线的差集）。
+    ///
+    /// `Some(0)` = 确认没改动，不渲染警示行；`Some(n>0)` = 渲染警示行；
+    /// `None` = 查不到（节点离线 / 非 git 目录），同样不渲染——不能把「不知道」
+    /// 说成「没改动」，也不能拿全量脏文件冒充本轮改动。
+    pub dirty_files: Option<usize>,
     pub admin_url: Option<String>,
 }
 
@@ -300,10 +307,9 @@ pub fn build_task_gate_card(opts: &TaskGateCardOptions) -> Value {
     };
 
     let id_short: String = opts.interaction_id.chars().take(12).collect();
-    let dirty_line = if opts.dirty_files > 0 {
-        format!("\n⚠️ 第一轮已产生 {} 个文件改动", opts.dirty_files)
-    } else {
-        String::new()
+    let dirty_line = match opts.dirty_files {
+        Some(n) if n > 0 => format!("\n⚠️ 第一轮已产生 {n} 个文件改动"),
+        _ => String::new(),
     };
     let admin_hint = opts
         .admin_url
@@ -684,7 +690,7 @@ mod tests {
             analysis: "## 目标\nok\n## 范围\nok\n## 疑似改动点\nok\n## 风险\nok".into(),
             backend: "codex".into(),
             source_label: "飞书派单".into(),
-            dirty_files: 0,
+            dirty_files: Some(0),
             admin_url: Some("https://admin.example/admin/interactions/ia-gate-abcdef012345".into()),
         });
         let body = card["body"]["elements"].to_string();
@@ -710,6 +716,27 @@ mod tests {
     }
 
     #[test]
+    fn task_gate_card_hides_dirty_line_when_count_is_unknown() {
+        // dirty_files=None 表示查不到（节点离线 / 非 git 目录）。
+        // 不能渲染成「0 个改动」那种「已确认干净」的口径。
+        let card = build_task_gate_card(&TaskGateCardOptions {
+            interaction_id: "ia-unknown".into(),
+            session_id: "s".into(),
+            chat_id: "c".into(),
+            topic_id: "t".into(),
+            goal: "g".into(),
+            analysis: "a".into(),
+            backend: "codex".into(),
+            source_label: "飞书派单".into(),
+            dirty_files: None,
+            admin_url: None,
+        });
+        let body = card["body"]["elements"].to_string();
+        assert!(!body.contains("第一轮已产生"));
+        assert!(!body.contains("0 个文件改动"));
+    }
+
+    #[test]
     fn task_gate_card_shows_dirty_warning_and_truncates_analysis() {
         let long_analysis: String = "甲".repeat(2600);
         let card = build_task_gate_card(&TaskGateCardOptions {
@@ -721,7 +748,7 @@ mod tests {
             analysis: long_analysis,
             backend: "claude".into(),
             source_label: "飞书派单".into(),
-            dirty_files: 3,
+            dirty_files: Some(3),
             admin_url: Some("https://admin.example/admin/interactions/ia-dirty".into()),
         });
         let body = card["body"]["elements"].to_string();

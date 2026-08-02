@@ -310,7 +310,7 @@ async fn handle_task_gate_skip(
         .as_deref()
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|v| v["dirty_files"].as_u64())
-        .unwrap_or(0) as usize;
+        .map(|n| n as usize);
 
     if let Err(e) = state
         .db
@@ -322,9 +322,9 @@ async fn handle_task_gate_skip(
     dispatch_guard.release().await;
 
     let mut msg = "已跳过，不会继续执行。".to_string();
-    if dirty_files > 0 {
+    if let Some(n) = dirty_files.filter(|n| *n > 0) {
         msg.push_str(&format!(
-            "\n第一轮产生的 {dirty_files} 个文件改动仍在你本机工作目录，需要的话请自行 git 处理。"
+            "\n第一轮产生的 {n} 个文件改动仍在你本机工作目录，需要的话请自行 git 处理。"
         ));
     }
     if let Some(api) = api {
@@ -359,7 +359,9 @@ async fn resume_task_gate(args: ResumeInteraction) -> Result<()> {
         serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
     let backend = resume["backend"].as_str().unwrap_or("").to_string();
     let exec_client_id = resume["exec_client_id"].as_str().unwrap_or("").to_string();
+    let gate_thread_id = resume["thread_id"].as_str().unwrap_or("").to_string();
     let goal = row.goal.as_deref().unwrap_or("").to_string();
+    let analysis = row.analysis.as_deref().unwrap_or("").to_string();
 
     if backend.is_empty() || exec_client_id.is_empty() {
         dispatch_guard.release().await;
@@ -431,8 +433,42 @@ async fn resume_task_gate(args: ResumeInteraction) -> Result<()> {
         return Ok(());
     }
 
-    // 第二轮 prompt：不重复注入分析全文（thread resume 已带上下文）。
-    let prompt_text = format!("用户已确认开始修复，按你上一轮的分析执行。\n\n原始目标：\n{goal}");
+    // 第二轮 prompt：正常情况下不重复注入分析全文（thread resume 已带上下文）。
+    // 但 thread 对不上时 resume 接不到第一轮，必须把分析补回 prompt，
+    // 否则模型收到的是一句没有上下文的「按你上一轮的分析执行」。
+    let thread_state = if gate_thread_id.is_empty() {
+        // 老数据没存 thread_id：保持既有行为（靠 metadata 自然续接）。
+        tracing::warn!(
+            interaction_id = %interaction_id,
+            "task_gate 交互单未记录 thread_id，按 session metadata 续接"
+        );
+        cli_agent::GateThread::Match
+    } else {
+        match cli_agent::reconcile_gate_thread(&state, &session_id, &gate_thread_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    interaction_id = %interaction_id,
+                    "校正 task_gate thread 失败，按分叉处理: {e:#}"
+                );
+                cli_agent::GateThread::Diverged
+            }
+        }
+    };
+    if thread_state != cli_agent::GateThread::Match {
+        tracing::info!(
+            interaction_id = %interaction_id,
+            session_id = %session_id,
+            ?thread_state,
+            "task_gate 第二轮 thread 与第一轮不一致"
+        );
+    }
+    let prompt_text = match thread_state {
+        cli_agent::GateThread::Diverged if !analysis.is_empty() => format!(
+            "用户已确认开始修复，按下面这份你先前产出的分析执行。\n\n原始目标：\n{goal}\n\n先前的分析：\n{analysis}"
+        ),
+        _ => format!("用户已确认开始修复，按你上一轮的分析执行。\n\n原始目标：\n{goal}"),
+    };
     let content = vec![ContentBlock::Text { text: prompt_text }];
 
     if let Err(e) = cli_agent::attach_active_task_gate(&state, &session_id, &interaction_id).await {
@@ -596,7 +632,7 @@ fn task_gate_card_from_interaction(
 ) -> Value {
     let resume: Value =
         serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
-    let dirty_files = resume["dirty_files"].as_u64().unwrap_or(0) as usize;
+    let dirty_files = resume["dirty_files"].as_u64().map(|n| n as usize);
     let backend = resume["backend"].as_str().unwrap_or("cli").to_string();
     let admin_url = admin_interaction_url(state, &row.id);
     let chat = row.chat_id.as_deref().unwrap_or(chat_id);
@@ -957,6 +993,41 @@ pub(crate) fn admin_interaction_url(state: &AppState, interaction_id: &str) -> O
         .as_ref()
         .filter(|u| !u.trim().is_empty())
         .map(|base| build_admin_interaction_url(base, interaction_id))
+}
+
+/// 把被新一轮取代的闸门卡片改成灰色终态，让按钮不再邀请点击。
+pub(crate) async fn close_superseded_gate_card(
+    state: &Arc<AppState>,
+    interaction_id: &str,
+    card_message_id: &str,
+) -> Result<()> {
+    let row = state
+        .db
+        .get_interaction(interaction_id)
+        .await?
+        .ok_or_else(|| anyhow!("交互单不存在"))?;
+    let Some(account_id) = row.account_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let account = state
+        .db
+        .get_feishu_account(account_id)
+        .await?
+        .ok_or_else(|| anyhow!("飞书账号不存在"))?;
+    let api = FeishuApi::new_archived(&account, state.db.clone());
+    let question = row
+        .goal
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| row.title.clone());
+    let card = build_confirm_done_card(
+        "新任务 · 已被新一轮取代",
+        &question,
+        "已作废",
+        "系统",
+        Some(interaction_id),
+    );
+    api.update_card(card_message_id, &card).await
 }
 
 fn card_action_claim_id(

@@ -198,10 +198,11 @@ async fn run_server() -> Result<()> {
         tasks: Arc::new(task_state::TaskRegistry::new()),
     });
 
-    // 一次性收尾：过期 pending → expired；卡住的 answered 僵尸 → pending。
+    // 一次性收尾：过期 pending → expired；卡住的 answered 僵尸 → pending；
+    // executing 僵尸 → failed（执行进程已随重启消失，不能永远留在中间态）。
     // 不进 scheduler——scheduler_enabled=false 时也要跑；与部署恢复同级。
     match state.db.expire_stale_interactions().await {
-        Ok((expired, reverted)) => {
+        Ok((expired, reverted, failed)) => {
             if expired > 0 {
                 tracing::info!(count = expired, "启动收尾：已过期交互单标记为 expired");
             }
@@ -209,6 +210,12 @@ async fn run_server() -> Result<()> {
                 tracing::info!(
                     count = reverted,
                     "启动收尾：answered 僵尸退回 pending（派发未完成可重试）"
+                );
+            }
+            if failed > 0 {
+                tracing::info!(
+                    count = failed,
+                    "启动收尾：executing 僵尸标记为 failed（执行进程已中断）"
                 );
             }
         }

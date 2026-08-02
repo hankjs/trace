@@ -126,10 +126,14 @@ task_gate_enabled = true
 开启后，飞书派**代码任务**（`trace_code` / `quant_code` / `general_task`）时不再直接改码，而是：
 
 1. **第一轮**：CLI 只读分析（靠 prompt 约束；CLI 以 bypass-approvals 启动，写操作不会被沙箱拦住），产出 `## 目标` / `## 范围` / `## 疑似改动点` / `## 风险`。
-2. 落 `kind=task_gate` 交互单，发大卡片（任务编号、目标、基本信息、分析全文、`开始修` / `跳过`）。
+2. 落 `kind=task_gate` 交互单，发大卡片（任务编号、目标、基本信息、分析全文、`开始修` / `跳过`）。进度卡同时落「等待确认」灰色终态。
 3. 用户点 **开始修** → 在同一 CLI thread 上 resume 第二轮真正改代码；点 **跳过** → 交互单 `cancelled`，**不继续执行**（不保证第一轮无副作用——若模型未听话已改文件，卡片会提示「第一轮已产生 N 个文件改动」，回滚由用户自行 git 处理）。
 
-**不走闸门**：开关关闭、`conversation` / `quant_research`、非飞书来源、话题已有 `agent_thread_id`（续聊）。第一轮若拿不到 CLI `thread_id`，退回直接完成，不落无法续接的闸门。
+「第一轮已产生 N 个文件改动」是**增量**口径：第一轮开跑前先取一次 `git status --porcelain` 作基线，事后做差集，因此用户本机原有的未提交改动不会被算进来。查不到时（节点离线 / 非 git 目录）不显示这行，不会把「不知道」说成「没改动」。
+
+**不走闸门**：开关关闭、`conversation` / `quant_research`、非飞书来源、话题已有 `agent_thread_id`（续聊）。第一轮若拿不到 CLI `thread_id` 则无法续接，终态会明确说明「本轮只做了只读分析，没有修改代码」，需要执行请再发一次指令。
+
+**闸门单的生命周期**：同一会话开始新一轮时，仍 `pending` 的旧闸门单会被标 `cancelled`（卡片改灰），避免用户过很久回头点老卡片，在上下文已跑偏的 thread 上 resume。第二轮派发前会用 `resume_ref.thread_id` 校正 session 的 `agent_thread_id`：一致则直接 resume；session 丢了 thread（话题会话被重建）则写回；已分叉则把 `analysis` 全文注入第二轮 prompt 兜底。服务重启时滞留在 `executing` 的闸门单会被标 `failed`，不会永远卡在中间态。
 
 admin `/interactions` 可筛 `kind=task_gate` 查看 `goal` / `analysis` 全文；手动应答与飞书按钮共用 `answer_and_resume`。
 
@@ -303,8 +307,10 @@ make sync-agent-cli-config
   （按 `interaction_id` 原子抢答）。若确实需要重跑，让 agent 重新发起工具调用。
 - **闸门大卡片不出现**：确认 `[server_agent].task_gate_enabled = true`；
   且话题必须是新话题（已有 `agent_thread_id` 的续聊不弹闸门）、
-  来源是飞书、`agent_kind` 是代码类。第一轮拿不到 CLI `thread_id` 时也会
-  跳过闸门直接执行（日志有 warn）。
+  来源是飞书、`agent_kind` 是代码类。第一轮拿不到 CLI `thread_id` 时不落闸门
+  （日志有 warn），终态文案会说明「本轮只做了只读分析，没有修改代码」。
+- **闸门卡片变灰、写着「已被新一轮取代」**：闸门挂着期间同会话又派了新任务，
+  旧闸门单已作废。这是有意行为——在跑偏的 thread 上 resume 比重新派单更糟。
 
 ## 七、定时任务（系统主动推送）
 
@@ -328,5 +334,6 @@ make sync-agent-cli-config
 - 普通文件附件下载（当前已支持图片输入和 `[file:]` 图片回传）
 - 更多 job：agent 整理的简报（cron 驱动 run_chat_turn）、失败 @人告警、巡检类任务
 - 多 bot 互相 @ 协作（agent-os 文档后半程的团队作战）
-- 取消交互单时同步把飞书卡片改成终态（当前卡片仍可点，点了会被拒但不会误执行）
+- 取消交互单时同步把飞书卡片改成终态（`task_gate` 被新一轮取代时已会改灰；
+  admin 手动取消、过期回收等路径的卡片仍可点，点了会被拒但不会误执行）
 - admin 交互单详情的 `analysis` 渲染 markdown（当前纯文本展示）

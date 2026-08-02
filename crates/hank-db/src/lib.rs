@@ -4329,14 +4329,19 @@ impl Database {
     /// 进程重启收尾：
     /// 1. 已过期的 pending → expired
     /// 2. answered 僵尸 → pending（应答已记录但派发未完成，退回让用户重点）
+    /// 3. executing 僵尸 → failed（派发出去了但执行进程已随重启消失）
     ///
     /// 为什么 answered 要退回而不是标失败：用户的确认意图是真实的，
     /// 丢掉它等于让用户白点一次且无从得知。退回 pending 可重试。
     ///
-    /// answered 僵尸加 5 分钟时间窗，避免误伤「正在派发中」的行
-    /// （进程重启时不存在这种行，但手动调用或将来定时清理时这个窗很重要）。
-    /// 返回 `(expired 条数, reverted 条数)`。
-    pub async fn expire_stale_interactions(&self) -> Result<(u64, u64)> {
+    /// 为什么 executing 要标 failed 而不是退回 pending：那一轮已经真的跑起来过，
+    /// 可能已经改了文件，退回 pending 会让用户再点一次从而重复执行。标 failed
+    /// 让它离开中间态（否则 admin 永远看到它卡着），用户按需重新派单。
+    ///
+    /// 僵尸判定都带时间窗，避免误伤「正在派发 / 正在执行」的行。executing 的窗
+    /// 取 2 小时，比单轮超时（默认 30 分钟）宽出足够余量。
+    /// 返回 `(expired 条数, reverted 条数, failed 条数)`。
+    pub async fn expire_stale_interactions(&self) -> Result<(u64, u64, u64)> {
         let expired = db_retry!(sqlx::query(
             "UPDATE agent_interactions
                  SET status = 'expired', updated_at = NOW()
@@ -4354,7 +4359,20 @@ impl Database {
                    AND answered_at < NOW() - INTERVAL 5 MINUTE"
         )
         .execute(&self.pool))?;
-        Ok((expired.rows_affected(), reverted.rows_affected()))
+        let failed = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = 'failed',
+                     error = COALESCE(error, '执行进程已中断（服务重启或异常退出），未收到终态'),
+                     updated_at = NOW()
+                 WHERE status = 'executing'
+                   AND updated_at < NOW() - INTERVAL 2 HOUR"
+        )
+        .execute(&self.pool))?;
+        Ok((
+            expired.rows_affected(),
+            reverted.rows_affected(),
+            failed.rows_affected(),
+        ))
     }
 
     /// 交互单列表（admin）。筛选项均为可选，传 None 表示不限。
@@ -4418,6 +4436,36 @@ impl Database {
         .bind(id)
         .execute(&self.pool))?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// 作废本会话所有仍 pending 的 task_gate 闸门单，返回受影响行数与它们的卡片 id。
+    ///
+    /// 为什么需要：用户不点按钮、直接发下一条消息时，那张闸门单会一直 pending 且
+    /// 按钮一直可点。等他过很久回头点「开始修」，会在一个已经跑过若干轮、上下文
+    /// 完全不同的 thread 上 resume。新一轮开始时就把旧闸门作废，比事后校验便宜。
+    pub async fn supersede_pending_task_gates(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let rows: Vec<(String, Option<String>)> = db_retry!(sqlx::query_as(
+            "SELECT id, card_message_id FROM agent_interactions
+                 WHERE session_id = ? AND kind = 'task_gate' AND status = 'pending'"
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool))?;
+        if rows.is_empty() {
+            return Ok(rows);
+        }
+        db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = 'cancelled',
+                     error = '已被同会话的新一轮任务取代',
+                     updated_at = NOW()
+                 WHERE session_id = ? AND kind = 'task_gate' AND status = 'pending'"
+        )
+        .bind(session_id)
+        .execute(&self.pool))?;
+        Ok(rows)
     }
 
     // 渠道消息留档
