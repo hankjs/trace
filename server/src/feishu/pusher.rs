@@ -6,8 +6,8 @@
 use crate::chat::EventEntry;
 use crate::feishu::api::FeishuApi;
 use crate::feishu::card::{
-    build_confirm_card, build_task_card, ConfirmCardOptions, TaskCardOptions, TaskStatus,
-    ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
+    build_confirm_card, build_task_card, build_task_gate_card, ConfirmCardOptions, TaskCardOptions,
+    TaskGateCardOptions, TaskStatus, ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
 };
 // 滞后/静默时回 EventBuffer 补齐事件的共享实现，微信 pusher 也用同一套。
 use crate::task_state::{drain_buffer, next_event, Incoming, ProgressSnapshot};
@@ -298,20 +298,7 @@ async fn run(
                     kind,
                     ..
                 } => {
-                    let is_quant = kind
-                        .as_deref()
-                        .is_some_and(|k| k.starts_with("quant_confirm:"));
-                    let title = if is_quant {
-                        "高成本操作确认"
-                    } else {
-                        "需要你的输入"
-                    };
-                    let hint = if is_quant {
-                        Some("点击按钮或回复文字作答；回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作".to_string())
-                    } else {
-                        Some("点击按钮或直接回复消息作答".to_string())
-                    };
-                    // chat.rs forwarder 在 push 到 buffer 前已 await create_interaction，
+                    // chat.rs forwarder / cli_agent 在 push 到 buffer 前已 await create_interaction，
                     // 此处 latest_pending 一定能读到刚落库的那一行（时序正确，无旁路 map）。
                     let interaction = state
                         .db
@@ -337,17 +324,77 @@ async fn run(
                                 interaction_id
                             )
                         });
-                    let card = build_confirm_card(&ConfirmCardOptions {
-                        title: title.to_string(),
-                        question: question.clone(),
-                        choices: options.clone(),
-                        interaction_id: interaction_id.clone(),
-                        session_id: session_id.clone(),
-                        chat_id: chat_id.clone(),
-                        topic_id: topic_id.clone(),
-                        admin_url,
-                        hint,
-                    });
+
+                    // task_gate 单独开分支：大卡片结构与 quant_confirm / 普通 ask_user 不同，
+                    // 强行复用 build_confirm_card 会弄坏 quant 确认路径。
+                    let is_task_gate = kind.as_deref() == Some("task_gate")
+                        || interaction.as_ref().is_some_and(|r| r.kind == "task_gate");
+                    let card = if is_task_gate {
+                        let resume: Value = interaction
+                            .as_ref()
+                            .and_then(|r| r.resume_ref.as_deref())
+                            .and_then(|raw| serde_json::from_str(raw).ok())
+                            .unwrap_or_default();
+                        let dirty_files = resume["dirty_files"].as_u64().unwrap_or(0) as usize;
+                        let backend = resume["backend"].as_str().unwrap_or("cli").to_string();
+                        let goal = interaction
+                            .as_ref()
+                            .and_then(|r| r.goal.clone())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| question.clone());
+                        let analysis = interaction
+                            .as_ref()
+                            .and_then(|r| r.analysis.clone())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| question.clone());
+                        let chat = interaction
+                            .as_ref()
+                            .and_then(|r| r.chat_id.clone())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| chat_id.clone());
+                        let topic = interaction
+                            .as_ref()
+                            .and_then(|r| r.topic_id.clone())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| topic_id.clone());
+                        build_task_gate_card(&TaskGateCardOptions {
+                            interaction_id: interaction_id.clone(),
+                            session_id: session_id.clone(),
+                            chat_id: chat,
+                            topic_id: topic,
+                            goal,
+                            analysis,
+                            backend,
+                            source_label: "飞书派单".to_string(),
+                            dirty_files,
+                            admin_url,
+                        })
+                    } else {
+                        let is_quant = kind
+                            .as_deref()
+                            .is_some_and(|k| k.starts_with("quant_confirm:"));
+                        let title = if is_quant {
+                            "高成本操作确认"
+                        } else {
+                            "需要你的输入"
+                        };
+                        let hint = if is_quant {
+                            Some("点击按钮或回复文字作答；回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作".to_string())
+                        } else {
+                            Some("点击按钮或直接回复消息作答".to_string())
+                        };
+                        build_confirm_card(&ConfirmCardOptions {
+                            title: title.to_string(),
+                            question: question.clone(),
+                            choices: options.clone(),
+                            interaction_id: interaction_id.clone(),
+                            session_id: session_id.clone(),
+                            chat_id: chat_id.clone(),
+                            topic_id: topic_id.clone(),
+                            admin_url,
+                            hint,
+                        })
+                    };
                     match api.reply_card(&message_id, &card, in_thread).await {
                         Ok(card_mid) => {
                             if !interaction_id.is_empty() {
@@ -379,7 +426,7 @@ async fn run(
                             let _ = api.reply_text(&message_id, &msg, in_thread).await;
                         }
                     }
-                    // ask_user 期间 run 处于暂停：进度停在这里等用户作答，
+                    // ask_user / task_gate 期间 run 处于暂停：进度停在这里等用户作答，
                     // 让"进度怎样了"能看出是在等人而不是在算。
                     progress.push_activity("等待用户确认".to_string());
                     publish(&progress).await;

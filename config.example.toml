@@ -16,6 +16,11 @@ database_url = "mysql://user:password@host:3306/dbname"
 # 深链格式：{admin_base_url}/#/interactions/{id}
 # admin_base_url = "https://your-host"
 
+# 多实例共库时只能一个实例开启长连接 / 调度（默认均为 true）
+# weixin_monitor = true
+# feishu_monitor = true
+# scheduler_enabled = true
+
 # 飞书驱动的 server-only monorepo Agent（默认关闭）。
 # 开启后，绑定到 can_login_admin 用户的飞书新话题会先判断任务归属：
 # Trace/quant 任务创建 Git worktree，其他任务创建普通隔离目录，命令和问询不建目录。
@@ -36,6 +41,9 @@ agent_output_limit_bytes = 67108864
 agent_sandbox_bin = "/usr/bin/bwrap"
 deploy_use_sudo = true
 approval_ttl_secs = 600
+# 两阶段任务闸门（默认关闭）：飞书代码任务先只产出分析大卡片，用户点「开始修」后才 resume 改码。
+# 与 enabled 无关——client-only 链路在 enabled=false 时同样可开闸门。
+# task_gate_enabled = false
 
 [quant_a2a]
 # 是否在所有已登录会话注册 quant_* 工具（默认 false）。

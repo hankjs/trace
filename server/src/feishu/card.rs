@@ -262,6 +262,136 @@ pub struct DeploymentCardOptions {
     pub approve_label: String,
 }
 
+/// 两阶段任务闸门大卡片入参（字段多，避免 too_many_arguments）。
+pub struct TaskGateCardOptions {
+    pub interaction_id: String,
+    pub session_id: String,
+    pub chat_id: String,
+    pub topic_id: String,
+    pub goal: String,
+    pub analysis: String,
+    /// 基本信息「当前角色」展示用（如 codex / claude）
+    pub backend: String,
+    /// 「来源」文案，如「飞书派单」
+    pub source_label: String,
+    /// >0 时渲染警示行：第一轮已产生改动（CLI bypass-approvals，只读靠 prompt 约束）
+    pub dirty_files: usize,
+    pub admin_url: Option<String>,
+}
+
+/// 飞书卡片正文长度上限；分析全文在 agent_interactions.analysis，不丢。
+const TASK_GATE_ANALYSIS_CARD_LIMIT: usize = 2500;
+
+/// 两阶段任务闸门大卡片：目标 + 基本信息 + 分析全文 + 开始修/跳过。
+///
+/// 按钮 callback 与 `build_confirm_card` 同构（action=answer），
+/// 共用 answer_and_resume，无需 callback.rs 新分支。
+pub fn build_task_gate_card(opts: &TaskGateCardOptions) -> Value {
+    let analysis_chars = opts.analysis.chars().count();
+    let analysis_body = if analysis_chars <= TASK_GATE_ANALYSIS_CARD_LIMIT {
+        opts.analysis.clone()
+    } else {
+        let truncated: String = opts
+            .analysis
+            .chars()
+            .take(TASK_GATE_ANALYSIS_CARD_LIMIT)
+            .collect();
+        format!("{truncated}…完整分析见 admin")
+    };
+
+    let id_short: String = opts.interaction_id.chars().take(12).collect();
+    let dirty_line = if opts.dirty_files > 0 {
+        format!("\n⚠️ 第一轮已产生 {} 个文件改动", opts.dirty_files)
+    } else {
+        String::new()
+    };
+    let admin_hint = opts
+        .admin_url
+        .as_ref()
+        .map(|u| format!(" · [在 Admin 查看全文]({u})"))
+        .unwrap_or_default();
+
+    let buttons = vec![
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "开始修" },
+            "type": "primary",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "action": "answer",
+                    "interaction_id": opts.interaction_id,
+                    "session_id": opts.session_id,
+                    "chat_id": opts.chat_id,
+                    "topic_id": opts.topic_id,
+                    "choice": "开始修",
+                }
+            }]
+        }),
+        json!({
+            "tag": "button",
+            "text": { "tag": "plain_text", "content": "跳过" },
+            "type": "default",
+            "behaviors": [{
+                "type": "callback",
+                "value": {
+                    "action": "answer",
+                    "interaction_id": opts.interaction_id,
+                    "session_id": opts.session_id,
+                    "chat_id": opts.chat_id,
+                    "topic_id": opts.topic_id,
+                    "choice": "跳过",
+                }
+            }]
+        }),
+    ];
+
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "summary": { "content": "新任务 · 待确认是否开始修" }
+        },
+        "header": {
+            "template": "orange",
+            "title": { "tag": "plain_text", "content": "新任务 · 待确认是否开始修" }
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!("**目标**\n{}", opts.goal)
+                },
+                {
+                    "tag": "markdown",
+                    "content": format!(
+                        "**基本信息**\n任务编号 `{id_short}`   状态 待确认\n当前角色 {}   来源 {}{}",
+                        opts.backend,
+                        opts.source_label,
+                        dirty_line
+                    )
+                },
+                {
+                    "tag": "hr"
+                },
+                {
+                    "tag": "markdown",
+                    "content": format!("**任务分析**\n{analysis_body}")
+                },
+                {
+                    "tag": "markdown",
+                    "content": format!("*点击下方按钮决定是否开始修{admin_hint}*")
+                },
+                {
+                    "tag": "action",
+                    "actions": buttons
+                }
+            ]
+        }
+    })
+}
+
 /// 部署审批使用独立 action，回调直接进入部署状态机，不再把“确认”交给 LLM。
 pub fn build_deployment_card(opts: &DeploymentCardOptions) -> Value {
     let target_text = opts.targets.join("、");
@@ -541,6 +671,75 @@ mod tests {
         let content = card["body"]["elements"][0]["content"].as_str().unwrap();
         assert!(content.contains("ia-1"));
         assert!(content.contains("已选择"));
+    }
+
+    #[test]
+    fn task_gate_card_carries_answer_callbacks_and_fields() {
+        let card = build_task_gate_card(&TaskGateCardOptions {
+            interaction_id: "ia-gate-abcdef012345".into(),
+            session_id: "sess-1".into(),
+            chat_id: "chat-1".into(),
+            topic_id: "topic-1".into(),
+            goal: "修一下登录 bug".into(),
+            analysis: "## 目标\nok\n## 范围\nok\n## 疑似改动点\nok\n## 风险\nok".into(),
+            backend: "codex".into(),
+            source_label: "飞书派单".into(),
+            dirty_files: 0,
+            admin_url: Some("https://admin.example/#/interactions/ia-gate-abcdef012345".into()),
+        });
+        let body = card["body"]["elements"].to_string();
+        assert!(body.contains("ia-gate-abcd")); // 前 12 位
+        assert!(body.contains("修一下登录 bug"));
+        assert!(body.contains("codex"));
+        assert!(body.contains("飞书派单"));
+        assert!(!body.contains("第一轮已产生"));
+
+        // 最后一个 element 是 action 按钮
+        let actions = card["body"]["elements"].as_array().unwrap().last().unwrap()["actions"]
+            .as_array()
+            .unwrap();
+        assert_eq!(actions.len(), 2);
+        let v0 = &actions[0]["behaviors"][0]["value"];
+        let v1 = &actions[1]["behaviors"][0]["value"];
+        assert_eq!(v0["action"], "answer");
+        assert_eq!(v0["choice"], "开始修");
+        assert_eq!(v0["interaction_id"], "ia-gate-abcdef012345");
+        assert_eq!(v1["action"], "answer");
+        assert_eq!(v1["choice"], "跳过");
+        assert_eq!(actions[1]["type"], "default");
+    }
+
+    #[test]
+    fn task_gate_card_shows_dirty_warning_and_truncates_analysis() {
+        let long_analysis: String = "甲".repeat(2600);
+        let card = build_task_gate_card(&TaskGateCardOptions {
+            interaction_id: "ia-dirty".into(),
+            session_id: "s".into(),
+            chat_id: "c".into(),
+            topic_id: "t".into(),
+            goal: "g".into(),
+            analysis: long_analysis,
+            backend: "claude".into(),
+            source_label: "飞书派单".into(),
+            dirty_files: 3,
+            admin_url: Some("https://admin.example/#/interactions/ia-dirty".into()),
+        });
+        let body = card["body"]["elements"].to_string();
+        assert!(body.contains("第一轮已产生 3 个文件改动"));
+        assert!(body.contains("完整分析见 admin"));
+        // 截断后正文不应仍含满 2600 字
+        let analysis_el = card["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|el| {
+                el["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with("**任务分析**"))
+            })
+            .unwrap();
+        let content = analysis_el["content"].as_str().unwrap();
+        assert!(content.chars().count() < 2600 + 20);
     }
 
     #[tokio::test(start_paused = true)]

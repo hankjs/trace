@@ -9,18 +9,24 @@
         │ im.message.receive_v1 / card.action.trigger
         ▼
 feishu/router.rs（消息解析、话题=会话、/命令、派发）
-        │ run_chat_turn（读取 session metadata.agent_backend）
+        │ run_chat_turn（native）/ cli_agent::run_cli_turn（本机 CLI）
         ▼
 feishu/pusher.rs（事件流 → 任务卡片 2s 节流刷新）
-        │ AskUser → 确认卡片（按钮）
+        │ AskUser → agent_interactions 落表 → 确认卡片 / task_gate 大卡片
         ▼
-feishu/callback.rs（按钮回调 → 包装成"确认"/"否"文本 → 现有确认闸门）
+feishu/callback.rs（按钮回调 → interaction_flow::answer_and_resume）
+        │ 原子应答 → 在交互单冻结的 session 上 resume
+        ▼
+interaction_flow.rs（quant_confirm / ask_user → run_chat_turn；
+                     task_gate → cli_agent resume 第二轮）
 ```
 
 - **话题 = 会话**：`feishu_chats` 表把 `account_id:chat_id:topic_id`（topic = thread_id || root_id || "main"）映射到 server session，重启不丢
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
-- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）
+- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`（历史字段，已无读写路径）。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）
+- **交互单管理入口**：`server/src/interactions.rs`（admin REST：列表 / 详情 / 手动应答 / 取消）与 `server/src/interaction_flow.rs`（应答派发；飞书按钮与 admin 手动应答共用同一条链路，避免顺序漂移）
+- **两阶段任务闸门（task_gate）**：见下文「两阶段任务闸门」小节。默认关闭（`[server_agent].task_gate_enabled`），与 `server_agent.enabled` 解耦。
 - **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。五种 `agent_kind`：`conversation`（纯对话、无工具）、`quant_research`（A 股研究、仅 quant 工具，需 `quant_a2a.enabled`）、`trace_code` / `quant_code` / `general_task`（代码与文件任务）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。`conversation` 与 `quant_research` 强制 `native`：前者无工具，后者只挂 `quant_*` + `ask_user` + `web_fetch`，均无工作区、不绑 `exec_client_id`。
 - **管理员边界**：`can_login_admin` 仅在创建 **server 侧** native / worktree **工作区**时校验；纯对话、`quant_research` 与 client-only hank-cli 用户不要求 admin
 
@@ -77,6 +83,17 @@ curl -X DELETE $SERVER/api/admin/feishu/bindings/{id} -H "..."
 feishu_monitor = false   # 其他实例关掉
 ```
 
+**admin 深链**（可选）：卡片上的「在 admin 查看」链接需要 server 知道 admin 的
+外部地址，在 `config.toml` 配置：
+
+```toml
+[server]
+admin_base_url = "https://your-host"   # 留空则卡片不渲染深链行
+```
+
+深链格式 `{admin_base_url}/#/interactions/{id}`（admin 用 hash 路由兼容深链）。
+本地 dev 通常留空。
+
 ## 三、用法
 
 | 操作 | 说明 |
@@ -95,6 +112,26 @@ feishu_monitor = false   # 其他实例关掉
 | `/deploy` | **仅 server worktree 会话**：固化 commit 并发送部署审批卡。**client-only 会话明确拒绝** |
 | `/rollback` | **仅 server worktree 会话**：回滚审批。**client-only 会话明确拒绝** |
 | `/help` | 命令列表 |
+
+### 两阶段任务闸门（task_gate）
+
+默认**关闭**。在 `config.toml` 的 `[server_agent]` 段设置：
+
+```toml
+[server_agent]
+# 与 enabled 无关：client-only 在 enabled=false 时同样可开闸门
+task_gate_enabled = true
+```
+
+开启后，飞书派**代码任务**（`trace_code` / `quant_code` / `general_task`）时不再直接改码，而是：
+
+1. **第一轮**：CLI 只读分析（靠 prompt 约束；CLI 以 bypass-approvals 启动，写操作不会被沙箱拦住），产出 `## 目标` / `## 范围` / `## 疑似改动点` / `## 风险`。
+2. 落 `kind=task_gate` 交互单，发大卡片（任务编号、目标、基本信息、分析全文、`开始修` / `跳过`）。
+3. 用户点 **开始修** → 在同一 CLI thread 上 resume 第二轮真正改代码；点 **跳过** → 交互单 `cancelled`，**不继续执行**（不保证第一轮无副作用——若模型未听话已改文件，卡片会提示「第一轮已产生 N 个文件改动」，回滚由用户自行 git 处理）。
+
+**不走闸门**：开关关闭、`conversation` / `quant_research`、非飞书来源、话题已有 `agent_thread_id`（续聊）。第一轮若拿不到 CLI `thread_id`，退回直接完成，不落无法续接的闸门。
+
+admin `/interactions` 可筛 `kind=task_gate` 查看 `goal` / `analysis` 全文；手动应答与飞书按钮共用 `answer_and_resume`。
 
 ### 本机 Agent CLI（client-only，默认代码执行路径）
 
@@ -258,6 +295,16 @@ make sync-agent-cli-config
 - **构建用户报权限错误**：检查 `hank`、`hank-build` 都在 `hank-workspace` 组，worktree 目录应为 setgid/group-writable；旧版 Git 的 `safe.directory` 必须注册具体 worktree 路径，不能使用 `*` 通配
 - **部署日志**：`journalctl -u 'hank-deploy-*'`；server/CLI/quant 分别看对应 systemd unit
 - **应急回退**：飞书不可用时通过 SSH 将目标的 `current` 原子切到 `previous` 并重启服务；SSH 始终保留为 break-glass
+- **点了确认卡片没反应**：先看 admin「交互单」页找到该任务编号，看 `status`。
+  `pending` 说明应答没写进去（多为节点离线，卡片会带提示）；`answered` 长期不动
+  说明派发未完成（server 重启会自动退回 `pending` 可重试）；`cancelled` 是被取消。
+  卡死的交互单可以在 admin 里直接手动应答，不必 `/new` 重开话题。
+- **确认卡片提示「这个操作已经提交过了」**：同一张卡片只能应答一次
+  （按 `interaction_id` 原子抢答）。若确实需要重跑，让 agent 重新发起工具调用。
+- **闸门大卡片不出现**：确认 `[server_agent].task_gate_enabled = true`；
+  且话题必须是新话题（已有 `agent_thread_id` 的续聊不弹闸门）、
+  来源是飞书、`agent_kind` 是代码类。第一轮拿不到 CLI `thread_id` 时也会
+  跳过闸门直接执行（日志有 warn）。
 
 ## 七、定时任务（系统主动推送）
 
@@ -281,3 +328,5 @@ make sync-agent-cli-config
 - 普通文件附件下载（当前已支持图片输入和 `[file:]` 图片回传）
 - 更多 job：agent 整理的简报（cron 驱动 run_chat_turn）、失败 @人告警、巡检类任务
 - 多 bot 互相 @ 协作（agent-os 文档后半程的团队作战）
+- 取消交互单时同步把飞书卡片改成终态（当前卡片仍可点，点了会被拒但不会误执行）
+- admin 交互单详情的 `analysis` 渲染 markdown（当前纯文本展示）

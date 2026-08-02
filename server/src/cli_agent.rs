@@ -4,7 +4,7 @@ use crate::chat::{ChatTurnHandle, EventBuffer};
 use crate::AppState;
 use anyhow::{anyhow, bail, Context, Result};
 use code_agent::{AgentEvent, FileChange, FileChangeKind, RunStatus};
-use hank_db::Session;
+use hank_db::{NewInteraction, Session};
 use hank_provider::ContentBlock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -480,7 +480,21 @@ async fn run_remote_cli_turn(
     if user_text.trim().is_empty() {
         bail!("本机 Agent 暂不支持没有文本说明的消息");
     }
-    let prompt = local_agent_prompt(&user_text, agent_kind);
+    // 闸门判定：与 server_agent.enabled 无关，只看 task_gate_enabled + 会话条件。
+    let metadata = parse_metadata(session.metadata.as_deref());
+    let source = metadata["source"].as_str();
+    let existing_thread = metadata["agent_thread_id"].as_str();
+    let gate_mode = should_gate_turn(
+        state.config.server_agent.task_gate_enabled,
+        agent_kind,
+        source,
+        existing_thread,
+    );
+    let prompt = if gate_mode {
+        local_agent_analysis_prompt(&user_text, agent_kind)
+    } else {
+        local_agent_prompt(&user_text, agent_kind)
+    };
 
     {
         let mut buffers = state.event_buffers.write().await;
@@ -505,6 +519,7 @@ async fn run_remote_cli_turn(
     let session_id_task = session_id.to_string();
     let backend = backend.to_string();
     let client_id = client_id.to_string();
+    let agent_kind = agent_kind.to_string();
     tokio::spawn(async move {
         let result = execute_remote_turn(
             &state_task,
@@ -516,6 +531,8 @@ async fn run_remote_cli_turn(
             &display_cwd,
             &user_text,
             &prompt,
+            gate_mode,
+            &agent_kind,
             cancel_token.clone(),
         )
         .await;
@@ -576,6 +593,9 @@ async fn execute_remote_turn(
     work_dir: &str,
     user_text: &str,
     prompt: &str,
+    // 第一轮闸门模式：成功结束时落 task_gate 交互单，不 emit RunCompleted。
+    gate_mode: bool,
+    agent_kind: &str,
     cancel_token: CancellationToken,
 ) -> Result<()> {
     let run_id = Uuid::new_v4().to_string();
@@ -773,6 +793,10 @@ async fn execute_remote_turn(
             if let Some(extra) = offline_error.as_deref() {
                 tracing::warn!(session_id, client_id, "本机 Agent 取消时附加信息: {extra}");
             }
+            if !gate_mode {
+                finalize_open_task_gate(state, session_id, "failed", None, Some("任务已取消"))
+                    .await;
+            }
             emit(
                 state,
                 session_id,
@@ -789,6 +813,10 @@ async fn execute_remote_turn(
             let message = offline_error
                 .clone()
                 .unwrap_or_else(|| "本机 Agent 执行超时".to_string());
+            if !gate_mode {
+                finalize_open_task_gate(state, session_id, "failed", None, Some(message.as_str()))
+                    .await;
+            }
             emit_failed(state, session_id, &run_id, &message).await;
         }
         Terminal::OutputLimit => {
@@ -799,6 +827,16 @@ async fn execute_remote_turn(
                 &run_state.final_text,
             )
             .await;
+            if !gate_mode {
+                finalize_open_task_gate(
+                    state,
+                    session_id,
+                    "failed",
+                    None,
+                    Some("本机 Agent 输出超过整流安全上限"),
+                )
+                .await;
+            }
             emit_failed(
                 state,
                 session_id,
@@ -845,21 +883,67 @@ async fn execute_remote_turn(
                 },
             )
             .await;
-            emit(
-                state,
-                session_id,
-                AgentEvent::RunCompleted {
-                    run_id,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                    status: RunStatus::Success,
-                    input_tokens: run_state.input_tokens,
-                    output_tokens: run_state.output_tokens,
-                    summary: final_text,
-                    permission_denials: vec![],
-                    file_changes: file_changes(&run_state),
-                },
-            )
-            .await;
+
+            // 闸门第一轮：有 thread_id 才落 task_gate；没有则无法 resume，退回直接完成。
+            // 绝不 emit RunCompleted——pusher 会把进度卡刷成绿色「已完成」，用户误以为事情做完了。
+            let gated = if gate_mode {
+                match run_state.thread_id.as_deref() {
+                    Some(thread_id) => {
+                        match finish_as_task_gate(
+                            state,
+                            session_id,
+                            user_id,
+                            client_id,
+                            backend,
+                            agent_kind,
+                            user_text,
+                            &final_text,
+                            thread_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => true,
+                            Err(error) => {
+                                tracing::warn!(
+                                    session_id,
+                                    "task_gate 落单失败，退回直接完成: {error:#}"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(
+                            session_id,
+                            "闸门第一轮未拿到 thread_id，退回直接完成（无法 resume）"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            if !gated {
+                // 第二轮（或非闸门轮）正常完成：若有 executing 的 task_gate 交互单，标 done。
+                finalize_open_task_gate(state, session_id, "done", Some(final_text.as_str()), None)
+                    .await;
+                emit(
+                    state,
+                    session_id,
+                    AgentEvent::RunCompleted {
+                        run_id,
+                        timestamp: chrono::Utc::now().to_rfc3339(),
+                        status: RunStatus::Success,
+                        input_tokens: run_state.input_tokens,
+                        output_tokens: run_state.output_tokens,
+                        summary: final_text,
+                        permission_denials: vec![],
+                        file_changes: file_changes(&run_state),
+                    },
+                )
+                .await;
+            }
         }
         Terminal::Completed => {
             let message = run_state
@@ -887,7 +971,12 @@ async fn execute_remote_turn(
                         .map(|code| format!("本机 {backend} 异常退出，状态码 {code}"))
                         .unwrap_or_else(|| format!("本机 {backend} 执行失败"))
                 });
-            emit_failed(state, session_id, &run_id, &truncate(&message, 4000)).await;
+            let message = truncate(&message, 4000);
+            if !gate_mode {
+                finalize_open_task_gate(state, session_id, "failed", None, Some(message.as_str()))
+                    .await;
+            }
+            emit_failed(state, session_id, &run_id, &message).await;
         }
     }
     if let Err(error) = state.db.touch_session(session_id).await {
@@ -2136,6 +2225,265 @@ fn local_agent_prompt(user_text: &str, agent_kind: &str) -> String {
     prompt
 }
 
+/// 是否对本轮启用两阶段闸门。抽成纯函数：判定条件多，且必须可单测。
+///
+/// 注意：`task_gate_enabled` 与 `server_agent.enabled` 解耦——后者关闭时
+/// client-only 链路仍可开闸门，调用方不要再加 `&& cfg.enabled`。
+fn should_gate_turn(
+    task_gate_enabled: bool,
+    agent_kind: &str,
+    source: Option<&str>,
+    existing_thread_id: Option<&str>,
+) -> bool {
+    if !task_gate_enabled {
+        return false;
+    }
+    // conversation 无工具、quant_research 是 REST 研究，都不走代码闸门。
+    if !matches!(agent_kind, "trace_code" | "quant_code" | "general_task") {
+        return false;
+    }
+    // 微信没有按钮卡片，文本确认长分析体验差，本次只做飞书。
+    if source != Some("feishu") {
+        return false;
+    }
+    // 已有 thread 说明是续聊，续聊不再弹闸门。
+    if existing_thread_id.is_some_and(|id| !id.is_empty()) {
+        return false;
+    }
+    true
+}
+
+/// 闸门第一轮 prompt：只读不改，产出结构化分析。
+///
+/// 注意 CLI 是以 bypass-approvals 启动的，写操作不会被沙箱拦住——这里只能靠
+/// 指令约束，配合第二轮前的 git status 事后检查。所以措辞要强，且要求它
+/// 在无法只读完成时明说，而不是擅自动手。
+fn local_agent_analysis_prompt(user_text: &str, agent_kind: &str) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("【本轮任务：只读分析，不要改代码】\n\n");
+    prompt.push_str(user_text);
+    prompt.push_str(
+        "\n\n运行约束（必须严格遵守）：\n\
+         - 本轮**只读**：可以读文件、搜索、看 git log / diff，**不要**修改、创建、删除任何文件。\n\
+         - **不要**执行会改变状态的命令（安装依赖、格式化、提交、checkout、reset 等）。\n\
+         - 只操作 hank-cli 提供的当前工作目录及其子目录；不要读取或修改凭据、密钥或本机 Agent 认证配置。\n\
+         - 输出固定四段 markdown，不要额外前言/后记：\n\
+         ## 目标\n\
+         ## 范围\n\
+         ## 疑似改动点\n\
+         ## 风险\n\
+         - 结尾**不要**问「要我开始吗」——是否开始由用户在飞书卡片上点按钮决定。\n\
+         - 若任务无法在只读前提下分析清楚，在「## 风险」里说明缺什么，**仍然不要动手**。",
+    );
+    if agent_kind == "quant_code" {
+        prompt.push_str(
+            "\n- 分析 quant 相关改动前必须读取 quant/AGENTS.md，并遵守禁止交易能力的产品边界。",
+        );
+    }
+    prompt
+}
+
+/// 第一轮分析成功后落 task_gate 交互单并发 AskUser，让 pusher 停在「等待确认」。
+#[allow(clippy::too_many_arguments)]
+async fn finish_as_task_gate(
+    state: &Arc<AppState>,
+    session_id: &str,
+    user_id: &str,
+    client_id: &str,
+    backend: &str,
+    agent_kind: &str,
+    user_text: &str,
+    analysis: &str,
+    thread_id: &str,
+) -> Result<()> {
+    let dirty_files = count_dirty_files_via_remote(state, user_id, client_id).await;
+    let feishu_chat = state
+        .db
+        .get_feishu_chat_by_session(session_id)
+        .await
+        .context("反查 feishu_chats")?;
+    let (account_id, chat_id, topic_id) = match feishu_chat.as_ref() {
+        Some(c) => (
+            Some(c.account_id.as_str()),
+            Some(c.chat_id.as_str()),
+            Some(c.topic_id.as_str()),
+        ),
+        None => {
+            tracing::warn!(
+                session_id,
+                "task_gate：session 无 feishu_chats 映射，交互单 account/chat/topic 为空"
+            );
+            (None, None, None)
+        }
+    };
+
+    let goal: String = user_text.chars().take(2000).collect();
+    let options_json = serde_json::to_string(&["开始修", "跳过"])
+        .unwrap_or_else(|_| r#"["开始修","跳过"]"#.to_string());
+    let resume_ref = serde_json::json!({
+        "backend": backend,
+        "thread_id": thread_id,
+        "exec_client_id": client_id,
+        "agent_kind": agent_kind,
+        "dirty_files": dirty_files,
+    })
+    .to_string();
+
+    let row = state
+        .db
+        .create_interaction(NewInteraction {
+            session_id,
+            user_id,
+            channel: "feishu",
+            account_id,
+            chat_id,
+            topic_id,
+            kind: "task_gate",
+            title: "新任务 · 待确认是否开始修",
+            goal: Some(&goal),
+            analysis: Some(analysis),
+            options: &options_json,
+            resume_ref: Some(&resume_ref),
+            expires_at: None,
+        })
+        .await
+        .context("创建 task_gate 交互单")?;
+
+    tracing::info!(
+        interaction_id = %row.id,
+        session_id,
+        dirty_files,
+        "task_gate 交互单已落表，等待用户确认是否开始修"
+    );
+
+    emit(
+        state,
+        session_id,
+        AgentEvent::AskUser {
+            question: goal,
+            options: vec!["开始修".to_string(), "跳过".to_string()],
+            tool_use_id: format!("task_gate:{}", row.id),
+            kind: Some("task_gate".to_string()),
+        },
+    )
+    .await;
+    Ok(())
+}
+
+/// 第二轮结束后把 interaction_flow 挂在 session metadata 上的 active_task_gate_id 标终态。
+///
+/// 不用 latest_pending_interaction：派发后状态是 executing，且 pending 查询会误伤
+/// 第一轮刚落、尚未应答的闸门单。
+async fn finalize_open_task_gate(
+    state: &Arc<AppState>,
+    session_id: &str,
+    status: &str,
+    result: Option<&str>,
+    error: Option<&str>,
+) {
+    let Ok(Some(session)) = state.db.get_session(session_id).await else {
+        return;
+    };
+    let mut metadata = parse_metadata(session.metadata.as_deref());
+    let Some(interaction_id) = metadata
+        .get("active_task_gate_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    if let Err(e) = state
+        .db
+        .update_interaction_status(&interaction_id, status, result, error)
+        .await
+    {
+        tracing::warn!(
+            interaction_id = %interaction_id,
+            session_id,
+            "finalize task_gate 失败: {e:#}"
+        );
+    }
+    metadata
+        .as_object_mut()
+        .map(|m| m.remove("active_task_gate_id"));
+    if let Err(e) = state
+        .db
+        .update_session_metadata(session_id, &metadata.to_string())
+        .await
+    {
+        tracing::warn!(session_id, "清除 active_task_gate_id 失败: {e:#}");
+    }
+}
+
+/// 派发第二轮前把交互单 id 挂到 session，供 cli_agent 终态回调 finalize。
+pub async fn attach_active_task_gate(
+    state: &Arc<AppState>,
+    session_id: &str,
+    interaction_id: &str,
+) -> Result<()> {
+    let session = state
+        .db
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow!("会话不存在"))?;
+    let mut metadata = parse_metadata(session.metadata.as_deref());
+    metadata["active_task_gate_id"] = serde_json::Value::String(interaction_id.to_string());
+    state
+        .db
+        .update_session_metadata(session_id, &metadata.to_string())
+        .await?;
+    Ok(())
+}
+
+/// 派发失败时清掉 active_task_gate_id，避免误标后续无关轮次。
+pub async fn clear_active_task_gate(state: &Arc<AppState>, session_id: &str) -> Result<()> {
+    let session = state
+        .db
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow!("会话不存在"))?;
+    let mut metadata = parse_metadata(session.metadata.as_deref());
+    if metadata
+        .as_object_mut()
+        .is_some_and(|m| m.remove("active_task_gate_id").is_some())
+    {
+        state
+            .db
+            .update_session_metadata(session_id, &metadata.to_string())
+            .await?;
+    }
+    Ok(())
+}
+
+/// 事后检查：本机节点 git status --porcelain 行数。失败/非 git 目录返回 0，不阻塞闸门。
+async fn count_dirty_files_via_remote(
+    state: &Arc<AppState>,
+    user_id: &str,
+    client_id: &str,
+) -> usize {
+    if !crate::remote_exec::is_client_online(state, user_id, client_id).await {
+        return 0;
+    }
+    match crate::remote_exec::dispatch_tool_call(
+        state,
+        user_id,
+        client_id,
+        "shell",
+        serde_json::json!({ "command": "git status --porcelain" }),
+        Duration::from_secs(30),
+    )
+    .await
+    {
+        Ok(result) if !result.is_error => result
+            .content
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+        Ok(_) | Err(_) => 0,
+    }
+}
+
 /// client-only 会话 RunStarted 展示 cwd：只用绑定节点注册的 work_dir。
 /// 缺失或空白时返回非路径占位文本；调用方不得传入 session.work_dir 作为 fallback
 ///（session 可能残留 wananyun/server worktree 绝对路径）。
@@ -2408,6 +2756,59 @@ mod tests {
     fn local_agent_prompt_does_not_embed_server_workspace_paths() {
         let prompt = local_agent_prompt("修一下 bug", "trace_code");
         assert!(prompt.contains("hank-cli"));
+        assert!(!prompt.contains("/opt/hank"));
+        assert!(!prompt.contains("/workspace"));
+    }
+
+    #[test]
+    fn should_gate_turn_hard_off_when_disabled() {
+        // 无回归硬判定：开关关闭时恒为 false，路径与现在完全一致。
+        assert!(!should_gate_turn(false, "trace_code", Some("feishu"), None));
+        assert!(!should_gate_turn(false, "quant_code", Some("feishu"), None));
+        assert!(!should_gate_turn(
+            false,
+            "general_task",
+            Some("feishu"),
+            None
+        ));
+    }
+
+    #[test]
+    fn should_gate_turn_requires_code_kind_feishu_and_fresh_thread() {
+        assert!(should_gate_turn(true, "trace_code", Some("feishu"), None));
+        assert!(should_gate_turn(true, "quant_code", Some("feishu"), None));
+        assert!(should_gate_turn(true, "general_task", Some("feishu"), None));
+        assert!(!should_gate_turn(
+            true,
+            "conversation",
+            Some("feishu"),
+            None
+        ));
+        assert!(!should_gate_turn(
+            true,
+            "quant_research",
+            Some("feishu"),
+            None
+        ));
+        assert!(!should_gate_turn(true, "trace_code", Some("weixin"), None));
+        assert!(!should_gate_turn(true, "trace_code", None, None));
+        assert!(!should_gate_turn(
+            true,
+            "trace_code",
+            Some("feishu"),
+            Some("thread-already-there")
+        ));
+    }
+
+    #[test]
+    fn local_agent_analysis_prompt_is_read_only_and_structured() {
+        let prompt = local_agent_analysis_prompt("修一下 bug", "trace_code");
+        assert!(prompt.contains("只读"));
+        assert!(prompt.contains("不要修改") || prompt.contains("**不要**修改"));
+        assert!(prompt.contains("## 目标"));
+        assert!(prompt.contains("## 范围"));
+        assert!(prompt.contains("## 疑似改动点"));
+        assert!(prompt.contains("## 风险"));
         assert!(!prompt.contains("/opt/hank"));
         assert!(!prompt.contains("/workspace"));
     }

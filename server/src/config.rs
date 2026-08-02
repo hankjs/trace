@@ -55,6 +55,13 @@ pub struct ServerAgentConfig {
     pub deploy_use_sudo: bool,
     #[serde(default = "default_deploy_approval_ttl_secs")]
     pub approval_ttl_secs: u64,
+    /// 两阶段任务闸门：代码任务先只产出分析，用户点「开始修」后才真正执行。
+    /// 默认关闭——开启后所有飞书代码任务都多一轮交互，需显式 opt-in。
+    ///
+    /// 与 `enabled` 解耦：client-only 链路在 `server_agent.enabled = false` 时
+    /// 同样要能用闸门。调用方不得写成 `enabled && task_gate_enabled`。
+    #[serde(default)]
+    pub task_gate_enabled: bool,
 }
 
 impl Default for ServerAgentConfig {
@@ -75,6 +82,7 @@ impl Default for ServerAgentConfig {
             agent_sandbox_bin: default_agent_sandbox_bin(),
             deploy_use_sudo: false,
             approval_ttl_secs: default_deploy_approval_ttl_secs(),
+            task_gate_enabled: false,
         }
     }
 }

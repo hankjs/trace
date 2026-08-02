@@ -22,6 +22,8 @@
 │   ├── weixin/          # 微信渠道（ilink 长轮询 monitor/router/pusher）
 │   ├── feishu/          # 飞书渠道（pbbp2 WS 长连接 + 任务卡片 + 按钮确认，见 docs/feishu.md）
 │   ├── scheduler/       # 定时任务调度（cron + job_runs 日志 + admin 手动触发）
+│   ├── interactions.rs  # 交互单 admin REST
+│   ├── interaction_flow.rs # 交互单应答与派发（飞书按钮 / admin 共用）
 │   ├── changes.rs       # 变更管理 API
 │   ├── specs.rs         # Spec 管理 API
 │   ├── admin.rs         # 管理端点
@@ -39,6 +41,10 @@
 │   ├── router/index.ts  # 路由配置
 │   ├── App.vue          # 根组件
 │   └── main.ts          # 前端入口
+├── admin/src/           # Vue 3 管理后台（独立前端，非 Tauri）
+│   ├── views/           # 管理页面（路由级）
+│   ├── components/      # 可复用组件
+│   └── composables/api.ts  # admin API 客户端与类型
 ├── cli/                 # hank-cli：headless 远程终端节点（独立 Cargo 项目，不进 workspace）
 ├── quant/               # A股日频量化信息系统（独立 Python 项目，仅与 server 共用 MySQL）
 │   ├── app/             # FastAPI 后端：baostock/akshare 采集、指标、策略信号、记账、回测
@@ -58,6 +64,34 @@
 | `/specs` | Specs.vue | Spec 管理 |
 | `/changes` | Changes.vue | 变更列表 |
 | `/changes/:changeId` | ChangeDetail.vue | 变更详情 |
+
+## Admin 页面
+
+base path `/admin/`（history 路由）。飞书卡片深链用 hash 兼容：`{admin_base_url}/#/interactions/{id}`。
+
+| 路径 | 组件 | 说明 |
+|------|------|------|
+| `/login` | Login.vue | 登录 |
+| `/` | Dashboard.vue | 概览 |
+| `/sessions` | Sessions.vue | 会话列表 |
+| `/sessions/:id` | SessionDetail.vue | 会话详情 |
+| `/sessions/:id/timeline` | SessionTimeline.vue | 会话时间线 |
+| `/sessions/:id/explore` | SessionExplore.vue | 会话 Explore |
+| `/explore` | ExploreList.vue | Explore 列表 |
+| `/explore/:id` | SessionExplore.vue | Explore 详情（复用） |
+| `/prompts` | PromptLab.vue | Prompt 实验室 |
+| `/users` | Users.vue | 用户管理 |
+| `/providers` | Providers.vue | LLM Provider |
+| `/agent-cli` | AgentCli.vue | Agent CLI 凭据与配置 |
+| `/image-providers` | ImageProviders.vue | 图像生成 Provider |
+| `/weixin` | WeixinBot.vue | 微信机器人账号与绑定 |
+| `/feishu` | FeishuBot.vue | 飞书机器人账号与绑定 |
+| `/chat-records` | ChatRecords.vue | 渠道消息留档 |
+| `/jobs` | Jobs.vue | 定时任务与执行记录 |
+| `/interactions` | Interactions.vue | 交互单：确认闸门 / ask_user / 任务闸门的状态与手动应答 |
+| `/interactions/:id` | Interactions.vue | 交互单详情（同页） |
+| `/terminals` | Terminals.vue | 远程终端 |
+| `/notifications` | Notifications.vue | 通知 |
 
 ## 前端组件清单
 
@@ -80,6 +114,10 @@
 # 前端开发
 cd client && npm run dev        # Vite 开发服务器
 cd client && npm run build      # 构建
+
+# 管理后台
+cd admin && npm run dev         # admin 开发服务器
+cd admin && npm run build       # admin 构建（严格 TS 检查）
 
 # 后端开发
 cargo run -p server             # 启动后端服务

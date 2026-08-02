@@ -2853,35 +2853,9 @@ impl Database {
         Ok(())
     }
 
-    // ─── Session: pending_ask_user & change_id ──────────────────────────
-
-    pub async fn get_session_pending_ask_user(&self, session_id: &str) -> Result<Option<String>> {
-        let row: Option<(Option<String>,)> = db_retry!(sqlx::query_as(
-            "SELECT pending_ask_user FROM sessions WHERE id = ?"
-        )
-        .bind(session_id)
-        .fetch_optional(&self.pool))?;
-        Ok(row.and_then(|r| r.0))
-    }
-
-    pub async fn set_session_pending_ask_user(&self, session_id: &str, json: &str) -> Result<()> {
-        db_retry!(sqlx::query(
-            "UPDATE sessions SET pending_ask_user = ?, updated_at = NOW() WHERE id = ?"
-        )
-        .bind(json)
-        .bind(session_id)
-        .execute(&self.pool))?;
-        Ok(())
-    }
-
-    pub async fn clear_session_pending_ask_user(&self, session_id: &str) -> Result<()> {
-        db_retry!(sqlx::query(
-            "UPDATE sessions SET pending_ask_user = NULL, updated_at = NOW() WHERE id = ?"
-        )
-        .bind(session_id)
-        .execute(&self.pool))?;
-        Ok(())
-    }
+    // ─── Session: change_id ─────────────────────────────────────────────
+    // pending_ask_user 读写方法已删除：待确认状态迁到 agent_interactions 后
+    // 零调用。列与 Session 字段仍保留（生产有数据，删列需 migration）。
 
     pub async fn get_session_by_change_id(&self, change_id: &str) -> Result<Option<Session>> {
         let session = db_retry!(
@@ -3986,6 +3960,23 @@ impl Database {
             .bind(topic_id)
             .fetch_optional(&self.pool)
         )?;
+        Ok(row)
+    }
+
+    /// 按 session 反查飞书话题映射。
+    ///
+    /// 任务闸门（task_gate）在 cli_agent 内落交互单时只有 session_id，
+    /// 需要 account_id / chat_id / topic_id 才能把卡片与 resume 发回原话题。
+    /// 同一 session 理论上只对应一条映射；多条时取最近更新的一条。
+    pub async fn get_feishu_chat_by_session(&self, session_id: &str) -> Result<Option<FeishuChat>> {
+        let row = db_retry!(sqlx::query_as::<_, FeishuChat>(
+            "SELECT id, account_id, chat_id, topic_id, session_id, user_id, created_at, updated_at
+                 FROM feishu_chats WHERE session_id = ?
+                 ORDER BY updated_at DESC
+                 LIMIT 1"
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool))?;
         Ok(row)
     }
 
