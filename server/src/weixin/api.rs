@@ -53,7 +53,11 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         out.push(CHARS[(b[0] >> 2) as usize] as char);
         out.push(CHARS[(((b[0] & 0x03) << 4) | (b[1] >> 4)) as usize] as char);
         if chunk.len() > 1 {
@@ -209,12 +213,22 @@ impl IlinkClient {
         h.insert("AuthorizationType", "ilink_bot_token".parse().unwrap());
         h.insert("X-WECHAT-UIN", random_wechat_uin().parse().unwrap());
         if let Some(t) = token.filter(|t| !t.trim().is_empty()) {
-            h.insert("Authorization", format!("Bearer {}", t.trim()).parse().unwrap());
+            h.insert(
+                "Authorization",
+                format!("Bearer {}", t.trim()).parse().unwrap(),
+            );
         }
         h
     }
 
-    async fn post(&self, base: &str, endpoint: &str, body: &Value, token: Option<&str>, timeout: Duration) -> Result<String> {
+    async fn post(
+        &self,
+        base: &str,
+        endpoint: &str,
+        body: &Value,
+        token: Option<&str>,
+        timeout: Duration,
+    ) -> Result<String> {
         let url = format!("{}/{}", base.trim_end_matches('/'), endpoint);
         let res = self
             .http
@@ -236,14 +250,21 @@ impl IlinkClient {
     pub async fn fetch_qrcode(&self) -> Result<(String, String)> {
         let body = json!({ "local_token_list": [] });
         let text = self
-            .post(QR_API_BASE, "ilink/bot/get_bot_qrcode?bot_type=3", &body, None, NORMAL_TIMEOUT)
+            .post(
+                QR_API_BASE,
+                "ilink/bot/get_bot_qrcode?bot_type=3",
+                &body,
+                None,
+                NORMAL_TIMEOUT,
+            )
             .await?;
         let resp: QrcodeResponse = serde_json::from_str(&text)?;
         match (resp.qrcode, resp.qrcode_img_content) {
             (Some(q), Some(img)) => Ok((q, img)),
             _ => Err(anyhow!(
                 "get_bot_qrcode 响应缺少字段: {}",
-                resp.errmsg.unwrap_or_else(|| text.chars().take(200).collect())
+                resp.errmsg
+                    .unwrap_or_else(|| text.chars().take(200).collect())
             )),
         }
     }
@@ -284,7 +305,11 @@ impl IlinkClient {
     }
 
     /// 长轮询收取消息。客户端超时返回空响应（ret=0），由调用方直接重试。
-    pub async fn get_updates(&self, account: &WeixinAccount, buf: Option<&str>) -> Result<GetUpdatesResponse> {
+    pub async fn get_updates(
+        &self,
+        account: &WeixinAccount,
+        buf: Option<&str>,
+    ) -> Result<GetUpdatesResponse> {
         let body = json!({
             "get_updates_buf": buf.unwrap_or(""),
             "base_info": base_info(),
@@ -301,7 +326,9 @@ impl IlinkClient {
         match result {
             Ok(text) => Ok(serde_json::from_str(&text)?),
             Err(e) => {
-                if e.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_timeout()) {
+                if e.downcast_ref::<reqwest::Error>()
+                    .is_some_and(|r| r.is_timeout())
+                {
                     Ok(GetUpdatesResponse {
                         ret: Some(0),
                         get_updates_buf: buf.map(|s| s.to_string()),
@@ -369,7 +396,12 @@ impl IlinkClient {
                 let errmsg = resp["errmsg"].as_str().unwrap_or("(none)");
                 return Err(anyhow!("sendmessage ret={ret} errmsg={errmsg}"));
             }
-            tracing::info!(to = to_user_id, client_id, len = part.chars().count(), "weixin: message sent");
+            tracing::info!(
+                to = to_user_id,
+                client_id,
+                len = part.chars().count(),
+                "weixin: message sent"
+            );
         }
         Ok(())
     }
@@ -418,7 +450,10 @@ impl IlinkClient {
             let errmsg = resp["errmsg"].as_str().unwrap_or("(none)");
             return Err(anyhow!("getuploadurl ret={ret} errmsg={errmsg}"));
         }
-        let upload_full_url = resp["upload_full_url"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let upload_full_url = resp["upload_full_url"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let upload_param = resp["upload_param"].as_str().filter(|s| !s.is_empty());
         let cdn_url = match (upload_full_url, upload_param) {
             (Some(u), _) => u.to_string(),
@@ -427,7 +462,12 @@ impl IlinkClient {
                 urlencoding_encode(p),
                 urlencoding_encode(&filekey)
             ),
-            (None, None) => return Err(anyhow!("getuploadurl 未返回上传地址: {}", text.chars().take(200).collect::<String>())),
+            (None, None) => {
+                return Err(anyhow!(
+                    "getuploadurl 未返回上传地址: {}",
+                    text.chars().take(200).collect::<String>()
+                ))
+            }
         };
 
         let ciphertext = aes128_ecb_encrypt(&aeskey, data);
@@ -481,7 +521,13 @@ impl IlinkClient {
             let errmsg = resp["errmsg"].as_str().unwrap_or("(none)");
             return Err(anyhow!("sendmessage ret={ret} errmsg={errmsg}"));
         }
-        tracing::info!(to = to_user_id, client_id, file_name, rawsize, "weixin: media sent");
+        tracing::info!(
+            to = to_user_id,
+            client_id,
+            file_name,
+            rawsize,
+            "weixin: media sent"
+        );
         Ok(())
     }
 
@@ -534,7 +580,9 @@ fn urlencoding_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

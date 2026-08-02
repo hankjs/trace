@@ -25,8 +25,20 @@ pub async fn create_spec(
     Extension(_claims): Extension<Claims>,
     Json(body): Json<CreateSpecRequest>,
 ) -> impl IntoResponse {
-    let metadata_str = body.metadata.as_ref().map(|m| serde_json::to_string(m).unwrap_or_default());
-    match state.db.create_spec(&body.capability, &body.title, &body.content, metadata_str.as_deref()).await {
+    let metadata_str = body
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_default());
+    match state
+        .db
+        .create_spec(
+            &body.capability,
+            &body.title,
+            &body.content,
+            metadata_str.as_deref(),
+        )
+        .await
+    {
         Ok(spec) => R::created(spec),
         Err(e) => {
             let msg = e.to_string();
@@ -83,18 +95,43 @@ pub async fn update_spec(
     };
 
     // Store current version as snapshot
-    if let Err(e) = state.db.create_spec_version(&spec.id, spec.version, &spec.content, spec.metadata.as_deref(), None).await {
+    if let Err(e) = state
+        .db
+        .create_spec_version(
+            &spec.id,
+            spec.version,
+            &spec.content,
+            spec.metadata.as_deref(),
+            None,
+        )
+        .await
+    {
         return R::internal_error(e);
     }
 
-    let metadata_str = body.metadata.as_ref().map(|m| serde_json::to_string(m).unwrap_or_default());
-    match state.db.update_spec(&id, body.content.as_deref(), metadata_str.as_deref(), body.title.as_deref()).await {
+    let metadata_str = body
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_default());
+    match state
+        .db
+        .update_spec(
+            &id,
+            body.content.as_deref(),
+            metadata_str.as_deref(),
+            body.title.as_deref(),
+        )
+        .await
+    {
         Ok(()) => {
             let updated = state.db.get_spec(&id).await.ok().flatten();
 
             // Emit SSE event if called from agent tool
             if let Some(session_id) = headers.get("x-session-id").and_then(|v| v.to_str().ok()) {
-                let new_version = updated.as_ref().map(|s| s.version).unwrap_or(spec.version + 1);
+                let new_version = updated
+                    .as_ref()
+                    .map(|s| s.version)
+                    .unwrap_or(spec.version + 1);
                 let event = AgentEvent::SpecUpdated {
                     spec_id: id.clone(),
                     capability: spec.capability.clone(),

@@ -114,11 +114,7 @@ pub fn start(state: Arc<AppState>) {
         loop {
             tick.tick().await;
             for job in JOB_DEFS {
-                let enabled = state
-                    .db
-                    .get_job_enabled(job.id)
-                    .await
-                    .unwrap_or(true);
+                let enabled = state.db.get_job_enabled(job.id).await.unwrap_or(true);
                 if !enabled {
                     continue;
                 }

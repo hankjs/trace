@@ -160,7 +160,14 @@ async fn run(
         let snapshot = ProgressSnapshot {
             percent: progress.percent(),
             detail: progress.detail(),
-            activities: progress.activities.iter().rev().take(3).rev().cloned().collect(),
+            activities: progress
+                .activities
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .cloned()
+                .collect(),
             started_at: started,
         };
         let state = state.clone();
@@ -248,7 +255,9 @@ async fn run(
                     progress.activities.push("更新执行计划".to_string());
                     publish(&progress).await;
                 }
-                AgentEvent::AskUser { question, options, .. } => {
+                AgentEvent::AskUser {
+                    question, options, ..
+                } => {
                     let mut msg = format!("❓ {question}");
                     if !options.is_empty() {
                         msg.push_str("\n选项：");
@@ -262,7 +271,11 @@ async fn run(
                     progress.activities.push("等待用户确认".to_string());
                     publish(&progress).await;
                 }
-                AgentEvent::Metrics { input_tokens: it, output_tokens: ot, .. } => {
+                AgentEvent::Metrics {
+                    input_tokens: it,
+                    output_tokens: ot,
+                    ..
+                } => {
                     llm_calls += 1;
                     input_tokens += it;
                     output_tokens += ot;
@@ -341,7 +354,10 @@ fn extract_file_markers(text: &str) -> (String, Vec<String>) {
         match after.find(']') {
             Some(end) => {
                 let path = after[..end].trim();
-                if !path.is_empty() && files.len() < MAX_MEDIA_FILES && !files.contains(&path.to_string()) {
+                if !path.is_empty()
+                    && files.len() < MAX_MEDIA_FILES
+                    && !files.contains(&path.to_string())
+                {
                     files.push(path.to_string());
                 }
                 rest = &after[end + 1..];
@@ -456,10 +472,7 @@ async fn send_media_files<F, Fut>(
                 return Err(anyhow!("文件为空"));
             }
             if bytes.len() > MAX_MEDIA_BYTES {
-                return Err(anyhow!(
-                    "文件超过 {}MB 上限",
-                    MAX_MEDIA_BYTES / 1024 / 1024
-                ));
+                return Err(anyhow!("文件超过 {}MB 上限", MAX_MEDIA_BYTES / 1024 / 1024));
             }
             client
                 .send_media(account, to_user_id, context_token, &file_name, &bytes)
@@ -505,7 +518,8 @@ mod tests {
 
     #[test]
     fn extract_markers_strips_and_collects() {
-        let (text, files) = extract_file_markers("图已生成\n[file:/tmp/a.png]\n[file: /data/b.pdf ] 说明");
+        let (text, files) =
+            extract_file_markers("图已生成\n[file:/tmp/a.png]\n[file: /data/b.pdf ] 说明");
         assert_eq!(files, vec!["/tmp/a.png", "/data/b.pdf"]);
         assert_eq!(text, "图已生成\n\n 说明");
     }

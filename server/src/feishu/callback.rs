@@ -175,8 +175,15 @@ pub async fn handle_card_action(
     let api2 = api.clone();
     let choice_for_dispatch = choice.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            router::dispatch_task(&state2, &api2, &account, &msg, &user_id, &choice_for_dispatch).await
+        if let Err(e) = router::dispatch_task(
+            &state2,
+            &api2,
+            &account,
+            &msg,
+            &user_id,
+            &choice_for_dispatch,
+        )
+        .await
         {
             tracing::warn!("feishu: dispatch from card action failed: {e:#}");
         }
@@ -247,7 +254,11 @@ async fn handle_deploy_approval(
     }
     let api = FeishuApi::new_archived(&account, state.db.clone());
     if decision == "cancel" {
-        if !state.db.cancel_deployment(deployment_id, &binding.user_id).await? {
+        if !state
+            .db
+            .cancel_deployment(deployment_id, &binding.user_id)
+            .await?
+        {
             return Ok(json!({
                 "toast": { "type": "warning", "content": "部署已处理、已过期或已被其他操作占用" }
             }));
@@ -261,13 +272,18 @@ async fn handle_deploy_approval(
         }));
     }
 
-    let Some(approved) = state.db.approve_deployment(deployment_id, &binding.user_id).await? else {
+    let Some(approved) = state
+        .db
+        .approve_deployment(deployment_id, &binding.user_id)
+        .await?
+    else {
         return Ok(json!({
             "toast": { "type": "warning", "content": "部署已处理、已过期或已被其他操作占用" }
         }));
     };
     if let Some(card_id) = card_message_id.as_deref() {
-        let card = build_confirm_done_card("Trace 发布", &approved.summary, "已批准，正在执行", "你");
+        let card =
+            build_confirm_done_card("Trace 发布", &approved.summary, "已批准，正在执行", "你");
         let _ = api.update_card(card_id, &card).await;
     }
     tokio::spawn(crate::deployment::start_deployment(state, approved));
@@ -277,7 +293,9 @@ async fn handle_deploy_approval(
 }
 
 fn card_message_id_from_event(ev: &CardActionEvent) -> Option<String> {
-    ev.context.as_ref().and_then(|context| context.open_message_id.clone())
+    ev.context
+        .as_ref()
+        .and_then(|context| context.open_message_id.clone())
 }
 
 fn card_action_claim_id(

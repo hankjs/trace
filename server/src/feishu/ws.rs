@@ -150,9 +150,12 @@ async fn get_conn_url(account: &FeishuAccount) -> Result<(String, ClientConfig)>
         .url
         .filter(|u| !u.is_empty())
         .ok_or_else(|| anyhow!("WS 端点响应缺少 URL"))?;
-    Ok((url, data.client_config.unwrap_or(ClientConfig {
-        ping_interval: None,
-    })))
+    Ok((
+        url,
+        data.client_config.unwrap_or(ClientConfig {
+            ping_interval: None,
+        }),
+    ))
 }
 
 fn parse_service_id(conn_url: &str) -> Result<i32> {
@@ -276,15 +279,13 @@ async fn dispatch_data_frame(
             });
             Value::Null
         }
-        "card" => {
-            match callback::handle_card_action(state, account, &payload).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    tracing::warn!(message_id, "feishu: card action failed: {e:#}");
-                    json!({ "toast": { "type": "error", "content": "操作处理失败，请直接文字回复" } })
-                }
+        "card" => match callback::handle_card_action(state, account, &payload).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                tracing::warn!(message_id, "feishu: card action failed: {e:#}");
+                json!({ "toast": { "type": "error", "content": "操作处理失败，请直接文字回复" } })
             }
-        }
+        },
         other => {
             tracing::debug!(frame_type = other, "feishu ws: unknown data frame type");
             Value::Null

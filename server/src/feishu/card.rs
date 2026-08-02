@@ -446,10 +446,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn throttle_merges_rapid_pushes() {
         let (update, calls, _count) = recorder();
-        let updater = ThrottledCardUpdater::new(
-            move |card| update(card),
-            Duration::from_secs(2),
-        );
+        let updater = ThrottledCardUpdater::new(move |card| update(card), Duration::from_secs(2));
         for i in 0..5 {
             updater.push(json!({ "n": i }));
         }
@@ -467,10 +464,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn finish_flushes_final_immediately() {
         let (update, calls, _count) = recorder();
-        let updater = ThrottledCardUpdater::new(
-            move |card| update(card),
-            Duration::from_secs(2),
-        );
+        let updater = ThrottledCardUpdater::new(move |card| update(card), Duration::from_secs(2));
         updater.push(json!({ "n": 1 }));
         updater.finish(json!({ "final": true })).await;
         let calls = calls.lock().unwrap();
@@ -481,10 +475,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancel_drops_pending() {
         let (update, calls, _count) = recorder();
-        let updater = ThrottledCardUpdater::new(
-            move |card| update(card),
-            Duration::from_secs(2),
-        );
+        let updater = ThrottledCardUpdater::new(move |card| update(card), Duration::from_secs(2));
         updater.push(json!({ "n": 1 }));
         tokio::task::yield_now().await; // 让 flusher 进入睡眠
         updater.cancel().await;

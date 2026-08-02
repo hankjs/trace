@@ -170,7 +170,14 @@ async fn run(
             status: TaskStatus::Running,
             progress: progress.percent(),
             detail: progress.detail(),
-            activities: progress.activities.iter().rev().take(3).rev().cloned().collect(),
+            activities: progress
+                .activities
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .cloned()
+                .collect(),
             footer: None,
         }));
     };
@@ -181,7 +188,14 @@ async fn run(
         let snapshot = ProgressSnapshot {
             percent: progress.percent(),
             detail: progress.detail(),
-            activities: progress.activities.iter().rev().take(3).rev().cloned().collect(),
+            activities: progress
+                .activities
+                .iter()
+                .rev()
+                .take(3)
+                .rev()
+                .cloned()
+                .collect(),
             started_at: started,
         };
         let state = state.clone();
@@ -238,7 +252,10 @@ async fn run(
                             "任务已结束，但没有收到完成事件，请用 /status 确认结果".to_string()
                         } else {
                             let (body, _) = extract_file_markers(final_text.trim());
-                            format!("{}\n\n（未收到完成事件，以上为已产出内容）", truncate_final(&body))
+                            format!(
+                                "{}\n\n（未收到完成事件，以上为已产出内容）",
+                                truncate_final(&body)
+                            )
                         };
                         let _ = api.reply_text(&message_id, &tail, in_thread).await;
                         break 'outer;
@@ -275,9 +292,20 @@ async fn run(
                     push_running(&progress);
                     publish(&progress).await;
                 }
-                AgentEvent::AskUser { question, options, kind, .. } => {
-                    let is_quant = kind.as_deref().is_some_and(|k| k.starts_with("quant_confirm:"));
-                    let title = if is_quant { "高成本操作确认" } else { "需要你的输入" };
+                AgentEvent::AskUser {
+                    question,
+                    options,
+                    kind,
+                    ..
+                } => {
+                    let is_quant = kind
+                        .as_deref()
+                        .is_some_and(|k| k.starts_with("quant_confirm:"));
+                    let title = if is_quant {
+                        "高成本操作确认"
+                    } else {
+                        "需要你的输入"
+                    };
                     let hint = if is_quant {
                         Some("点击按钮或回复文字作答；回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作".to_string())
                     } else {
@@ -309,7 +337,11 @@ async fn run(
                     progress.push_activity("等待用户确认".to_string());
                     publish(&progress).await;
                 }
-                AgentEvent::Metrics { input_tokens: it, output_tokens: ot, .. } => {
+                AgentEvent::Metrics {
+                    input_tokens: it,
+                    output_tokens: ot,
+                    ..
+                } => {
                     llm_calls += 1;
                     input_tokens += it;
                     output_tokens += ot;
@@ -334,7 +366,10 @@ async fn run(
                             status: TaskStatus::Success,
                             progress: 100,
                             detail: "执行完成".to_string(),
-                            activities: vec![progress.summary_line()].into_iter().filter(|s| !s.is_empty()).collect(),
+                            activities: vec![progress.summary_line()]
+                                .into_iter()
+                                .filter(|s| !s.is_empty())
+                                .collect(),
                             footer: Some(footer.clone()),
                         }))
                         .await;
@@ -353,13 +388,18 @@ async fn run(
                     break;
                 }
                 AgentEvent::RunFailed { message, .. } => {
+                    // 保留失败前的真实进度和工具摘要：写死 0% 会让"跑了很久才失败"
+                    // 看起来像"根本没跑起来"，掩盖了实际执行到哪一步。
                     updater
                         .finish(build_task_card(&TaskCardOptions {
                             title: "Agent 任务".to_string(),
                             status: TaskStatus::Failed,
-                            progress: 0,
+                            progress: progress.percent(),
                             detail: message.clone(),
-                            activities: vec![],
+                            activities: vec![progress.summary_line()]
+                                .into_iter()
+                                .filter(|s| !s.is_empty())
+                                .collect(),
                             footer: None,
                         }))
                         .await;
@@ -591,7 +631,10 @@ mod tests {
 
     #[test]
     fn detects_supported_image_types() {
-        assert_eq!(image_media_type(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(
+            image_media_type(b"\x89PNG\r\n\x1a\nrest"),
+            Some("image/png")
+        );
         assert_eq!(image_media_type(b"not-an-image"), None);
     }
 }

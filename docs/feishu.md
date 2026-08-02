@@ -126,6 +126,7 @@ hank-cli
 - **历史 server-agent 会话**：若话题仍映射到旧的 `server_agent=true` 且 backend 为 codex/claude/grok/kimi，server **拒绝静默复用**，要求发送 `/new` 转为 client-only 会话。
 - **路径边界**：server **不会**把 wananyun 上的 worktree 绝对路径下发给本机；`hank-cli` 只在注册 `work_dir` 内解析 cwd（缺省即 work_dir 根）。Codex 另以 `workspace-write` 限制写入；Claude/Grok/Kimi 权限模式由各自 CLI 负责。`agent_backends` 是严格 allowlist，未知值会被丢弃。
 - **取消与终态**：`/stop` 向同一节点下发 `agent_cancel` 并终止进程组；节点离线、结果通道中断或超时时卡片/回复会标失败，不吞错、不误报成功。
+- **输出闸门**：CLI 输出分两级限制。单行超 `agent_max_line_mib`（默认 1 MiB）只丢该行并继续执行——`stream-json` 下一条 tool_result 可能带整个文件内容，探索型任务撞线是常态，不按异常处理；整流累计超 `agent_max_stream_mib`（默认 64 MiB）才是 runaway，终止进程组并标失败。回传 server 的 stdout 只保留**尾部** 256 KiB（`final_text` 兜底解析要的 `result` 事件在流末尾）。超限失败时已产出的 `final_text` 会先落库成 assistant 消息再报错，不整轮丢弃。
 - **命令边界**：client-only 会话不支持 `/diff` `/test` `/deploy` `/rollback`（这些命令面向 server worktree 部署流程）。请在本机工作目录自行查看变更、跑测试或部署。
 
 ## 四、wananyun server Agent
@@ -175,7 +176,7 @@ execution_user = "hank-build"
 agent_cli_root = "/opt/hank-agent-cli"
 agent_state_root = "/opt/hank-agent-state"
 agent_timeout_secs = 1800
-agent_output_limit_bytes = 2097152
+agent_output_limit_bytes = 67108864
 agent_sandbox_bin = "/usr/bin/bwrap"
 deploy_use_sudo = true
 approval_ttl_secs = 600

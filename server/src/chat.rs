@@ -286,7 +286,9 @@ pub async fn run_chat_turn(
     let conversation_agent = routed_agent_kind
         .map(|kind| kind == "conversation")
         .unwrap_or(false);
-    let quant_code_agent = routed_agent_kind.map(|kind| kind == "quant_code").unwrap_or(false);
+    let quant_code_agent = routed_agent_kind
+        .map(|kind| kind == "quant_code")
+        .unwrap_or(false);
     let legacy_repository_agent = repository_workspace && routed_agent_kind.is_none();
 
     // Check if this session has a pending ask_user state.
@@ -316,8 +318,8 @@ pub async fn run_chat_turn(
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
         let token = opts.auth_token.clone();
         let checksum_store = new_checksum_store();
-        let execution_user = server_agent_session
-            .then(|| state.config.server_agent.execution_user.clone());
+        let execution_user =
+            server_agent_session.then(|| state.config.server_agent.execution_user.clone());
         // fs/shell 类工具：绑定 exec_client_id 的会话改用远程代理工具，
         // 在桌面 client 本地执行；test_runner 远程会话不提供（可用 shell 跑测试）
         let mut t: Vec<Arc<dyn Tool>> = match (&exec_client_id, &session_user_id) {
@@ -364,7 +366,7 @@ pub async fn run_chat_turn(
                     Arc::new(WebFetchTool::new()),
                     Arc::new(test_runner),
                 ]
-            },
+            }
         };
         t.push(Arc::new(UpdateSpecTool::new(
             base_url.clone(),
@@ -908,7 +910,9 @@ fn load_server_agent_instructions(
     work_dir: &Option<String>,
     include_quant: bool,
 ) -> Vec<code_agent::PromptSegment> {
-    let Some(work_dir) = work_dir else { return Vec::new() };
+    let Some(work_dir) = work_dir else {
+        return Vec::new();
+    };
     let root = std::path::Path::new(work_dir);
     let mut segments = Vec::new();
     let mut instruction_files = vec![
@@ -923,10 +927,12 @@ fn load_server_agent_instructions(
     }
     for (name, path) in instruction_files {
         match std::fs::read_to_string(&path) {
-            Ok(content) => segments.push(code_agent::PromptSegment::Dynamic(
-                format!("项目指令 {name}:\n{content}"),
-            )),
-            Err(e) => tracing::debug!(path = %path.display(), "server agent instruction unavailable: {e}"),
+            Ok(content) => segments.push(code_agent::PromptSegment::Dynamic(format!(
+                "项目指令 {name}:\n{content}"
+            ))),
+            Err(e) => {
+                tracing::debug!(path = %path.display(), "server agent instruction unavailable: {e}")
+            }
         }
     }
     segments.push(code_agent::PromptSegment::Dynamic(
@@ -1463,18 +1469,17 @@ mod tests {
             tools: vec![],
             skills,
         };
-        let (prompt, named) = code_agent::build_layered_prompt(
-            Some("base prompt"),
-            Some(&runtime),
-            None,
-            &segments,
-        );
+        let (prompt, named) =
+            code_agent::build_layered_prompt(Some("base prompt"), Some(&runtime), None, &segments);
         // project segment 存在，且 runtime 技能索引包含 quant-research
         assert!(
             named.iter().any(|s| s.name == "project"),
             "project segment should exist"
         );
-        assert!(prompt.contains("quant-research"), "prompt should reference quant-research");
+        assert!(
+            prompt.contains("quant-research"),
+            "prompt should reference quant-research"
+        );
         assert!(
             prompt.contains("S1 | 用户停止 / 会话结束"),
             "prompt should contain stop condition S1"
@@ -1532,12 +1537,8 @@ mod tests {
             tools: vec![],
             skills,
         };
-        let (prompt, named) = code_agent::build_layered_prompt(
-            Some("base prompt"),
-            Some(&runtime),
-            None,
-            &segments,
-        );
+        let (prompt, named) =
+            code_agent::build_layered_prompt(Some("base prompt"), Some(&runtime), None, &segments);
         assert!(!named.iter().any(|s| s.name == "project"));
         assert!(!prompt.contains("quant-research"));
         assert!(!prompt.contains("S1 | 用户停止 / 会话结束"));
@@ -1586,7 +1587,11 @@ mod tests {
         // 微信入口 5 分钟超时文案不应包含交易指令类措辞。
         let msg = "待确认单已超时（5 分钟），未执行高成本量化操作。如需执行请重新发起工具调用。";
         for phrase in ["已下单", "建议买入", "建议卖出"] {
-            assert!(!msg.contains(phrase), "timeout message contains forbidden phrase '{}'", phrase);
+            assert!(
+                !msg.contains(phrase),
+                "timeout message contains forbidden phrase '{}'",
+                phrase
+            );
         }
     }
 

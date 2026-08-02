@@ -15,7 +15,10 @@ const SNAP_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
 const TERM_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn err_out(content: impl Into<String>) -> ToolOutput {
-    ToolOutput { content: content.into(), is_error: true }
+    ToolOutput {
+        content: content.into(),
+        is_error: true,
+    }
 }
 
 /// 写临时 PNG，返回绝对路径（pusher 按 [file:] 约定读取回传）
@@ -102,7 +105,12 @@ impl TerminalSnapshotTool {
     }
 
     /// 派发 terminal_* 工具调用到 client，取文本结果
-    async fn dispatch_text(&self, client_id: &str, tool: &str, input: Value) -> Result<String, String> {
+    async fn dispatch_text(
+        &self,
+        client_id: &str,
+        tool: &str,
+        input: Value,
+    ) -> Result<String, String> {
         match crate::remote_exec::dispatch_tool_call(
             &self.state,
             &self.user_id,
@@ -140,7 +148,10 @@ fn resolve_prefix(terms: &[Value], prefix: Option<&str>) -> Result<String, Strin
             let matches: Vec<&str> = ids.iter().copied().filter(|id| id.starts_with(p)).collect();
             match matches.len() {
                 1 => Ok(matches[0].to_string()),
-                0 => Err(format!("没有找到 id 以 {p} 开头的终端会话：\n{}", candidates(&ids))),
+                0 => Err(format!(
+                    "没有找到 id 以 {p} 开头的终端会话：\n{}",
+                    candidates(&ids)
+                )),
                 _ => Err(format!(
                     "id 前缀 {p} 匹配到多个会话，请多输几位：\n{}",
                     candidates(&matches)
@@ -186,12 +197,19 @@ impl Tool for TerminalSnapshotTool {
     }
 
     async fn execute(&self, input: Value) -> Result<ToolOutput> {
-        let prefix = input["id"].as_str().map(str::trim).filter(|s| !s.is_empty());
-        let Some(client) = crate::remote_exec::pick_online_client(&self.state, &self.user_id).await else {
+        let prefix = input["id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(client) = crate::remote_exec::pick_online_client(&self.state, &self.user_id).await
+        else {
             return Ok(err_out("桌面 client 不在线，无法截取终端屏幕"));
         };
         // 列会话并解析 id 前缀
-        let list = match self.dispatch_text(&client.id, "terminal_list", json!({})).await {
+        let list = match self
+            .dispatch_text(&client.id, "terminal_list", json!({}))
+            .await
+        {
             Ok(c) => c,
             Err(e) => return Ok(err_out(format!("获取终端列表失败：{e}"))),
         };
@@ -205,7 +223,11 @@ impl Tool for TerminalSnapshotTool {
         };
         // raw=true：client 返回带 SGR 转义码的当前屏幕快照，server 本地渲染成 PNG
         let snap = match self
-            .dispatch_text(&client.id, "terminal_read", json!({ "id": id, "raw": true }))
+            .dispatch_text(
+                &client.id,
+                "terminal_read",
+                json!({ "id": id, "raw": true }),
+            )
             .await
         {
             Ok(c) => c,
@@ -239,6 +261,8 @@ mod tests {
         assert!(msg.contains("多个终端会话"));
         assert!(msg.contains("a1b2c3d4"));
         assert_eq!(resolve_prefix(&terms, Some("e5")).unwrap(), "e5f6a7b8");
-        assert!(resolve_prefix(&terms, Some("zz")).unwrap_err().contains("没有找到"));
+        assert!(resolve_prefix(&terms, Some("zz"))
+            .unwrap_err()
+            .contains("没有找到"));
     }
 }

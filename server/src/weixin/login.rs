@@ -29,9 +29,14 @@ pub struct LoginEntry {
 pub enum LoginStatus {
     Waiting,
     Scanned,
-    Confirmed { account_id: String, ilink_bot_id: String },
+    Confirmed {
+        account_id: String,
+        ilink_bot_id: String,
+    },
     Expired,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// 发起一次登录：取二维码，登记 login_id。
@@ -81,7 +86,10 @@ pub async fn poll(state: &Arc<AppState>, login_id: &str) -> Result<LoginStatus> 
 
     let qrcode = {
         let logins = state.weixin_logins.read().await;
-        logins.get(login_id).map(|e| e.qrcode.clone()).unwrap_or_default()
+        logins
+            .get(login_id)
+            .map(|e| e.qrcode.clone())
+            .unwrap_or_default()
     };
 
     let client = IlinkClient::new();
@@ -95,7 +103,9 @@ pub async fn poll(state: &Arc<AppState>, login_id: &str) -> Result<LoginStatus> 
                 entry.poll_in_flight = false;
                 return Ok(entry.status.clone());
             }
-            return Ok(LoginStatus::Error { message: e.to_string() });
+            return Ok(LoginStatus::Error {
+                message: e.to_string(),
+            });
         }
     };
 
@@ -104,18 +114,25 @@ pub async fn poll(state: &Arc<AppState>, login_id: &str) -> Result<LoginStatus> 
         "scaned" => finish_poll(state, login_id, LoginStatus::Scanned).await,
         "expired" => finish_poll(state, login_id, LoginStatus::Expired).await,
         "confirmed" => {
-            let (bot_token, ilink_bot_id, baseurl) = match (resp.bot_token, resp.ilink_bot_id, resp.baseurl) {
-                (Some(t), Some(b), Some(u)) => (t, b, u),
-                _ => {
-                    let status = LoginStatus::Error {
-                        message: "登录确认但响应缺少 bot_token/ilink_bot_id/baseurl".to_string(),
-                    };
-                    return finish_poll(state, login_id, status).await;
-                }
-            };
+            let (bot_token, ilink_bot_id, baseurl) =
+                match (resp.bot_token, resp.ilink_bot_id, resp.baseurl) {
+                    (Some(t), Some(b), Some(u)) => (t, b, u),
+                    _ => {
+                        let status = LoginStatus::Error {
+                            message: "登录确认但响应缺少 bot_token/ilink_bot_id/baseurl"
+                                .to_string(),
+                        };
+                        return finish_poll(state, login_id, status).await;
+                    }
+                };
             let account_id = match state
                 .db
-                .create_weixin_account(&ilink_bot_id, &bot_token, &baseurl, resp.ilink_user_id.as_deref())
+                .create_weixin_account(
+                    &ilink_bot_id,
+                    &bot_token,
+                    &baseurl,
+                    resp.ilink_user_id.as_deref(),
+                )
                 .await
             {
                 Ok(id) => id,
@@ -156,7 +173,11 @@ pub async fn poll(state: &Arc<AppState>, login_id: &str) -> Result<LoginStatus> 
     }
 }
 
-async fn finish_poll(state: &Arc<AppState>, login_id: &str, status: LoginStatus) -> Result<LoginStatus> {
+async fn finish_poll(
+    state: &Arc<AppState>,
+    login_id: &str,
+    status: LoginStatus,
+) -> Result<LoginStatus> {
     let mut logins = state.weixin_logins.write().await;
     let entry = logins
         .get_mut(login_id)

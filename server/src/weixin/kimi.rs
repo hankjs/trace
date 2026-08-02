@@ -24,9 +24,15 @@ async fn dispatch_to(
     tool: &str,
     input: serde_json::Value,
 ) -> Result<String> {
-    let result =
-        crate::remote_exec::dispatch_tool_call(state, user_id, client_id, tool, input, TERM_CMD_TIMEOUT)
-            .await?;
+    let result = crate::remote_exec::dispatch_tool_call(
+        state,
+        user_id,
+        client_id,
+        tool,
+        input,
+        TERM_CMD_TIMEOUT,
+    )
+    .await?;
     if result.is_error {
         Err(anyhow!(result.content))
     } else {
@@ -41,13 +47,19 @@ async fn alive_term(
     client_id: &str,
     term_id: &str,
 ) -> Option<serde_json::Value> {
-    let content = dispatch_to(state, user_id, client_id, "terminal_list", serde_json::json!({}))
-        .await
-        .ok()?;
+    let content = dispatch_to(
+        state,
+        user_id,
+        client_id,
+        "terminal_list",
+        serde_json::json!({}),
+    )
+    .await
+    .ok()?;
     let terms: Vec<serde_json::Value> = serde_json::from_str(&content).ok()?;
-    terms.into_iter().find(|t| {
-        t["id"].as_str() == Some(term_id) && t["alive"].as_bool().unwrap_or(false)
-    })
+    terms
+        .into_iter()
+        .find(|t| t["id"].as_str() == Some(term_id) && t["alive"].as_bool().unwrap_or(false))
 }
 
 /// 托管会话状态描述（/status、/kimi 复用）；无映射时返回 None
@@ -72,7 +84,10 @@ pub async fn start_session(state: &Arc<AppState>, binding: &WeixinBinding) -> Re
     // 已有映射且终端存活：不重复开
     if let Some(ref m) = mapping {
         if let (Some(cid), Some(tid)) = (m.client_id.clone(), m.term_id.clone()) {
-            if alive_term(state, &binding.user_id, &cid, &tid).await.is_some() {
+            if alive_term(state, &binding.user_id, &cid, &tid)
+                .await
+                .is_some()
+            {
                 let short = &tid[..tid.len().min(8)];
                 return Ok(format!(
                     "kimi 托管会话已在运行（终端 {short}），直接发送 kimi <文本> 即可交互，/kstop 结束"
@@ -127,7 +142,11 @@ pub async fn start_session(state: &Arc<AppState>, binding: &WeixinBinding) -> Re
 
 /// `kimi <文本>` 前缀消息：原样写入托管终端（末尾补回车）。
 /// 返回 None 表示成功（静默，无感知）；Some 为需要回复给用户的错误/提示文案。
-pub async fn send_input(state: &Arc<AppState>, binding: &WeixinBinding, text: &str) -> Option<String> {
+pub async fn send_input(
+    state: &Arc<AppState>,
+    binding: &WeixinBinding,
+    text: &str,
+) -> Option<String> {
     let mapping = match state.db.get_weixin_kimi(&binding.id).await {
         Ok(Some(m)) => m,
         _ => return Some("没有运行中的 kimi 托管会话，发送 /kimi 先开启".to_string()),
@@ -136,7 +155,10 @@ pub async fn send_input(state: &Arc<AppState>, binding: &WeixinBinding, text: &s
         (Some(c), Some(t)) => (c, t),
         _ => return Some("没有运行中的 kimi 托管会话，发送 /kimi 先开启".to_string()),
     };
-    if alive_term(state, &binding.user_id, &client_id, &term_id).await.is_none() {
+    if alive_term(state, &binding.user_id, &client_id, &term_id)
+        .await
+        .is_none()
+    {
         return Some("kimi 托管会话已退出，发送 /kimi 重新开启".to_string());
     }
     match dispatch_to(

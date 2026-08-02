@@ -1,16 +1,11 @@
 use crate::provider_registry;
 use crate::response::{self as R};
 use crate::AppState;
-use axum::{
-    extract::State,
-    response::IntoResponse,
-    body::Body,
-    Json,
-};
+use axum::http::Response;
+use axum::{body::Body, extract::State, response::IntoResponse, Json};
+use code_tools::{read_file::ReadFileTool, search::SearchTool, Tool};
 use futures::StreamExt;
 use hank_provider::{CompletionRequest, ContentBlock, Message, Role, StreamEvent, ToolDefinition};
-use code_tools::{read_file::ReadFileTool, search::SearchTool, Tool};
-use axum::http::Response;
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -168,7 +163,9 @@ pub async fn tool_exec_handler(
     };
 
     match result {
-        Ok(output) => R::ok(serde_json::json!({ "content": output.content, "is_error": output.is_error })),
+        Ok(output) => {
+            R::ok(serde_json::json!({ "content": output.content, "is_error": output.is_error }))
+        }
         Err(e) => R::ok(serde_json::json!({ "content": e.to_string(), "is_error": true })),
     }
 }

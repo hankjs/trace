@@ -47,7 +47,11 @@ pub async fn create_account(
         return R::bad_request(format!("飞书凭证校验失败：{e:#}"));
     }
     let name = body.name.unwrap_or_default();
-    let id = match state.db.create_feishu_account(&name, app_id, app_secret).await {
+    let id = match state
+        .db
+        .create_feishu_account(&name, app_id, app_secret)
+        .await
+    {
         Ok(id) => id,
         Err(e) => return R::internal_error(e),
     };

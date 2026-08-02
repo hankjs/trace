@@ -39,11 +39,15 @@ pub async fn quant_signal_brief(state: Arc<AppState>) -> Result<Value> {
         .as_ref()
         .ok_or_else(|| anyhow!("quant_a2a 未配置，跳过信号简报"))?;
     let base = quant.base_url.trim_end_matches('/');
-    let today = TZ.from_utc_datetime(&chrono::Utc::now().naive_utc()).date_naive();
+    let today = TZ
+        .from_utc_datetime(&chrono::Utc::now().naive_utc())
+        .date_naive();
 
     let bindings = state.db.list_feishu_bindings().await?;
     if bindings.is_empty() {
-        return Ok(json!({ "date": today.to_string(), "skipped": true, "reason": "无飞书绑定用户" }));
+        return Ok(
+            json!({ "date": today.to_string(), "skipped": true, "reason": "无飞书绑定用户" }),
+        );
     }
 
     let http = reqwest::Client::builder()
@@ -82,8 +86,9 @@ async fn push_user_brief(
     binding: &hank_db::FeishuBindingWithUsername,
     today: chrono::NaiveDate,
 ) -> Result<bool> {
-    let jwt = crate::auth::sign_internal_jwt(&state.jwt_secret, &binding.user_id, &binding.username)
-        .context("签内部 JWT 失败")?;
+    let jwt =
+        crate::auth::sign_internal_jwt(&state.jwt_secret, &binding.user_id, &binding.username)
+            .context("签内部 JWT 失败")?;
 
     let resp = http
         .get(format!("{base}/api/signals?date={today}&limit=100"))
@@ -108,8 +113,12 @@ async fn push_user_brief(
         bail!("飞书账号已停用: {}", account.app_id);
     }
     let api = FeishuApi::new_archived(&account, state.db.clone());
-    api.send_text("open_id", &binding.open_id, &format_brief(today, &signals.items))
-        .await?;
+    api.send_text(
+        "open_id",
+        &binding.open_id,
+        &format_brief(today, &signals.items),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -164,7 +173,10 @@ mod tests {
                 reason_text: None,
             },
         ];
-        let text = format_brief(chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(), &items);
+        let text = format_brief(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            &items,
+        );
         assert!(text.contains("盘后信号简报（2026-07-31）"));
         assert!(text.contains("买入 浦发银行（sh.600000）【双均线】@ 10.50"));
         assert!(text.contains("5 日均线上穿"));
@@ -183,7 +195,10 @@ mod tests {
                 reason_text: None,
             })
             .collect();
-        let text = format_brief(chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(), &items);
+        let text = format_brief(
+            chrono::NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            &items,
+        );
         assert!(text.contains("共 30 条"));
     }
 }

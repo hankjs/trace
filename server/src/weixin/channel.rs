@@ -62,7 +62,9 @@ pub async fn push_history(state: &AppState, binding_id: &str, user: &str, assist
         assistant: truncate(assistant, HISTORY_MSG_MAX),
     };
     let mut map = state.weixin_channel_history.write().await;
-    let h = map.entry(binding_id.to_string()).or_insert_with(VecDeque::new);
+    let h = map
+        .entry(binding_id.to_string())
+        .or_insert_with(VecDeque::new);
     h.push_back(turn);
     while h.len() > MAX_HISTORY_TURNS {
         h.pop_front();
@@ -71,7 +73,11 @@ pub async fn push_history(state: &AppState, binding_id: &str, user: &str, assist
 
 /// 清空渠道记忆（/new 开新会话时调用）。
 pub async fn clear_history(state: &AppState, binding_id: &str) {
-    state.weixin_channel_history.write().await.remove(binding_id);
+    state
+        .weixin_channel_history
+        .write()
+        .await
+        .remove(binding_id);
 }
 
 /// 渠道 agent 的路由决策。
@@ -152,11 +158,15 @@ async fn try_decide(
             [
                 Message {
                     role: Role::User,
-                    content: vec![ContentBlock::Text { text: t.user.clone() }],
+                    content: vec![ContentBlock::Text {
+                        text: t.user.clone(),
+                    }],
                 },
                 Message {
                     role: Role::Assistant,
-                    content: vec![ContentBlock::Text { text: t.assistant.clone() }],
+                    content: vec![ContentBlock::Text {
+                        text: t.assistant.clone(),
+                    }],
                 },
             ]
         })
@@ -237,7 +247,11 @@ async fn build_system_prompt(
             .take(5)
             .enumerate()
             .map(|(i, s)| {
-                let title = if s.title.is_empty() { "(无标题)" } else { &s.title };
+                let title = if s.title.is_empty() {
+                    "(无标题)"
+                } else {
+                    &s.title
+                };
                 format!(
                     "{}. {}（ID：{}，更新于 {}）",
                     i + 1,
@@ -251,7 +265,8 @@ async fn build_system_prompt(
     };
 
     // 桌面 client 在线状态：决定本地执行类任务能否 dispatch
-    let client_status = match crate::remote_exec::pick_online_client(state, &binding.user_id).await {
+    let client_status = match crate::remote_exec::pick_online_client(state, &binding.user_id).await
+    {
         Some(c) => format!(
             "在线（主机：{}，工作目录：{}）",
             c.hostname.as_deref().unwrap_or("未知"),
@@ -309,8 +324,12 @@ fn parse_decision(output: &str) -> Result<ChannelAction> {
         .and_then(|s| s.strip_suffix("```"))
         .unwrap_or(s)
         .trim();
-    let start = s.find('{').ok_or_else(|| anyhow!("no JSON object in output"))?;
-    let end = s.rfind('}').ok_or_else(|| anyhow!("no JSON object in output"))?;
+    let start = s
+        .find('{')
+        .ok_or_else(|| anyhow!("no JSON object in output"))?;
+    let end = s
+        .rfind('}')
+        .ok_or_else(|| anyhow!("no JSON object in output"))?;
     let action: ChannelAction = serde_json::from_str(&s[start..=end])?;
     Ok(action)
 }

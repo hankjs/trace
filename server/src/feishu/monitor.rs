@@ -73,7 +73,10 @@ async fn monitor_loop(state: Arc<AppState>, account: FeishuAccount, token: Arc<C
         match result {
             Ok(()) => break, // 正常关闭（cancel）
             Err(e) => {
-                tracing::warn!(account_id, "feishu ws disconnected: {e:#}, retry in {backoff:?}");
+                tracing::warn!(
+                    account_id,
+                    "feishu ws disconnected: {e:#}, retry in {backoff:?}"
+                );
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = tokio::time::sleep(backoff) => {}
@@ -85,7 +88,10 @@ async fn monitor_loop(state: Arc<AppState>, account: FeishuAccount, token: Arc<C
 
     // 清理注册表（仅当表里还是自己这个 token，避免误删重启后的新 monitor）
     let mut monitors = state.feishu_monitors.write().await;
-    if monitors.get(&account_id).is_some_and(|t| Arc::ptr_eq(t, &token)) {
+    if monitors
+        .get(&account_id)
+        .is_some_and(|t| Arc::ptr_eq(t, &token))
+    {
         monitors.remove(&account_id);
     }
     tracing::info!(account_id, "feishu monitor exited");

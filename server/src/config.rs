@@ -119,8 +119,10 @@ fn default_agent_timeout_secs() -> u64 {
     30 * 60
 }
 
+/// 外部 Agent stdout 上限（runaway 保护）。JSONL 是逐行转发即弃的，不占内存，
+/// 所以这里只需要防跑飞；stream-json 下探索型任务几 MiB 起步，2 MiB 会误杀。
 fn default_agent_output_limit_bytes() -> usize {
-    2 * 1024 * 1024
+    64 * 1024 * 1024
 }
 
 fn default_agent_sandbox_bin() -> String {

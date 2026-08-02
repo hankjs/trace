@@ -31,13 +31,17 @@ pub async fn create_doc(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateDocRequest>,
 ) -> axum::response::Response {
-    match state.db.create_requirement_doc(
-        &body.change_id,
-        body.session_id.as_deref(),
-        &body.name,
-        &body.content,
-        body.progress_json.as_deref(),
-    ).await {
+    match state
+        .db
+        .create_requirement_doc(
+            &body.change_id,
+            body.session_id.as_deref(),
+            &body.name,
+            &body.content,
+            body.progress_json.as_deref(),
+        )
+        .await
+    {
         Ok(doc) => R::created(doc),
         Err(e) => R::internal_error(e),
     }
@@ -49,13 +53,17 @@ pub async fn update_doc(
     Json(body): Json<UpdateDocRequest>,
 ) -> axum::response::Response {
     let source = body.source.as_deref().unwrap_or("system");
-    match state.db.update_requirement_doc(
-        &id,
-        &body.content,
-        body.progress_json.as_deref(),
-        body.status.as_deref(),
-        source,
-    ).await {
+    match state
+        .db
+        .update_requirement_doc(
+            &id,
+            &body.content,
+            body.progress_json.as_deref(),
+            body.status.as_deref(),
+            source,
+        )
+        .await
+    {
         Ok(()) => R::no_content(),
         Err(e) => R::internal_error(e),
     }
@@ -96,8 +104,17 @@ pub async fn admin_list_docs(
 ) -> axum::response::Response {
     let page = q.page.unwrap_or(1);
     let page_size = q.page_size.unwrap_or(20);
-    match state.db.list_requirement_docs(q.search.as_deref(), q.status.as_deref(), page, page_size).await {
-        Ok((items, total)) => R::ok(PaginatedDocs { items, total, page, page_size }),
+    match state
+        .db
+        .list_requirement_docs(q.search.as_deref(), q.status.as_deref(), page, page_size)
+        .await
+    {
+        Ok((items, total)) => R::ok(PaginatedDocs {
+            items,
+            total,
+            page,
+            page_size,
+        }),
         Err(e) => R::internal_error(e),
     }
 }
@@ -135,8 +152,17 @@ pub async fn admin_list_tasks(
 ) -> axum::response::Response {
     let page = q.page.unwrap_or(1);
     let page_size = q.page_size.unwrap_or(20);
-    match state.db.list_all_tasks(q.status.as_deref(), q.change_id.as_deref(), page, page_size).await {
-        Ok((items, total)) => R::ok(PaginatedTasks { items, total, page, page_size }),
+    match state
+        .db
+        .list_all_tasks(q.status.as_deref(), q.change_id.as_deref(), page, page_size)
+        .await
+    {
+        Ok((items, total)) => R::ok(PaginatedTasks {
+            items,
+            total,
+            page,
+            page_size,
+        }),
         Err(e) => R::internal_error(e),
     }
 }

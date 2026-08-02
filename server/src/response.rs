@@ -65,10 +65,7 @@ pub fn internal_error(e: impl ToString) -> axum::response::Response {
         caller = %format!("{}:{}", caller.file(), caller.line()),
         "internal server error"
     );
-    err(
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "internal server error",
-    )
+    err(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
 }
 
 pub fn not_found(msg: impl ToString) -> axum::response::Response {

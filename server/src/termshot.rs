@@ -68,8 +68,8 @@ pub fn render_png(sgr_text: &str) -> Result<Vec<u8>> {
     let tree = usvg::Tree::from_str(&svg, &opt)?;
     let size = tree.size();
     let (w, h) = (size.width().ceil() as u32, size.height().ceil() as u32);
-    let mut pixmap =
-        tiny_skia::Pixmap::new(w.max(1), h.max(1)).ok_or_else(|| anyhow!("创建画布失败 {w}x{h}"))?;
+    let mut pixmap = tiny_skia::Pixmap::new(w.max(1), h.max(1))
+        .ok_or_else(|| anyhow!("创建画布失败 {w}x{h}"))?;
     resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
     Ok(pixmap.encode_png()?)
 }
@@ -78,7 +78,13 @@ pub fn render_png(sgr_text: &str) -> Result<Vec<u8>> {
 pub fn strip_ansi(sgr_text: &str) -> String {
     parse(sgr_text)
         .iter()
-        .map(|l| l.iter().map(|c| c.ch).collect::<String>().trim_end().to_string())
+        .map(|l| {
+            l.iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -216,7 +222,9 @@ fn hex([r, g, b]: [u8; 3]) -> String {
 }
 
 fn escape_xml(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// 单元格行 → SVG 文本（深色背景、等宽字体、相同颜色 run 合并 tspan、bg 色 rect 垫底）
@@ -266,7 +274,11 @@ fn build_svg(lines: &[Vec<Cell>]) -> String {
                 run.push(line[col].ch);
                 col += 1;
             }
-            let bold = if style.bold { r#" font-weight="bold""# } else { "" };
+            let bold = if style.bold {
+                r#" font-weight="bold""#
+            } else {
+                ""
+            };
             text.push_str(&format!(
                 r#"<tspan x="{:.1}" fill="{}"{bold}>{}</tspan>"#,
                 PAD + start as f32 * CHAR_W,
@@ -303,7 +315,14 @@ mod tests {
     #[test]
     fn parse_bold_and_bright() {
         let line = first_line("\x1b[1;32mX\x1b[22mY\x1b[92mZ");
-        assert_eq!(line[0].style, CellStyle { fg: Some(Color::Ansi(2)), bg: None, bold: true });
+        assert_eq!(
+            line[0].style,
+            CellStyle {
+                fg: Some(Color::Ansi(2)),
+                bg: None,
+                bold: true
+            }
+        );
         assert!(!line[1].style.bold);
         assert_eq!(line[2].style.fg, Some(Color::Ansi(10)));
     }
@@ -360,8 +379,10 @@ mod tests {
             eprintln!("no system fonts found, skip render_smoke");
             return;
         }
-        let png = render_png("\x1b[1;32m$ cargo test\x1b[0m\n\x1b[38;5;208mwarning\x1b[0m: 中文输出 hello")
-            .unwrap();
+        let png = render_png(
+            "\x1b[1;32m$ cargo test\x1b[0m\n\x1b[38;5;208mwarning\x1b[0m: 中文输出 hello",
+        )
+        .unwrap();
         assert!(png.len() > 100);
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
     }

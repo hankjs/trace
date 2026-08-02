@@ -25,7 +25,10 @@ pub async fn snap_url(chrome_path: Option<&str>, url: &str) -> Result<Vec<u8>> {
     let chrome = resolve_chrome_path(chrome_path)?;
     match tokio::time::timeout(SNAP_TIMEOUT, snap_inner(&chrome, url)).await {
         Ok(r) => r,
-        Err(_) => Err(anyhow!("网页截图超时（>{}s）：{url}", SNAP_TIMEOUT.as_secs())),
+        Err(_) => Err(anyhow!(
+            "网页截图超时（>{}s）：{url}",
+            SNAP_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -42,12 +45,19 @@ fn resolve_chrome_path(chrome_path: Option<&str>) -> Result<String> {
     if std::path::Path::new(macos).exists() {
         return Ok(macos.to_string());
     }
-    for name in ["chromium", "chromium-browser", "google-chrome", "google-chrome-stable"] {
+    for name in [
+        "chromium",
+        "chromium-browser",
+        "google-chrome",
+        "google-chrome-stable",
+    ] {
         if let Some(p) = find_in_path(name) {
             return Ok(p);
         }
     }
-    Err(anyhow!("server 未安装 Chrome，请在 config.toml 配置 chrome_path"))
+    Err(anyhow!(
+        "server 未安装 Chrome，请在 config.toml 配置 chrome_path"
+    ))
 }
 
 fn find_in_path(name: &str) -> Option<String> {

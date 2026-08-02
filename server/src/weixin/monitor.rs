@@ -93,7 +93,10 @@ async fn monitor_loop(state: Arc<AppState>, account: WeixinAccount, token: Arc<C
             Ok(resp) => {
                 if resp.token_expired() {
                     tracing::warn!(account_id, "weixin bot token expired, disabling account");
-                    let _ = state.db.set_weixin_account_enabled(&account_id, false).await;
+                    let _ = state
+                        .db
+                        .set_weixin_account_enabled(&account_id, false)
+                        .await;
                     break;
                 }
                 backoff = BACKOFF_INIT;
@@ -101,7 +104,11 @@ async fn monitor_loop(state: Arc<AppState>, account: WeixinAccount, token: Arc<C
                 if let Some(new_buf) = resp.get_updates_buf {
                     if !new_buf.is_empty() && buf.as_deref() != Some(new_buf.as_str()) {
                         buf = Some(new_buf.clone());
-                        if let Err(e) = state.db.update_weixin_cursor(&account_id, Some(&new_buf)).await {
+                        if let Err(e) = state
+                            .db
+                            .update_weixin_cursor(&account_id, Some(&new_buf))
+                            .await
+                        {
                             tracing::warn!(account_id, "weixin: save cursor failed: {e:#}");
                         }
                     }
@@ -114,7 +121,10 @@ async fn monitor_loop(state: Arc<AppState>, account: WeixinAccount, token: Arc<C
                 }
             }
             Err(e) => {
-                tracing::warn!(account_id, "weixin getupdates error: {e:#}, retry in {backoff:?}");
+                tracing::warn!(
+                    account_id,
+                    "weixin getupdates error: {e:#}, retry in {backoff:?}"
+                );
                 tokio::select! {
                     _ = token.cancelled() => break,
                     _ = tokio::time::sleep(backoff) => {}
@@ -126,7 +136,10 @@ async fn monitor_loop(state: Arc<AppState>, account: WeixinAccount, token: Arc<C
 
     // 清理注册表（仅当表里还是自己这个 token，避免误删重启后的新 monitor）
     let mut monitors = state.weixin_monitors.write().await;
-    if monitors.get(&account_id).is_some_and(|t| Arc::ptr_eq(t, &token)) {
+    if monitors
+        .get(&account_id)
+        .is_some_and(|t| Arc::ptr_eq(t, &token))
+    {
         monitors.remove(&account_id);
     }
     tracing::info!(account_id, "weixin monitor exited");

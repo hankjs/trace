@@ -68,7 +68,16 @@ pub async fn create_change(
     Extension(_claims): Extension<Claims>,
     Json(body): Json<CreateChangeRequest>,
 ) -> impl IntoResponse {
-    match state.db.create_change(&body.name, body.work_dir.as_deref(), body.requirement_path.as_deref(), body.tasks_path.as_deref()).await {
+    match state
+        .db
+        .create_change(
+            &body.name,
+            body.work_dir.as_deref(),
+            body.requirement_path.as_deref(),
+            body.tasks_path.as_deref(),
+        )
+        .await
+    {
         Ok(change) => R::created(change),
         Err(e) => {
             let msg = e.to_string();
@@ -122,13 +131,21 @@ pub async fn get_change(
 
     let detail = ChangeDetail {
         change,
-        artifacts: artifacts.into_iter().map(|a| ArtifactSummary {
-            id: a.id,
-            artifact_type: a.artifact_type,
-            capability: a.capability,
-            updated_at: a.updated_at,
-        }).collect(),
-        task_counts: TaskCounts { total, done, in_progress, pending },
+        artifacts: artifacts
+            .into_iter()
+            .map(|a| ArtifactSummary {
+                id: a.id,
+                artifact_type: a.artifact_type,
+                capability: a.capability,
+                updated_at: a.updated_at,
+            })
+            .collect(),
+        task_counts: TaskCounts {
+            total,
+            done,
+            in_progress,
+            pending,
+        },
     };
 
     R::ok(detail)
@@ -150,7 +167,11 @@ pub async fn update_change(
             return R::internal_error(e);
         }
     }
-    match state.db.update_change(&id, body.name.as_deref(), body.status.as_deref()).await {
+    match state
+        .db
+        .update_change(&id, body.name.as_deref(), body.status.as_deref())
+        .await
+    {
         Ok(()) => R::no_content(),
         Err(e) => {
             let msg = e.to_string();
@@ -222,7 +243,16 @@ pub async fn archive_change(
             Ok(Some(s)) => s,
             Ok(None) => {
                 // Create new spec from artifact
-                match state.db.create_spec(capability, capability, &artifact.content, artifact.metadata.as_deref()).await {
+                match state
+                    .db
+                    .create_spec(
+                        capability,
+                        capability,
+                        &artifact.content,
+                        artifact.metadata.as_deref(),
+                    )
+                    .await
+                {
                     Ok(s) => s,
                     Err(e) => return R::internal_error(e),
                 };
@@ -232,19 +262,35 @@ pub async fn archive_change(
         };
 
         // Store snapshot of current spec
-        if let Err(e) = state.db.create_spec_version(&spec.id, spec.version, &spec.content, spec.metadata.as_deref(), Some(&change.id)).await {
+        if let Err(e) = state
+            .db
+            .create_spec_version(
+                &spec.id,
+                spec.version,
+                &spec.content,
+                spec.metadata.as_deref(),
+                Some(&change.id),
+            )
+            .await
+        {
             return R::internal_error(e);
         }
 
         // Merge: use LLM to intelligently merge, fallback to append
-        let merged = match llm_merge_specs(&state, &spec.content, &artifact.content, capability).await {
+        let merged = match llm_merge_specs(&state, &spec.content, &artifact.content, capability)
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 tracing::warn!("LLM merge failed for {capability}, falling back to append: {e:#}");
                 format!("{}\n\n{}", spec.content, artifact.content)
             }
         };
-        if let Err(e) = state.db.update_spec(&spec.id, Some(&merged), None, None).await {
+        if let Err(e) = state
+            .db
+            .update_spec(&spec.id, Some(&merged), None, None)
+            .await
+        {
             return R::internal_error(e);
         }
     }
@@ -264,7 +310,8 @@ async fn llm_merge_specs(
     new_content: &str,
     capability: &str,
 ) -> anyhow::Result<String> {
-    let (record, provider) = provider_registry::resolve_default(&state.db).await
+    let (record, provider) = provider_registry::resolve_default(&state.db)
+        .await
         .ok_or_else(|| anyhow::anyhow!("No provider available for spec merge"))?;
     let model = provider_registry::resolve_default_model(&record);
 
@@ -339,8 +386,22 @@ pub async fn create_artifact(
     Path(change_id): Path<String>,
     Json(body): Json<CreateArtifactRequest>,
 ) -> impl IntoResponse {
-    let metadata_str = body.metadata.as_ref().map(|m| serde_json::to_string(m).unwrap_or_default());
-    match state.db.create_artifact(&change_id, &body.artifact_type, body.capability.as_deref(), &body.content, metadata_str.as_deref(), body.status.as_deref()).await {
+    let metadata_str = body
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_default());
+    match state
+        .db
+        .create_artifact(
+            &change_id,
+            &body.artifact_type,
+            body.capability.as_deref(),
+            &body.content,
+            metadata_str.as_deref(),
+            body.status.as_deref(),
+        )
+        .await
+    {
         Ok(artifact) => R::created(artifact),
         Err(e) => {
             let msg = e.to_string();
@@ -372,14 +433,30 @@ pub async fn update_artifact(
     headers: HeaderMap,
     Json(body): Json<UpdateArtifactRequest>,
 ) -> impl IntoResponse {
-    let metadata_str = body.metadata.as_ref().map(|m| serde_json::to_string(m).unwrap_or_default());
-    match state.db.update_artifact(&artifact_id, body.content.as_deref(), metadata_str.as_deref(), None).await {
+    let metadata_str = body
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).unwrap_or_default());
+    match state
+        .db
+        .update_artifact(
+            &artifact_id,
+            body.content.as_deref(),
+            metadata_str.as_deref(),
+            None,
+        )
+        .await
+    {
         Ok(()) => {
             // Emit SSE event if called from agent tool
             if let Some(session_id) = headers.get("x-session-id").and_then(|v| v.to_str().ok()) {
                 // Get artifact type for the event
-                let artifact_type = state.db.get_artifact(&artifact_id).await
-                    .ok().flatten()
+                let artifact_type = state
+                    .db
+                    .get_artifact(&artifact_id)
+                    .await
+                    .ok()
+                    .flatten()
                     .map(|a| a.artifact_type)
                     .unwrap_or_default();
                 let event = AgentEvent::ArtifactUpdated {
@@ -462,7 +539,12 @@ pub async fn list_tasks(
                 group_name,
                 group_order,
                 tasks: vec![task],
-                counts: TaskCounts { total: 0, done: 0, in_progress: 0, pending: 0 },
+                counts: TaskCounts {
+                    total: 0,
+                    done: 0,
+                    in_progress: 0,
+                    pending: 0,
+                },
             });
         }
     }
@@ -471,7 +553,11 @@ pub async fn list_tasks(
     for group in &mut groups {
         group.counts.total = group.tasks.len() as i64;
         group.counts.done = group.tasks.iter().filter(|t| t.status == "done").count() as i64;
-        group.counts.in_progress = group.tasks.iter().filter(|t| t.status == "in_progress").count() as i64;
+        group.counts.in_progress = group
+            .tasks
+            .iter()
+            .filter(|t| t.status == "in_progress")
+            .count() as i64;
         group.counts.pending = group.counts.total - group.counts.done - group.counts.in_progress;
     }
 
@@ -484,8 +570,18 @@ pub async fn batch_create_tasks(
     Path(change_id): Path<String>,
     Json(body): Json<BatchCreateTasksRequest>,
 ) -> impl IntoResponse {
-    let tasks: Vec<(String, i32, i32, String, Option<String>)> = body.tasks.into_iter()
-        .map(|t| (t.group_name, t.group_order, t.task_order, t.title, t.description))
+    let tasks: Vec<(String, i32, i32, String, Option<String>)> = body
+        .tasks
+        .into_iter()
+        .map(|t| {
+            (
+                t.group_name,
+                t.group_order,
+                t.task_order,
+                t.title,
+                t.description,
+            )
+        })
         .collect();
     match state.db.batch_create_tasks(&change_id, &tasks).await {
         Ok(created) => R::created(created),
@@ -500,7 +596,17 @@ pub async fn update_task(
     headers: HeaderMap,
     Json(body): Json<UpdateTaskRequest>,
 ) -> impl IntoResponse {
-    match state.db.update_task(&task_id, body.status.as_deref(), body.title.as_deref(), body.description.as_deref(), None).await {
+    match state
+        .db
+        .update_task(
+            &task_id,
+            body.status.as_deref(),
+            body.title.as_deref(),
+            body.description.as_deref(),
+            None,
+        )
+        .await
+    {
         Ok(()) => {
             // Emit SSE event if called from agent tool
             if let Some(session_id) = headers.get("x-session-id").and_then(|v| v.to_str().ok()) {
@@ -560,7 +666,10 @@ pub async fn get_change_context(
     let mut ctx = format!("# Change: {}\n\n", change.name);
 
     // Specs
-    let spec_artifacts: Vec<_> = artifacts.iter().filter(|a| a.artifact_type == "spec").collect();
+    let spec_artifacts: Vec<_> = artifacts
+        .iter()
+        .filter(|a| a.artifact_type == "spec")
+        .collect();
     if !spec_artifacts.is_empty() {
         ctx.push_str("## Specs\n\n");
         for spec in spec_artifacts {
@@ -610,7 +719,19 @@ pub async fn start_explore(
 
     // Create a dedicated session for explore
     let work_dir = change.work_dir.as_deref();
-    let session = match state.db.create_session("", "", work_dir, Some(&claims.sub), None, Some("explore"), None).await {
+    let session = match state
+        .db
+        .create_session(
+            "",
+            "",
+            work_dir,
+            Some(&claims.sub),
+            None,
+            Some("explore"),
+            None,
+        )
+        .await
+    {
         Ok(s) => s,
         Err(e) => return R::internal_error(e),
     };

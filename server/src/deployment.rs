@@ -150,10 +150,7 @@ pub async fn prepare_repository_workspace(
 }
 
 /// 为与 Trace/quant 无关的飞书话题创建普通隔离目录。
-pub async fn prepare_general_workspace(
-    state: &Arc<AppState>,
-    session_id: &str,
-) -> Result<String> {
+pub async fn prepare_general_workspace(state: &Arc<AppState>, session_id: &str) -> Result<String> {
     let cfg = &state.config.server_agent;
     if !cfg.enabled {
         bail!("server_agent 未启用");
@@ -1113,13 +1110,7 @@ async fn ensure_safe_directory_as_user(worktree: &str, user: &str) -> Result<()>
     }
 
     let output = git_command_as_user(user)
-        .args([
-            "config",
-            "--global",
-            "--add",
-            "safe.directory",
-            worktree,
-        ])
+        .args(["config", "--global", "--add", "safe.directory", worktree])
         .output()
         .await
         .context("写入 Git safe.directory")?;

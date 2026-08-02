@@ -1,5 +1,5 @@
-use crate::AppState;
 use crate::response::{self as R};
+use crate::AppState;
 use axum::{
     extract::{Multipart, State},
     response::IntoResponse,
@@ -33,7 +33,11 @@ pub struct ImageResult {
 }
 
 pub async fn list_image_providers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let providers = state.db.list_image_providers_ordered().await.unwrap_or_default();
+    let providers = state
+        .db
+        .list_image_providers_ordered()
+        .await
+        .unwrap_or_default();
     let list: Vec<serde_json::Value> = providers
         .iter()
         .filter(|p| p.enabled)
@@ -57,10 +61,11 @@ pub async fn generate_image(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ImageGenRequest>,
 ) -> impl IntoResponse {
-    let (record, base_url, model) = match resolve_provider(&state, body.provider_id.as_deref()).await {
-        Ok(v) => v,
-        Err(e) => return R::bad_request(e),
-    };
+    let (record, base_url, model) =
+        match resolve_provider(&state, body.provider_id.as_deref()).await {
+            Ok(v) => v,
+            Err(e) => return R::bad_request(e),
+        };
     let model = body.model.unwrap_or(model);
 
     let n = body.n.unwrap_or(1).min(4);
@@ -104,7 +109,15 @@ pub async fn edit_image(
             "provider_id" => provider_id = Some(field.text().await.unwrap_or_default()),
             "model" => model = Some(field.text().await.unwrap_or_default()),
             "size" => size = field.text().await.unwrap_or_default(),
-            "n" => n = field.text().await.unwrap_or_default().parse::<u32>().unwrap_or(1).min(4),
+            "n" => {
+                n = field
+                    .text()
+                    .await
+                    .unwrap_or_default()
+                    .parse::<u32>()
+                    .unwrap_or(1)
+                    .min(4)
+            }
             _ => {}
         }
     }
@@ -163,7 +176,9 @@ async fn resolve_provider(
         .await
         .unwrap_or_default();
     let record = if let Some(pid) = provider_id {
-        providers.into_iter().find(|p| p.enabled && (p.id == pid || p.name == pid))
+        providers
+            .into_iter()
+            .find(|p| p.enabled && (p.id == pid || p.name == pid))
     } else {
         providers.into_iter().find(|p| p.enabled)
     };
@@ -185,7 +200,13 @@ async fn call_provider_json(
     model: &str,
 ) -> axum::response::Response {
     let client = reqwest::Client::new();
-    let resp = match client.post(url).bearer_auth(api_key).json(&body).send().await {
+    let resp = match client
+        .post(url)
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => return R::internal_error(format!("Request failed: {e}")),
     };

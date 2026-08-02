@@ -792,7 +792,20 @@ async fn execute_remote_turn(
             emit_failed(state, session_id, &run_id, &message).await;
         }
         Terminal::OutputLimit => {
-            emit_failed(state, session_id, &run_id, "本机 Agent 输出超过安全上限").await;
+            persist_partial_before_failure(
+                state,
+                session_id,
+                &user_message_id,
+                &run_state.final_text,
+            )
+            .await;
+            emit_failed(
+                state,
+                session_id,
+                &run_id,
+                "本机 Agent 输出超过整流安全上限（已保留截断前内容）",
+            )
+            .await;
         }
         Terminal::Completed if !remote_failed && run_state.failed_message.is_none() => {
             let final_text = if run_state.final_text.trim().is_empty() {
@@ -1094,7 +1107,20 @@ async fn execute_turn(
             emit_failed(state, session_id, &run_id, "外部 Agent 执行超时").await;
         }
         Terminal::OutputLimit => {
-            emit_failed(state, session_id, &run_id, "外部 Agent 输出超过安全上限").await;
+            persist_partial_before_failure(
+                state,
+                session_id,
+                &user_message_id,
+                &redact_secrets(&run_state.final_text, auth),
+            )
+            .await;
+            emit_failed(
+                state,
+                session_id,
+                &run_id,
+                "外部 Agent 输出超过整流安全上限（已保留截断前内容）",
+            )
+            .await;
         }
         Terminal::Completed
             if status.as_ref().is_some_and(|status| status.success())
@@ -2145,6 +2171,44 @@ async fn emit(state: &Arc<AppState>, session_id: &str, event: AgentEvent) {
     let mut buffers = state.event_buffers.write().await;
     if let Some(buffer) = buffers.get_mut(session_id) {
         buffer.push(event);
+    }
+}
+
+/// 输出超限时保住已产出的内容：把 partial final_text 落库成 assistant 消息，
+/// 再报失败。整轮丢弃会让用户白等一次长任务。
+async fn persist_partial_before_failure(
+    state: &Arc<AppState>,
+    session_id: &str,
+    parent_id: &str,
+    partial: &str,
+) {
+    let partial = partial.trim();
+    if partial.is_empty() {
+        return;
+    }
+    let content = serde_json::json!([{
+        "type": "text",
+        "text": format!("{partial}\n\n（输出超过安全上限，以上为截断前已产出内容）"),
+    }]);
+    match state
+        .db
+        .save_message(
+            session_id,
+            "assistant",
+            &content,
+            chrono::Utc::now(),
+            Some(parent_id),
+        )
+        .await
+    {
+        Ok(assistant_id) => {
+            if let Err(error) = state.db.update_active_leaf(session_id, &assistant_id).await {
+                tracing::warn!(session_id, "更新超限 partial 消息游标失败: {error:#}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(session_id, "保存超限 partial 消息失败: {error:#}");
+        }
     }
 }
 

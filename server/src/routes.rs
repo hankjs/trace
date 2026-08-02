@@ -48,8 +48,16 @@ pub async fn login(
         return R::forbidden("no client access");
     }
 
-    match auth::create_token(&state.jwt_secret, &user.id, &user.username, user.can_login_admin, user.can_login_client) {
-        Ok(token) => R::ok(serde_json::json!({"token": token, "username": user.username, "can_admin": user.can_login_admin, "can_client": user.can_login_client})),
+    match auth::create_token(
+        &state.jwt_secret,
+        &user.id,
+        &user.username,
+        user.can_login_admin,
+        user.can_login_client,
+    ) {
+        Ok(token) => R::ok(
+            serde_json::json!({"token": token, "username": user.username, "can_admin": user.can_login_admin, "can_client": user.can_login_client}),
+        ),
         Err(e) => R::internal_error(e),
     }
 }
@@ -78,17 +86,23 @@ pub async fn create_session(
     };
     let model = match &body.model {
         Some(m) => m.clone(),
-        None => {
-            match state.db.get_provider_by_name(&provider).await {
-                Ok(Some(record)) => provider_registry::resolve_default_model(&record),
-                _ => DEFAULT_MODEL.to_string(),
-            }
-        }
+        None => match state.db.get_provider_by_name(&provider).await {
+            Ok(Some(record)) => provider_registry::resolve_default_model(&record),
+            _ => DEFAULT_MODEL.to_string(),
+        },
     };
 
     match state
         .db
-        .create_session(&provider, &model, body.work_dir.as_deref(), Some(&claims.sub), body.environment.as_deref(), body.session_type.as_deref(), body.metadata.as_deref())
+        .create_session(
+            &provider,
+            &model,
+            body.work_dir.as_deref(),
+            Some(&claims.sub),
+            body.environment.as_deref(),
+            body.session_type.as_deref(),
+            body.metadata.as_deref(),
+        )
         .await
     {
         Ok(session) => R::created(serde_json::json!(session)),
@@ -148,12 +162,24 @@ pub async fn update_session(
         }
     }
     if body.work_dir.is_some() {
-        if let Err(e) = state.db.update_session_work_dir(&id, body.work_dir.as_deref()).await {
+        if let Err(e) = state
+            .db
+            .update_session_work_dir(&id, body.work_dir.as_deref())
+            .await
+        {
             return R::internal_error(e);
         }
     }
     if body.local_agent.is_some() || body.local_work_dir.is_some() {
-        if let Err(e) = state.db.update_session_local_agent(&id, body.local_agent.as_deref(), body.local_work_dir.as_deref()).await {
+        if let Err(e) = state
+            .db
+            .update_session_local_agent(
+                &id,
+                body.local_agent.as_deref(),
+                body.local_work_dir.as_deref(),
+            )
+            .await
+        {
             return R::internal_error(e);
         }
     }
@@ -256,10 +282,16 @@ pub async fn post_message(
 
     let now = chrono::Utc::now();
     // If parent_id not provided, fall back to session's active_leaf_id to prevent broken chains
-    let parent_id = body.parent_id.as_deref()
+    let parent_id = body
+        .parent_id
+        .as_deref()
         .or(session.active_leaf_id.as_deref());
 
-    match state.db.save_message(&id, &body.role, &body.content, now, parent_id).await {
+    match state
+        .db
+        .save_message(&id, &body.role, &body.content, now, parent_id)
+        .await
+    {
         Ok(msg_id) => {
             // Update active_leaf_id to the new message
             let _ = state.db.update_active_leaf(&id, &msg_id).await;
@@ -308,7 +340,8 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
         .iter()
         .filter(|p| p.enabled)
         .map(|p| {
-            let models: serde_json::Value = serde_json::from_str(&p.models).unwrap_or(serde_json::json!({}));
+            let models: serde_json::Value =
+                serde_json::from_str(&p.models).unwrap_or(serde_json::json!({}));
             serde_json::json!({
                 "name": p.name,
                 "type": p.provider_type,
@@ -318,7 +351,11 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
         })
         .collect();
 
-    let default_provider = providers.iter().find(|p| p.enabled).map(|p| p.name.clone()).unwrap_or_default();
+    let default_provider = providers
+        .iter()
+        .find(|p| p.enabled)
+        .map(|p| p.name.clone())
+        .unwrap_or_default();
 
     R::ok(serde_json::json!({
         "providers": provider_list,
@@ -392,9 +429,7 @@ pub async fn list_directory(
             .cmp(b["name"].as_str().unwrap_or(""))
     });
 
-    let parent = dir_path
-        .parent()
-        .map(|p| p.to_string_lossy().to_string());
+    let parent = dir_path.parent().map(|p| p.to_string_lossy().to_string());
 
     let mut result = serde_json::json!({
         "path": dir_path.to_string_lossy(),
@@ -521,7 +556,11 @@ pub async fn get_session_transcript(
     };
 
     let messages = if let Some(ref leaf) = session.active_leaf_id {
-        state.db.get_branch_messages(&id, leaf).await.unwrap_or_default()
+        state
+            .db
+            .get_branch_messages(&id, leaf)
+            .await
+            .unwrap_or_default()
     } else {
         state.db.get_messages(&id).await.unwrap_or_default()
     };
@@ -530,11 +569,13 @@ pub async fn get_session_transcript(
     let transcript: Vec<serde_json::Value> = messages
         .iter()
         .filter(|m| m.role == "user" || m.role == "assistant")
-        .map(|m| serde_json::json!({
-            "role": m.role,
-            "content": m.content,
-            "created_at": m.created_at,
-        }))
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "content": m.content,
+                "created_at": m.created_at,
+            })
+        })
         .collect();
 
     R::ok(serde_json::json!({

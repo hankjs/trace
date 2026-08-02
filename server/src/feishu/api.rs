@@ -150,13 +150,8 @@ impl FeishuApi {
         text: &str,
         reply_in_thread: bool,
     ) -> Result<String> {
-        self.reply_message(
-            message_id,
-            "text",
-            json!({ "text": text }),
-            reply_in_thread,
-        )
-        .await
+        self.reply_message(message_id, "text", json!({ "text": text }), reply_in_thread)
+            .await
     }
 
     /// 回复交互卡片，返回卡片消息的 message_id（后续 update_card 要用）。
@@ -386,7 +381,11 @@ impl FeishuApi {
         if let Some(archive) = &self.archive {
             let conversation_id = data["chat_id"].as_str().unwrap_or(receive_id);
             let (user_id, session_id) = if receive_id_type == "open_id" {
-                match archive.db.get_feishu_binding(&archive.account_id, receive_id).await {
+                match archive
+                    .db
+                    .get_feishu_binding(&archive.account_id, receive_id)
+                    .await
+                {
                     Ok(Some(binding)) => {
                         let session = archive
                             .db

@@ -1002,7 +1002,11 @@ async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTop
     match try_decide_new_topic(state, text, default_backend, server_agent_enabled).await {
         Ok(decision) => {
             let decision = decision.normalized(default_backend);
-            tracing::info!(?decision, server_agent_enabled, "feishu: new topic workspace decision");
+            tracing::info!(
+                ?decision,
+                server_agent_enabled,
+                "feishu: new topic workspace decision"
+            );
             decision
         }
         Err(e) => {
@@ -1517,7 +1521,12 @@ fn missing_agent_node_message(backend: &str) -> String {
 
 /// 节点展示名：hostname 优先，否则 client_id 前 8 位。
 fn node_display_name(node: &HankCliNodeInfo) -> String {
-    match node.hostname.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    match node
+        .hostname
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(name) => name.to_string(),
         None => {
             let id = node.client_id.as_str();
@@ -1661,10 +1670,7 @@ async fn collect_hank_cli_nodes(state: &AppState, user_id: &str) -> Vec<HankCliN
     nodes
 }
 
-async fn build_feishu_conversation_extra_prompts(
-    state: &AppState,
-    user_id: &str,
-) -> Vec<String> {
+async fn build_feishu_conversation_extra_prompts(state: &AppState, user_id: &str) -> Vec<String> {
     let nodes = collect_hank_cli_nodes(state, user_id).await;
     let snapshot = render_hank_cli_nodes_snapshot(&nodes);
     vec![format!(
@@ -1935,10 +1941,7 @@ mod tests {
             Some(SlashCommand::Status)
         );
         assert_eq!(parse_command("@MyBot /nodes"), Some(SlashCommand::Nodes));
-        assert_eq!(
-            parse_command("@Agent OS /nodes"),
-            Some(SlashCommand::Nodes)
-        );
+        assert_eq!(parse_command("@Agent OS /nodes"), Some(SlashCommand::Nodes));
         assert_eq!(parse_command("帮我运行 /status"), None);
         assert_eq!(parse_command("怎么使用 help"), None);
         assert_eq!(parse_command("/unknown"), None);

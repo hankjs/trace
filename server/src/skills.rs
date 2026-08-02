@@ -85,8 +85,8 @@ pub async fn list_skills(
 
 #[derive(Deserialize)]
 pub struct InstallSkillRequest {
-    pub source: String,      // "owner/repo"
-    pub skill_name: String,  // skill 名称
+    pub source: String,     // "owner/repo"
+    pub skill_name: String, // skill 名称
     pub work_dir: String,
     pub skill_path: Option<String>, // 仓库内路径，默认 "skill/SKILL.md"
 }
@@ -97,7 +97,10 @@ pub async fn install_skill(
     Json(body): Json<InstallSkillRequest>,
 ) -> impl IntoResponse {
     let work_dir = PathBuf::from(&body.work_dir);
-    let skills_dir = work_dir.join(".agents").join("skills").join(&body.skill_name);
+    let skills_dir = work_dir
+        .join(".agents")
+        .join("skills")
+        .join(&body.skill_name);
     let lock_path = work_dir.join("skills-lock.json");
 
     // 确定下载路径
@@ -129,10 +132,7 @@ pub async fn install_skill(
             Err(e) => return R::internal_error(format!("GitHub 请求失败: {}", e)),
         };
         if !resp2.status().is_success() {
-            return R::bad_request(format!(
-                "无法从 GitHub 下载 skill: HTTP {}",
-                resp2.status()
-            ));
+            return R::bad_request(format!("无法从 GitHub 下载 skill: HTTP {}", resp2.status()));
         }
         let content = match resp2.text().await {
             Ok(c) => c,
@@ -168,11 +168,10 @@ async fn save_skill(
     }
 
     // 更新 lock file
-    let mut lock_entries: Vec<SkillLockEntry> =
-        match tokio::fs::read_to_string(lock_path).await {
-            Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+    let mut lock_entries: Vec<SkillLockEntry> = match tokio::fs::read_to_string(lock_path).await {
+        Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
 
     // 移除已有同名条目
     lock_entries.retain(|e| e.name != body.skill_name);
@@ -213,11 +212,10 @@ pub async fn uninstall_skill(
     }
 
     // 更新 lock file
-    let mut lock_entries: Vec<SkillLockEntry> =
-        match tokio::fs::read_to_string(&lock_path).await {
-            Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+    let mut lock_entries: Vec<SkillLockEntry> = match tokio::fs::read_to_string(&lock_path).await {
+        Ok(c) => serde_json::from_str(&c).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
 
     lock_entries.retain(|e| e.name != name);
 

@@ -24,14 +24,21 @@ async fn is_git_repo(work_dir: &str) -> bool {
 }
 
 /// 在 orphan 分支上创建 checkpoint commit（不切换分支、不影响工作区）
-async fn git_create_checkpoint(work_dir: &str, branch: &str, label: &str) -> anyhow::Result<String> {
+async fn git_create_checkpoint(
+    work_dir: &str,
+    branch: &str,
+    label: &str,
+) -> anyhow::Result<String> {
     // 1. 将当前工作区所有文件加入 index（临时）
     let add_output = Command::new("git")
         .args(["-C", work_dir, "add", "-A"])
         .output()
         .await?;
     if !add_output.status.success() {
-        anyhow::bail!("git add -A failed: {}", String::from_utf8_lossy(&add_output.stderr));
+        anyhow::bail!(
+            "git add -A failed: {}",
+            String::from_utf8_lossy(&add_output.stderr)
+        );
     }
 
     // 2. 写入 tree object
@@ -41,13 +48,24 @@ async fn git_create_checkpoint(work_dir: &str, branch: &str, label: &str) -> any
         .await?;
     if !tree_output.status.success() {
         // 恢复 index
-        let _ = Command::new("git").args(["-C", work_dir, "reset"]).output().await;
-        anyhow::bail!("git write-tree failed: {}", String::from_utf8_lossy(&tree_output.stderr));
+        let _ = Command::new("git")
+            .args(["-C", work_dir, "reset"])
+            .output()
+            .await;
+        anyhow::bail!(
+            "git write-tree failed: {}",
+            String::from_utf8_lossy(&tree_output.stderr)
+        );
     }
-    let tree_sha = String::from_utf8_lossy(&tree_output.stdout).trim().to_string();
+    let tree_sha = String::from_utf8_lossy(&tree_output.stdout)
+        .trim()
+        .to_string();
 
     // 3. 恢复 index（撤销 add -A）
-    let _ = Command::new("git").args(["-C", work_dir, "reset"]).output().await;
+    let _ = Command::new("git")
+        .args(["-C", work_dir, "reset"])
+        .output()
+        .await;
 
     // 4. 检查 orphan 分支是否存在
     let ref_name = format!("refs/heads/{}", branch);
@@ -59,13 +77,27 @@ async fn git_create_checkpoint(work_dir: &str, branch: &str, label: &str) -> any
     // 5. 创建 commit（有 parent 或无 parent）
     let commit_msg = format!("checkpoint: {}", label);
     let commit_sha = if parent_output.status.success() {
-        let parent_sha = String::from_utf8_lossy(&parent_output.stdout).trim().to_string();
+        let parent_sha = String::from_utf8_lossy(&parent_output.stdout)
+            .trim()
+            .to_string();
         let output = Command::new("git")
-            .args(["-C", work_dir, "commit-tree", &tree_sha, "-p", &parent_sha, "-m", &commit_msg])
+            .args([
+                "-C",
+                work_dir,
+                "commit-tree",
+                &tree_sha,
+                "-p",
+                &parent_sha,
+                "-m",
+                &commit_msg,
+            ])
             .output()
             .await?;
         if !output.status.success() {
-            anyhow::bail!("git commit-tree failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "git commit-tree failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     } else {
@@ -74,7 +106,10 @@ async fn git_create_checkpoint(work_dir: &str, branch: &str, label: &str) -> any
             .output()
             .await?;
         if !output.status.success() {
-            anyhow::bail!("git commit-tree failed: {}", String::from_utf8_lossy(&output.stderr));
+            anyhow::bail!(
+                "git commit-tree failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };
@@ -85,7 +120,10 @@ async fn git_create_checkpoint(work_dir: &str, branch: &str, label: &str) -> any
         .output()
         .await?;
     if !update_output.status.success() {
-        anyhow::bail!("git update-ref failed: {}", String::from_utf8_lossy(&update_output.stderr));
+        anyhow::bail!(
+            "git update-ref failed: {}",
+            String::from_utf8_lossy(&update_output.stderr)
+        );
     }
 
     Ok(commit_sha)
@@ -99,10 +137,16 @@ async fn git_restore_checkpoint(work_dir: &str, commit_sha: &str) -> anyhow::Res
         .output()
         .await?;
     if !output.status.success() {
-        anyhow::bail!("git checkout failed: {}", String::from_utf8_lossy(&output.stderr));
+        anyhow::bail!(
+            "git checkout failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     // reset index 回到干净状态
-    let _ = Command::new("git").args(["-C", work_dir, "reset"]).output().await;
+    let _ = Command::new("git")
+        .args(["-C", work_dir, "reset"])
+        .output()
+        .await;
     Ok(())
 }
 
@@ -117,7 +161,10 @@ pub async fn create_checkpoint_for_turn(
     label: &str,
 ) -> anyhow::Result<()> {
     if !is_git_repo(work_dir).await {
-        tracing::debug!(session_id, "work_dir is not a git repo, skipping checkpoint");
+        tracing::debug!(
+            session_id,
+            "work_dir is not a git repo, skipping checkpoint"
+        );
         return Ok(());
     }
 
@@ -131,14 +178,17 @@ pub async fn create_checkpoint_for_turn(
     let spec_snapshot = capture_spec_snapshot(&state.db).await?;
 
     // 存入数据库
-    state.db.create_checkpoint(
-        session_id,
-        message_id,
-        &commit_sha,
-        &branch,
-        spec_snapshot.as_deref(),
-        &truncated_label,
-    ).await?;
+    state
+        .db
+        .create_checkpoint(
+            session_id,
+            message_id,
+            &commit_sha,
+            &branch,
+            spec_snapshot.as_deref(),
+            &truncated_label,
+        )
+        .await?;
 
     tracing::info!(session_id, commit_sha = %commit_sha, "checkpoint created");
     Ok(())
@@ -150,16 +200,19 @@ async fn capture_spec_snapshot(db: &hank_db::Database) -> anyhow::Result<Option<
     if specs.is_empty() {
         return Ok(None);
     }
-    let snapshot: Vec<serde_json::Value> = specs.iter().map(|s| {
-        serde_json::json!({
-            "id": s.id,
-            "capability": s.capability,
-            "title": s.title,
-            "content": s.content,
-            "metadata": s.metadata,
-            "version": s.version,
+    let snapshot: Vec<serde_json::Value> = specs
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "capability": s.capability,
+                "title": s.title,
+                "content": s.content,
+                "metadata": s.metadata,
+                "version": s.version,
+            })
         })
-    }).collect();
+        .collect();
     Ok(Some(serde_json::to_string(&snapshot)?))
 }
 
@@ -245,12 +298,20 @@ pub async fn rewind_handler(
     }
 
     // 6. 更新 session 的 active_leaf_id 到 checkpoint 的 message_id
-    if let Err(e) = state.db.update_active_leaf(&session_id, &checkpoint.message_id).await {
+    if let Err(e) = state
+        .db
+        .update_active_leaf(&session_id, &checkpoint.message_id)
+        .await
+    {
         return R::internal_error(e);
     }
 
     // 7. 删除该 checkpoint 之后的 checkpoints
-    if let Err(e) = state.db.delete_checkpoints_after(&session_id, checkpoint.created_at).await {
+    if let Err(e) = state
+        .db
+        .delete_checkpoints_after(&session_id, checkpoint.created_at)
+        .await
+    {
         tracing::warn!(session_id = %session_id, "Failed to cleanup later checkpoints: {e:#}");
     }
 

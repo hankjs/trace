@@ -10,8 +10,7 @@ pub fn build_provider_from_record(record: &ProviderRecord) -> Arc<dyn LlmProvide
 
     match record.provider_type.as_str() {
         "anthropic" => Arc::new(
-            AnthropicProvider::new(record.api_key.clone())
-                .with_base_url(record.base_url.clone()),
+            AnthropicProvider::new(record.api_key.clone()).with_base_url(record.base_url.clone()),
         ),
         _ => Arc::new(
             OpenAiProvider::new(record.api_key.clone())
@@ -22,7 +21,10 @@ pub fn build_provider_from_record(record: &ProviderRecord) -> Arc<dyn LlmProvide
 }
 
 /// Resolve a single provider by name from DB.
-pub async fn resolve_provider(db: &Database, name: &str) -> Option<(ProviderRecord, Arc<dyn LlmProvider>)> {
+pub async fn resolve_provider(
+    db: &Database,
+    name: &str,
+) -> Option<(ProviderRecord, Arc<dyn LlmProvider>)> {
     let record = db.get_provider_by_name(name).await.ok()??;
     if !record.enabled {
         return None;
@@ -39,7 +41,10 @@ pub fn get_models_map(record: &ProviderRecord) -> HashMap<String, String> {
 /// Resolve model name using the provider record's model aliases.
 pub fn resolve_model(record: &ProviderRecord, model_name: &str) -> String {
     let models = get_models_map(record);
-    models.get(model_name).cloned().unwrap_or_else(|| model_name.to_string())
+    models
+        .get(model_name)
+        .cloned()
+        .unwrap_or_else(|| model_name.to_string())
 }
 
 /// Resolve default model for a provider record.
