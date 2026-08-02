@@ -29,6 +29,14 @@ const POLL_TIMEOUT: Duration = Duration::from_secs(25);
 const ONLINE_WINDOW: Duration = Duration::from_secs(60);
 /// 远程调用在被代理工具超时之上追加的网络余量
 pub const NETWORK_MARGIN: Duration = Duration::from_secs(10);
+/// 纯观察类工具：admin 终端页每 3~5s 轮询一次，若计入「最后运行」
+/// 会把该字段永久钉在「刚刚」，使它失去意义。
+const OBSERVE_ONLY_TOOLS: [&str; 2] = ["terminal_list", "terminal_read"];
+
+/// 该工具调用是否算作一次「真实派发」（用于刷新 last_active_at）
+fn counts_as_dispatch(tool: &str) -> bool {
+    !OBSERVE_ONLY_TOOLS.contains(&tool)
+}
 
 /// 一条待 client 执行的工具调用
 #[derive(Debug, Clone, Serialize)]
@@ -130,6 +138,12 @@ pub async fn dispatch_tool_call(
         hub.notify.notify_one();
     }
 
+    // 入队即视为一次派发；DB 失败不影响本次调用。
+    // 观察类工具（admin 页高频轮询）不计入，否则「最后运行」永远是「刚刚」。
+    if counts_as_dispatch(tool) {
+        let _ = state.db.touch_client_agent_active(client_id).await;
+    }
+
     let result = tokio::time::timeout(timeout, rx).await;
 
     // 无论结果如何都清理 inflight，迟到的结果会走"未知 request_id"分支
@@ -176,6 +190,8 @@ pub async fn start_agent_run(
         hub.agent_events.insert(request_id.clone(), event_tx);
         hub.notify.notify_one();
     }
+    // 独立入队路径，不走 dispatch_tool_call，需单独刷新最后运行时间
+    let _ = state.db.touch_client_agent_active(client_id).await;
     Ok(RemoteAgentRun {
         request_id,
         event_rx,
@@ -227,6 +243,11 @@ pub async fn is_client_online(state: &AppState, user_id: &str, client_id: &str) 
         .is_some_and(|hub| hub.is_online(client_id))
 }
 
+/// 是否可被自动选路派发（接受远程 + 未停用）
+fn is_dispatchable(c: &ClientAgent) -> bool {
+    c.accept_remote && c.enabled
+}
+
 /// 挑选一台在线且接受远程任务的 client：最近 poll 的优先
 pub async fn pick_online_client(state: &AppState, user_id: &str) -> Option<ClientAgent> {
     let candidates = state.db.list_client_agents(user_id).await.ok()?;
@@ -234,7 +255,7 @@ pub async fn pick_online_client(state: &AppState, user_id: &str) -> Option<Clien
     let hub = hubs.get(user_id)?;
     candidates
         .into_iter()
-        .filter(|c| c.accept_remote)
+        .filter(is_dispatchable)
         .filter_map(|c| {
             hub.last_polls
                 .get(&c.id)
@@ -256,7 +277,7 @@ pub async fn pick_online_agent_client(
     let hub = hubs.get(user_id)?;
     candidates
         .into_iter()
-        .filter(|client| client.accept_remote && client.work_dir.is_some())
+        .filter(|client| is_dispatchable(client) && client.work_dir.is_some())
         .filter(|client| {
             hub.agent_backends
                 .get(&client.id)
@@ -411,6 +432,9 @@ pub async fn poll_requests(
         return R::bad_request("client_id is required");
     }
 
+    // 长轮询进入即视为一次在线观测；25s 粒度足够，不必在 loop 内重复写
+    let _ = state.db.touch_client_agent_seen(&client_id).await;
+
     let deadline = Instant::now() + POLL_TIMEOUT;
     loop {
         let (notify, requests) = {
@@ -516,6 +540,9 @@ pub async fn list_online(
                 "hostname": c.hostname,
                 "work_dir": c.work_dir,
                 "accept_remote": c.accept_remote,
+                "enabled": c.enabled,
+                "last_active_at": c.last_active_at,
+                "last_seen_at": c.last_seen_at,
                 "online": hub.is_online(&c.id),
                 "agent_backends": hub.agent_backends.get(&c.id).cloned().unwrap_or_default(),
             })
@@ -604,6 +631,48 @@ mod tests {
         assert_eq!(hub.pending[0].request_id, "other");
         assert!(!hub.inflight.contains_key(rid));
         assert!(!hub.agent_events.contains_key(rid));
+    }
+
+    fn sample_client(accept_remote: bool, enabled: bool) -> ClientAgent {
+        ClientAgent {
+            id: "c1".into(),
+            user_id: "u1".into(),
+            hostname: Some("host".into()),
+            work_dir: Some("/tmp".into()),
+            accept_remote,
+            enabled,
+            last_active_at: None,
+            last_seen_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn disabled_client_is_skipped_by_pick() {
+        let c = sample_client(true, false);
+        assert!(!is_dispatchable(&c));
+    }
+
+    #[test]
+    fn enabled_client_passes_pick() {
+        assert!(is_dispatchable(&sample_client(true, true)));
+        // 两个条件是且关系：不接受远程即使 enabled 也不能自动派发
+        assert!(!is_dispatchable(&sample_client(false, true)));
+    }
+
+    #[test]
+    fn observation_tools_do_not_count_as_dispatch() {
+        // admin 终端页 3~5s 一次的轮询不应刷新「最后运行」
+        assert!(!counts_as_dispatch("terminal_list"));
+        assert!(!counts_as_dispatch("terminal_read"));
+    }
+
+    #[test]
+    fn real_tool_calls_count_as_dispatch() {
+        assert!(counts_as_dispatch("terminal_write"));
+        assert!(counts_as_dispatch("terminal_create"));
+        assert!(counts_as_dispatch("shell"));
     }
 }
 

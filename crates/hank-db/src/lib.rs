@@ -510,6 +510,9 @@ pub struct ClientAgent {
     pub hostname: Option<String>,
     pub work_dir: Option<String>,
     pub accept_remote: bool,
+    pub enabled: bool,
+    pub last_active_at: Option<DateTime<Utc>>,
+    pub last_seen_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1164,6 +1167,9 @@ impl Database {
                 hostname VARCHAR(255) DEFAULT NULL,
                 work_dir TEXT DEFAULT NULL,
                 accept_remote BOOLEAN NOT NULL DEFAULT FALSE,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                last_active_at DATETIME DEFAULT NULL,
+                last_seen_at DATETIME DEFAULT NULL,
                 created_at DATETIME NOT NULL DEFAULT NOW(),
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
@@ -1218,6 +1224,28 @@ impl Database {
             "sessions",
             "exec_client_id",
             "ALTER TABLE sessions ADD COLUMN exec_client_id VARCHAR(36) DEFAULT NULL",
+        )
+        .await?;
+        // client_agents：节点停用开关与活跃时间（停用只挡自动选路，不挡 admin 代理）
+        Self::ensure_column(
+            &pool,
+            "client_agents",
+            "enabled",
+            "ALTER TABLE client_agents ADD COLUMN enabled BOOLEAN NOT NULL DEFAULT TRUE AFTER accept_remote",
+        )
+        .await?;
+        Self::ensure_column(
+            &pool,
+            "client_agents",
+            "last_active_at",
+            "ALTER TABLE client_agents ADD COLUMN last_active_at DATETIME DEFAULT NULL AFTER enabled",
+        )
+        .await?;
+        Self::ensure_column(
+            &pool,
+            "client_agents",
+            "last_seen_at",
+            "ALTER TABLE client_agents ADD COLUMN last_seen_at DATETIME DEFAULT NULL AFTER last_active_at",
         )
         .await?;
         // 为旧库补 bot 唯一键；历史重复记录会使这条 DDL 失败，但运行时仍由
@@ -4485,10 +4513,11 @@ impl Database {
         work_dir: Option<&str>,
         accept_remote: bool,
     ) -> Result<()> {
+        // 注册即一次在线观测（刷 last_seen_at）；UPDATE 故意不碰 enabled，避免重启把停用状态刷回
         db_retry!(
             sqlx::query(
-                "INSERT INTO client_agents (id, user_id, hostname, work_dir, accept_remote) VALUES (?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), hostname = VALUES(hostname), work_dir = VALUES(work_dir), accept_remote = VALUES(accept_remote), updated_at = NOW()"
+                "INSERT INTO client_agents (id, user_id, hostname, work_dir, accept_remote, last_seen_at) VALUES (?, ?, ?, ?, ?, NOW())
+                 ON DUPLICATE KEY UPDATE user_id = VALUES(user_id), hostname = VALUES(hostname), work_dir = VALUES(work_dir), accept_remote = VALUES(accept_remote), last_seen_at = NOW(), updated_at = NOW()"
             )
             .bind(id)
             .bind(user_id)
@@ -4507,7 +4536,7 @@ impl Database {
     ) -> Result<Option<ClientAgent>> {
         let agent = db_retry!(
             sqlx::query_as::<_, ClientAgent>(
-                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents WHERE user_id = ? AND id = ?"
+                "SELECT id, user_id, hostname, work_dir, accept_remote, enabled, last_active_at, last_seen_at, created_at, updated_at FROM client_agents WHERE user_id = ? AND id = ?"
             )
             .bind(user_id)
             .bind(client_id)
@@ -4519,7 +4548,7 @@ impl Database {
     pub async fn list_client_agents(&self, user_id: &str) -> Result<Vec<ClientAgent>> {
         let agents = db_retry!(
             sqlx::query_as::<_, ClientAgent>(
-                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents WHERE user_id = ? ORDER BY created_at ASC"
+                "SELECT id, user_id, hostname, work_dir, accept_remote, enabled, last_active_at, last_seen_at, created_at, updated_at FROM client_agents WHERE user_id = ? ORDER BY created_at ASC"
             )
             .bind(user_id)
             .fetch_all(&self.pool)
@@ -4531,7 +4560,7 @@ impl Database {
     pub async fn list_all_client_agents(&self) -> Result<Vec<ClientAgent>> {
         let agents = db_retry!(
             sqlx::query_as::<_, ClientAgent>(
-                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents ORDER BY created_at ASC"
+                "SELECT id, user_id, hostname, work_dir, accept_remote, enabled, last_active_at, last_seen_at, created_at, updated_at FROM client_agents ORDER BY created_at ASC"
             )
             .fetch_all(&self.pool)
         )?;
@@ -4542,12 +4571,43 @@ impl Database {
     pub async fn get_client_agent_by_id(&self, client_id: &str) -> Result<Option<ClientAgent>> {
         let agent = db_retry!(
             sqlx::query_as::<_, ClientAgent>(
-                "SELECT id, user_id, hostname, work_dir, accept_remote, created_at, updated_at FROM client_agents WHERE id = ?"
+                "SELECT id, user_id, hostname, work_dir, accept_remote, enabled, last_active_at, last_seen_at, created_at, updated_at FROM client_agents WHERE id = ?"
             )
             .bind(client_id)
             .fetch_optional(&self.pool)
         )?;
         Ok(agent)
+    }
+
+    /// 停用/启用节点；停用后不再被 pick_online_* 自动选中
+    pub async fn set_client_agent_enabled(&self, client_id: &str, enabled: bool) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE client_agents SET enabled = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(enabled)
+        .bind(client_id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 刷新最后运行时间（被派发任务时调用）
+    pub async fn touch_client_agent_active(&self, client_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE client_agents SET last_active_at = NOW() WHERE id = ?")
+                .bind(client_id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    /// 刷新最后在线时间（poll / 注册时调用；不碰 updated_at）
+    pub async fn touch_client_agent_seen(&self, client_id: &str) -> Result<()> {
+        db_retry!(
+            sqlx::query("UPDATE client_agents SET last_seen_at = NOW() WHERE id = ?")
+                .bind(client_id)
+                .execute(&self.pool)
+        )?;
+        Ok(())
     }
 
     /// 上报一条终端通知（kimi task complete / approval 等）

@@ -28,11 +28,38 @@ pub async fn list_clients(State(state): State<Arc<AppState>>) -> impl IntoRespon
                     "hostname": a.hostname,
                     "work_dir": a.work_dir,
                     "accept_remote": a.accept_remote,
+                    "enabled": a.enabled,
+                    "last_active_at": a.last_active_at,
+                    "last_seen_at": a.last_seen_at,
                     "online": online,
                 }));
             }
             R::ok(out)
         }
+        Err(e) => R::internal_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ClientEnabledBody {
+    enabled: bool,
+}
+
+/// POST /api/admin/clients/{cid}/enabled — 停用/启用 hank-cli 节点。
+/// 停用只影响自动选路（pick_online_*），admin 侧终端代理仍可用。
+pub async fn set_client_enabled(
+    State(state): State<Arc<AppState>>,
+    Path(cid): Path<String>,
+    Json(body): Json<ClientEnabledBody>,
+) -> impl IntoResponse {
+    // 先确认存在，避免对不存在的 id 静默返回成功
+    match state.db.get_client_agent_by_id(&cid).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return R::not_found("client not found"),
+        Err(e) => return R::internal_error(e),
+    }
+    match state.db.set_client_agent_enabled(&cid, body.enabled).await {
+        Ok(()) => R::ok(serde_json::json!({ "id": cid, "enabled": body.enabled })),
         Err(e) => R::internal_error(e),
     }
 }

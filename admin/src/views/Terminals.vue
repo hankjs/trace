@@ -50,6 +50,16 @@ async function toggleEnabled(t: TermInfo) {
   }
 }
 
+/** 停用/启用整个 hank-cli 节点；停用后新任务不再自动落到它头上 */
+async function toggleClientEnabled(c: ClientAgentInfo) {
+  try {
+    await api.clientSetEnabled(c.id, !c.enabled)
+    await loadClients()
+  } catch (e: any) {
+    error.value = e.message
+  }
+}
+
 function ensureXterm() {
   if (xterm || !termEl.value) return
   const { cols, rows } = selectedTermSize()
@@ -210,7 +220,7 @@ onUnmounted(() => {
 
     <p v-if="error" class="mb-4 text-[13px] text-red-400 shrink-0">{{ error }}</p>
 
-    <div class="grid grid-cols-[220px_1fr] gap-6 flex-1 min-h-0">
+    <div class="grid grid-cols-[260px_1fr] gap-6 flex-1 min-h-0">
       <!-- 左：client 列表 + 终端列表 -->
       <div class="space-y-6 overflow-y-auto min-h-0">
         <div>
@@ -218,15 +228,42 @@ onUnmounted(() => {
           <div
             v-for="c in clients"
             :key="c.id"
-            class="px-2 py-1.5 rounded-md cursor-pointer text-[13px] flex items-center gap-2 transition-colors"
-            :class="c.id === selectedClientId ? 'bg-surface-raised text-text-primary' : 'text-text-secondary hover:bg-surface-raised/50'"
+            class="px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors"
+            :class="[
+              c.id === selectedClientId ? 'bg-surface-raised text-text-primary' : 'text-text-secondary hover:bg-surface-raised/50',
+              c.enabled === false ? 'opacity-60' : '',
+            ]"
             @click="selectedClientId = c.id"
           >
-            <span
-              class="w-1.5 h-1.5 rounded-full shrink-0"
-              :class="c.online ? 'bg-green-400' : 'bg-text-tertiary'"
-            ></span>
-            <span class="truncate">{{ c.hostname || shortId(c.id) }}</span>
+            <div class="flex items-center gap-2">
+              <span
+                class="w-1.5 h-1.5 rounded-full shrink-0"
+                :class="c.online ? 'bg-green-400' : 'bg-text-tertiary'"
+              ></span>
+              <span class="truncate">{{ c.hostname || shortId(c.id) }}</span>
+              <span
+                v-if="c.enabled === false"
+                class="text-[10px] text-text-tertiary shrink-0 px-1 rounded bg-surface-raised"
+              >已停用</span>
+              <button
+                class="flex items-center shrink-0 ml-auto"
+                title="停用/启用节点"
+                @click.stop="toggleClientEnabled(c)"
+              >
+                <span
+                  class="relative inline-flex h-4 w-7 items-center rounded-full transition-colors"
+                  :class="c.enabled !== false ? 'bg-green-500' : 'bg-border-subtle'"
+                >
+                  <span
+                    class="inline-block h-3 w-3 rounded-full bg-white transition-transform"
+                    :class="c.enabled !== false ? 'translate-x-3.5' : 'translate-x-0.5'"
+                  ></span>
+                </span>
+              </button>
+            </div>
+            <div class="text-[11px] text-text-tertiary truncate pl-3.5">
+              最后运行 {{ relTime(c.last_active_at) }} · 最后在线 {{ relTime(c.last_seen_at) }}
+            </div>
           </div>
           <div v-if="clients.length === 0" class="text-[12px] text-text-tertiary px-1">
             暂无 client 注册

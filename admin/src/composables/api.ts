@@ -509,6 +509,13 @@ export const api = {
     return request<ClientAgentInfo[]>('/api/admin/clients')
   },
 
+  clientSetEnabled(clientId: string, enabled: boolean) {
+    return request<{ id: string; enabled: boolean }>(
+      `/api/admin/clients/${clientId}/enabled`,
+      { method: 'POST', body: JSON.stringify({ enabled }) }
+    )
+  },
+
   listClientTerminals(clientId: string) {
     return request<TermInfo[]>(`/api/admin/clients/${clientId}/terminals`)
   },
@@ -662,6 +669,9 @@ export interface ClientAgentInfo {
   hostname: string | null
   work_dir: string | null
   accept_remote: boolean
+  enabled: boolean
+  last_active_at: string | null
+  last_seen_at: string | null
   online: boolean
 }
 

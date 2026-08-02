@@ -559,6 +559,10 @@ async fn run_server() -> Result<()> {
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
         .route(
+            "/api/admin/clients/{cid}/enabled",
+            post(admin_terminal::set_client_enabled),
+        )
+        .route(
             "/api/admin/clients/{cid}/terminals",
             get(admin_terminal::list_terminals),
         )
