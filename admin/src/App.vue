@@ -21,6 +21,7 @@ const nav = [
   { to: '/feishu', label: '飞书机器人', icon: '✈' },
   { to: '/chat-records', label: '聊天记录', icon: '▤' },
   { to: '/jobs', label: '定时任务', icon: '⏱' },
+  { to: '/interactions', label: '交互单', icon: '✋' },
   { to: '/terminals', label: '终端', icon: '▸' },
   { to: '/notifications', label: '通知', icon: '◉' },
   { to: '/users', label: '用户', icon: '⚇' },
@@ -69,7 +70,7 @@ function handleGenerate() {
       class="flex-1 min-w-0 px-10 py-8"
       :class="route.path === '/terminals'
         ? 'flex flex-col h-screen overflow-hidden'
-        : route.path === '/chat-records'
+        : route.path === '/chat-records' || route.path.startsWith('/interactions')
           ? 'w-full max-w-[1400px]'
           : 'max-w-4xl'"
     >

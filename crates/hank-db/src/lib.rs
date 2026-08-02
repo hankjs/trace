@@ -4366,6 +4366,69 @@ impl Database {
         Ok((expired.rows_affected(), reverted.rows_affected()))
     }
 
+    /// 交互单列表（admin）。筛选项均为可选，传 None 表示不限。
+    /// 返回 (当页数据, 总条数)，与 list_channel_messages 的既有约定一致。
+    ///
+    /// 用 `? IS NULL OR col = ?` 做可选筛选，避免字符串拼 SQL；绑定值走 `.bind()`。
+    pub async fn list_interactions(
+        &self,
+        status: Option<&str>,
+        kind: Option<&str>,
+        channel: Option<&str>,
+        page: u32,
+        per_page: u32,
+    ) -> Result<(Vec<AgentInteraction>, i64)> {
+        let (count,): (i64,) = db_retry!(sqlx::query_as(
+            "SELECT COUNT(*) FROM agent_interactions
+                 WHERE (? IS NULL OR status = ?)
+                   AND (? IS NULL OR kind = ?)
+                   AND (? IS NULL OR channel = ?)"
+        )
+        .bind(status)
+        .bind(status)
+        .bind(kind)
+        .bind(kind)
+        .bind(channel)
+        .bind(channel)
+        .fetch_one(&self.pool))?;
+        let offset = ((page.saturating_sub(1)) * per_page) as i64;
+        let rows = db_retry!(sqlx::query_as::<_, AgentInteraction>(
+            "SELECT id, session_id, user_id, channel, account_id,
+                        chat_id, topic_id, kind, title, goal, analysis, `options` AS `options`, status,
+                        answer, answered_by, answered_at, resume_ref, card_message_id, expires_at,
+                        result, error, created_at, updated_at
+                 FROM agent_interactions
+                 WHERE (? IS NULL OR status = ?)
+                   AND (? IS NULL OR kind = ?)
+                   AND (? IS NULL OR channel = ?)
+                 ORDER BY created_at DESC
+                 LIMIT ? OFFSET ?"
+        )
+        .bind(status)
+        .bind(status)
+        .bind(kind)
+        .bind(kind)
+        .bind(channel)
+        .bind(channel)
+        .bind(per_page as i64)
+        .bind(offset)
+        .fetch_all(&self.pool))?;
+        Ok((rows, count))
+    }
+
+    /// 取消待确认交互单。只动 pending，不覆盖终态。
+    pub async fn cancel_interaction(&self, id: &str, operator: &str) -> Result<bool> {
+        let result = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                 SET status = 'cancelled', answered_by = ?, answered_at = NOW(), updated_at = NOW()
+                 WHERE id = ? AND status = 'pending'"
+        )
+        .bind(operator)
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     // 渠道消息留档
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_channel_message(

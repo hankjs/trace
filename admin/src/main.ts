@@ -24,10 +24,24 @@ const router = createRouter({
     { path: '/feishu', component: () => import('./views/FeishuBot.vue') },
     { path: '/chat-records', component: () => import('./views/ChatRecords.vue') },
     { path: '/jobs', component: () => import('./views/Jobs.vue') },
+    { path: '/interactions', component: () => import('./views/Interactions.vue') },
+    { path: '/interactions/:id', component: () => import('./views/Interactions.vue') },
     { path: '/terminals', component: () => import('./views/Terminals.vue') },
     { path: '/notifications', component: () => import('./views/Notifications.vue') },
   ],
 })
+
+// 兼容飞书卡片深链：{admin_base_url}/#/interactions/{id}
+// admin 使用 history 路由，hash 不会被 vue-router 消费，启动时改写到 history 路径。
+const deepHash = window.location.hash.match(/^#\/(interactions(?:\/[^/?#]+)?)/)
+if (deepHash) {
+  const target = `/${deepHash[1]}`
+  window.history.replaceState(
+    null,
+    '',
+    `${import.meta.env.BASE_URL.replace(/\/$/, '')}${target}`,
+  )
+}
 
 router.beforeEach((to) => {
   if (!to.meta.public && !hasToken()) {

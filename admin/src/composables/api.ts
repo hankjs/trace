@@ -287,6 +287,34 @@ export interface AdminJob {
   manual_run: JobRun | null
 }
 
+/** 与 hank_db::AgentInteraction 对齐（snake_case） */
+export interface AgentInteraction {
+  id: string
+  session_id: string
+  user_id: string
+  channel: string
+  account_id: string | null
+  chat_id: string | null
+  topic_id: string | null
+  kind: string
+  title: string
+  goal: string | null
+  analysis: string | null
+  /** 按钮文案数组 JSON 文本，如 `["确认","否"]` */
+  options: string
+  status: string
+  answer: string | null
+  answered_by: string | null
+  answered_at: string | null
+  resume_ref: string | null
+  card_message_id: string | null
+  expires_at: string | null
+  result: string | null
+  error: string | null
+  created_at: string
+  updated_at: string
+}
+
 export interface AgentEventRecord {
   id: string
   session_id: string
@@ -649,6 +677,42 @@ export const api = {
 
   runJob(id: string) {
     return request<{ status: string }>(`/api/admin/jobs/${id}/run`, { method: 'POST' })
+  },
+
+  // 交互单管理
+  listInteractions(params: {
+    status?: string
+    kind?: string
+    channel?: string
+    page?: number
+    per_page?: number
+  } = {}) {
+    const q = new URLSearchParams()
+    if (params.status) q.set('status', params.status)
+    if (params.kind) q.set('kind', params.kind)
+    if (params.channel) q.set('channel', params.channel)
+    q.set('page', String(params.page ?? 1))
+    q.set('per_page', String(params.per_page ?? 30))
+    return request<PaginatedResponse<AgentInteraction>>(
+      `/api/admin/interactions?${q}`,
+    )
+  },
+
+  getInteraction(id: string) {
+    return request<AgentInteraction>(`/api/admin/interactions/${id}`)
+  },
+
+  answerInteraction(id: string, answer: string) {
+    return request<AgentInteraction>(`/api/admin/interactions/${id}/answer`, {
+      method: 'POST',
+      body: JSON.stringify({ answer }),
+    })
+  },
+
+  cancelInteraction(id: string) {
+    return request<AgentInteraction>(`/api/admin/interactions/${id}/cancel`, {
+      method: 'POST',
+    })
   },
 
   chatGenerate(prompt: string, context?: string) {

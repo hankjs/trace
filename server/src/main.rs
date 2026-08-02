@@ -10,6 +10,8 @@ mod config;
 mod deployment;
 mod feishu;
 mod image_gen;
+mod interaction_flow;
+mod interactions;
 mod llm;
 pub mod provider_registry;
 pub mod remote_exec;
@@ -570,6 +572,23 @@ async fn run_server() -> Result<()> {
             get(scheduler::routes::job_runs),
         )
         .route("/api/admin/jobs/{id}/run", post(scheduler::routes::run_job))
+        // 交互单管理（列表/详情/手动应答/取消；应答会真派发 resume）
+        .route(
+            "/api/admin/interactions",
+            get(interactions::list_interactions),
+        )
+        .route(
+            "/api/admin/interactions/{id}",
+            get(interactions::get_interaction),
+        )
+        .route(
+            "/api/admin/interactions/{id}/answer",
+            post(interactions::answer_interaction),
+        )
+        .route(
+            "/api/admin/interactions/{id}/cancel",
+            post(interactions::cancel_interaction),
+        )
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
         .route(
