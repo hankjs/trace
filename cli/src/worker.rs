@@ -8,8 +8,8 @@ use std::time::Duration;
 use base64::Engine;
 use tokio::sync::mpsc;
 
-use crate::api::{ApiClient, PollOutcome, ToolCallRequest};
 use crate::agent::{AgentRunInput, AgentRunner};
+use crate::api::{ApiClient, PollOutcome, ToolCallRequest};
 use crate::notify::{self, NotifyTx};
 use crate::terminal::TermManager;
 
@@ -27,22 +27,35 @@ struct ToolOutput {
 
 impl ToolOutput {
     fn ok(content: String) -> Self {
-        Self { content, is_error: false }
+        Self {
+            content,
+            is_error: false,
+        }
     }
     fn err(content: String) -> Self {
-        Self { content, is_error: true }
+        Self {
+            content,
+            is_error: true,
+        }
     }
 }
 
 /// 执行一条远程下发的工具调用
-async fn execute_tool(term: &Arc<TermManager>, notify_tx: &NotifyTx, req: &ToolCallRequest) -> ToolOutput {
+async fn execute_tool(
+    term: &Arc<TermManager>,
+    notify_tx: &NotifyTx,
+    req: &ToolCallRequest,
+) -> ToolOutput {
     let input = &req.input;
     match req.tool.as_str() {
         "terminal_create" => {
             // 远程开终端（微信托管会话用），默认值与 TS 版一致
             let cols = input.get("cols").and_then(|v| v.as_u64()).unwrap_or(120) as u16;
             let rows = input.get("rows").and_then(|v| v.as_u64()).unwrap_or(30) as u16;
-            let cwd = input.get("cwd").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let cwd = input
+                .get("cwd")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             match term.term_create(cols, rows, cwd, notify_tx.clone()) {
                 Ok(info) => ToolOutput::ok(serde_json::to_string(&info).unwrap_or_default()),
                 Err(e) => ToolOutput::err(format!("Remote exec error: {e}")),
@@ -52,7 +65,10 @@ async fn execute_tool(term: &Arc<TermManager>, notify_tx: &NotifyTx, req: &ToolC
             let id = input.get("id").and_then(|v| v.as_str()).unwrap_or("");
             if input.get("raw").and_then(|v| v.as_bool()).unwrap_or(false) {
                 // raw 模式保留 ANSI；app 侧优先取 xterm 屏幕快照，CLI 直接走 PTY 原始流
-                let max_bytes = input.get("maxBytes").and_then(|v| v.as_u64()).unwrap_or(65536) as usize;
+                let max_bytes = input
+                    .get("maxBytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(65536) as usize;
                 match term.term_read(id, Some(max_bytes), Some(true)) {
                     Ok(text) => ToolOutput::ok(text),
                     Err(e) => ToolOutput::err(format!("Remote exec error: {e}")),
@@ -60,7 +76,11 @@ async fn execute_tool(term: &Arc<TermManager>, notify_tx: &NotifyTx, req: &ToolC
             } else {
                 let lines = input.get("lines").and_then(|v| v.as_u64()).unwrap_or(200) as usize;
                 // 未指定 lines 时按字节兜底，避免返回过大；指定 lines 时读全量再按行截尾
-                let max_bytes = if input.get("lines").is_some() { None } else { Some(40000) };
+                let max_bytes = if input.get("lines").is_some() {
+                    None
+                } else {
+                    Some(40000)
+                };
                 match term.term_read(id, max_bytes, None) {
                     Ok(text) => {
                         let tail: Vec<&str> = text.split('\n').collect();
@@ -83,6 +103,14 @@ async fn execute_tool(term: &Arc<TermManager>, notify_tx: &NotifyTx, req: &ToolC
             let id = input.get("id").and_then(|v| v.as_str()).unwrap_or("");
             match term.term_close(id) {
                 Ok(()) => ToolOutput::ok("ok".into()),
+                Err(e) => ToolOutput::err(format!("Remote exec error: {e}")),
+            }
+        }
+        "terminal_set_enabled" => {
+            let id = input.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            let enabled = input.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            match term.term_set_enabled(id, enabled) {
+                Ok(info) => ToolOutput::ok(serde_json::to_string(&info).unwrap_or_default()),
                 Err(e) => ToolOutput::err(format!("Remote exec error: {e}")),
             }
         }
@@ -182,8 +210,12 @@ pub async fn run(
                     let agent = agent.clone();
                     let notify_tx = notify_tx.clone();
                     tokio::spawn(async move {
-                        let out = execute_request(api.clone(), agent, &term, &notify_tx, &req).await;
-                        if let Err(e) = api.post_result(&req.request_id, &out.content, out.is_error).await {
+                        let out =
+                            execute_request(api.clone(), agent, &term, &notify_tx, &req).await;
+                        if let Err(e) = api
+                            .post_result(&req.request_id, &out.content, out.is_error)
+                            .await
+                        {
                             tracing::warn!(request_id = %req.request_id, "回传工具结果失败: {e}");
                         }
                     });
@@ -257,12 +289,25 @@ mod tests {
         assert!(out.content.contains(&id));
 
         // write → read：看到回显
-        let out = execute_tool(&term, &tx, &req("terminal_write", serde_json::json!({"id": id, "data": "echo dispatch-ok\n"}))).await;
+        let out = execute_tool(
+            &term,
+            &tx,
+            &req(
+                "terminal_write",
+                serde_json::json!({"id": id, "data": "echo dispatch-ok\n"}),
+            ),
+        )
+        .await;
         assert!(!out.is_error);
         assert_eq!(out.content, "ok");
         let mut seen = String::new();
         for _ in 0..50 {
-            let out = execute_tool(&term, &tx, &req("terminal_read", serde_json::json!({"id": id}))).await;
+            let out = execute_tool(
+                &term,
+                &tx,
+                &req("terminal_read", serde_json::json!({"id": id})),
+            )
+            .await;
             assert!(!out.is_error);
             if out.content.contains("dispatch-ok") {
                 seen = out.content;
@@ -273,20 +318,92 @@ mod tests {
         assert!(seen.contains("dispatch-ok"), "read output: {seen}");
 
         // read lines 截尾：只取最后一行
-        let out = execute_tool(&term, &tx, &req("terminal_read", serde_json::json!({"id": id, "lines": 1}))).await;
+        let out = execute_tool(
+            &term,
+            &tx,
+            &req("terminal_read", serde_json::json!({"id": id, "lines": 1})),
+        )
+        .await;
         assert!(!out.is_error);
-        assert!(!out.content.contains('\n'), "lines=1 should be single line: {:?}", out.content);
+        assert!(
+            !out.content.contains('\n'),
+            "lines=1 should be single line: {:?}",
+            out.content
+        );
 
         // write 到不存在的终端：错误路径
-        let out = execute_tool(&term, &tx, &req("terminal_write", serde_json::json!({"id": "fake", "data": "x"}))).await;
+        let out = execute_tool(
+            &term,
+            &tx,
+            &req(
+                "terminal_write",
+                serde_json::json!({"id": "fake", "data": "x"}),
+            ),
+        )
+        .await;
         assert!(out.is_error);
-        assert!(out.content.contains("terminal not found"), "content: {}", out.content);
+        assert!(
+            out.content.contains("terminal not found"),
+            "content: {}",
+            out.content
+        );
 
         // close
-        let out = execute_tool(&term, &tx, &req("terminal_close", serde_json::json!({"id": id}))).await;
+        let out = execute_tool(
+            &term,
+            &tx,
+            &req("terminal_close", serde_json::json!({"id": id})),
+        )
+        .await;
         assert!(!out.is_error);
         let out = execute_tool(&term, &tx, &req("terminal_list", serde_json::json!({}))).await;
         assert_eq!(out.content, "[]");
+    }
+
+    #[tokio::test]
+    async fn terminal_set_enabled_dispatch_blocks_write() {
+        let (term, tx) = setup("dispatch-enabled");
+
+        let out = execute_tool(&term, &tx, &req("terminal_create", serde_json::json!({}))).await;
+        assert!(!out.is_error, "create failed: {}", out.content);
+        let info: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        let id = info["id"].as_str().unwrap().to_string();
+
+        let out = execute_tool(
+            &term,
+            &tx,
+            &req(
+                "terminal_set_enabled",
+                serde_json::json!({"id": id, "enabled": false}),
+            ),
+        )
+        .await;
+        assert!(!out.is_error, "set_enabled failed: {}", out.content);
+        let info: serde_json::Value = serde_json::from_str(&out.content).unwrap();
+        assert_eq!(info["enabled"], false);
+
+        let out = execute_tool(
+            &term,
+            &tx,
+            &req(
+                "terminal_write",
+                serde_json::json!({"id": id, "data": "echo blocked\n"}),
+            ),
+        )
+        .await;
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("terminal disabled"),
+            "content: {}",
+            out.content
+        );
+
+        let _ = execute_tool(
+            &term,
+            &tx,
+            &req("terminal_close", serde_json::json!({"id": id})),
+        )
+        .await;
     }
 
     #[test]
@@ -308,10 +425,18 @@ mod tests {
     fn read_file_base64_rejects_dir_and_missing() {
         let out = read_file_base64("/tmp");
         assert!(out.is_error);
-        assert!(out.content.contains("Not a regular file"), "{}", out.content);
+        assert!(
+            out.content.contains("Not a regular file"),
+            "{}",
+            out.content
+        );
         let out = read_file_base64("/tmp/hank-cli-test-no-such-file");
         assert!(out.is_error);
-        assert!(out.content.contains("Error reading file"), "{}", out.content);
+        assert!(
+            out.content.contains("Error reading file"),
+            "{}",
+            out.content
+        );
     }
 
     #[test]

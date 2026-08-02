@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 
@@ -28,6 +29,12 @@ pub struct TermSession {
     pub created_at: String,
     pub scrollback: Arc<Mutex<VecDeque<u8>>>,
     pub alive: Arc<AtomicBool>,
+    /// 是否启用；停用后拒绝写入、不再上报通知（不杀进程）
+    pub enabled: Arc<AtomicBool>,
+    /// 最后工作时间：最近一次有 PTY 输出或写入的时刻
+    pub last_active_at: Arc<Mutex<DateTime<Utc>>>,
+    /// 最后在线时间：最近一次被观测到 alive 的时刻（term_list 时刷新）
+    pub last_seen_at: Arc<Mutex<DateTime<Utc>>>,
     /// PTY 尺寸，创建时确定（协议无 terminal_resize，运行期不变）
     pub cols: u16,
     pub rows: u16,
@@ -39,7 +46,7 @@ pub struct TermManager {
     data_dir: PathBuf,
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug)]
 pub struct TermInfo {
     pub id: String,
     pub shell: String,
@@ -49,6 +56,9 @@ pub struct TermInfo {
     pub created_at: String,
     pub cols: u16,
     pub rows: u16,
+    pub enabled: bool,
+    pub last_active_at: String,
+    pub last_seen_at: String,
 }
 
 /// macOS 下沿 `ps` 树找 child_pid 后代链最深的进程，返回 (pid, comm)。
@@ -144,16 +154,24 @@ fn foreground_cwd(s: &TermSession) -> String {
 }
 
 fn session_info(s: &TermSession) -> TermInfo {
+    let alive = s.alive.load(Ordering::SeqCst);
+    // term_list / 观测时刷新 last_seen_at；子进程已退出则冻结在死亡前最后一次观测
+    if alive {
+        *s.last_seen_at.lock().unwrap() = Utc::now();
+    }
     TermInfo {
         id: s.id.clone(),
         shell: s.shell.clone(),
         // 展示用实时 cwd（前台进程 cd 过也能跟上），代价是每次一次 lsof，量级可忽略
         cwd: foreground_cwd(s),
         foreground_cmd: foreground_cmd(s.child_pid, &s.shell),
-        alive: s.alive.load(Ordering::SeqCst),
+        alive,
         created_at: s.created_at.clone(),
         cols: s.cols,
         rows: s.rows,
+        enabled: s.enabled.load(Ordering::SeqCst),
+        last_active_at: s.last_active_at.lock().unwrap().to_rfc3339(),
+        last_seen_at: s.last_seen_at.lock().unwrap().to_rfc3339(),
     }
 }
 
@@ -255,7 +273,10 @@ impl TermManager {
 
         // zsh：注入 shell integration（OSC 133 命令生命周期 + OSC 7 cwd 上报），
         // 通过 ZDOTDIR 包装用户的 .zshrc，对任意命令生效
-        if std::path::Path::new(&shell).file_name().is_some_and(|n| n == "zsh") {
+        if std::path::Path::new(&shell)
+            .file_name()
+            .is_some_and(|n| n == "zsh")
+        {
             if let Some(dir) = write_zsh_integration(&self.data_dir) {
                 if let Ok(orig) = std::env::var("ZDOTDIR") {
                     cmd.env("TRACE_ORIG_ZDOTDIR", orig);
@@ -274,6 +295,10 @@ impl TermManager {
         let id = uuid::Uuid::new_v4().to_string();
         let scrollback: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
         let alive = Arc::new(AtomicBool::new(true));
+        let enabled = Arc::new(AtomicBool::new(true));
+        let now = Utc::now();
+        let last_active_at = Arc::new(Mutex::new(now));
+        let last_seen_at = Arc::new(Mutex::new(now));
 
         // reader 线程：PTY 输出 → scrollback + 通知捕获（OSC 9/777/133/BEL）
         let mut reader = pair
@@ -284,6 +309,8 @@ impl TermManager {
             let scrollback = scrollback.clone();
             let term_id = id.clone();
             let shell_for_notify = shell.clone();
+            let enabled = enabled.clone();
+            let last_active_at = last_active_at.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 8192];
                 let mut scanner = NotifyScanner::default();
@@ -293,7 +320,12 @@ impl TermManager {
                         Ok(n) => {
                             let chunk = &buf[..n];
                             append_scrollback(&scrollback, chunk);
+                            *last_active_at.lock().unwrap() = Utc::now();
+                            // 停用时仍 feed 保持状态机连续，只是不发送通知
                             for (kind, title, body) in scanner.feed(chunk) {
+                                if !enabled.load(Ordering::SeqCst) {
+                                    continue;
+                                }
                                 // 带上前台进程名（如 "kimi · 任务通知"），与 app 侧行为一致
                                 let fg = foreground_cmd(child_pid, &shell_for_notify);
                                 let _ = notify_tx.send(NotifyEvent {
@@ -331,9 +363,12 @@ impl TermManager {
             child_pid,
             shell,
             cwd,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.to_rfc3339(),
             scrollback,
             alive,
+            enabled,
+            last_active_at,
+            last_seen_at,
             cols,
             rows,
         };
@@ -345,11 +380,24 @@ impl TermManager {
     pub fn term_write(&self, id: &str, data: &str) -> Result<(), String> {
         let mut sessions = self.sessions.lock().unwrap();
         let session = sessions.get_mut(id).ok_or("terminal not found")?;
+        if !session.enabled.load(Ordering::SeqCst) {
+            return Err("terminal disabled".into());
+        }
         session
             .writer
             .write_all(data.as_bytes())
             .and_then(|_| session.writer.flush())
-            .map_err(|e| format!("write failed: {e}"))
+            .map_err(|e| format!("write failed: {e}"))?;
+        *session.last_active_at.lock().unwrap() = Utc::now();
+        Ok(())
+    }
+
+    /// 停用/启用会话；返回更新后的会话信息
+    pub fn term_set_enabled(&self, id: &str, enabled: bool) -> Result<TermInfo, String> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions.get(id).ok_or("terminal not found")?;
+        session.enabled.store(enabled, Ordering::SeqCst);
+        Ok(session_info(session))
     }
 
     pub fn term_close(&self, id: &str) -> Result<(), String> {
@@ -364,7 +412,12 @@ impl TermManager {
         Ok(())
     }
 
-    pub fn term_read(&self, id: &str, max_bytes: Option<usize>, raw: Option<bool>) -> Result<String, String> {
+    pub fn term_read(
+        &self,
+        id: &str,
+        max_bytes: Option<usize>,
+        raw: Option<bool>,
+    ) -> Result<String, String> {
         let sessions = self.sessions.lock().unwrap();
         let session = sessions.get(id).ok_or("terminal not found")?;
         let buf = session.scrollback.lock().unwrap();
@@ -453,7 +506,10 @@ mod tests {
 
         // raw 保留 ANSI 转义（shell 提示符一般会带），非 raw 不含 ESC
         let plain = mgr.term_read(&info.id, None, None).unwrap();
-        assert!(!plain.contains('\x1b'), "plain output still has ESC: {plain:?}");
+        assert!(
+            !plain.contains('\x1b'),
+            "plain output still has ESC: {plain:?}"
+        );
 
         mgr.term_close(&info.id).unwrap();
     }
@@ -467,5 +523,71 @@ mod tests {
         assert_eq!(info.cols, 80);
         assert_eq!(info.rows, 24);
         mgr.term_close(&info.id).unwrap();
+    }
+
+    #[test]
+    fn set_enabled_blocks_write_but_keeps_read() {
+        let mgr = test_manager("term-enabled");
+        let (tx, _rx) = notify_tx();
+        let info = mgr.term_create(80, 24, None, tx).unwrap();
+        assert!(info.enabled);
+
+        mgr.term_write(&info.id, "echo enable-marker\n").unwrap();
+        let out = wait_output(&mgr, &info.id, "enable-marker");
+        assert!(out.contains("enable-marker"), "output: {out}");
+
+        let disabled = mgr.term_set_enabled(&info.id, false).unwrap();
+        assert!(!disabled.enabled);
+        assert!(mgr.term_write(&info.id, "echo should-fail\n").is_err());
+
+        // 读与列表不受停用影响
+        let still = mgr.term_read(&info.id, None, None).unwrap();
+        assert!(still.contains("enable-marker"));
+        let list = mgr.term_list();
+        let found = list.iter().find(|t| t.id == info.id).unwrap();
+        assert!(!found.enabled);
+
+        // 启用后写入恢复
+        let enabled = mgr.term_set_enabled(&info.id, true).unwrap();
+        assert!(enabled.enabled);
+        mgr.term_write(&info.id, "echo re-enabled\n").unwrap();
+        let out = wait_output(&mgr, &info.id, "re-enabled");
+        assert!(out.contains("re-enabled"), "output: {out}");
+
+        mgr.term_close(&info.id).unwrap();
+    }
+
+    #[test]
+    fn last_active_at_advances_on_write() {
+        let mgr = test_manager("term-active");
+        let (tx, _rx) = notify_tx();
+        let info = mgr.term_create(80, 24, None, tx).unwrap();
+        let before = DateTime::parse_from_rfc3339(&info.last_active_at)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // 稍等再写，避免同一秒内时间戳完全相同
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        mgr.term_write(&info.id, "echo active-marker\n").unwrap();
+        wait_output(&mgr, &info.id, "active-marker");
+
+        let list = mgr.term_list();
+        let found = list.iter().find(|t| t.id == info.id).unwrap();
+        let after = DateTime::parse_from_rfc3339(&found.last_active_at)
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            after > before,
+            "last_active_at should advance: before={before} after={after}"
+        );
+
+        mgr.term_close(&info.id).unwrap();
+    }
+
+    #[test]
+    fn term_set_enabled_unknown_id_errors() {
+        let mgr = test_manager("term-unknown-enabled");
+        let err = mgr.term_set_enabled("no-such-id", false).unwrap_err();
+        assert_eq!(err, "terminal not found");
     }
 }

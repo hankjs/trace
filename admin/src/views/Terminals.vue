@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from 'vue'
 import { api, type ClientAgentInfo, type TermInfo } from '../composables/api'
 import { Terminal } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
@@ -12,13 +12,42 @@ const input = ref('')
 const autoRefresh = ref(true)
 const error = ref('')
 
+const selectedTerm = computed(() =>
+  terminals.value.find((t) => t.id === selectedTermId.value)
+)
+
 // xterm 输出视图（raw ANSI 回放渲染）；宽高与 client 端实际终端一致，超出部分滚动查看
 const termEl = ref<HTMLElement | null>(null)
 let xterm: Terminal | null = null
 
 function selectedTermSize() {
-  const t = terminals.value.find((t) => t.id === selectedTermId.value)
+  const t = selectedTerm.value
   return { cols: t?.cols || 80, rows: t?.rows || 24 }
+}
+
+/** 相对时间：刚刚 / N分钟前 / N小时前 / N天前；无值或非法返回 '—' */
+function relTime(value: string | null | undefined): string {
+  if (!value) return '—'
+  const t = Date.parse(value)
+  if (Number.isNaN(t)) return '—'
+  const sec = Math.max(0, Math.floor((Date.now() - t) / 1000))
+  if (sec < 60) return '刚刚'
+  const min = Math.floor(sec / 60)
+  if (min < 60) return `${min}分钟前`
+  const hr = Math.floor(min / 60)
+  if (hr < 24) return `${hr}小时前`
+  const day = Math.floor(hr / 24)
+  return `${day}天前`
+}
+
+async function toggleEnabled(t: TermInfo) {
+  if (!selectedClientId.value) return
+  try {
+    await api.terminalSetEnabled(selectedClientId.value, t.id, !t.enabled)
+    await loadTerminals()
+  } catch (e: any) {
+    error.value = e.message
+  }
 }
 
 function ensureXterm() {
@@ -210,7 +239,10 @@ onUnmounted(() => {
             v-for="t in terminals"
             :key="t.id"
             class="px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors"
-            :class="t.id === selectedTermId ? 'bg-surface-raised text-text-primary' : 'text-text-secondary hover:bg-surface-raised/50'"
+            :class="[
+              t.id === selectedTermId ? 'bg-surface-raised text-text-primary' : 'text-text-secondary hover:bg-surface-raised/50',
+              t.enabled === false ? 'opacity-60' : '',
+            ]"
             @click="selectedTermId = t.id"
           >
             <div class="flex items-center gap-2">
@@ -219,9 +251,31 @@ onUnmounted(() => {
                 :class="t.alive ? 'bg-green-400' : 'bg-text-tertiary'"
               ></span>
               <span class="truncate">{{ t.foreground_cmd }}</span>
-              <span class="text-[11px] text-text-tertiary ml-auto shrink-0">{{ shortId(t.id) }}</span>
+              <span
+                v-if="t.enabled === false"
+                class="text-[10px] text-text-tertiary shrink-0 px-1 rounded bg-surface-raised"
+              >已停用</span>
+              <button
+                class="flex items-center shrink-0 ml-auto"
+                title="停用/启用"
+                @click.stop="toggleEnabled(t)"
+              >
+                <span
+                  class="relative inline-flex h-4 w-7 items-center rounded-full transition-colors"
+                  :class="t.enabled !== false ? 'bg-green-500' : 'bg-border-subtle'"
+                >
+                  <span
+                    class="inline-block h-3 w-3 rounded-full bg-white transition-transform"
+                    :class="t.enabled !== false ? 'translate-x-3.5' : 'translate-x-0.5'"
+                  ></span>
+                </span>
+              </button>
+              <span class="text-[11px] text-text-tertiary shrink-0">{{ shortId(t.id) }}</span>
             </div>
             <div class="text-[11px] text-text-tertiary truncate pl-3.5">{{ homeCwd(t.cwd) }}</div>
+            <div class="text-[11px] text-text-tertiary truncate pl-3.5">
+              最后工作 {{ relTime(t.last_active_at) }} · 最后在线 {{ relTime(t.last_seen_at) }}
+            </div>
           </div>
           <div v-if="terminals.length === 0" class="text-[12px] text-text-tertiary px-1">
             该 client 没有终端会话
@@ -235,16 +289,24 @@ onUnmounted(() => {
           ref="termEl"
           class="flex-1 min-h-0 bg-[#0d1117] border border-border-subtle rounded-md overflow-auto p-1"
         ></div>
+        <p
+          v-if="selectedTerm && selectedTerm.enabled === false"
+          class="mt-2 text-[12px] text-text-tertiary"
+        >
+          该终端已停用，启用后可发送命令
+        </p>
         <div class="flex gap-2 mt-3">
           <input
             v-model="input"
             type="text"
             placeholder="输入命令，回车发送（如 ls -la）"
-            class="flex-1 bg-transparent border border-border rounded-md px-3 py-2 text-[13px] font-mono placeholder:text-text-tertiary focus:outline-none focus:border-accent transition-colors"
+            class="flex-1 bg-transparent border border-border rounded-md px-3 py-2 text-[13px] font-mono placeholder:text-text-tertiary focus:outline-none focus:border-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedTerm?.enabled === false"
             @keydown.enter="send"
           />
           <button
-            class="px-3.5 py-1.5 bg-text-primary text-surface-raised text-[13px] rounded-md hover:opacity-80 transition-opacity"
+            class="px-3.5 py-1.5 bg-text-primary text-surface-raised text-[13px] rounded-md hover:opacity-80 transition-opacity disabled:opacity-50 disabled:cursor-not-allowed"
+            :disabled="selectedTerm?.enabled === false"
             @click="send"
           >
             发送

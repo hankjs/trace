@@ -533,6 +533,13 @@ export const api = {
     )
   },
 
+  terminalSetEnabled(clientId: string, termId: string, enabled: boolean) {
+    return request<TermInfo>(
+      `/api/admin/clients/${clientId}/terminals/${termId}/enabled`,
+      { method: 'POST', body: JSON.stringify({ enabled }) }
+    )
+  },
+
   listNotifications(limit = 100) {
     return request<ClientNotification[]>(`/api/admin/notifications?limit=${limit}`)
   },
@@ -667,6 +674,9 @@ export interface TermInfo {
   created_at: string
   cols: number
   rows: number
+  enabled: boolean
+  last_active_at: string
+  last_seen_at: string
 }
 
 export interface ClientNotification {

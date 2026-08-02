@@ -2,12 +2,13 @@ mod admin;
 mod admin_terminal;
 mod auth;
 mod changes;
+mod channel_records;
 mod chat;
 mod checkpoints;
 mod cli_agent;
-mod channel_records;
 mod config;
 mod deployment;
+mod feishu;
 mod image_gen;
 mod llm;
 pub mod provider_registry;
@@ -16,14 +17,13 @@ pub mod remote_tools;
 mod requirement_docs;
 pub mod response;
 mod routes;
+mod scheduler;
 mod skills;
 mod snap_tools;
 mod specs;
 pub mod task_state;
 mod termshot;
 mod websnap;
-mod feishu;
-mod scheduler;
 mod weixin;
 
 use anyhow::Result;
@@ -195,9 +195,7 @@ async fn run_server() -> Result<()> {
         weixin_channel_history: RwLock::new(HashMap::new()),
         client_hubs: RwLock::new(HashMap::new()),
         quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
-        quant_pending_confirms: Arc::new(
-            code_tools::quant_grant::QuantPendingConfirmStore::new(),
-        ),
+        quant_pending_confirms: Arc::new(code_tools::quant_grant::QuantPendingConfirmStore::new()),
         tasks: Arc::new(task_state::TaskRegistry::new()),
     });
 
@@ -369,8 +367,7 @@ async fn run_server() -> Result<()> {
         .route("/api/client/poll", get(remote_exec::poll_requests))
         .route(
             "/api/client/agent-event",
-            post(remote_exec::post_agent_event)
-                .route_layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
+            post(remote_exec::post_agent_event).route_layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
         )
         // tool-result 可能携带媒体文件 base64 回传（20MB 文件约 27MB），放宽 body 上限
         .route(
@@ -553,18 +550,12 @@ async fn run_server() -> Result<()> {
         )
         // Scheduler admin routes（定时任务管理）
         .route("/api/admin/jobs", get(scheduler::routes::list_jobs))
-        .route(
-            "/api/admin/jobs/{id}",
-            patch(scheduler::routes::update_job),
-        )
+        .route("/api/admin/jobs/{id}", patch(scheduler::routes::update_job))
         .route(
             "/api/admin/jobs/{id}/runs",
             get(scheduler::routes::job_runs),
         )
-        .route(
-            "/api/admin/jobs/{id}/run",
-            post(scheduler::routes::run_job),
-        )
+        .route("/api/admin/jobs/{id}/run", post(scheduler::routes::run_job))
         // Admin terminal proxy
         .route("/api/admin/clients", get(admin_terminal::list_clients))
         .route(
@@ -578,6 +569,10 @@ async fn run_server() -> Result<()> {
         .route(
             "/api/admin/clients/{cid}/terminals/{tid}/input",
             post(admin_terminal::terminal_input),
+        )
+        .route(
+            "/api/admin/clients/{cid}/terminals/{tid}/enabled",
+            post(admin_terminal::terminal_set_enabled),
         )
         .route(
             "/api/admin/notifications",

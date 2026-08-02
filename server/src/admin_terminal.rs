@@ -54,7 +54,16 @@ async fn dispatch(
     if !remote_exec::is_client_online(state, &agent.user_id, &agent.id).await {
         return Err(R::bad_request("client 不在线或未开启远程执行"));
     }
-    match remote_exec::dispatch_tool_call(state, &agent.user_id, &agent.id, tool, input, TERM_TIMEOUT).await {
+    match remote_exec::dispatch_tool_call(
+        state,
+        &agent.user_id,
+        &agent.id,
+        tool,
+        input,
+        TERM_TIMEOUT,
+    )
+    .await
+    {
         Ok(r) if !r.is_error => Ok(r.content),
         Ok(r) => Err(R::bad_request(r.content)),
         Err(e) => Err(R::bad_request(e.to_string())),
@@ -136,6 +145,33 @@ pub async fn terminal_input(
     .await
     {
         Ok(_) => R::ok(serde_json::json!({ "sent": true })),
+        Err(resp) => resp,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct EnabledBody {
+    enabled: bool,
+}
+
+/// POST /api/admin/clients/{cid}/terminals/{tid}/enabled — 停用/启用终端会话
+pub async fn terminal_set_enabled(
+    State(state): State<Arc<AppState>>,
+    Path((cid, tid)): Path<(String, String)>,
+    Json(body): Json<EnabledBody>,
+) -> impl IntoResponse {
+    match dispatch(
+        &state,
+        &cid,
+        "terminal_set_enabled",
+        serde_json::json!({ "id": tid, "enabled": body.enabled }),
+    )
+    .await
+    {
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(v) => R::ok(v),
+            Err(_) => R::ok(serde_json::json!({ "enabled": body.enabled })),
+        },
         Err(resp) => resp,
     }
 }
