@@ -12,6 +12,7 @@ import { ChevronDown, ChevronRight, Loader2, Play, RefreshCw, Timer } from 'luci
 import { api, type AdminJob, type AdminJobRun } from '../api'
 import InlineFeedback from '../components/InlineFeedback.vue'
 import { confirmDialog } from '../confirmDialog'
+import { rawResult, summarizeJobRun } from '../jobRunSummary'
 import { useAsyncAction } from '../useAsyncAction'
 
 const loading = ref(true)
@@ -98,16 +99,9 @@ function formatTime(value: string | null | undefined): string {
   return d.toLocaleString('zh-CN', { hour12: false })
 }
 
-function runSummary(record: AdminJobRun): string {
-  if (record.status === 'running') return '执行中…'
-  if (record.status === 'failed') return `失败: ${record.error ?? '未知错误'}`
-  if (record.result == null) return '已完成'
-  try {
-    const text = JSON.stringify(record.result)
-    return text.length > 120 ? `${text.slice(0, 120)}…` : text
-  } catch {
-    return '已完成'
-  }
+/** 结果摘要:按 job 归一为中文描述,原始 JSON 只留在 title 里供排障。 */
+function runSummary(jobId: string, record: AdminJobRun): string {
+  return summarizeJobRun(jobId, record)
 }
 
 function statusClass(record: AdminJobRun): string {
@@ -192,8 +186,8 @@ onBeforeUnmount(() => {
                 </td>
                 <td class="px-3 py-2.5 align-top">
                   <template v-if="job.last_system_run">
-                    <div :class="statusClass(job.last_system_run)">
-                      {{ runSummary(job.last_system_run) }}
+                    <div :class="statusClass(job.last_system_run)" :title="rawResult(job.last_system_run)">
+                      {{ runSummary(job.id, job.last_system_run) }}
                     </div>
                     <div class="mt-0.5 text-[10px] text-text-tertiary">
                       {{ formatTime(job.last_system_run.started_at) }}
@@ -209,8 +203,8 @@ onBeforeUnmount(() => {
                         :size="12"
                         class="animate-spin text-accent"
                       />
-                      <span :class="statusClass(job.manual_run)">
-                        {{ runSummary(job.manual_run) }}
+                      <span :class="statusClass(job.manual_run)" :title="rawResult(job.manual_run)">
+                        {{ runSummary(job.id, job.manual_run) }}
                       </span>
                     </div>
                     <div class="mt-0.5 text-[10px] text-text-tertiary">
@@ -281,8 +275,8 @@ onBeforeUnmount(() => {
                         <td class="whitespace-nowrap py-1.5 pr-3" :class="statusClass(record)">
                           {{ record.status === 'running' ? '执行中' : record.status === 'failed' ? '失败' : '完成' }}
                         </td>
-                        <td class="max-w-md break-all py-1.5" :class="statusClass(record)">
-                          {{ runSummary(record) }}
+                        <td class="max-w-md break-all py-1.5" :class="statusClass(record)" :title="rawResult(record)">
+                          {{ runSummary(job.id, record) }}
                         </td>
                       </tr>
                     </tbody>

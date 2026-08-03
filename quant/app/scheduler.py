@@ -421,12 +421,20 @@ def job_def(job_id: str) -> dict | None:
     return next((j for j in JOB_DEFS if j["id"] == job_id), None)
 
 
+# 业务任务 id 集合:调度器里还有基础设施任务(互斥锁保活),它们不写执行记录。
+_JOB_IDS = frozenset(j["id"] for j in JOB_DEFS)
+
+
 # 调度器自动执行的日志:监听器在完成回调里写 quant_job_run(旁路,
 # 写库失败不影响任务,见 app/job_log.py)。注意多数 job 内部自己吞异常
 # (记日志返回 None),所以 status=finished 不代表子阶段全部成功,
 # 详细失败仍要看日志。
 def _record_system_run(event) -> None:
     from . import job_log  # 延迟导入,避免 scheduler<->job_log 循环依赖
+    if event.job_id not in _JOB_IDS:
+        # 基础设施任务(如互斥锁保活)不写执行记录,否则每 10 分钟一行,
+        # 把 quant_job_run 和 admin 任务页淹掉。
+        return
     started_at = (
         event.scheduled_run_time.replace(tzinfo=None)
         if getattr(event, "scheduled_run_time", None) is not None
@@ -443,15 +451,31 @@ def _record_system_run(event) -> None:
 
 
 def _run_with_lock_check(func: Callable[[], T]) -> Callable[[], T | None]:
-    """调度任务执行前校验本实例是否仍持有互斥锁;失锁则停止调度。"""
+    """调度任务执行前校验本实例是否仍是 leader;确实失锁才停止调度。
+
+    注意用 `ensure_scheduler_slot` 而非 `is_scheduler_slot_held`:后者在
+    持锁连接被 MySQL 空闲回收(线上 wait_timeout=3600s,而周级/月级任务
+    空窗远超此值)时也返回 False,曾导致实例把「连接没了」误判成
+    「锁被别人抢走」,一次性 stop_scheduler,此后所有定时任务全部停摆。
+    """
     @wraps(func)
     def wrapper() -> T | None:
-        if not scheduler_lock.is_scheduler_slot_held():
-            logger.error("调度器互斥锁已丢失,停止本实例调度")
+        if not scheduler_lock.ensure_scheduler_slot():
+            logger.error("调度器互斥锁已被其他实例持有,停止本实例调度")
             stop_scheduler()
             return None
         return func()
     return wrapper
+
+
+def _keepalive_scheduler_lock() -> None:
+    """保活持锁连接:空闲超过 MySQL wait_timeout 就会被服务端杀掉。
+
+    只探活/必要时重抢,不做业务;真的失锁(锁归了别人)才停调度。
+    """
+    if not scheduler_lock.ensure_scheduler_slot():
+        logger.error("调度器互斥锁已被其他实例持有,停止本实例调度")
+        stop_scheduler()
 
 
 def start_scheduler() -> BackgroundScheduler:
@@ -503,6 +527,14 @@ def start_scheduler() -> BackgroundScheduler:
         _run_with_lock_check(job_intraday_snapshot), "cron",
         day_of_week="mon-fri", minute="*/30",
         id="intraday_snapshot", replace_existing=True,
+        max_instances=1, coalesce=True, misfire_grace_time=600,
+    )
+    # 互斥锁保活:间隔必须明显小于 MySQL wait_timeout(线上 3600s),
+    # 否则周末/月中的任务空窗期里持锁连接会被服务端回收。
+    # 不进 JOB_DEFS —— 这是基础设施任务,不该出现在 admin 任务列表里。
+    scheduler.add_job(
+        _keepalive_scheduler_lock, "interval",
+        minutes=10, id="_scheduler_lock_keepalive", replace_existing=True,
         max_instances=1, coalesce=True, misfire_grace_time=600,
     )
     scheduler.start()

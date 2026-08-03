@@ -15,9 +15,14 @@
 4. 非 MySQL 方言(sqlite 测试环境)无 GET_LOCK,退化为「开关为真即运行」——
    单进程测试不存在跨进程竞态。
 
-本模块刻意独立于 `app/scheduler.py`:那个文件属 agent-data 的 scope
-(见 logs/scope-gap.md 5.1),锁的获取放在 `app/main.py` 的 lifespan 里,
-`scheduler.py` 一行不用改。
+会话级锁的代价:持锁连接空闲超过 MySQL `wait_timeout`(线上 3600s)会被
+服务端杀掉。而周级/月级任务之间的空窗远超这个值,所以「连接还活着」
+不能等同于「本实例还是 leader」,反之更要紧 —— 连接被回收**不等于**
+锁被别人抢走。`ensure_scheduler_slot` 负责区分这两种情况,
+`start_scheduler` 另挂一个保活任务定期探活,避免锁连接被空闲回收。
+
+锁的获取放在 `app/main.py` 的 lifespan 里;`app/scheduler.py` 只在任务
+执行前与保活任务里调用 `ensure_scheduler_slot`。
 """
 from __future__ import annotations
 
@@ -44,10 +49,35 @@ def _dialect_name() -> str:
     return engine.dialect.name
 
 
-def acquire_scheduler_slot() -> bool:
-    """本实例是否应该运行定时任务。"""
+def _try_get_lock() -> bool:
+    """连一条新连接抢 GET_LOCK;成功则把连接存到 `_lock_connection`。"""
     global _lock_connection
 
+    try:
+        connection = engine.connect()
+    except Exception:  # noqa: BLE001 - 库不可达时不参与调度,但别把进程/任务打挂
+        logger.exception("连接数据库失败,无法获取调度器互斥锁")
+        return False
+    try:
+        acquired = connection.execute(
+            text("SELECT GET_LOCK(:name, 0)"), {"name": LOCK_NAME},
+        ).scalar()
+    except Exception:  # noqa: BLE001 - 拿锁失败不应阻断整个进程启动
+        connection.close()
+        logger.exception("获取调度器互斥锁失败,本实例不参与调度")
+        return False
+
+    if acquired != 1:
+        connection.close()
+        logger.info("调度器互斥锁已被其他实例持有,本实例不参与调度")
+        return False
+
+    _lock_connection = connection
+    return True
+
+
+def acquire_scheduler_slot() -> bool:
+    """本实例是否应该运行定时任务。"""
     if settings.env != ENV_PROD:
         logger.info(
             "env=%s,非生产环境不启动调度器"
@@ -65,24 +95,28 @@ def acquire_scheduler_slot() -> bool:
         logger.info("非 MySQL 方言(%s),跳过跨进程互斥", engine.dialect.name)
         return True
 
-    connection = engine.connect()
-    try:
-        acquired = connection.execute(
-            text("SELECT GET_LOCK(:name, 0)"), {"name": LOCK_NAME},
-        ).scalar()
-    except Exception:  # noqa: BLE001 - 拿锁失败不应阻断整个进程启动
-        connection.close()
-        logger.exception("获取调度器互斥锁失败,本实例不参与调度")
+    if not _try_get_lock():
         return False
-
-    if acquired != 1:
-        connection.close()
-        logger.info("调度器互斥锁已被其他实例持有,本实例不参与调度")
-        return False
-
-    _lock_connection = connection
     logger.info("已取得调度器互斥锁 %s,本实例负责运行定时任务", LOCK_NAME)
     return True
+
+
+def _drop_lock_connection() -> None:
+    """丢弃已失效的持锁连接引用(不再发语句,连接已不可用)。"""
+    global _lock_connection
+
+    connection, _lock_connection = _lock_connection, None
+    if connection is None:
+        return
+    try:
+        # 事务可能处于 PendingRollback,先回滚再归还,否则 close 路径会抛
+        connection.rollback()
+    except Exception:  # noqa: BLE001 - 已失效的连接,回滚失败无所谓
+        pass
+    try:
+        connection.close()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def is_scheduler_slot_held() -> bool:
@@ -101,19 +135,36 @@ def is_scheduler_slot_held() -> bool:
     return holder is not None and holder == me
 
 
-def ping_scheduler_lock() -> bool:
-    """对持有锁的连接做一次心跳探测;失锁时返回 False 并清空引用。"""
-    global _lock_connection
+def ensure_scheduler_slot() -> bool:
+    """任务执行前/保活时确认本实例仍是 leader,必要时重新抢锁。
+
+    关键区分(此前把两者混为一谈,导致整个实例调度停摆):
+    - 锁**被其他实例抢走** -> 本实例必须停止调度;
+    - 持锁连接被 MySQL 按 `wait_timeout` 回收(线上 3600s,而周级任务
+      之间空窗远超此值)-> 只是连接没了,leader 身份并没有让给谁,
+      重新 GET_LOCK 抢回来即可继续调度。
+
+    返回 True 表示可以继续跑定时任务。
+    """
     if _dialect_name() != "mysql":
         return True
-    if _lock_connection is None:
-        return False
-    try:
-        _lock_connection.execute(text("SELECT 1"))
-    except Exception:  # noqa: BLE001
-        _lock_connection = None
-        return False
-    return is_scheduler_slot_held()
+    if is_scheduler_slot_held():
+        return True
+    # 走到这里:连接失效或锁不在本连接上。丢掉旧引用后重抢一次,
+    # 抢不到才说明锁真的归了别人。
+    _drop_lock_connection()
+    if _try_get_lock():
+        logger.warning(
+            "持锁连接已失效(疑似 MySQL 空闲回收),已重新取得互斥锁 %s,继续调度",
+            LOCK_NAME,
+        )
+        return True
+    return False
+
+
+def ping_scheduler_lock() -> bool:
+    """保活探测:定期跑一次,避免持锁连接被 MySQL 按空闲超时回收。"""
+    return ensure_scheduler_slot()
 
 
 def release_scheduler_slot() -> None:
@@ -127,7 +178,13 @@ def release_scheduler_slot() -> None:
         connection.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": LOCK_NAME})
         logger.info("已释放调度器互斥锁 %s", LOCK_NAME)
     except Exception:  # noqa: BLE001 - 关闭路径不抛
-        logger.exception("释放调度器互斥锁失败")
+        # 连接已被服务端回收时这里必然失败(锁也早已随连接释放),
+        # 记 info 即可:关闭路径打 exception 栈只会污染日志。
+        logger.info("释放调度器互斥锁时连接已失效,锁已随连接自动释放")
+        try:
+            connection.rollback()
+        except Exception:  # noqa: BLE001
+            pass
     finally:
         connection.close()
 

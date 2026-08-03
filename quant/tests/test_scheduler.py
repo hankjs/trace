@@ -217,3 +217,105 @@ def test_financial_job_refreshes_recent_market_periods(monkeypatch):
         date(2026, 6, 30),
     ]]
     assert result == {"upserted": 20000}
+
+
+# ---- 互斥锁守卫:空闲回收不得停掉整个实例的调度 ----
+
+
+def test_lock_guard_runs_job_when_slot_can_be_ensured(monkeypatch):
+    """连接被回收但锁能重抢回来时,任务照常执行、调度器不停。"""
+    calls: list[str] = []
+    stopped: list[bool] = []
+
+    monkeypatch.setattr(
+        scheduler.scheduler_lock, "ensure_scheduler_slot", lambda: True)
+    monkeypatch.setattr(scheduler, "stop_scheduler",
+                        lambda: stopped.append(True))
+
+    wrapped = scheduler._run_with_lock_check(lambda: calls.append("ran"))
+    wrapped()
+
+    assert calls == ["ran"]
+    assert stopped == []
+
+
+def test_lock_guard_stops_scheduling_only_when_lock_is_taken(monkeypatch):
+    """锁确实归了别人:跳过任务并停调度(避免多实例重复抓取)。"""
+    calls: list[str] = []
+    stopped: list[bool] = []
+
+    monkeypatch.setattr(
+        scheduler.scheduler_lock, "ensure_scheduler_slot", lambda: False)
+    monkeypatch.setattr(scheduler, "stop_scheduler",
+                        lambda: stopped.append(True))
+
+    wrapped = scheduler._run_with_lock_check(lambda: calls.append("ran"))
+
+    assert wrapped() is None
+    assert calls == []
+    assert stopped == [True]
+
+
+def test_lock_guard_uses_ensure_not_bare_held_check(monkeypatch):
+    """回归:守卫不得直接用 is_scheduler_slot_held。
+
+    旧实现如此,持锁连接被 MySQL 按 wait_timeout 回收后被误判为失锁,
+    一次 stop_scheduler 让该实例后续所有定时任务永久停摆。
+    """
+    stopped: list[bool] = []
+    monkeypatch.setattr(scheduler, "stop_scheduler",
+                        lambda: stopped.append(True))
+    # 连接已失效(held=False),但锁仍属本实例(ensure 重抢成功)
+    monkeypatch.setattr(
+        scheduler.scheduler_lock, "is_scheduler_slot_held", lambda: False)
+    monkeypatch.setattr(
+        scheduler.scheduler_lock, "ensure_scheduler_slot", lambda: True)
+
+    assert scheduler._run_with_lock_check(lambda: "ok")() == "ok"
+    assert stopped == []
+
+
+def test_keepalive_job_is_registered_and_excluded_from_job_defs():
+    """保活任务必须存在(否则空窗期连接必被回收),但不进业务任务列表。"""
+    import app.scheduler as mod
+
+    assert "_scheduler_lock_keepalive" not in {j["id"] for j in mod.JOB_DEFS}
+    assert "_scheduler_lock_keepalive" not in mod._JOB_IDS
+
+
+def test_keepalive_stops_scheduler_only_on_real_lock_loss(monkeypatch):
+    stopped: list[bool] = []
+    monkeypatch.setattr(scheduler, "stop_scheduler",
+                        lambda: stopped.append(True))
+
+    monkeypatch.setattr(
+        scheduler.scheduler_lock, "ensure_scheduler_slot", lambda: True)
+    scheduler._keepalive_scheduler_lock()
+    assert stopped == []
+
+    monkeypatch.setattr(
+        scheduler.scheduler_lock, "ensure_scheduler_slot", lambda: False)
+    scheduler._keepalive_scheduler_lock()
+    assert stopped == [True]
+
+
+def test_system_run_log_skips_infrastructure_jobs(monkeypatch):
+    """保活每 10 分钟一次,不能污染 quant_job_run 与 admin 任务页。"""
+    from app import job_log
+
+    recorded: list[str] = []
+    monkeypatch.setattr(job_log, "record_run",
+                        lambda job_id, *a, **k: recorded.append(job_id))
+
+    class _Event:
+        def __init__(self, job_id):
+            self.job_id = job_id
+            self.exception = None
+            self.retval = None
+            self.scheduled_run_time = None
+
+    scheduler._record_system_run(_Event("_scheduler_lock_keepalive"))
+    assert recorded == []
+
+    scheduler._record_system_run(_Event("sync_stock_list"))
+    assert recorded == ["sync_stock_list"]
