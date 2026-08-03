@@ -279,6 +279,128 @@ pub fn build_confirm_card(opts: &ConfirmCardOptions) -> Value {
     })
 }
 
+/// 多问题 ask_user 卡片入参。
+pub struct MultiQuestionCardOptions {
+    pub interaction_id: String,
+    pub session_id: String,
+    pub chat_id: String,
+    pub topic_id: String,
+    pub questions: Vec<code_agent::AskUserQuestion>,
+    /// 已作答：题号 → 选项文案。渲染成 ✓ 行，该题不再出按钮。
+    pub answered: std::collections::HashMap<String, String>,
+    pub admin_url: Option<String>,
+}
+
+/// 多问题作答卡：每题一行题干 + 一组按钮（文案形如 `1A main`）；
+/// 已答的题显示 `✓ 1A main`，不再出按钮。
+///
+/// 按钮 action 为 `answer_multi`（与一次性 `answer` 区分——点一题不能整单应答）。
+pub fn build_multi_question_card(opts: &MultiQuestionCardOptions) -> Value {
+    use crate::chat::flatten_question_options;
+
+    // 合法 token 全集与落表 options / 回调白名单同源
+    let flat_tokens = flatten_question_options(&opts.questions);
+    let session_short: String = opts.session_id.chars().take(8).collect();
+    let admin_line = opts
+        .admin_url
+        .as_ref()
+        .map(|u| format!("\n[在 Admin 查看详情]({u})"))
+        .unwrap_or_default();
+
+    let mut elements: Vec<Value> = Vec::new();
+    elements.push(json!({
+        "tag": "markdown",
+        "content": format!(
+            "**基本信息**\n任务编号 `{}` · 会话 `{}`{}",
+            opts.interaction_id, session_short, admin_line
+        )
+    }));
+
+    for q in &opts.questions {
+        if let Some(opt_text) = opts.answered.get(&q.id) {
+            // 反查字母，token 必须落在 flatten 全集内
+            let letter = q
+                .options
+                .iter()
+                .position(|o| o == opt_text)
+                .filter(|&i| i < 26)
+                .map(|i| (b'A' + i as u8) as char)
+                .unwrap_or('?');
+            let token = format!("{}{letter}", q.id);
+            debug_assert!(flat_tokens.iter().any(|t| t == &token) || letter == '?');
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!("**{}.** {}\n✓ `{token}` {opt_text}", q.id, q.question)
+            }));
+        } else {
+            elements.push(json!({
+                "tag": "markdown",
+                "content": format!("**{}.** {}", q.id, q.question)
+            }));
+            let buttons: Vec<Value> = q
+                .options
+                .iter()
+                .enumerate()
+                .take(26)
+                .filter_map(|(i, choice)| {
+                    let letter = (b'A' + i as u8) as char;
+                    let choice_token = format!("{}{letter}", q.id);
+                    // 只渲染 flatten 全集内的 token，保证与白名单一致
+                    if !flat_tokens.iter().any(|t| t == &choice_token) {
+                        return None;
+                    }
+                    let label = format!("{choice_token} {choice}");
+                    Some(json!({
+                        "tag": "button",
+                        "text": { "tag": "plain_text", "content": label },
+                        "type": if i == 0 { "primary" } else { "default" },
+                        "behaviors": [{
+                            "type": "callback",
+                            "value": {
+                                "action": "answer_multi",
+                                "interaction_id": opts.interaction_id,
+                                "question_id": q.id,
+                                "choice": choice,
+                                "choice_token": choice_token,
+                                "session_id": opts.session_id,
+                                "chat_id": opts.chat_id,
+                                "topic_id": opts.topic_id,
+                            }
+                        }]
+                    }))
+                })
+                .collect();
+            if !buttons.is_empty() {
+                elements.push(json!({
+                    "tag": "action",
+                    "actions": buttons
+                }));
+            }
+        }
+    }
+
+    elements.push(json!({
+        "tag": "markdown",
+        "content": "*可点按钮逐题作答，或直接回复「1A 2B」一次答完*"
+    }));
+
+    json!({
+        "schema": "2.0",
+        "config": {
+            "update_multi": true,
+            "summary": { "content": "需要你的输入：多问题" }
+        },
+        "header": {
+            "template": "orange",
+            "title": { "tag": "plain_text", "content": "需要你的输入" }
+        },
+        "body": {
+            "direction": "vertical",
+            "elements": elements
+        }
+    })
+}
+
 /// 确认完成后的终态卡片（按钮替换为结果文本，防止重复点击）。
 pub fn build_confirm_done_card(
     title: &str,
@@ -901,6 +1023,97 @@ mod tests {
             .unwrap();
         let content = analysis_el["content"].as_str().unwrap();
         assert!(content.chars().count() < 2600 + 20);
+    }
+
+    fn sample_multi_qs() -> Vec<code_agent::AskUserQuestion> {
+        vec![
+            code_agent::AskUserQuestion {
+                id: "1".into(),
+                question: "用哪个分支？".into(),
+                options: vec!["main".into(), "dev".into()],
+            },
+            code_agent::AskUserQuestion {
+                id: "2".into(),
+                question: "要跑测试吗？".into(),
+                options: vec!["要".into(), "不要".into()],
+            },
+            code_agent::AskUserQuestion {
+                id: "3".into(),
+                question: "部署吗？".into(),
+                options: vec!["是".into(), "否".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn multi_question_card_all_unanswered_has_three_action_groups() {
+        let card = build_multi_question_card(&MultiQuestionCardOptions {
+            interaction_id: "ia-m".into(),
+            session_id: "sess".into(),
+            chat_id: "c".into(),
+            topic_id: "t".into(),
+            questions: sample_multi_qs(),
+            answered: std::collections::HashMap::new(),
+            admin_url: None,
+        });
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let action_count = elements.iter().filter(|e| e["tag"] == "action").count();
+        assert_eq!(action_count, 3);
+        // 第一个按钮 action 为 answer_multi
+        let first_btn = &elements
+            .iter()
+            .find(|e| e["tag"] == "action")
+            .unwrap()["actions"][0];
+        assert_eq!(
+            first_btn["behaviors"][0]["value"]["action"],
+            "answer_multi"
+        );
+        assert_eq!(first_btn["behaviors"][0]["value"]["choice_token"], "1A");
+        assert!(first_btn["text"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("1A"));
+    }
+
+    #[test]
+    fn multi_question_card_partial_hides_answered_buttons() {
+        let mut answered = std::collections::HashMap::new();
+        answered.insert("1".into(), "main".into());
+        let card = build_multi_question_card(&MultiQuestionCardOptions {
+            interaction_id: "ia-m".into(),
+            session_id: "sess".into(),
+            chat_id: "c".into(),
+            topic_id: "t".into(),
+            questions: sample_multi_qs(),
+            answered,
+            admin_url: None,
+        });
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let action_count = elements.iter().filter(|e| e["tag"] == "action").count();
+        assert_eq!(action_count, 2); // 题 2、3 仍可点
+        let body = serde_json::to_string(elements).unwrap();
+        assert!(body.contains('✓') || body.contains("✓"));
+        assert!(body.contains("1A") || body.contains("main"));
+    }
+
+    #[test]
+    fn multi_question_card_all_answered_no_actions() {
+        let mut answered = std::collections::HashMap::new();
+        answered.insert("1".into(), "main".into());
+        answered.insert("2".into(), "要".into());
+        answered.insert("3".into(), "否".into());
+        let card = build_multi_question_card(&MultiQuestionCardOptions {
+            interaction_id: "ia-m".into(),
+            session_id: "sess".into(),
+            chat_id: "c".into(),
+            topic_id: "t".into(),
+            questions: sample_multi_qs(),
+            answered,
+            admin_url: None,
+        });
+        let elements = card["body"]["elements"].as_array().unwrap();
+        let action_count = elements.iter().filter(|e| e["tag"] == "action").count();
+        assert_eq!(action_count, 0);
     }
 
     #[tokio::test(start_paused = true)]

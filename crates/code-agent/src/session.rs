@@ -8,12 +8,13 @@ use crate::runtime::{
     build_run_summary_from as runtime_build_run_summary_from, emit_run_terminal, now_ts, RunState,
     ToolCallContext, ToolRuntime,
 };
-use crate::AgentEvent;
+use crate::{AgentEvent, AskUserQuestion, SuggestedAction};
 use anyhow::Result;
 use code_tools::{PermissionConfig, PermissionGuard, PermissionMode, Tool, ToolRisk};
 use hank_provider::{
     CompletionRequest, ContentBlock, LlmProvider, Message, Role, StopReason, ToolDefinition,
 };
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -33,9 +34,9 @@ const CONTINUATION_MIN_GAIN_TOKENS: u32 = 500;
 
 /// quant 高成本确认闸门的提问文案与选项。
 ///
-/// 选项只放真实可点的按钮；批量授权只能在文字回复中输入（如「确认5次」），
-/// 不把「确认N次」这种字面模板放进 options——用户一点就会被解析层当成拒绝。
-/// 微信入口无批量授权、5 分钟超时，话术单独一份。
+/// 选项只放真实可点的按钮；「确认N次」字面模板不能进 options（点击会被解析层
+/// 当成拒绝）。飞书/网页多一个「本会话全部同意」（等价确认 50 次）；
+/// 微信入口无批量授权、5 分钟超时，话术与选项单独一份。
 fn quant_confirm_prompt(summary: &str, source: &str) -> (String, Vec<String>) {
     if source == "weixin" {
         (
@@ -48,13 +49,133 @@ fn quant_confirm_prompt(summary: &str, source: &str) -> (String, Vec<String>) {
     } else {
         (
             format!(
-                "{summary}\n\n确认执行该高成本量化操作？可回复：确认 / 否；\
-                 回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作。\
+                "{summary}\n\n确认执行该高成本量化操作？可点「确认」/「本会话全部同意」/「否」；\
+                 或回复文字：确认 / 否；回复「确认N次」（如「确认5次」，N≤50）也可批量授权。\
                  授权与日高成本配额共用，本会话内有效。"
             ),
-            vec!["确认".to_string(), "否".to_string()],
+            vec![
+                "确认".to_string(),
+                "本会话全部同意".to_string(),
+                "否".to_string(),
+            ],
         )
     }
+}
+
+/// 解析并裁剪 agent 提议的动作。
+///
+/// 超限截断而不报错：模型多写了几个不该让整轮失败。
+/// - 最多 3 个（卡片一行放得下，加上「查看详情」共 4 个）
+/// - label 最多 12 字符（飞书按钮宽度），按 chars() 截断
+/// id 是否可安全进入 MySQL JSON 路径与飞书 callback value。
+/// 只允许 `[A-Za-z0-9_-]`，长度 ≤ 8；拒绝 `"` / `.` / 超长等注入面。
+pub fn is_safe_question_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 8
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// 解析多问题。裁剪规则（超限截断不报错，同 suggest_actions 口径）：
+/// 最多 5 题、每题最多 4 个选项；id 去重（重复的丢弃后者）；
+/// id / question / options 任一为空的题丢弃；不安全 id 丢弃并 warn。
+fn parse_ask_user_questions(input: &Value) -> Vec<AskUserQuestion> {
+    const MAX_QUESTIONS: usize = 5;
+    const MAX_OPTIONS: usize = 4;
+
+    let Some(arr) = input.get("questions").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(MAX_QUESTIONS.min(arr.len()));
+    for item in arr {
+        if out.len() >= MAX_QUESTIONS {
+            break;
+        }
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let question = item
+            .get("question")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if id.is_empty() || question.is_empty() {
+            continue;
+        }
+        if !is_safe_question_id(id) {
+            tracing::warn!(id, "ask_user: 丢弃不安全的 question id");
+            continue;
+        }
+        if !seen_ids.insert(id.to_string()) {
+            // 重复 id：丢弃后者
+            continue;
+        }
+        let options: Vec<String> = item
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        v.as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string())
+                    })
+                    .take(MAX_OPTIONS)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if options.is_empty() {
+            continue;
+        }
+        out.push(AskUserQuestion {
+            id: id.to_string(),
+            question: question.to_string(),
+            options,
+        });
+    }
+    out
+}
+
+/// - prompt 最多 2000 字符
+/// - label 或 prompt 为空的条目直接丢弃
+fn parse_suggested_actions(input: &Value) -> Vec<SuggestedAction> {
+    const MAX_ACTIONS: usize = 3;
+    const MAX_LABEL_CHARS: usize = 12;
+    const MAX_PROMPT_CHARS: usize = 2000;
+
+    let Some(arr) = input.get("actions").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::with_capacity(MAX_ACTIONS.min(arr.len()));
+    for item in arr {
+        if out.len() >= MAX_ACTIONS {
+            break;
+        }
+        let label = item
+            .get("label")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let prompt = item
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if label.is_empty() || prompt.is_empty() {
+            continue;
+        }
+        let label: String = label.chars().take(MAX_LABEL_CHARS).collect();
+        let prompt: String = prompt.chars().take(MAX_PROMPT_CHARS).collect();
+        out.push(SuggestedAction { label, prompt });
+    }
+    out
 }
 
 /// Agent execution mode
@@ -838,6 +959,7 @@ impl AgentSession {
                                         options,
                                         tool_use_id: id.clone(),
                                         kind: Some(format!("quant_confirm:{}", req.source)),
+                                        questions: Vec::new(),
                                     })
                                     .await;
                                 ask_user_triggered = true;
@@ -848,27 +970,68 @@ impl AgentSession {
 
                         // Detect ask_user tool — emit event and break
                         if name == "ask_user" {
-                            let question =
-                                input["question"].as_str().unwrap_or_default().to_string();
-                            let options = input["options"]
-                                .as_array()
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                            let questions = parse_ask_user_questions(input);
+                            let has_single = input.get("question").and_then(|v| v.as_str()).is_some()
+                                || input
+                                    .get("options")
+                                    .and_then(|v| v.as_array())
+                                    .is_some_and(|a| !a.is_empty());
+                            if !questions.is_empty() && has_single {
+                                tracing::warn!(
+                                    "ask_user: 同时传了 questions 与 question/options，以 questions 为准"
+                                );
+                            }
+                            let (question, options) = if !questions.is_empty() {
+                                // 多问题：question 取第一题题干供 title/单行展示；
+                                // options 留空（扁平全集由落表层写）
+                                (
+                                    questions[0].question.clone(),
+                                    Vec::new(),
+                                )
+                            } else {
+                                let question = input["question"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let options = input["options"]
+                                    .as_array()
+                                    .map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                (question, options)
+                            };
                             let _ = event_tx
                                 .send(AgentEvent::AskUser {
                                     question,
                                     options,
                                     tool_use_id: id.clone(),
                                     kind: None,
+                                    questions,
                                 })
                                 .await;
                             ask_user_triggered = true;
                             ask_user_tool_id = Some(id.clone());
                             break;
+                        }
+
+                        // suggest_actions 不中断循环：它只是记录建议，agent 继续跑完本轮。
+                        // 拦截而非让工具自己 execute，是因为要把结构化 actions 送进事件流。
+                        if name == "suggest_actions" {
+                            let actions = parse_suggested_actions(input);
+                            if !actions.is_empty() {
+                                let _ = event_tx
+                                    .send(AgentEvent::SuggestedActions { actions })
+                                    .await;
+                            }
+                            tool_results.push(ContentBlock::ToolResult {
+                                tool_use_id: id.clone(),
+                                content: "已记录建议动作，将在任务结束时展示给用户".to_string(),
+                                is_error: false,
+                            });
+                            continue;
                         }
 
                         // Check for loop detection（【SA 03】相同调用+相同结果才算无进展）
@@ -1108,7 +1271,8 @@ impl AgentSession {
 
 #[cfg(test)]
 mod tests {
-    use super::quant_confirm_prompt;
+    use super::{is_safe_question_id, parse_ask_user_questions, parse_suggested_actions, quant_confirm_prompt};
+    use serde_json::json;
 
     #[test]
     fn test_quant_confirm_prompt_no_literal_batch_button() {
@@ -1122,6 +1286,17 @@ mod tests {
     }
 
     #[test]
+    fn test_quant_confirm_prompt_feishu_has_batch_agree_button() {
+        let (_, options) = quant_confirm_prompt("回测策略 42", "trace_chat");
+        assert!(options.contains(&"本会话全部同意".to_string()));
+        assert_eq!(options.len(), 3);
+
+        let (_, options) = quant_confirm_prompt("回测策略 42", "weixin");
+        assert!(!options.contains(&"本会话全部同意".to_string()));
+        assert_eq!(options.len(), 2);
+    }
+
+    #[test]
     fn test_quant_confirm_prompt_weixin_no_batch_wording() {
         let (question, _) = quant_confirm_prompt("回测策略 42", "weixin");
         assert!(!question.contains("确认N次"));
@@ -1130,5 +1305,149 @@ mod tests {
         let (question, _) = quant_confirm_prompt("回测策略 42", "trace_chat");
         assert!(question.contains("确认N次"));
         assert!(question.contains("确认5次"));
+        assert!(question.contains("本会话全部同意"));
+    }
+
+    #[test]
+    fn parse_suggested_actions_normal_two() {
+        let input = json!({
+            "actions": [
+                {"label": "补单测", "prompt": "给登录模块补单元测试"},
+                {"label": "只修 P0", "prompt": "只修复 P0 级别的问题"}
+            ]
+        });
+        let actions = parse_suggested_actions(&input);
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].label, "补单测");
+        assert_eq!(actions[1].prompt, "只修复 P0 级别的问题");
+    }
+
+    #[test]
+    fn parse_suggested_actions_caps_at_three() {
+        let input = json!({
+            "actions": [
+                {"label": "a", "prompt": "1"},
+                {"label": "b", "prompt": "2"},
+                {"label": "c", "prompt": "3"},
+                {"label": "d", "prompt": "4"}
+            ]
+        });
+        let actions = parse_suggested_actions(&input);
+        assert_eq!(actions.len(), 3);
+        assert_eq!(actions[2].label, "c");
+    }
+
+    #[test]
+    fn parse_suggested_actions_truncates_long_chinese_label() {
+        // 15 个汉字 → 截到 12，不能出现半个字
+        let long = "帮我仔细检查一下用户登录";
+        assert_eq!(long.chars().count(), 12); // baseline for exact
+        let longer = "帮我仔细检查一下用户登录模块实现";
+        assert!(longer.chars().count() > 12);
+        let input = json!({
+            "actions": [{"label": longer, "prompt": "do it"}]
+        });
+        let actions = parse_suggested_actions(&input);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].label.chars().count(), 12);
+        let expected: String = longer.chars().take(12).collect();
+        assert_eq!(actions[0].label, expected);
+    }
+
+    #[test]
+    fn parse_suggested_actions_drops_empty() {
+        let input = json!({
+            "actions": [
+                {"label": "", "prompt": "x"},
+                {"label": "y", "prompt": ""},
+                {"label": "  ", "prompt": "  "},
+                {"label": "ok", "prompt": "run"}
+            ]
+        });
+        let actions = parse_suggested_actions(&input);
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].label, "ok");
+    }
+
+    #[test]
+    fn parse_suggested_actions_non_array_is_empty() {
+        assert!(parse_suggested_actions(&json!({})).is_empty());
+        assert!(parse_suggested_actions(&json!({"actions": "nope"})).is_empty());
+        assert!(parse_suggested_actions(&json!({"actions": null})).is_empty());
+    }
+
+    #[test]
+    fn parse_ask_user_questions_normal() {
+        let input = json!({
+            "questions": [
+                {"id": "1", "question": "用哪个分支？", "options": ["main", "dev"]},
+                {"id": "2", "question": "要跑测试吗？", "options": ["要", "不要"]}
+            ]
+        });
+        let qs = parse_ask_user_questions(&input);
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].id, "1");
+        assert_eq!(qs[0].options, vec!["main", "dev"]);
+        assert_eq!(qs[1].id, "2");
+    }
+
+    #[test]
+    fn parse_ask_user_questions_caps_at_five_and_four_options() {
+        let mut questions = Vec::new();
+        for i in 1..=6 {
+            questions.push(json!({
+                "id": format!("{i}"),
+                "question": format!("q{i}"),
+                "options": ["a", "b", "c", "d", "e"]
+            }));
+        }
+        let qs = parse_ask_user_questions(&json!({"questions": questions}));
+        assert_eq!(qs.len(), 5);
+        assert_eq!(qs[0].options.len(), 4);
+    }
+
+    #[test]
+    fn parse_ask_user_questions_rejects_unsafe_ids() {
+        // JSON 路径注入面：含引号、点号、超长
+        let input = json!({
+            "questions": [
+                {"id": "1\".injected", "question": "bad", "options": ["a"]},
+                {"id": "a.b", "question": "bad", "options": ["a"]},
+                {"id": "toolongid9", "question": "bad", "options": ["a"]},
+                {"id": "1", "question": "ok", "options": ["a"]}
+            ]
+        });
+        let qs = parse_ask_user_questions(&input);
+        assert_eq!(qs.len(), 1);
+        assert_eq!(qs[0].id, "1");
+    }
+
+    #[test]
+    fn parse_ask_user_questions_dedupes_and_drops_empty() {
+        let input = json!({
+            "questions": [
+                {"id": "1", "question": "first", "options": ["a"]},
+                {"id": "1", "question": "dup", "options": ["b"]},
+                {"id": "2", "question": "", "options": ["a"]},
+                {"id": "3", "question": "no opts", "options": []},
+                {"id": "4", "question": "ok", "options": ["x"]}
+            ]
+        });
+        let qs = parse_ask_user_questions(&input);
+        assert_eq!(qs.len(), 2);
+        assert_eq!(qs[0].id, "1");
+        assert_eq!(qs[0].question, "first");
+        assert_eq!(qs[1].id, "4");
+    }
+
+    #[test]
+    fn is_safe_question_id_whitelist() {
+        assert!(is_safe_question_id("1"));
+        assert!(is_safe_question_id("q1"));
+        assert!(is_safe_question_id("A_b-2"));
+        assert!(!is_safe_question_id(""));
+        assert!(!is_safe_question_id("1\".injected"));
+        assert!(!is_safe_question_id("a.b"));
+        assert!(!is_safe_question_id("toolongid9"));
     }
 }

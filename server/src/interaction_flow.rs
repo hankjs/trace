@@ -23,7 +23,8 @@ use hank_provider::ContentBlock;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// 飞书卡片回调上下文。admin 手动应答传 None，跳过 claim / 改卡 / 恢复卡。
+/// 飞书卡片回调上下文。admin 手动应答传 None：跳过 claim / 恢复卡，
+/// 但终态改卡仍会按交互单 account_id 自行解析账号完成。
 pub struct ChannelCardContext {
     pub api: FeishuApi,
     pub account: FeishuAccount,
@@ -155,9 +156,24 @@ pub async fn answer_and_resume(
     }
 
     // ③ 原子应答
+    // answer 列 VARCHAR(64)：超长时截断写入，完整版已由多问题路径写入
+    // resume_ref.final_answer；resume 派发仍用调用方传入的完整 `answer`。
+    let answer_for_db = crate::chat::truncate_answer_for_column(answer);
+    if answer_for_db.chars().count() < answer.chars().count() {
+        if let Err(e) = state
+            .db
+            .set_interaction_final_answer(interaction_id, answer)
+            .await
+        {
+            tracing::warn!(
+                interaction_id,
+                "set_interaction_final_answer 失败: {e:#}"
+            );
+        }
+    }
     let answered_row = match state
         .db
-        .answer_interaction(interaction_id, answer, operator_user_id)
+        .answer_interaction(interaction_id, &answer_for_db, operator_user_id)
         .await
     {
         Ok(Some(row)) => row,
@@ -173,41 +189,31 @@ pub async fn answer_and_resume(
         }
     };
 
-    // ④ 改终态卡（仅飞书卡片路径）
-    if let Some(ref ctx) = channel_ctx {
-        if let Some(card_mid) = &ctx.card_message_id {
-            let question = if answered_row.kind == "task_gate" || answered_row.kind == "team_gate"
-            {
-                answered_row
-                    .goal
-                    .clone()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| answered_row.title.clone())
-            } else {
-                answered_row
-                    .resume_ref
-                    .as_deref()
-                    .and_then(|raw| {
-                        serde_json::from_str::<Value>(raw)
-                            .ok()
-                            .and_then(|v| v["question"].as_str().map(|s| s.to_string()))
-                    })
-                    .or_else(|| ctx.question_fallback.clone())
-                    .unwrap_or_else(|| "确认操作".to_string())
-            };
-            let title = if answered_row.kind == "task_gate" {
-                "新任务 · 待确认是否开始修"
-            } else if answered_row.kind == "team_gate" {
-                "团队任务闸门"
-            } else {
-                "待确认"
-            };
-            let done =
-                build_confirm_done_card(title, &question, answer, "你", Some(interaction_id));
-            if let Err(e) = ctx.api.update_card(card_mid, &done).await {
-                tracing::warn!("feishu: patch confirm card failed: {e:#}");
-            }
-        }
+    // ④ 改终态卡。飞书按钮点过来时用回调自带的 api 与 card_message_id；
+    // admin 手动应答（channel_ctx 为 None）也要改——否则管理员替用户拍板后，
+    // 群里那张卡片按钮依然亮着，是在骗人。此时按交互单的 account_id 自行解析账号。
+    // 标题/文案统一走 interaction_card_* helper，与取消/过期路径同一套约定。
+    let operator_label = if channel_ctx.is_some() {
+        "你"
+    } else {
+        "管理员"
+    };
+    if let Err(e) = patch_card_to_done(
+        state,
+        &answered_row,
+        channel_ctx.as_ref().map(|c| &c.api),
+        channel_ctx
+            .as_ref()
+            .and_then(|c| c.card_message_id.as_deref()),
+        channel_ctx
+            .as_ref()
+            .and_then(|c| c.question_fallback.as_deref()),
+        answer,
+        operator_label,
+    )
+    .await
+    {
+        tracing::warn!(interaction_id, "feishu: patch confirm card failed: {e:#}");
     }
 
     // ⑤ 派发。task_gate 在开关打开且有 team_task_id 时交给编排器，
@@ -240,9 +246,7 @@ pub async fn answer_and_resume(
     let team_settings = crate::team_task::settings::effective(state).await;
 
     match answered_row.kind.as_str() {
-        "task_gate" | "team_gate"
-            if team_settings.enabled && team_task_id.is_some() =>
-        {
+        "task_gate" | "team_gate" if team_settings.enabled && team_task_id.is_some() => {
             let task_id = team_task_id.expect("is_some guard");
             // 编排器的 dispatch_role 内部会自己抢名额。
             // 进编排器之前必须先释放 answer_and_resume 持有的 guard，
@@ -296,9 +300,7 @@ pub async fn answer_and_resume(
                             let _ = api
                                 .reply_text(
                                     &msg_id_fail,
-                                    &format!(
-                                        "派发失败，已恢复待确认，可重新点击按钮。原因：{e:#}"
-                                    ),
+                                    &format!("派发失败，已恢复待确认，可重新点击按钮。原因：{e:#}"),
                                     topic_id_fail != "main",
                                 )
                                 .await;
@@ -1084,7 +1086,8 @@ fn confirm_card_from_interaction(
     };
     let hint = if is_quant {
         Some(
-            "点击按钮或回复文字作答；回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作"
+            "点「确认」执行本次；点「本会话全部同意」等同「确认50次」；\
+             不同意可直接回复你的意见。也可文字回复「确认N次」（N≤50）"
                 .to_string(),
         )
     } else {
@@ -1184,8 +1187,7 @@ fn interaction_card_question_parts(
 /// `choice_label` 是终态文案（如「已取消」「已超时」「已作废」），
 /// `operator_label` 是执行者展示名（如「管理员」「系统」）。
 ///
-/// 尽力而为：非飞书渠道、账号已删、卡片 id 为空都直接返回 Ok。
-/// 库状态才是权威，卡片只是镜像；改卡失败不能让取消/过期本身失败。
+/// 查交互单后转调 `patch_card_to_done`（应答 / 取消 / 过期 / 取代共用实现）。
 pub(crate) async fn close_interaction_card(
     state: &Arc<AppState>,
     interaction_id: &str,
@@ -1196,6 +1198,40 @@ pub(crate) async fn close_interaction_card(
     let Some(row) = state.db.get_interaction(interaction_id).await? else {
         return Ok(());
     };
+    patch_card_to_done(
+        state,
+        &row,
+        None,
+        card_message_id,
+        None,
+        choice_label,
+        operator_label,
+    )
+    .await
+}
+
+/// 终态卡片改写的唯一实现：应答、取消、过期、取代四条路径共用。
+///
+/// 为什么合成一处：这四条路径都要「查账号 → 拼终态卡 → update_card」，
+/// 各写一遍会让标题与问题文案漂移——步骤④ 曾自带一套硬编码标题，
+/// 导致同一张 quant 确认卡应答后叫「待确认」、被取消后叫「高成本操作确认」。
+///
+/// `api` 为 None 时（admin 手动应答、取消、过期回收）按交互单的 `account_id`
+/// 自行解析飞书账号；飞书按钮回调直接复用回调那侧已建好的 api，不重复建客户端。
+/// `question_fallback` 只有卡片回调 payload 带，其余路径传 None。
+///
+/// 尽力而为：非飞书渠道、账号已删、卡片 id 为空都直接返回 Ok。
+/// 库状态才是权威，卡片只是镜像；改卡失败不能让应答/取消/过期本身失败。
+#[allow(clippy::too_many_arguments)]
+async fn patch_card_to_done(
+    state: &Arc<AppState>,
+    row: &AgentInteraction,
+    api: Option<&FeishuApi>,
+    card_message_id: Option<&str>,
+    question_fallback: Option<&str>,
+    choice_label: &str,
+    operator_label: &str,
+) -> Result<()> {
     if row.channel != "feishu" {
         return Ok(());
     }
@@ -1205,21 +1241,37 @@ pub(crate) async fn close_interaction_card(
     let Some(card_mid) = card_mid else {
         return Ok(());
     };
-    let Some(account_id) = row.account_id.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(());
+
+    // 已有 api 直接用，避免飞书回调路径重复建客户端。
+    // owned_api 绑定局部变量延长生命周期，不能在 match 里直接返回 &FeishuApi。
+    let owned_api = match api {
+        Some(_) => None,
+        None => {
+            let Some(account_id) = row.account_id.as_deref().filter(|s| !s.is_empty()) else {
+                return Ok(());
+            };
+            let Some(account) = state.db.get_feishu_account(account_id).await? else {
+                // 账号被删是正常终局，不是错误。
+                return Ok(());
+            };
+            Some(FeishuApi::new_archived(&account, state.db.clone()))
+        }
     };
-    let Some(account) = state.db.get_feishu_account(account_id).await? else {
-        // 账号被删是正常终局，不是错误。
-        return Ok(());
-    };
-    let api = FeishuApi::new_archived(&account, state.db.clone());
-    let question = interaction_card_question(&row);
+    let api = api.or(owned_api.as_ref()).expect("api 必有其一");
+
+    let mut question = interaction_card_question(row);
+    // 交互单上没记下问句时（回落到了 title），才用卡片 payload 带的兜底。
+    if question == row.title {
+        if let Some(fallback) = question_fallback.filter(|s| !s.is_empty()) {
+            question = fallback.to_string();
+        }
+    }
     let card = build_confirm_done_card(
         interaction_card_title(&row.kind),
         &question,
         choice_label,
         operator_label,
-        Some(interaction_id),
+        Some(&row.id),
     );
     api.update_card(card_mid, &card).await
 }
@@ -1309,6 +1361,20 @@ mod tests {
         assert_eq!(interaction_card_title("quant_confirm"), "高成本操作确认");
         assert_eq!(interaction_card_title("ask_user"), "需要你的输入");
         assert_eq!(interaction_card_title("unknown_kind"), "待确认");
+    }
+
+    /// 步骤④ 曾自带一套硬编码标题（其余 kind 一律「待确认」），导致同一张
+    /// quant 确认卡应答后叫「待确认」、被取消后叫「高成本操作确认」。
+    /// 收敛到 helper 后这里锁住：四种 kind 都不该回落到兜底标题。
+    #[test]
+    fn answer_path_title_agrees_with_cancel_path() {
+        for kind in ["quant_confirm", "ask_user", "task_gate", "team_gate"] {
+            assert_ne!(
+                interaction_card_title(kind),
+                "待确认",
+                "{kind} 不应回落到兜底标题"
+            );
+        }
     }
 
     #[test]

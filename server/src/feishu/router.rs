@@ -1360,7 +1360,11 @@ async fn dispatch_task_content(
         Err(e) => {
             tracing::warn!("feishu: run_chat_turn failed: {e}");
             state.tasks.clear_progress(&session_id).await;
-            api.reply_text(&msg.message_id, &format!("启动失败：{e}"), msg.in_thread())
+            let reply = match &e {
+                crate::chat::ChatTurnError::UserFacing(msg) => msg.clone(),
+                _ => format!("启动失败：{e}"),
+            };
+            api.reply_text(&msg.message_id, &reply, msg.in_thread())
                 .await?;
         }
     }

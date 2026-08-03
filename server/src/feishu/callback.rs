@@ -8,15 +8,18 @@
 //! 若先应答再抢名额，会留下「answered 但未派发」的不可恢复僵尸。
 //! 飞书回调与 admin 手动应答共用 `answer_and_resume`，避免两处顺序漂移。
 
+use crate::chat::{flatten_question_options, format_multi_answer_token_string};
 use crate::feishu::api::FeishuApi;
-use crate::feishu::card::build_confirm_done_card;
+use crate::feishu::card::{build_confirm_done_card, build_multi_question_card, MultiQuestionCardOptions};
 use crate::feishu::router::{self, IncomingMessage};
 use crate::interaction_flow::{self, ChannelCardContext};
 use crate::AppState;
 use anyhow::{anyhow, Result};
+use code_agent::AskUserQuestion;
 use hank_db::FeishuAccount;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +102,20 @@ pub async fn handle_card_action(
             operator_open_id,
             value,
             card_message_id_from_event(&ev),
+        )
+        .await;
+    }
+
+    // 多问题逐题：answer_multi 放在 answer 之前——点一题不能整单应答。
+    if value["action"].as_str() == Some("answer_multi") {
+        return handle_answer_multi(
+            state,
+            account,
+            operator_open_id,
+            value,
+            card_message_id_from_event(&ev),
+            event_id,
+            created_at,
         )
         .await;
     }
@@ -210,6 +227,224 @@ pub async fn handle_card_action(
         Ok(json!({
             "toast": { "type": "success", "content": format!("已提交：{choice}") }
         }))
+    }
+}
+
+/// 多问题逐题点击：累积 partial_answers，全答完才走 answer_and_resume。
+async fn handle_answer_multi(
+    state: Arc<AppState>,
+    account: FeishuAccount,
+    operator_open_id: String,
+    value: Value,
+    card_message_id: Option<String>,
+    event_id: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+) -> Result<Value> {
+    let interaction_id = value["interaction_id"].as_str().unwrap_or("").to_string();
+    let question_id = value["question_id"].as_str().unwrap_or("").to_string();
+    let choice = value["choice"].as_str().unwrap_or("").to_string();
+    let choice_token = value["choice_token"].as_str().unwrap_or("").to_string();
+    let chat_id = value["chat_id"].as_str().unwrap_or("").to_string();
+    let topic_id = value["topic_id"].as_str().unwrap_or("").to_string();
+
+    let api = FeishuApi::new_archived(&account, state.db.clone());
+
+    let binding = state
+        .db
+        .get_feishu_binding(&account.id, &operator_open_id)
+        .await
+        .unwrap_or(None);
+    let Some(binding) = binding else {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "你还没有绑定，请先发送 bind 绑定码" }
+        }));
+    };
+    let user_id = binding.user_id.clone();
+
+    if interaction_id.is_empty() || question_id.is_empty() || choice_token.is_empty() {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "卡片数据不完整" }
+        }));
+    }
+
+    let row = match state.db.get_interaction(&interaction_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return Ok(json!({
+                "toast": { "type": "warning", "content": "这张卡已失效" }
+            }));
+        }
+        Err(e) => {
+            tracing::warn!(interaction_id = %interaction_id, "get_interaction: {e:#}");
+            return Ok(json!({
+                "toast": { "type": "warning", "content": "读取交互单失败" }
+            }));
+        }
+    };
+    if row.status != "pending" {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "这张卡已失效" }
+        }));
+    }
+
+    let resume: Value =
+        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
+    let questions: Vec<AskUserQuestion> = resume
+        .get("questions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default();
+    if questions.is_empty() {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "这不是多问题卡" }
+        }));
+    }
+
+    // 白名单：question_id 在 questions 内，choice_token 在扁平全集内
+    if !questions.iter().any(|q| q.id == question_id) {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "题号无效" }
+        }));
+    }
+    let flat = flatten_question_options(&questions);
+    if !flat.iter().any(|t| t == &choice_token) {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "选项无效" }
+        }));
+    }
+
+    // 存选项文案（渲染 ✓ 行与最终 human 文案需要）
+    let stored = if choice.is_empty() {
+        // 从 token 反查文案
+        questions
+            .iter()
+            .find(|q| q.id == question_id)
+            .and_then(|q| {
+                let letter = choice_token
+                    .strip_prefix(&q.id)
+                    .and_then(|s| s.chars().next())?;
+                let idx = (letter.to_ascii_uppercase() as u8).saturating_sub(b'A') as usize;
+                q.options.get(idx).cloned()
+            })
+            .unwrap_or_else(|| choice_token.clone())
+    } else {
+        choice.clone()
+    };
+
+    match state
+        .db
+        .set_interaction_partial_answer(&interaction_id, &question_id, &stored)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return Ok(json!({
+                "toast": { "type": "warning", "content": "这张卡已失效" }
+            }));
+        }
+        Err(e) => {
+            tracing::warn!(interaction_id = %interaction_id, "set_interaction_partial_answer: {e:#}");
+            return Ok(json!({
+                "toast": { "type": "warning", "content": "记录答案失败" }
+            }));
+        }
+    }
+
+    // 重读 partial_answers
+    let row = state
+        .db
+        .get_interaction(&interaction_id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(row);
+    let resume: Value =
+        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
+    let mut answered: HashMap<String, String> = HashMap::new();
+    if let Some(obj) = resume.get("partial_answers").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                answered.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+
+    let remaining = questions
+        .iter()
+        .filter(|q| !answered.contains_key(&q.id))
+        .count();
+
+    if remaining > 0 {
+        // 未答完：刷新卡片，不动交互单状态
+        let admin_url = interaction_flow::admin_interaction_url(&state, &interaction_id);
+        let card = build_multi_question_card(&MultiQuestionCardOptions {
+            interaction_id: interaction_id.clone(),
+            session_id: row.session_id.clone(),
+            chat_id: chat_id.clone(),
+            topic_id: topic_id.clone(),
+            questions,
+            answered,
+            admin_url,
+        });
+        let mid = card_message_id
+            .clone()
+            .or_else(|| row.card_message_id.clone());
+        if let Some(mid) = mid {
+            if let Err(e) = api.update_card(&mid, &card).await {
+                tracing::warn!(interaction_id = %interaction_id, "update multi card: {e:#}");
+            }
+        }
+        return Ok(json!({
+            "toast": {
+                "type": "success",
+                "content": format!("已记录，还剩 {remaining} 题")
+            }
+        }));
+    }
+
+    // 全答完：拼完整串 → answer_and_resume（会改终态卡，此处不要再 update_card）
+    let pairs: Vec<(String, String)> = questions
+        .iter()
+        .filter_map(|q| {
+            answered
+                .get(&q.id)
+                .map(|opt| (q.id.clone(), opt.clone()))
+        })
+        .collect();
+    let full = format_multi_answer_token_string(&questions, &pairs);
+    if let Err(e) = state
+        .db
+        .set_interaction_final_answer(&interaction_id, &full)
+        .await
+    {
+        tracing::warn!(interaction_id = %interaction_id, "set_interaction_final_answer: {e:#}");
+    }
+
+    // 传完整串：answer_and_resume 写库时会截断 answer 列，resume text 保持完整
+    match interaction_flow::answer_and_resume(
+        &state,
+        &interaction_id,
+        &full,
+        &user_id,
+        Some(ChannelCardContext {
+            api,
+            account,
+            card_message_id,
+            event_id,
+            operator_open_id,
+            created_at,
+            chat_id,
+            topic_id,
+            question_fallback: None,
+        }),
+    )
+    .await
+    {
+        Ok(()) => Ok(json!({
+            "toast": { "type": "success", "content": format!("已全部作答：{full}") }
+        })),
+        Err(e) => Ok(json!({
+            "toast": { "type": "warning", "content": e.message }
+        })),
     }
 }
 
@@ -348,6 +583,12 @@ async fn handle_task_detail(
             "toast": { "type": "warning", "content": "详情已过期（超过 30 天）" }
         }));
     };
+    // 拒绝混用 action_id：伪造 id 可让「建议动作」的 prompt 被当详情发出，反之亦然。
+    if row.kind != "detail" {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "无效的详情请求" }
+        }));
+    }
 
     // A 用户不能点 B 用户卡片上的按钮。answer 路径靠交互单 user_id 兜住，
     // 详情按钮没有交互单，必须显式校验 session 归属。
@@ -394,10 +635,9 @@ async fn handle_task_detail(
     Ok(json!({ "toast": { "type": "success", "content": "详情已发送" } }))
 }
 
-/// 终态卡建议动作骨架：以 payload 为 prompt 起新一轮。
+/// 终态卡建议动作：以 payload 为 prompt 起新一轮。
 ///
-/// B 阶段的 suggest_actions 会往 feishu_card_actions 写 kind=suggest 的行；
-/// A 阶段没有任何入口产生这种行，此分支实际走不到，但先建好以固定契约。
+/// 不改写原卡——用户可能想连着点两个建议；新一轮进度卡由 pusher 自然产生。
 async fn handle_task_suggest(
     state: Arc<AppState>,
     account: FeishuAccount,
@@ -427,6 +667,12 @@ async fn handle_task_suggest(
             "toast": { "type": "warning", "content": "该动作已过期（超过 30 天）" }
         }));
     };
+    // 只接受 kind=suggest：否则伪造 action_id 可让「查看详情」全文被当 prompt 执行。
+    if row.kind != "suggest" {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "无效的建议动作" }
+        }));
+    }
 
     // A 用户不能点 B 用户卡片上的按钮触发执行。
     // answer 路径靠交互单的 user_id 兜住身份，task_suggest 没有交互单，必须显式查。
@@ -439,10 +685,24 @@ async fn handle_task_suggest(
         }));
     }
 
+    // 并发：session 正在跑时给明确 toast，而不是让 dispatch 静默回进度文案。
+    if state
+        .active_tasks
+        .read()
+        .await
+        .contains_key(&row.session_id)
+        || state.tasks.is_dispatching(&row.session_id).await
+    {
+        return Ok(json!({
+            "toast": { "type": "warning", "content": "任务正在执行中，请稍候" }
+        }));
+    }
+
     tracing::info!(
         operator = %operator_open_id,
         action_id = %action_id,
         session_id = %row.session_id,
+        session_id_from_card = %session_id_from_card,
         "feishu: 卡片建议动作按钮点击"
     );
 
@@ -465,8 +725,6 @@ async fn handle_task_suggest(
     let account2 = account.clone();
     let user_id = binding.user_id.clone();
     let prompt = row.payload.clone();
-    // session_id_from_card 仅作日志关联；真正派发仍走话题映射找/建 session
-    let _ = session_id_from_card;
     tokio::spawn(async move {
         if let Err(e) =
             router::dispatch_task(&state2, &api, &account2, &msg, &user_id, &prompt).await

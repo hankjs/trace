@@ -20,7 +20,7 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user a question with multiple choice options. The agent loop will pause and wait for the user's response before continuing."
+        "Ask the user a question with multiple choice options. Provide either question+options (single) or questions (multiple). The agent loop will pause and wait for the user's response before continuing."
     }
 
     fn input_schema(&self) -> Value {
@@ -29,15 +29,27 @@ impl Tool for AskUserTool {
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "The question to ask the user"
+                    "description": "The question to ask the user (single-question mode)"
                 },
                 "options": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "List of options for the user to choose from"
+                    "description": "List of options for the user to choose from (single-question mode)"
+                },
+                "questions": {
+                    "type": "array",
+                    "description": "Ask several questions at once. Each needs a short id (\"1\", \"2\"), the question text, and its options. Use this instead of question/options when you need multiple answers. At most 5 questions, at most 4 options each.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "question": { "type": "string" },
+                            "options": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "required": ["id", "question", "options"]
+                    }
                 }
-            },
-            "required": ["question", "options"]
+            }
         })
     }
 

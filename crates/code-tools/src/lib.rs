@@ -12,6 +12,7 @@ pub mod search;
 pub mod shell;
 pub mod spec_tools;
 pub mod str_replace;
+pub mod suggest_actions;
 pub mod test_runner;
 pub mod web_fetch;
 pub mod write_file;

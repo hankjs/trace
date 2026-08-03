@@ -8,7 +8,7 @@ use axum::{
         IntoResponse,
     },
 };
-use code_agent::{AgentEvent, AgentSession};
+use code_agent::{AgentEvent, AgentSession, AskUserQuestion};
 use code_tools::{
     ask_user::AskUserTool,
     explore_tools::FinalizeExploreTool,
@@ -22,6 +22,7 @@ use code_tools::{
     shell::ShellTool,
     spec_tools::{UpdateArtifactTool, UpdateSpecTool, UpdateTaskStatusTool},
     str_replace::StrReplaceTool,
+    suggest_actions::SuggestActionsTool,
     test_runner::TestRunnerTool,
     web_fetch::WebFetchTool,
     write_file::WriteFileTool,
@@ -173,6 +174,9 @@ pub enum ChatTurnError {
     NoProviders,
     #[error("{0}")]
     ExternalAgent(String),
+    /// 用户作答格式错误等可直接回显的业务错误（交互单保持 pending，不启 agent）。
+    #[error("{0}")]
+    UserFacing(String),
 }
 
 /// Extract the plain text of a content-block list (used for checkpoint
@@ -419,6 +423,8 @@ pub async fn run_chat_turn(
             session_id.clone(),
         )));
         t.push(Arc::new(AskUserTool::new()));
+        // 收尾建议动作：不中断循环；quant_research 精简工具集不注册（纯查询不该提议代码动作）
+        t.push(Arc::new(SuggestActionsTool::new()));
         // 截图类工具永远 server 本地执行：网页快照用 server 本机 Chrome，
         // 终端截图由 server 拉 client 快照后本地渲染（无 user_id 的会话无法定位 client，不注册）
         t.push(Arc::new(crate::snap_tools::WebSnapshotTool::new(
@@ -503,32 +509,92 @@ pub async fn run_chat_turn(
         let interaction_id = pending["interaction_id"].as_str().unwrap_or("").to_string();
         let answered_by = session_user_id.as_deref().unwrap_or("");
 
+        // 多问题：从 pending 取 questions（resolve_pending_ask_user 已塞进 JSON）
+        let multi_questions = parse_questions_from_pending(&pending);
+
         // 文字回复路径：仍为 pending，在此原子应答；按钮回调路径：已是 answered。
-        let answer_blocked = if pending["status"].as_str() == Some("pending")
+        // 多问题文字作答先校验格式——失败直接回用户、保持 pending，不启 agent。
+        let (answer_blocked, multi_answer_pairs) = if pending["status"].as_str() == Some("pending")
             && !interaction_id.is_empty()
         {
-            match state
-                .db
-                .answer_interaction(&interaction_id, &content_text, answered_by)
-                .await
-            {
-                Ok(Some(_)) => None,
-                Ok(None) => {
-                    // 区分过期与已被抢答，给可读文案
-                    let expired = pending_expires_at_is_past(&pending);
-                    Some(if expired {
-                        "待确认已超时，未执行。如需执行请重新发起。".to_string()
-                    } else {
-                        "这个操作已经提交过了。".to_string()
-                    })
+            if !multi_questions.is_empty() {
+                match parse_multi_answer(&multi_questions, &content_text) {
+                    Ok(pairs) => {
+                        let full =
+                            format_multi_answer_token_string(&multi_questions, &pairs);
+                        // answer 列 VARCHAR(64)：完整串另存 final_answer，列内截断
+                        let for_db = truncate_answer_for_column(&full);
+                        if let Err(e) = state
+                            .db
+                            .set_interaction_final_answer(&interaction_id, &full)
+                            .await
+                        {
+                            tracing::warn!(
+                                interaction_id = %interaction_id,
+                                "set_interaction_final_answer 失败: {e:#}"
+                            );
+                        }
+                        match state
+                            .db
+                            .answer_interaction(&interaction_id, &for_db, answered_by)
+                            .await
+                        {
+                            Ok(Some(_)) => (None, Some(pairs)),
+                            Ok(None) => {
+                                let expired = pending_expires_at_is_past(&pending);
+                                (
+                                    Some(if expired {
+                                        "待确认已超时，未执行。如需执行请重新发起。".to_string()
+                                    } else {
+                                        "这个操作已经提交过了。".to_string()
+                                    }),
+                                    None,
+                                )
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    interaction_id = %interaction_id,
+                                    "answer_interaction 失败: {e:#}"
+                                );
+                                (Some(format!("确认写入失败：{e:#}")), None)
+                            }
+                        }
+                    }
+                    // 格式错误：交互单保持 pending 等重答；不注入 tool_result、不启 agent。
+                    Err(msg) => {
+                        return Err(ChatTurnError::UserFacing(msg));
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(interaction_id = %interaction_id, "answer_interaction 失败: {e:#}");
-                    Some(format!("确认写入失败：{e:#}"))
+            } else {
+                let for_db = truncate_answer_for_column(&content_text);
+                match state
+                    .db
+                    .answer_interaction(&interaction_id, &for_db, answered_by)
+                    .await
+                {
+                    Ok(Some(_)) => (None, None),
+                    Ok(None) => {
+                        let expired = pending_expires_at_is_past(&pending);
+                        (
+                            Some(if expired {
+                                "待确认已超时，未执行。如需执行请重新发起。".to_string()
+                            } else {
+                                "这个操作已经提交过了。".to_string()
+                            }),
+                            None,
+                        )
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            interaction_id = %interaction_id,
+                            "answer_interaction 失败: {e:#}"
+                        );
+                        (Some(format!("确认写入失败：{e:#}")), None)
+                    }
                 }
             }
         } else {
-            None
+            (None, None)
         };
 
         let content = if let Some(msg) = answer_blocked {
@@ -536,8 +602,32 @@ pub async fn run_chat_turn(
         } else if let Some(kind) = pending["kind"].as_str() {
             if let Some(source) = kind.strip_prefix("quant_confirm:") {
                 handle_quant_confirmation(state, &session_id, source, &pending, &content_text).await
+            } else if let Some(ref pairs) = multi_answer_pairs {
+                format_multi_answer_human(&multi_questions, pairs)
+            } else if !multi_questions.is_empty() {
+                // 按钮路径：status 已是 answered，content_text 是 "1A 2B" 串
+                // 优先用 final_answer，再回落 content_text
+                let answer_src = pending["final_answer"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(content_text.as_str());
+                match parse_multi_answer(&multi_questions, answer_src) {
+                    Ok(pairs) => format_multi_answer_human(&multi_questions, &pairs),
+                    Err(_) => content_text.clone(),
+                }
             } else {
                 content_text.clone()
+            }
+        } else if let Some(ref pairs) = multi_answer_pairs {
+            format_multi_answer_human(&multi_questions, pairs)
+        } else if !multi_questions.is_empty() {
+            let answer_src = pending["final_answer"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(content_text.as_str());
+            match parse_multi_answer(&multi_questions, answer_src) {
+                Ok(pairs) => format_multi_answer_human(&multi_questions, &pairs),
+                Err(_) => content_text.clone(),
             }
         } else {
             content_text.clone()
@@ -694,6 +784,7 @@ pub async fn run_chat_turn(
                         options,
                         tool_use_id,
                         kind,
+                        questions,
                     } => {
                         // 两类 ask_user 统一落 agent_interactions：此前 quant_confirm 走进程内
                         // map、普通 ask_user 走 sessions 字段，都以 session_id 为 key，会话重建即丢单。
@@ -716,14 +807,25 @@ pub async fn run_chat_turn(
                             .chars()
                             .take(255)
                             .collect();
-                        let options_json =
-                            serde_json::to_string(options).unwrap_or_else(|_| "[]".to_string());
-                        let resume_ref = serde_json::json!({
+                        // 多问题：options 列存扁平合法答案全集（如 ["1A","1B","2A","2B"]），
+                        // 结构存 resume_ref.questions；不要改 options 列语义。
+                        let options_for_db: Vec<String> = if !questions.is_empty() {
+                            flatten_question_options(questions)
+                        } else {
+                            options.clone()
+                        };
+                        let options_json = serde_json::to_string(&options_for_db)
+                            .unwrap_or_else(|_| "[]".to_string());
+                        let mut resume_val = serde_json::json!({
                             "tool_use_id": tool_use_id,
                             "source": source,
                             "question": question,
-                        })
-                        .to_string();
+                        });
+                        if !questions.is_empty() {
+                            resume_val["questions"] = serde_json::to_value(questions)
+                                .unwrap_or_else(|_| serde_json::json!([]));
+                        }
+                        let resume_ref = resume_val.to_string();
                         let channel = match source.as_str() {
                             "weixin" => "weixin",
                             "feishu" => "feishu",
@@ -1269,7 +1371,8 @@ pub async fn stop_handler(
 /// 从 agent_interactions 表取本会话最近可恢复的交互单，映射为调用方期望的 JSON 形状。
 ///
 /// 返回字段保持 tool_use_id / question / options / kind，另附 interaction_id /
-/// status / expires_at 供应答与超时判断。不再读 sessions.pending_ask_user。
+/// status / expires_at 供应答与超时判断。多问题时附 questions / final_answer。
+/// 不再读 sessions.pending_ask_user。
 async fn resolve_pending_ask_user(state: &Arc<AppState>, session_id: &str) -> Option<String> {
     let row = match state.db.latest_pending_interaction(session_id).await {
         Ok(v) => v?,
@@ -1292,20 +1395,195 @@ async fn resolve_pending_ask_user(state: &Arc<AppState>, session_id: &str) -> Op
         .as_str()
         .unwrap_or(row.title.as_str())
         .to_string();
-    Some(
-        serde_json::json!({
-            "tool_use_id": resume["tool_use_id"].as_str().unwrap_or(""),
-            "question": question,
-            "options": options,
-            "kind": kind,
-            "interaction_id": row.id,
-            "status": row.status,
-            "answer": row.answer,
-            "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
-            "created_at_ms": row.created_at.timestamp_millis(),
+    let mut payload = serde_json::json!({
+        "tool_use_id": resume["tool_use_id"].as_str().unwrap_or(""),
+        "question": question,
+        "options": options,
+        "kind": kind,
+        "interaction_id": row.id,
+        "status": row.status,
+        "answer": row.answer,
+        "expires_at": row.expires_at.map(|t| t.to_rfc3339()),
+        "created_at_ms": row.created_at.timestamp_millis(),
+    });
+    if let Some(qs) = resume.get("questions") {
+        payload["questions"] = qs.clone();
+    }
+    if let Some(fa) = resume.get("final_answer") {
+        payload["final_answer"] = fa.clone();
+    }
+    Some(payload.to_string())
+}
+
+// ── 多问题 ask_user 纯函数 ──────────────────────────────────────────────
+
+/// answer 列是 VARCHAR(64)。完整作答串写入前按 60 字符截断；
+/// 完整版应另存 resume_ref.final_answer，resume 时读那份。不改列宽（迁移成本，
+/// 且 64 对单问题场景够用）。
+pub fn truncate_answer_for_column(answer: &str) -> String {
+    answer.chars().take(60).collect()
+}
+
+/// 多问题的合法答案全集：每题每选项一个 token，形如 "1A"。
+/// 选项超过 26 个的题按前 26 个处理（A-Z 用尽）——实际上限是 4，不会触发。
+pub fn flatten_question_options(questions: &[AskUserQuestion]) -> Vec<String> {
+    let mut out = Vec::new();
+    for q in questions {
+        for (i, _) in q.options.iter().enumerate().take(26) {
+            let letter = (b'A' + i as u8) as char;
+            out.push(format!("{}{letter}", q.id));
+        }
+    }
+    out
+}
+
+/// 从 pending JSON 解析 questions 数组。
+fn parse_questions_from_pending(pending: &serde_json::Value) -> Vec<AskUserQuestion> {
+    pending
+        .get("questions")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// 解析用户的文字作答，如 "1A 2B" / "1a2b" / "1A，2B"。
+/// 返回 Ok(题号→选项文案) 或 Err(给用户看的中文错误)。
+///
+/// 容错：忽略大小写、允许中英文逗号/空格/无分隔符；
+/// 拒绝：未知题号、选项越界、有题未作答（错误信息要指出缺哪题）。
+pub fn parse_multi_answer(
+    questions: &[AskUserQuestion],
+    text: &str,
+) -> Result<Vec<(String, String)>, String> {
+    if questions.is_empty() {
+        return Err("没有待答的问题".to_string());
+    }
+
+    // 合法 token → (question_id, option_text)，key 大写
+    let mut token_map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for q in questions {
+        for (i, opt) in q.options.iter().enumerate().take(26) {
+            let letter = (b'A' + i as u8) as char;
+            let token = format!("{}{letter}", q.id).to_ascii_uppercase();
+            token_map.insert(token, (q.id.clone(), opt.clone()));
+        }
+    }
+
+    // 按长度降序，贪心匹配（避免 "1" 与 "10" 前缀歧义时优先长 token）
+    let mut tokens_by_len: Vec<String> = token_map.keys().cloned().collect();
+    tokens_by_len.sort_by(|a, b| b.len().cmp(&a.len()));
+
+    // 归一化：中英文逗号 → 空格，去其它分隔符时仍可连续匹配
+    let normalized: String = text
+        .chars()
+        .map(|c| match c {
+            '，' | ',' | '；' | ';' | '、' | '\n' | '\t' => ' ',
+            _ => c,
         })
-        .to_string(),
-    )
+        .collect();
+    let upper = normalized.to_ascii_uppercase();
+    // 去掉空格后做无分隔扫描，同时也按空白分词
+    let compact: String = upper.chars().filter(|c| !c.is_whitespace()).collect();
+
+    let mut found: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut rest = compact.as_str();
+    while !rest.is_empty() {
+        let mut matched = false;
+        for tok in &tokens_by_len {
+            if rest.starts_with(tok.as_str()) {
+                if let Some((qid, opt)) = token_map.get(tok) {
+                    // 同题多次作答：后者覆盖前者
+                    found.insert(qid.clone(), opt.clone());
+                }
+                rest = &rest[tok.len()..];
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            // 跳过无法识别的单个字符，避免卡死
+            let mut chars = rest.chars();
+            let bad = chars.next().unwrap_or('?');
+            rest = chars.as_str();
+            // 若整串都扫完仍无任何匹配，后面统一报错
+            let _ = bad;
+        }
+    }
+
+    if found.is_empty() {
+        let example = questions
+            .iter()
+            .map(|q| format!("{}A", q.id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Err(format!(
+            "无法解析作答。请按「{example}」格式回复（题号+选项字母），或点卡片按钮。"
+        ));
+    }
+
+    // 检查漏题
+    let mut missing = Vec::new();
+    for q in questions {
+        if !found.contains_key(&q.id) {
+            missing.push(q.id.clone());
+        }
+    }
+    if !missing.is_empty() {
+        let ids = missing
+            .iter()
+            .map(|id| format!("第 {id} 题"))
+            .collect::<Vec<_>>()
+            .join("、");
+        return Err(format!("还没答完：缺 {ids}。请补全后重发，或点卡片按钮逐题作答。"));
+    }
+
+    // 按 questions 顺序输出
+    Ok(questions
+        .iter()
+        .filter_map(|q| {
+            found
+                .get(&q.id)
+                .map(|opt| (q.id.clone(), opt.clone()))
+        })
+        .collect())
+}
+
+/// 从 questions + pairs 生成 "1A 2B" token 串（用于 answer 列 / final_answer）。
+pub fn format_multi_answer_token_string(
+    questions: &[AskUserQuestion],
+    pairs: &[(String, String)],
+) -> String {
+    let mut tokens = Vec::new();
+    for (qid, opt_text) in pairs {
+        if let Some(q) = questions.iter().find(|q| &q.id == qid) {
+            if let Some(i) = q.options.iter().position(|o| o == opt_text) {
+                if i < 26 {
+                    let letter = (b'A' + i as u8) as char;
+                    tokens.push(format!("{qid}{letter}"));
+                }
+            }
+        }
+    }
+    tokens.join(" ")
+}
+
+/// 人类可读 tool_result：`用哪个分支？→ main；要跑测试吗？→ 要`
+pub fn format_multi_answer_human(
+    questions: &[AskUserQuestion],
+    pairs: &[(String, String)],
+) -> String {
+    let mut parts = Vec::new();
+    for (qid, opt_text) in pairs {
+        let q_text = questions
+            .iter()
+            .find(|q| &q.id == qid)
+            .map(|q| q.question.as_str())
+            .unwrap_or(qid.as_str());
+        // 题干取首行，避免多行题干把 tool_result 撑爆
+        let q_one: String = q_text.lines().next().unwrap_or(q_text).chars().take(40).collect();
+        parts.push(format!("{q_one}→ {opt_text}"));
+    }
+    parts.join("；")
 }
 
 /// 交互单是否已过期：`expires_at` 为 None 永不过期；为过去时刻则过期。
@@ -1364,6 +1642,12 @@ fn parse_quant_confirmation(text: &str, source: &str) -> (u32, String) {
 
     // 微信入口无批量授权
     if source != "weixin" {
+        // 飞书卡片按钮的文案，等价于「确认50次」。
+        // 与打字路径共用同一个 grant 上限，不引入第二套配额语义。
+        // 用 trim 后的原文判断（normalize 会去空白/小写，中文不受影响）。
+        if text.trim() == "本会话全部同意" {
+            return (50, "用户已确认批量授权本会话后续高成本量化操作".to_string());
+        }
         for prefix in ["确认", "允许"] {
             if let Some(rest) = normalized.strip_prefix(prefix) {
                 if let Some(num_part) = rest.strip_suffix("次") {
@@ -1424,6 +1708,7 @@ fn extract_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::TaskUpdated { .. } => "task_updated",
         AgentEvent::ArtifactUpdated { .. } => "artifact_updated",
         AgentEvent::AskUser { .. } => "ask_user",
+        AgentEvent::SuggestedActions { .. } => "suggested_actions",
         AgentEvent::ExploreComplete { .. } => "explore_complete",
         AgentEvent::GenerateComplete { .. } => "generate_complete",
         AgentEvent::LlmRequest { .. } => "llm_request",
@@ -1547,6 +1832,20 @@ mod tests {
 
         let (n, _) = parse_quant_confirmation("确认", "weixin");
         assert_eq!(n, 1);
+
+        // 微信也不能靠「本会话全部同意」绕过批量限制
+        let (n, _) = parse_quant_confirmation("本会话全部同意", "weixin");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn test_parse_quant_confirmation_batch_agree_button() {
+        let (n, summary) = parse_quant_confirmation("本会话全部同意", "feishu");
+        assert_eq!(n, 50);
+        assert!(summary.contains("批量授权"));
+
+        let (n, _) = parse_quant_confirmation("本会话全部同意", "trace_chat");
+        assert_eq!(n, 50);
     }
 
     #[test]
@@ -1556,6 +1855,100 @@ mod tests {
 
         let (n, _) = parse_quant_confirmation("再想想", "weixin");
         assert_eq!(n, 0);
+    }
+
+    fn sample_multi_questions() -> Vec<AskUserQuestion> {
+        vec![
+            AskUserQuestion {
+                id: "1".into(),
+                question: "用哪个分支？".into(),
+                options: vec!["main".into(), "dev".into()],
+            },
+            AskUserQuestion {
+                id: "2".into(),
+                question: "要跑测试吗？".into(),
+                options: vec!["要".into(), "不要".into()],
+            },
+        ]
+    }
+
+    #[test]
+    fn flatten_question_options_tokens() {
+        let flat = flatten_question_options(&sample_multi_questions());
+        assert_eq!(flat, vec!["1A", "1B", "2A", "2B"]);
+    }
+
+    #[test]
+    fn parse_multi_answer_space_separated() {
+        let qs = sample_multi_questions();
+        let pairs = parse_multi_answer(&qs, "1A 2B").unwrap();
+        assert_eq!(pairs[0], ("1".into(), "main".into()));
+        assert_eq!(pairs[1], ("2".into(), "不要".into()));
+        assert_eq!(format_multi_answer_token_string(&qs, &pairs), "1A 2B");
+    }
+
+    #[test]
+    fn parse_multi_answer_no_sep_lowercase() {
+        let pairs = parse_multi_answer(&sample_multi_questions(), "1a2b").unwrap();
+        assert_eq!(pairs[0].1, "main");
+        assert_eq!(pairs[1].1, "不要");
+    }
+
+    #[test]
+    fn parse_multi_answer_chinese_comma() {
+        let pairs = parse_multi_answer(&sample_multi_questions(), "1A，2B").unwrap();
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn parse_multi_answer_missing_question() {
+        let err = parse_multi_answer(&sample_multi_questions(), "1A").unwrap_err();
+        assert!(err.contains("第 2 题"), "err={err}");
+    }
+
+    #[test]
+    fn parse_multi_answer_unknown_question() {
+        // 3A 非法被跳过；1A 2B 齐全 → 仍成功
+        assert!(parse_multi_answer(&sample_multi_questions(), "3A 1A 2B").is_ok());
+        // 只有非法题号 → 无法解析或缺题
+        let err = parse_multi_answer(&sample_multi_questions(), "3A").unwrap_err();
+        assert!(
+            err.contains("无法解析") || err.contains("缺"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn parse_multi_answer_option_out_of_range() {
+        // 第 1 题只有 A/B，1C 非法
+        let err = parse_multi_answer(&sample_multi_questions(), "1C 2A").unwrap_err();
+        assert!(
+            err.contains("无法解析") || err.contains("缺") || err.contains("第 1"),
+            "err={err}"
+        );
+    }
+
+    #[test]
+    fn parse_multi_answer_garbage() {
+        let err = parse_multi_answer(&sample_multi_questions(), "随便写点啥").unwrap_err();
+        assert!(err.contains("无法解析"), "err={err}");
+    }
+
+    #[test]
+    fn format_multi_answer_human_readable() {
+        let qs = sample_multi_questions();
+        let pairs = parse_multi_answer(&qs, "1A 2A").unwrap();
+        let human = format_multi_answer_human(&qs, &pairs);
+        assert!(human.contains("用哪个分支？→ main"));
+        assert!(human.contains("要跑测试吗？→ 要"));
+    }
+
+    #[test]
+    fn truncate_answer_for_column_caps_at_60() {
+        let long: String = "1A ".repeat(30);
+        assert!(long.chars().count() > 60);
+        let t = truncate_answer_for_column(&long);
+        assert_eq!(t.chars().count(), 60);
     }
 
     #[test]

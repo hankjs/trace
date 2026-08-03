@@ -6,9 +6,9 @@
 use crate::chat::EventEntry;
 use crate::feishu::api::FeishuApi;
 use crate::feishu::card::{
-    build_confirm_card, build_task_card, build_task_gate_card, build_task_title,
-    ConfirmCardOptions, TaskCardAction, TaskCardOptions, TaskGateCardOptions, TaskStatus,
-    ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
+    build_confirm_card, build_multi_question_card, build_task_card, build_task_gate_card,
+    build_task_title, ConfirmCardOptions, MultiQuestionCardOptions, TaskCardAction,
+    TaskCardOptions, TaskGateCardOptions, TaskStatus, ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
 };
 // 滞后/静默时回 EventBuffer 补齐事件的共享实现，微信 pusher 也用同一套。
 use crate::task_state::{drain_buffer, next_event, Incoming, ProgressSnapshot};
@@ -176,6 +176,9 @@ async fn run(
 
     let mut progress = Progress::default();
     let mut final_text = String::new();
+    // suggest_actions 可能在最终回复前若干轮就调用了，先存着，
+    // 等 RunComplete 时和总结一起渲染进终态卡。
+    let mut suggested: Vec<code_agent::SuggestedAction> = Vec::new();
     let mut llm_calls: u32 = 0;
     let mut input_tokens: u32 = 0;
     let mut output_tokens: u32 = 0;
@@ -322,6 +325,7 @@ async fn run(
                     question,
                     options,
                     kind,
+                    questions,
                     ..
                 } => {
                     // chat.rs forwarder / cli_agent 在 push 到 buffer 前已 await create_interaction，
@@ -344,6 +348,8 @@ async fn run(
                     // 强行复用 build_confirm_card 会弄坏 quant 确认路径。
                     let is_task_gate = kind.as_deref() == Some("task_gate")
                         || interaction.as_ref().is_some_and(|r| r.kind == "task_gate");
+                    // 多问题：questions 非空走独立卡（逐题按钮 + 文字「1A 2B」提示）
+                    let is_multi = !questions.is_empty();
                     let card = if is_task_gate {
                         let resume: Value = interaction
                             .as_ref()
@@ -385,6 +391,16 @@ async fn run(
                             dirty_files,
                             admin_url,
                         })
+                    } else if is_multi {
+                        build_multi_question_card(&MultiQuestionCardOptions {
+                            interaction_id: interaction_id.clone(),
+                            session_id: session_id.clone(),
+                            chat_id: chat_id.clone(),
+                            topic_id: topic_id.clone(),
+                            questions: questions.clone(),
+                            answered: std::collections::HashMap::new(),
+                            admin_url,
+                        })
                     } else {
                         let is_quant = kind
                             .as_deref()
@@ -395,7 +411,11 @@ async fn run(
                             "需要你的输入"
                         };
                         let hint = if is_quant {
-                            Some("点击按钮或回复文字作答；回复「确认N次」（如「确认5次」，N≤50）可批量授权本会话后续高成本操作".to_string())
+                            Some(
+                                "点「确认」执行本次；点「本会话全部同意」等同「确认50次」；\
+                                 不同意可直接回复你的意见。也可文字回复「确认N次」（N≤50）"
+                                    .to_string(),
+                            )
                         } else {
                             Some("点击按钮或直接回复消息作答".to_string())
                         };
@@ -496,6 +516,10 @@ async fn run(
                             .await;
                     }
                 }
+                AgentEvent::SuggestedActions { actions } => {
+                    // 同一轮多次调用以最后一次为准：模型改主意时不该叠加出 6 个按钮。
+                    suggested = actions;
+                }
                 AgentEvent::Metrics {
                     input_tokens: it,
                     output_tokens: ot,
@@ -519,29 +543,34 @@ async fn run(
                         input_tokens,
                         output_tokens
                     );
-                    // 详情全文进表而不进 callback value：value 有大小限制，且客户端可改。
-                    // 写库失败不影响卡片主体，只是没有详情按钮——不能让它整轮失败。
-                    // 存未截断全文：详情按钮的价值就在于绕过进度卡的长度限制。
-                    let detail_actions = match state
+                    // 详情全文与建议动作进表而不进 callback value。
+                    // 顺序即按钮顺序：建议动作在前（用户更可能点），查看详情兜底在最后。
+                    // 写库失败不影响卡片主体，只是没有按钮——不能让它整轮失败。
+                    let mut items: Vec<(String, String, String)> = suggested
+                        .iter()
+                        .map(|a| ("suggest".to_string(), a.label.clone(), a.prompt.clone()))
+                        .collect();
+                    items.push(("detail".to_string(), "查看详情".to_string(), body.clone()));
+                    let terminal_actions = match state
                         .db
-                        .create_feishu_card_actions(
-                            &session_id,
-                            &[("detail".to_string(), "查看详情".to_string(), body.clone())],
-                        )
+                        .create_feishu_card_actions(&session_id, &items)
                         .await
                     {
-                        Ok(ids) => ids
-                            .into_iter()
-                            .next()
-                            .map(|id| TaskCardAction {
-                                label: "查看详情".to_string(),
-                                action: "task_detail".to_string(),
+                        Ok(ids) => items
+                            .iter()
+                            .zip(ids.into_iter())
+                            .map(|((kind, label, _), id)| TaskCardAction {
+                                label: label.clone(),
+                                action: if kind == "suggest" {
+                                    "task_suggest".to_string()
+                                } else {
+                                    "task_detail".to_string()
+                                },
                                 action_id: id,
                             })
-                            .into_iter()
                             .collect(),
                         Err(e) => {
-                            tracing::warn!(session_id, "写入卡片详情 payload 失败: {e:#}");
+                            tracing::warn!(session_id, "写入卡片按钮 payload 失败: {e:#}");
                             vec![]
                         }
                     };
@@ -556,7 +585,7 @@ async fn run(
                                 .filter(|s| !s.is_empty())
                                 .collect(),
                             footer: Some(footer.clone()),
-                            actions: detail_actions,
+                            actions: terminal_actions,
                             session_id: session_id.clone(),
                             chat_id: chat_id.clone(),
                             topic_id: topic_id.clone(),

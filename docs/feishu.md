@@ -26,7 +26,7 @@ interaction_flow.rs（quant_confirm / ask_user → run_chat_turn；
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
 - **任务进度卡**：标题带任务摘要（超长截断到 24 字）；终态绿卡可挂「查看详情」等按钮。按钮 callback value 只带 `feishu_card_actions` 主键 id，真正的详情全文 / 建议动作 prompt 存服务端（避免客户端改写指令、也避免 value 超长），启动时清理 30 天前的 payload
-- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`（历史字段，已无读写路径）。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）。交互单进入终态（应答 / 取代 / 取消 / 过期）时会同步把飞书卡片改成灰色终态，四条路径共用 `patch_card_to_done`，标题走 `interaction_card_title` 统一约定；admin 手动应答与取消同样会改卡（按交互单的 `account_id` 解析账号），改卡失败只记日志、不影响库状态
+- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`（历史字段，已无读写路径）。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）。交互单进入终态（应答 / 取代 / 取消 / 过期）时会同步把飞书卡片改成灰色终态，四条路径共用 `patch_card_to_done`，标题走 `interaction_card_title` 统一约定；admin 手动应答与取消同样会改卡（按交互单的 `account_id` 解析账号），改卡失败只记日志、不影响库状态。多问题 ask_user 的部分应答停在 `pending` 并写 `resume_ref.partial_answers`，不引入新状态
 - **交互单管理入口**：`server/src/interactions.rs`（admin REST：列表 / 详情 / 手动应答 / 取消）与 `server/src/interaction_flow.rs`（应答派发；飞书按钮与 admin 手动应答共用同一条链路，避免顺序漂移）
 - **两阶段任务闸门（task_gate）**：见下文「两阶段任务闸门」小节。默认关闭（`[server_agent].task_gate_enabled`），与 `server_agent.enabled` 解耦。
 - **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。五种 `agent_kind`：`conversation`（纯对话、无工具）、`quant_research`（A 股研究、仅 quant 工具，需 `quant_a2a.enabled`）、`trace_code` / `quant_code` / `general_task`（代码与文件任务）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。`conversation` 与 `quant_research` 强制 `native`：前者无工具，后者只挂 `quant_*` + `ask_user` + `web_fetch`，均无工作区、不绑 `exec_client_id`。
@@ -101,10 +101,12 @@ admin_base_url = "https://your-host"   # 留空则卡片不渲染深链行
 | 操作 | 说明 |
 |------|------|
 | `@机器人 帮我做 xxx` | 派任务：蓝卡片出现（标题带任务摘要），进度 2s 节流原地刷新，结束变绿/红；完成后可点「查看详情」在话题内获取完整总结（不受进度卡长度限制） |
+| 终态卡建议动作 | agent 收尾时若调用 `suggest_actions`，绿卡上会出现最多 3 个自拟按钮；点击即以该建议为指令起新一轮（新蓝卡） |
 | 直接问行情 / 信号 / 回测 | 路由到 `quant_research`（需 `quant_a2a.enabled`）：server 侧 native，挂 `quant_*` 工具，无代码工作区 |
 | 发送截图 | 图片下载后作为多模态输入交给当前话题 Agent |
 | 话题内继续追问 | 同一会话续接（`feishu_chats` 映射），上下文不断 |
-| 高成本 quant 工具 | 弹确认卡片：点「确认」/「否」；文字回复「确认5次」可批量授权（N≤50，飞书允许批量，与微信不同） |
+| 高成本 quant 工具 | 弹确认卡片三按钮：「确认」/「本会话全部同意」（等价「确认50次」）/「否」；也可文字回复「确认N次」（N≤50）批量授权（微信无批量） |
+| 多问题 ask_user | agent 一次问多题时出多问题卡：可**逐题点按钮**（点后卡片刷新，已答显示 ✓，全部答完才 resume），或文字一次回「1A 2B」。格式错误会提示、交互单保持 pending 可重答。部分应答存在 DB，**跨重启仍有效** |
 | `/new` | 关闭当前话题会话，下次发消息开新会话 |
 | `/stop` | 取消当前执行中的任务 |
 | `/status` | 查看当前话题的会话 ID 与状态 |
@@ -114,6 +116,22 @@ admin_base_url = "https://your-host"   # 留空则卡片不渲染深链行
 | `/deploy` | **仅 server worktree 会话**：固化 commit 并发送部署审批卡。**client-only 会话明确拒绝** |
 | `/rollback` | **仅 server worktree 会话**：回滚审批。**client-only 会话明确拒绝** |
 | `/help` | 命令列表 |
+
+### 多问题 ask_user
+
+`ask_user` 支持两种入参（向后兼容，至少传一组）：
+
+- **单问题**（旧）：`{question, options}` —— 一行按钮，点一下即应答并 resume。
+- **多问题**（新）：`{questions: [{id, question, options}, ...]}` —— 最多 5 题、每题最多 4 选项；id 限 `[A-Za-z0-9_-]` 且 ≤8 字符。
+
+飞书多问题卡：
+
+1. **逐题点选**：按钮文案形如 `1A main`；点第 1 题后卡片原地刷新为「✓ 1A main」，其余题仍可点。`partial_answers` 用 MySQL `JSON_SET` 原子写入，状态仍是 `pending`。**所有题答完**才走 `answer_and_resume` 整单应答并 resume agent。
+2. **文字一次答完**：直接回复 `1A 2B`（大小写不敏感，中英文逗号/空格/无分隔均可）。漏题、越界、乱串会得到中文提示，交互单保持 pending，可重答；不会把垃圾串塞给模型。
+
+部分应答跨重启：`resume_ref.partial_answers` 在 DB，卡片还在飞书侧；服务重启后继续点仍然有效（状态机未引入新中间态，仍是 `pending`）。`answer` 列 `VARCHAR(64)` 对超长完整串会截断，完整版在 `resume_ref.final_answer`。
+
+微信走文字路径，自动获得「1A 2B」解析能力；不专门做多问题卡渲染。
 
 ### 两阶段任务闸门（task_gate）
 

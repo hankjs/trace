@@ -4502,6 +4502,65 @@ impl Database {
         Ok(())
     }
 
+    /// 记录多问题交互单的一题答案（乐观并发：JSON_SET 在单条 UPDATE 内原子，
+    /// 避免「读 resume_ref → 改 → 写回」的丢更新）。
+    ///
+    /// `question_id` 必须由调用方按 resume_ref.questions 白名单校验过——
+    /// 它会拼进 JSON 路径，未校验即为 JSON 路径注入。
+    ///
+    /// 返回 false 表示交互单已不是 pending（被抢答/取消/过期），调用方据此回 toast。
+    pub async fn set_interaction_partial_answer(
+        &self,
+        id: &str,
+        question_id: &str,
+        answer: &str,
+    ) -> Result<bool> {
+        // 防御性断言：即便调用方已白名单，这里再拒一次引号/反斜杠
+        if question_id.is_empty()
+            || question_id.contains('"')
+            || question_id.contains('\\')
+            || !question_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            anyhow::bail!("set_interaction_partial_answer: 非法 question_id");
+        }
+        // resume_ref 可能为 NULL：先 COALESCE 成 '{}' 再 JSON_SET，
+        // 否则 JSON_SET(NULL,…) 返回 NULL 会把整个 resume_ref 抹掉。
+        let path = format!("$.partial_answers.\"{question_id}\"");
+        let result = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                SET resume_ref = JSON_SET(COALESCE(resume_ref, '{}'), ?, ?), updated_at = NOW()
+              WHERE id = ? AND status = 'pending'"
+        )
+        .bind(&path)
+        .bind(answer)
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// 写入 resume_ref.final_answer（完整作答串）。
+    ///
+    /// answer 列是 VARCHAR(64)：多问题完整串写入前会截断，完整版放这里供 resume 使用。
+    /// 仅 pending 可写。
+    pub async fn set_interaction_final_answer(
+        &self,
+        id: &str,
+        final_answer: &str,
+    ) -> Result<bool> {
+        let result = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                SET resume_ref = JSON_SET(COALESCE(resume_ref, '{}'), '$.final_answer', ?),
+                    updated_at = NOW()
+              WHERE id = ? AND status = 'pending'"
+        )
+        .bind(final_answer)
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// 原子应答：仅 pending 且未过期时成功，防重复点击。返回 None 表示已被抢答或过期。
     ///
     /// 注意 `expires_at IS NULL` 分支——飞书/网页交互单不过期，不能写成

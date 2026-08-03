@@ -134,7 +134,17 @@ pub async fn answer_interaction(
         Ok(v) => v,
         Err(e) => return R::internal_error(format!("options 解析失败: {e}")),
     };
-    if !options.iter().any(|o| o == answer) {
+    // 多问题单：options 列存扁平 token 全集（["1A","1B","2A",…]），合法答案是
+    // 组合串（如 "1A 2B"）而非枚举——逐一枚举会组合爆炸。有 resume_ref.questions
+    // 时跳过白名单校验，交给 answer_and_resume / 下游 parse。
+    let is_multi = row
+        .resume_ref
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| v.get("questions").cloned())
+        .and_then(|q| q.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false);
+    if !is_multi && !options.iter().any(|o| o == answer) {
         return R::bad_request(format!(
             "answer 不在 options 内（允许：{}）",
             options.join(" / ")

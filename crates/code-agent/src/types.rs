@@ -27,6 +27,21 @@ pub enum RunStatus {
     Cancelled,
 }
 
+/// Agent 提议的后续动作（由渠道渲染为可点按钮）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuggestedAction {
+    pub label: String,
+    pub prompt: String,
+}
+
+/// ask_user 多问题中的单题
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskUserQuestion {
+    pub id: String,
+    pub question: String,
+    pub options: Vec<String>,
+}
+
 /// Events emitted by the agent loop to the caller (SSE stream)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -155,6 +170,13 @@ pub enum AgentEvent {
         /// 可选标记，用于区分普通 ask_user 与 quant 高成本确认等场景。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         kind: Option<String>,
+        /// 多问题作答。为空表示单问题（走 question / options）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<AskUserQuestion>,
+    },
+    /// Agent 提议的后续动作（不中断循环，由渠道渲染成按钮）
+    SuggestedActions {
+        actions: Vec<SuggestedAction>,
     },
     /// Explore phase completed for a change
     ExploreComplete {

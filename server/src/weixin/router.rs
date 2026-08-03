@@ -935,7 +935,11 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
         Err(e) => {
             tracing::warn!("weixin: run_chat_turn failed: {e}");
             state.tasks.clear_progress(&session_id).await;
-            reply(&format!("启动失败：{e}")).await;
+            let msg = match &e {
+                crate::chat::ChatTurnError::UserFacing(m) => m.clone(),
+                _ => format!("启动失败：{e}"),
+            };
+            reply(&msg).await;
         }
     }
 }

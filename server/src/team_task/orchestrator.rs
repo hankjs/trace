@@ -528,6 +528,7 @@ async fn open_gate(
             options,
             tool_use_id: format!("team_gate:{}", row.id),
             kind: Some("team_gate".to_string()),
+            questions: Vec::new(),
         },
     )
     .await;

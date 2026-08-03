@@ -2583,6 +2583,7 @@ async fn finish_as_task_gate(
             options: vec!["开始修".to_string(), "跳过".to_string()],
             tool_use_id: format!("task_gate:{}", row.id),
             kind: Some("task_gate".to_string()),
+            questions: Vec::new(),
         },
     )
     .await;
