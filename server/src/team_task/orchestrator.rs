@@ -191,8 +191,7 @@ pub enum Trigger {
         outcome: RunOutcome,
         final_text: Option<String>,
     },
-    /// 看板 / 飞书 /stop 取消。看板 REST 第 7 步接入。
-    #[allow(dead_code)]
+    /// 看板 / 飞书 /stop 取消。
     Cancelled { operator: String },
 }
 
@@ -300,6 +299,8 @@ pub async fn advance(state: &Arc<AppState>, task_id: &str, trigger: Trigger) -> 
                 Some(&format!("boundary={}", boundary.as_str())),
             )
             .await;
+            // 主卡刷新是可观测性：best-effort，不接收返回值
+            super::card::sync_team_card(state, task_id).await;
             Ok(())
         }
         Decision::DispatchRole { role, round } => {
@@ -316,6 +317,11 @@ pub async fn advance(state: &Arc<AppState>, task_id: &str, trigger: Trigger) -> 
                 )
                 .await;
             }
+            // dispatch_role 成功路径内部已 sync（先建主卡再起 pusher）；
+            // 跳过路径也刷一次，让流转记录及时出现。
+            if !started {
+                super::card::sync_team_card(state, task_id).await;
+            }
             Ok(())
         }
         Decision::Finish { status, reason } => {
@@ -330,6 +336,7 @@ pub async fn advance(state: &Arc<AppState>, task_id: &str, trigger: Trigger) -> 
                 reason.as_deref(),
             )
             .await;
+            super::card::sync_team_card(state, task_id).await;
             Ok(())
         }
     }
@@ -417,6 +424,9 @@ async fn finalize_run(
             "finish_team_run 失败: {e:#}"
         );
     }
+
+    // 流转记录及时出现；best-effort，不接收返回值
+    super::card::sync_team_card(state, &task.id).await;
 
     Ok(verdict)
 }
@@ -727,12 +737,25 @@ async fn dispatch_role(
     // 7. 失败回滚——不做自动重试（工作区可能已改了一半）。
     match turn {
         Ok(handle) => {
+            // 先建/刷主卡、再起 pusher——否则首个角色的进度仍然丢
+            // （spawn_role_pusher 依赖 card_message_id，此前从未写入）。
+            super::card::sync_team_card(state, &task_id).await;
+            // 重读拿到刚写入的 card_message_id；失败则退回原 task 快照
+            let task_for_pusher = match state.db.get_team_task(&task_id).await {
+                Ok(Some(t)) => t,
+                _ => {
+                    // 状态已改 running，用更新后的字段拼一份
+                    let mut t = task.clone();
+                    t.status = running_status.to_string();
+                    t.current_role = Some(role.to_string());
+                    t
+                }
+            };
             // 进度卡是附加功能：缺主卡/账号只 warn。独立 spawn 避免并进 advance future。
             let state_p = state.clone();
-            let task_p = task.clone();
             let rx = handle.event_rx;
             tokio::spawn(async move {
-                spawn_role_pusher_if_possible(&state_p, &task_p, rx).await;
+                spawn_role_pusher_if_possible(&state_p, &task_for_pusher, rx).await;
             });
             dispatch_guard.release().await;
             Ok(true)
@@ -766,7 +789,8 @@ async fn dispatch_role(
 
 
 /// 起飞书进度 pusher。进度卡是附加功能：没有主卡 / 账号停用 / 查不到时只 warn，
-/// 不阻断任务执行。团队任务主卡（build_team_stage_card）是第 6 步的事。
+/// 不阻断任务执行。调用方须先 `sync_team_card` 再调本函数，否则
+/// `card_message_id` 仍为空会跳过首个角色的进度。
 async fn spawn_role_pusher_if_possible(
     state: &Arc<AppState>,
     task: &TeamTask,
@@ -780,7 +804,7 @@ async fn spawn_role_pusher_if_possible(
     else {
         tracing::warn!(
             task_id = %task.id,
-            "team_task 尚无 card_message_id，跳过 pusher（主卡由第 6 步接入）"
+            "team_task 尚无 card_message_id，跳过 pusher（请确认 sync_team_card 已先执行且 origin_message_id 有值）"
         );
         return;
     };
@@ -904,6 +928,94 @@ async fn prepare_session_for_role(
         .update_session_metadata(session_id, &metadata.to_string())
         .await?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 看板重试
+// ---------------------------------------------------------------------------
+
+/// 从失败时的角色重开一轮（round + 1）。
+///
+/// 为什么用 `round + 1` 而不是复用原 round：`team_task_runs` 的
+/// `(task_id, role, round)` 唯一键会拒绝重复插入。递增轮次同时保留了
+/// 失败那轮的记录，看板上能看到「第 1 轮失败、第 2 轮重试」。
+///
+/// 返回 `Ok(true)` 已派发；`Ok(false)` 并发跳过（已有在途）；
+/// `Err` 前置条件不满足或派发失败。
+pub async fn retry_from_current_role(state: &Arc<AppState>, task_id: &str) -> Result<bool> {
+    let task = state
+        .db
+        .get_team_task(task_id)
+        .await
+        .context("读团队任务")?
+        .ok_or_else(|| anyhow!("团队任务不存在: {task_id}"))?;
+
+    if task.status != super::STATUS_FAILED {
+        return Err(anyhow!(
+            "仅 failed 状态可重试，当前 status={}",
+            task.status
+        ));
+    }
+
+    let latest = state
+        .db
+        .latest_team_run(task_id)
+        .await
+        .context("读 latest run")?
+        .ok_or_else(|| anyhow!("没有可重试的角色轮次"))?;
+
+    let role = latest.role.clone();
+    let new_round = latest.round + 1;
+    let role_def = role_def(&role).ok_or_else(|| anyhow!("未知角色: {role}"))?;
+
+    // 先把状态改回 running_*，再派发；dispatch_role 内部会再写一次
+    state
+        .db
+        .update_team_task_status(
+            task_id,
+            role_def.running_status,
+            Some(&role),
+            None,
+            None,
+        )
+        .await
+        .context("重试前更新任务状态")?;
+
+    // 重读，让 dispatch 用最新状态
+    let task = state
+        .db
+        .get_team_task(task_id)
+        .await
+        .context("重读团队任务")?
+        .ok_or_else(|| anyhow!("团队任务不存在: {task_id}"))?;
+
+    let started = dispatch_role(state, &task, &role, new_round).await?;
+    if started {
+        let _ = append_event(
+            state,
+            task_id,
+            "role_started",
+            Some(&role),
+            Some(new_round),
+            None,
+            Some("看板重试"),
+        )
+        .await;
+    } else {
+        // 并发跳过：状态已被改成 running_*，但没真正派发。
+        // 把状态拨回 failed，避免看板显示「运行中」却无 run。
+        let _ = state
+            .db
+            .update_team_task_status(
+                task_id,
+                super::STATUS_FAILED,
+                None,
+                None,
+                Some("重试时已有在途派发，请稍后重试"),
+            )
+            .await;
+    }
+    Ok(started)
 }
 
 // ---------------------------------------------------------------------------

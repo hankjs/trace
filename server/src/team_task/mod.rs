@@ -6,6 +6,7 @@
 //!
 //! 派发 run、发卡片、读写 DB 都在后续的 `orchestrator` 里，不要写进这里。
 //!
+pub mod card;
 pub mod orchestrator;
 pub mod roles;
 pub mod routes;

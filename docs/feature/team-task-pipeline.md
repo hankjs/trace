@@ -146,6 +146,9 @@ CREATE TABLE IF NOT EXISTS team_tasks (
     chat_id         VARCHAR(128) DEFAULT NULL,
     topic_id        VARCHAR(128) DEFAULT NULL,
     card_message_id VARCHAR(256) DEFAULT NULL,
+    -- 闸门卡片 message_id：主卡要 reply 一条已有消息，建任务行时还没有卡片，
+    -- 由 pusher 发闸门卡成功后回填；编排器派发首个角色时 reply 它生成主卡
+    origin_message_id VARCHAR(256) DEFAULT NULL,
     result        MEDIUMTEXT   DEFAULT NULL,
     error         TEXT         DEFAULT NULL,
     created_at    DATETIME NOT NULL DEFAULT NOW(),
@@ -384,7 +387,23 @@ pub enum Trigger {
 并调 `finalize_open_task_gate` 收尾交互单。团队任务复用同一个钩子：
 
 在 `execute_remote_turn` 的收尾处，若 `sessions.metadata.team_task_id` 非空，
-则调 `team_task::orchestrator::advance(..., Trigger::RunFinished { .. })`。
+则通知编排器推进（`Trigger::RunFinished`）。
+
+**不能直接 `await advance`**：`advance` → `dispatch_role` → `run_cli_turn`
+→ `execute_remote_turn` → `advance` 构成 async 递归，直接 await 会让 future
+类型无限大、编译不过。实现改为 **channel + worker**：
+`enqueue_run_finished` 只把终态入队，`start_run_finished_worker`（main 里起一次）
+在独立协程里消费并调 `advance`。副作用是解耦了时序，run 的终态路径不会被编排阻塞。
+
+入队点只有两处且互斥：`execute_remote_turn` 内部的 `Ok` 路径、
+spawn 闭包里的 `Err` 路径。闸门轮通过 `finished_as_gate: true` 显式跳过——
+任务此时停在 `pending_confirm` 等用户点按钮，不该由 run 终态推进。
+**不要**在 7 处 `finalize_open_task_gate` 旁边各加一次入队，那会让一次 run
+推进多次状态机。
+
+已知取舍：channel 是 fire-and-forget，进程在入队后、worker 处理前被杀会丢掉
+这次推进，任务停在 `running_*`，靠下次启动的 `fail_stale_team_tasks` 标 `failed`。
+不会静默错乱，最坏是一次任务需要重试。
 
 **关键约束（踩过的坑）**：终态判定必须回 `EventBuffer` 补读，
 不能只订阅 broadcast——broadcast 订阅者在终态事件发出后才建立就永远收不到。
@@ -426,30 +445,39 @@ match answered_row.kind.as_str() {
 ### 7.1 任务主卡（新增）
 
 `team_task::card::build_team_stage_card`，一张卡片贯穿整个流水线原地刷新
-（`card_message_id` 存在 `team_tasks`），标题随角色变化：
+（`card_message_id` 存在 `team_tasks`），标题随状态变化：
 
 ```
-团队任务 · 开发 · 开发 开始       （running_developer）
-团队任务 · 评审 · 评审中           （running_reviewer）
-团队任务 · 评审 → 开发（打回）      （pending_dev_gate / 第 2 轮开发）
-团队任务 · 已完成                  （done）
+团队任务 · 开发 · 进行中              （running_developer）
+团队任务 · 评审 · 进行中              （running_reviewer）
+团队任务 · 测试 · 进行中              （running_tester）
+团队任务 · 开发完成 · 待进入评审      （pending_review_gate）
+团队任务 · 评审 → 开发（打回）        （pending_dev_gate）
+团队任务 · 评审通过 · 待进入测试      （pending_test_gate）
+团队任务 · 已完成 / 失败 / 已取消     （done / failed / cancelled）
 ```
 
-正文分区（对齐截图）：
+header `template`：运行中 `blue`、待闸门 `orange`、`done` `green`、
+`failed` `red`、`cancelled` `grey`。
+
+正文分区（顺序固定）：
 
 ```
-目标        「IK5MOR」优化：主界面的开始拟真改为拟真开始！
-基本信息    任务编号 tsk_ms8oi5d9_94ak    状态 running_developer
-            当前角色 开发                 Issue IK5MOR
-            来源 飞书派单                 后端 codex
+目标        （goal，超 500 字符按 chars() 截断）
+基本信息    任务编号 / 状态 / 当前角色 / Issue（可空不渲染）/ 来源 / 后端 / 开发轮次
+hr
 流转记录    ✅ 开发 第1轮 · 改动 3 个文件
             🔄 评审 第1轮 · 进行中
-当前进展    （沿用 pusher 的进度条与最近活动）
-[在看板查看] http://{dashboard}/#team/tsk_ms8oi5d9_94ak
+            ❌ 评审 第1轮 · 打回：漏了错误处理
+当前进展    （有 progress 时：进度条 + 最近活动；复用 feishu::card::build_progress_bar）
+说明        （终态 reason，可空不渲染）
+[在看板查看] http://{dashboard}/#/team/tsk_ms8oi5d9_94ak
 ```
 
-`schema 2.0` + `update_multi: true`，节流沿用 `card.rs` 里已有的 `CardUpdater`
-（2s 合并推送），不新写一套节流。
+首次：reply 到 `origin_message_id`（闸门卡）生成主卡并 `set_team_task_card`；
+之后 `update_card` 原地刷新。`sync_team_card` 全程 best-effort。
+节流：主卡跨角色离散同步，用进程内 `task_id → Instant` 最小 2s 间隔
+（`ThrottledCardUpdater` 面向单角色连续 push，形状不适配）。
 
 ### 7.2 闸门卡片
 
@@ -499,36 +527,40 @@ team/
 
 ### 8.2 页面
 
-**TaskBoard**：按 status 分泳道（待确认 / 开发中 / 待放行 / 评审中 / 测试中 / 已完成 / 失败），
+**TaskBoard**：按 status 分泳道（待确认 / 开发中 / 待放行 / 评审中 / 测试中 /
+已完成 / 失败 / 已取消；三个 `pending_*_gate` 合并为「待放行」），
 卡片显示 `task_no`、目标首行、Issue、当前角色、已用时长、开发轮次。
-轮询 `GET /api/team/tasks`（5s，与 admin Jobs 页同款轮询，不引入 WS）。
+轮询 `GET /api/team/tasks`（5s，仅非终态时开启，与 admin Jobs 页同款，不引入 WS）。
 
 **TaskDetail**：
-- 顶部：任务编号 / Issue / 状态 / 后端 / 节点 / 耗时
-- 左侧时间轴：`team_task_events` 逐条
+- 顶部：任务编号 / Issue / 状态 / 后端 / 耗时 / 最后修改
+- 左侧时间轴：`team_task_events` 逐条（kind 中文）
 - 右侧主区：按角色轮次折叠展示 `team_task_runs`（summary、handoff、改动文件数、错误）
-- 分析全文（`team_tasks.analysis`，markdown 渲染）
-- 操作区：待闸门时可直接应答（复用 `/api/admin/interactions/{id}/answer`），
-  运行中可取消，失败可从当前角色重试
+- 分析全文（`team_tasks.analysis`，**纯文本 `<pre>`**，不引入 markdown 库）
+- 操作区：运行中可取消，失败可从当前角色重试。
+  **闸门应答不在看板做**——需要交互单 id 与 `/api/admin/interactions/{id}/answer`，
+  属额外链路；待闸门时提示「请在飞书卡片上确认」。
 
 ### 8.3 REST 接口
 
-新增 `server/src/team_task/routes.rs`，挂在 `admin_api` 那一组
-（同样 `admin_required` + `auth_middleware`，看板登录复用 admin JWT）：
+`server/src/team_task/routes.rs`，挂在 `admin_api` 那一组
+（同样 `admin_required` + `auth_middleware`，看板登录复用 admin JWT）。
+配置接口在 `/api/admin/team-task/*`，看板数据在 `/api/team/*`，前缀刻意不同。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/team/tasks` | 列表，支持 status / user / issue_key 筛选与分页 |
+| GET | `/api/team/tasks` | 列表，支持 status / user_id / issue_key 筛选与分页 |
 | GET | `/api/team/tasks/{task_no}` | 详情：任务 + runs + events |
-| POST | `/api/team/tasks/{task_no}/cancel` | 取消（走 `Trigger::Cancelled`） |
-| POST | `/api/team/tasks/{task_no}/retry` | 从当前角色重试（仅 failed 可用） |
-| POST | `/api/team/tasks` | 看板手动建任务（source=dashboard） |
+| POST | `/api/team/tasks/{task_no}/cancel` | 取消（走 `Trigger::Cancelled`，终态幂等） |
+| POST | `/api/team/tasks/{task_no}/retry` | 从当前角色重试（仅 failed 可用，round+1） |
+| POST | `/api/team/tasks` | 看板手动建任务（source=dashboard）— **未实现** |
 
 筛选参数沿用 `interactions::parse_filter_param` 的白名单校验，不放行任意值。
 
-**看板 base URL 新增配置** `[team_task].dashboard_base_url`，
-深链格式只在一处定义（仿照 `interaction_flow::admin_interaction_url`）：
-`{dashboard_base_url}/#team/{task_no}`。未配置时卡片不渲染看板链接行，
+**看板 base URL 配置** `dashboard_base_url`（admin「团队任务」页可改，DB 优先），
+深链格式只在 `team_task::card::build_dashboard_task_url` 一处定义
+（仿照 `interaction_flow::admin_interaction_url`）：
+`{dashboard_base_url}/#/team/{task_no}`。未配置时卡片不渲染看板链接行，
 而不是拼出一个坏链接。
 
 ### 8.4 部署
@@ -541,26 +573,43 @@ team/
 
 ## 9. 配置
 
-```toml
-[team_task]
-# 总开关。关闭时 task_gate 走原来的单角色两阶段路径，行为与今天一致。
-enabled = false
-# 参与流水线的角色，按顺序流转。可裁剪成 ["developer"] 只跑单角色。
-roles = ["developer", "reviewer", "tester"]
-# 需要人工确认的边界。默认只保留现有的开发前闸门。
-gates = ["dev_start"]
-# 评审打回后最多重新开发几轮，超出即 failed
-max_dev_rounds = 3
-# 单个角色 run 的超时沿用 [server_agent].agent_timeout_secs，不另设
-# 看板地址，用于飞书卡片深链；未配置则卡片不渲染看板链接
-dashboard_base_url = "http://127.0.0.1:18789"
-```
+配置**存在数据库**（`settings` 表单行 JSON，key = `team_task_config`），
+在 admin「团队任务」页（`/admin/team-task`）修改，**改完即时生效、无需重启**。
 
-`enabled` 与 `[server_agent].task_gate_enabled` 的关系：
-团队任务**依赖**闸门产出分析（分析轮是流水线的入口），
-所以 `team_task.enabled = true` 且 `task_gate_enabled = false` 是无效组合，
-启动时校验并 `bail`，不静默降级——静默降级会让用户以为流水线在跑而实际没跑。
-与 `[server_agent].enabled` 则完全解耦（client-only 链路照样能跑流水线）。
+字段：
+
+| 字段 | 说明 |
+|------|------|
+| `task_gate_enabled` | 两阶段闸门总开关。关闭时代码任务直接执行，不弹分析闸门 |
+| `enabled` | 多角色流水线总开关。关闭时「开始修」走原来的单角色 resume |
+| `roles` | 参与流水线的角色，按数组顺序流转。可裁剪成 `["developer"]` |
+| `gates` | 需要人工确认的边界。默认只有 `dev_start`，其余自动流转 |
+| `max_dev_rounds` | 评审打回后最多重新开发几轮（1–10），超出即 `failed` |
+| `dashboard_base_url` | 看板地址，用于飞书卡片深链；留空则不渲染看板链接行 |
+
+单个角色 run 的超时沿用 `[server_agent].agent_timeout_secs`，不另设。
+
+**为什么在 DB 而不在 `config.toml`**：这些是运行时策略开关（要不要弹闸门、
+要不要走流水线），不是部署基础设施。与 `job_states`（定时任务启停）、
+`agent_cli_profiles`（CLI 凭据）同类。放文件里意味着改个开关要登服务器改文件 + 重启。
+
+留在 `config.toml` 的 `[team_task]` 段与 `[server_agent].task_gate_enabled`
+**降级为「DB 里还没有配置时的初始默认值」**，只在首次部署时兜底，
+这样升级上线时行为不变、不必先去 admin 点一遍。读取路径见
+`server/src/team_task/settings.rs` 的 `effective_with_source`：
+DB 有值用 DB，DB 无值或读失败则退回 config.toml 并 `warn`（DB 抖一下不该让所有任务失败）。
+
+**为什么每次读 DB 不缓存**：这些开关只在「派发一个任务」「推进一次状态机」时读，
+一个任务全程也就几次，不是每 token 都读。直接读换来的是 admin 改完立刻生效、
+没有缓存失效 bug、多实例共库天然一致。
+
+**校验在写入时而非启动时**：`settings::validate` 由 admin REST 在保存前调用，
+非法配置回 400 并给出中文原因。用户点保存立刻看到问题，而不是重启后服务起不来。
+校验项：`enabled` 依赖 `task_gate_enabled`（流水线入口是分析轮）、
+角色名合法且不重复（`next_role` 靠位置查找，重复会让流转错乱）、
+边界名合法、`max_dev_rounds` 在 1–10（防手滑输入 1000 烧穿 token）。
+
+与 `[server_agent].enabled` 完全解耦（client-only 链路照样能跑流水线）。
 
 ## 10. 并发与失败边界
 
@@ -601,18 +650,20 @@ dashboard_base_url = "http://127.0.0.1:18789"
 
 按「每步都能独立验证」切分，不做一次性大合并：
 
-1. **数据层**：三张表 + `hank-db` 的 CRUD（`create_team_task` / `list_team_tasks`
+1. ✅ **数据层**：三张表 + `hank-db` 的 CRUD（`create_team_task` / `list_team_tasks`
    / `get_team_task_by_no` / `insert_team_run` / `finish_team_run` / `append_team_event`）。
-2. **状态机纯函数**：`team_task/mod.rs` 的 `decide_next` + `parse_handoff` + `task_no`，
+2. ✅ **状态机纯函数**：`team_task/mod.rs` 的 `decide_next` + `parse_handoff` + `task_no`，
    带完整单测。此时不接任何链路。
-3. **角色注册表与 prompt**：`roles.rs`，三个角色的 prompt 与交接段要求。
-4. **编排器**：`orchestrator.rs` 的 `advance`，接 `run_cli_turn` 与 `TaskRegistry`。
-5. **接入分析轮与闸门**：`finish_as_task_gate` 建任务行、`answer_and_resume` 分三路，
+3. ✅ **角色注册表与 prompt**：`roles.rs`，三个角色的 prompt 与交接段要求。
+4. ✅ **编排器**：`orchestrator.rs` 的 `advance`，接 `run_cli_turn` 与 `TaskRegistry`。
+5. ✅ **接入分析轮与闸门**：`finish_as_task_gate` 建任务行、`answer_and_resume` 分三路，
    配置开关加上。此时飞书链路已可跑通（卡片先复用现有闸门卡）。
-6. **飞书主卡**：`team_task/card.rs` + pusher 接主卡刷新。
-7. **REST**：`team_task/routes.rs` 挂到 `admin_api`。
-8. **看板前端**：`team/` 工程，Login → TaskBoard → TaskDetail。
-9. **文档**：`docs/feishu.md` 增「团队任务流水线」小节，`CLAUDE.md` 补目录与页面表。
+   含 05a 配置入库 + 05b admin 配置页。
+6. ✅ **飞书主卡**：`team_task/card.rs` + `origin_message_id` + `sync_team_card`，
+   编排器四个状态点刷新。
+7. ✅ **REST**：`team_task/routes.rs` 看板列表/详情/取消/重试挂到 `admin_api`。
+8. ✅ **看板前端**：`team/` 工程，Login → TaskBoard → TaskDetail，端口 18789。
+9. ✅ **文档**：`docs/feishu.md` 增「团队任务流水线」小节，`CLAUDE.md` 补目录与页面表。
 
 1–4 步不改任何现有行为，可以放心先落地。第 5 步是唯一动到现有链路的地方，
 且由 `team_task.enabled` 守着，默认关闭。
@@ -627,3 +678,7 @@ dashboard_base_url = "http://127.0.0.1:18789"
 - **跨节点角色分配**（开发在 A 机、测试在 B 机）：整个流水线固定一个节点。
 - **看板实时推送**：先轮询，需要再上 WS。
 - **自动重试**：failed 任务由人在看板点重试。
+- **看板手动建任务**（`POST /api/team/tasks`）：需要选节点、选 backend、跑分析轮，
+  是另一条独立入口，本期未实现。
+- **看板内闸门应答**：需要交互单 id 与 admin answer 链路，引导去飞书卡片确认。
+- **markdown 渲染**：分析全文在看板为纯文本 `<pre>`，不引入 markdown 库。

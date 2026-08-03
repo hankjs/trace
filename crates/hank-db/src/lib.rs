@@ -283,6 +283,10 @@ pub struct TeamTask {
     pub topic_id: Option<String>,
     /// 飞书任务主卡：跨角色复用同一张卡片原地刷新
     pub card_message_id: Option<String>,
+    /// 闸门卡片的 message_id。主卡要 reply 一条已有消息，而建任务行时
+    /// 还没有卡片（卡片是 pusher 收到 AskUser 后才发的），所以由 pusher
+    /// 发闸门卡成功后回填此列，编排器派发首个角色时再 reply 生成主卡。
+    pub origin_message_id: Option<String>,
     pub result: Option<String>,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -1598,6 +1602,16 @@ impl Database {
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
+        .await?;
+
+        // 闸门卡片 message_id：主卡 reply 目标。建任务行时还没有卡片，
+        // 由 pusher 发闸门卡后回填；已有库用 ensure_column 幂等加列。
+        Self::ensure_column(
+            &pool,
+            "team_tasks",
+            "origin_message_id",
+            "ALTER TABLE team_tasks ADD COLUMN origin_message_id VARCHAR(256) DEFAULT NULL",
+        )
         .await?;
 
         // 从单行结构（agent_cli_configs）迁移到多配置。旧表每后端至多一行，
@@ -4679,8 +4693,8 @@ impl Database {
     /// SELECT 列清单，与 TeamTask / FromRow 字段顺序一致；不用 SELECT *。
     const TEAM_TASK_COLS: &'static str = "id, task_no, session_id, user_id, source, issue_key, \
         title, goal, analysis, status, current_role, dev_rounds, backend, exec_client_id, \
-        agent_kind, account_id, chat_id, topic_id, card_message_id, result, error, \
-        created_at, updated_at, finished_at";
+        agent_kind, account_id, chat_id, topic_id, card_message_id, origin_message_id, \
+        result, error, created_at, updated_at, finished_at";
 
     const TEAM_RUN_COLS: &'static str = "id, task_id, role, round, thread_id, status, verdict, \
         handoff, summary, dirty_files, error, started_at, finished_at";
@@ -4870,6 +4884,24 @@ impl Database {
             "UPDATE team_tasks SET card_message_id = ?, updated_at = NOW() WHERE id = ?"
         )
         .bind(card_message_id)
+        .bind(task_id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// 回填闸门卡片的 message_id，供后续主卡 reply 使用。
+    ///
+    /// 主卡要 reply 一条已有消息，而建任务行时还没有卡片
+    /// （卡片是 pusher 收到 AskUser 后才发的）。
+    pub async fn set_team_task_origin_message(
+        &self,
+        task_id: &str,
+        message_id: &str,
+    ) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE team_tasks SET origin_message_id = ?, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(message_id)
         .bind(task_id)
         .execute(&self.pool))?;
         Ok(())

@@ -608,6 +608,20 @@ async fn run_server() -> Result<()> {
             "/api/admin/team-task/config",
             patch(team_task::routes::update_config),
         )
+        // 团队任务看板数据（路径前缀 /api/team/* 与配置接口刻意不同，见 06 任务 B2.1）
+        .route("/api/team/tasks", get(team_task::routes::list_tasks))
+        .route(
+            "/api/team/tasks/{task_no}",
+            get(team_task::routes::get_task),
+        )
+        .route(
+            "/api/team/tasks/{task_no}/cancel",
+            post(team_task::routes::cancel_task),
+        )
+        .route(
+            "/api/team/tasks/{task_no}/retry",
+            post(team_task::routes::retry_task),
+        )
         // 交互单管理（列表/详情/手动应答/取消；应答会真派发 resume）
         .route(
             "/api/admin/interactions",

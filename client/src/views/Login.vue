@@ -2,6 +2,7 @@
 import { ref } from "vue";
 import { useRouter } from "vue-router";
 import { useSession } from "../composables/useSession";
+import TraceLogo from "../components/TraceLogo.vue";
 
 const { login } = useSession();
 const router = useRouter();
@@ -33,7 +34,10 @@ async function handleLogin() {
 <template>
   <div class="login-page">
     <div class="login-form">
-      <span class="login-brand">Trace</span>
+      <div class="login-brand">
+        <TraceLogo :size="36" />
+        <span class="login-brand-name">Trace</span>
+      </div>
 
       <form @submit.prevent="handleLogin">
         <input
@@ -76,11 +80,16 @@ async function handleLogin() {
 }
 
 .login-brand {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-8);
+}
+
+.login-brand-name {
   font-size: 13px;
   font-weight: 600;
   color: var(--color-text-secondary);
-  margin-bottom: var(--space-8);
 }
 
 form {

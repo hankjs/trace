@@ -42,7 +42,8 @@ pub struct TaskCardOptions {
     pub footer: Option<String>,
 }
 
-fn build_progress_bar(progress: u32) -> String {
+/// 进度条字符（10 格）。`pub` 供 team_task 主卡复用，避免复制一份。
+pub(crate) fn build_progress_bar(progress: u32) -> String {
     let progress = progress.min(100);
     let filled = (progress / 10) as usize;
     format!("{}{}", "█".repeat(filled), "░".repeat(10 - filled))

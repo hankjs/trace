@@ -24,6 +24,7 @@
 │   ├── scheduler/       # 定时任务调度（cron + job_runs 日志 + admin 手动触发）
 │   ├── interactions.rs  # 交互单 admin REST
 │   ├── interaction_flow.rs # 交互单应答与派发（飞书按钮 / admin 共用）
+│   ├── team_task/       # 团队任务流水线（开发→评审→测试多角色编排，见 docs/feature/team-task-pipeline.md）
 │   ├── changes.rs       # 变更管理 API
 │   ├── specs.rs         # Spec 管理 API
 │   ├── admin.rs         # 管理端点
@@ -45,6 +46,8 @@
 │   ├── views/           # 管理页面（路由级）
 │   ├── components/      # 可复用组件
 │   └── composables/api.ts  # admin API 客户端与类型
+├── team/                # 团队任务看板（独立前端，端口 18789，hash 路由）
+│   └── src/views/       # Login / TaskBoard / TaskDetail
 ├── cli/                 # hank-cli：headless 远程终端节点（独立 Cargo 项目，不进 workspace）
 ├── quant/               # A股日频量化信息系统（独立 Python 项目，仅与 server 共用 MySQL）
 │   ├── app/             # FastAPI 后端：baostock/akshare 采集、指标、策略信号、记账、回测
@@ -89,6 +92,7 @@ base path `/admin/`（history 路由）。飞书卡片深链：`{admin_base_url}
 | `/chat-records` | ChatRecords.vue | 渠道消息留档 |
 | `/jobs` | Jobs.vue | 定时任务与执行记录 |
 | `/interactions` | Interactions.vue | 交互单：确认闸门 / ask_user / 任务闸门的状态与手动应答 |
+| `/team-task` | TeamTask.vue | 团队任务流水线配置：闸门/流水线开关、角色顺序、闸门边界（存 DB，即时生效） |
 | `/interactions/:id` | Interactions.vue | 交互单详情（同页） |
 | `/terminals` | Terminals.vue | 远程终端 |
 | `/notifications` | Notifications.vue | 通知 |
@@ -116,15 +120,19 @@ cd client && npm run dev        # Vite 开发服务器
 cd client && npm run build      # 构建
 
 # 管理后台
-cd admin && npm run dev         # admin 开发服务器
-cd admin && npm run build       # admin 构建（严格 TS 检查）
+cd admin && pnpm dev            # admin 开发服务器
+cd admin && pnpm build          # admin 构建（严格 TS 检查）
+
+# 团队任务看板（独立前端，端口 18789，hash 路由 #/team/:taskNo）
+cd team && pnpm install && pnpm dev
+cd team && pnpm build
 
 # 后端开发
-cargo run -p server             # 启动后端服务
+cargo run -p hank-server        # 启动后端服务
 cargo build --workspace         # 构建所有 crate
 
 # Tauri 开发
-cd client && npm run tauri dev  # Tauri 开发模式
+cd client && pnpm tauri dev     # Tauri 开发模式
 
 # quant 量化系统(独立 Python 项目)
 cd quant && uv sync                          # 安装依赖(Python 3.11~3.13)

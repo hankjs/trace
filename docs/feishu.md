@@ -288,7 +288,48 @@ make sync-agent-cli-config
 | 会话存 `data/sessions.json` | `feishu_chats` 表 + server 会话本就在 DB | 天然解决持久化与重启恢复 |
 | 文本回复确认 | 卡片按钮确认 | 文档后期审批篇的形态，提前落地 |
 
-## 六、故障排查
+## 六、团队任务流水线
+
+代码任务从单角色两阶段（分析 → 闸门 → 执行）扩展成 **开发 → 评审 → 测试**
+串行流水线，每个角色独占 CLI thread，角色间用产物交接、不共享上下文。
+设计见 `docs/feature/team-task-pipeline.md`，实现在 `server/src/team_task/`。
+
+**开关**：admin「团队任务」页（`/admin/team-task`）。改完即时生效、无需重启
+（配置存 DB，优先于 `config.toml`）。流水线入口依赖两阶段闸门
+（`task_gate_enabled`）：分析轮结束后落闸门卡，点「开始修」才进编排器。
+
+**流转（简化）**：
+
+```
+pending_confirm → running_developer → [pending_review_gate?] → running_reviewer
+       │                                      │ reject
+       └ 跳过 → cancelled                     ↓
+                                    pending_dev_gate? / running_developer (round+1)
+                                              │ pass
+                                              ↓
+                              [pending_test_gate?] → running_tester → done
+```
+
+闸门边界由配置 `gates` 控制；默认只开 `dev_start`，其余自动流转。
+打回上限 `max_dev_rounds`（默认 3），触顶进 `failed`。
+
+**角色**：
+
+| 角色 | 做什么 | thread |
+|------|--------|--------|
+| developer | 改代码，输出变更摘要 | 独占新 thread |
+| reviewer | 只读评审，verdict=pass/reject | 独占新 thread |
+| tester | 只读验证，verdict=pass/reject | 独占新 thread |
+
+**看板**：独立前端 `team/`，开发端口 **18789**（`cd team && pnpm dev`）。
+深链格式 `{dashboard_base_url}/#/team/{task_no}`（hash 路由，与 admin 的
+history 托管方式不同）。主卡上的「在看板查看」链接与此一致；
+`dashboard_base_url` 未配置时主卡不渲染该行。
+
+**飞书主卡**：点「开始修」后 reply 闸门卡生成，整条流水线原地刷新
+（流转记录 + 当前进展）。依赖 pusher 发闸门卡时回填的 `origin_message_id`。
+
+## 七、故障排查
 
 - **收不到消息**：检查事件订阅是否选了长连接、`im.message.receive_v1` 是否添加、应用是否已发布、机器人是否在群里；群里消息必须 @机器人（权限是"群聊中被 @ 的消息"）
 - **按钮点了没反应**：检查回调订阅是否也开了长连接并添加 `card.action.trigger`
@@ -311,8 +352,15 @@ make sync-agent-cli-config
   （日志有 warn），终态文案会说明「本轮只做了只读分析，没有修改代码」。
 - **闸门卡片变灰、写着「已被新一轮取代」**：闸门挂着期间同会话又派了新任务，
   旧闸门单已作废。这是有意行为——在跑偏的 thread 上 resume 比重新派单更糟。
+- **团队任务主卡不出现**：检查任务是否有 `origin_message_id`
+  （闸门卡片没发成功时为空；`card_message_id` 由首个角色派发时 reply 生成）。
+- **评审 verdict 是 unknown、任务莫名 failed**：模型没按格式输出交接段，
+  看 `team_task_runs.summary` / `handoff` 原文；Unknown 一律 failed、不开闸门。
+- **任务卡在 `running_*`**：可能是 run 终态回调丢了（channel fire-and-forget，
+  进程被杀会丢）。重启后会被 `fail_stale_team_tasks` 标 failed，在看板点重试。
+- **打回反复到上限**：`max_dev_rounds` 触顶是有意行为，需人工接手。
 
-## 七、定时任务（系统主动推送）
+## 八、定时任务（系统主动推送）
 
 `server/src/scheduler/`：cron 调度器（上海时区），agent-os 文档"自动化工作流"的落地。
 管理入口在 admin「定时任务」页：查看调度状态/下次执行时间、启停、手动触发、执行记录。
@@ -329,7 +377,7 @@ make sync-agent-cli-config
 
 新增 job 的步骤：在 `scheduler/jobs.rs` 写 handler（返回 JSON 结果），在 `JOB_DEFS` 注册 cron，admin 页面自动出现。
 
-## 八、后续（未实现）
+## 九、后续（未实现）
 
 - 普通文件附件下载（当前已支持图片输入和 `[file:]` 图片回传）
 - 更多 job：agent 整理的简报（cron 驱动 run_chat_turn）、失败 @人告警、巡检类任务
