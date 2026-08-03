@@ -226,6 +226,30 @@ pub struct NewInteraction<'a> {
     pub expires_at: Option<DateTime<Utc>>,
 }
 
+/// 团队任务流水线的运行时配置。存在 settings 表的单行 JSON 里
+/// （key = 'team_task_config'），admin 可改、改完即时生效。
+///
+/// 为什么用一行 JSON 而不是每个开关一个 settings key：
+/// 这几个字段有互相约束（enabled=true 要求 task_gate_enabled=true、
+/// roles 与 gates 取值要匹配），分成多行会出现「改了一半」的中间态。
+/// 单行 JSON 保证一次写入是原子的。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TeamTaskSettings {
+    /// 两阶段闸门总开关（原 [server_agent].task_gate_enabled）
+    pub task_gate_enabled: bool,
+    /// 多角色流水线总开关（原 [team_task].enabled）
+    pub enabled: bool,
+    pub roles: Vec<String>,
+    pub gates: Vec<String>,
+    pub max_dev_rounds: i32,
+    pub dashboard_base_url: Option<String>,
+    /// 最后修改人（admin 用户名），审计用
+    pub updated_by: Option<String>,
+}
+
+/// settings 表里存团队任务配置的 key。
+pub const TEAM_TASK_SETTINGS_KEY: &str = "team_task_config";
+
 /// 团队任务：串起开发/评审/测试多角色轮次的任务主体。
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct TeamTask {
@@ -5007,6 +5031,32 @@ impl Database {
         .bind(Utc::now())
         .execute(&self.pool))?;
         Ok(())
+    }
+
+    /// 读团队任务运行时配置。返回 Ok(None) 表示 DB 里还没有（调用方用 config.toml 兜底）。
+    /// JSON 解析失败也返回 Ok(None) 并 warn——配置坏了应该退回默认值继续跑，
+    /// 而不是让每个飞书任务都报错。
+    pub async fn get_team_task_settings(&self) -> Result<Option<TeamTaskSettings>> {
+        let raw = self.get_setting(TEAM_TASK_SETTINGS_KEY).await?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        match serde_json::from_str::<TeamTaskSettings>(&raw) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) => {
+                tracing::warn!(
+                    key = TEAM_TASK_SETTINGS_KEY,
+                    "team_task_config JSON 解析失败，退回默认值: {e:#}"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// 覆盖写入团队任务运行时配置。调用方（admin REST）必须先校验。
+    pub async fn save_team_task_settings(&self, s: &TeamTaskSettings) -> Result<()> {
+        let value = serde_json::to_string(s)?;
+        self.set_setting(TEAM_TASK_SETTINGS_KEY, &value).await
     }
 
     /// 按 task_id 查时间线，按 id 升序（插入顺序即时间顺序）。

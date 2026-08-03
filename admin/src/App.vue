@@ -22,6 +22,7 @@ const nav = [
   { to: '/chat-records', label: '聊天记录', icon: '▤' },
   { to: '/jobs', label: '定时任务', icon: '⏱' },
   { to: '/interactions', label: '交互单', icon: '✋' },
+  { to: '/team-task', label: '团队任务', icon: '⛓' },
   { to: '/terminals', label: '终端', icon: '▸' },
   { to: '/notifications', label: '通知', icon: '◉' },
   { to: '/users', label: '用户', icon: '⚇' },

@@ -176,7 +176,8 @@ pub async fn answer_and_resume(
     // ④ 改终态卡（仅飞书卡片路径）
     if let Some(ref ctx) = channel_ctx {
         if let Some(card_mid) = &ctx.card_message_id {
-            let question = if answered_row.kind == "task_gate" {
+            let question = if answered_row.kind == "task_gate" || answered_row.kind == "team_gate"
+            {
                 answered_row
                     .goal
                     .clone()
@@ -196,6 +197,8 @@ pub async fn answer_and_resume(
             };
             let title = if answered_row.kind == "task_gate" {
                 "新任务 · 待确认是否开始修"
+            } else if answered_row.kind == "team_gate" {
+                "团队任务闸门"
             } else {
                 "待确认"
             };
@@ -207,8 +210,8 @@ pub async fn answer_and_resume(
         }
     }
 
-    // ⑤ 派发：对冻结 session 跑 turn；名额 guard 传入 resume。
-    // task_gate 的派发不是 run_chat_turn 注入 tool_result，而是在原 CLI thread 上 resume 第二轮。
+    // ⑤ 派发。task_gate 在开关打开且有 team_task_id 时交给编排器，
+    // 否则走原来的单角色 resume；team_gate 一律交给编排器。
     // 分流放在这里而不是各调用方：飞书按钮与 admin 手动应答必须走同一条派发逻辑。
     let (api_for_resume, restore_card) =
         resolve_resume_api(state, &answered_row, channel_ctx.as_ref()).await;
@@ -226,74 +229,184 @@ pub async fn answer_and_resume(
     let chat_id2 = chat_id;
     let topic_id2 = topic_id;
 
-    if answered_row.kind == "task_gate" {
-        if answer == "跳过" {
-            handle_task_gate_skip(
-                state,
-                &answered_row,
-                api_for_resume.as_ref(),
-                &message_id,
-                in_thread,
-                dispatch_guard,
-            )
-            .await;
-            return Ok(());
-        }
-        tokio::spawn(async move {
-            if let Err(e) = resume_task_gate(ResumeInteraction {
-                state: state2,
-                api: api_for_resume,
-                user_id: user_id2,
-                session_id: session_for_dispatch.clone(),
-                interaction_id: interaction_id2.clone(),
-                text: answer2,
-                message_id,
-                chat_id: chat_id2,
-                topic_id: topic_id2,
-                in_thread,
-                card_message_id,
-                restore_card_on_fail: restore_card,
-                dispatch_guard,
-            })
-            .await
-            {
-                tracing::warn!(
-                    interaction_id = %interaction_id2,
-                    session_id = %session_for_dispatch,
-                    "resume task_gate failed: {e:#}"
-                );
-            }
-        });
-        return Ok(());
-    }
+    let team_task_id = answered_row
+        .resume_ref
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|v| v["team_task_id"].as_str().map(str::to_string))
+        .filter(|s| !s.is_empty());
 
-    tokio::spawn(async move {
-        if let Err(e) = resume_interaction_on_session(ResumeInteraction {
-            state: state2,
-            api: api_for_resume,
-            user_id: user_id2,
-            session_id: session_for_dispatch.clone(),
-            interaction_id: interaction_id2.clone(),
-            text: answer2,
-            message_id,
-            chat_id: chat_id2,
-            topic_id: topic_id2,
-            in_thread,
-            card_message_id,
-            restore_card_on_fail: restore_card,
-            dispatch_guard,
-        })
-        .await
+    // match guard 不能 await：先取运行时配置
+    let team_settings = crate::team_task::settings::effective(state).await;
+
+    match answered_row.kind.as_str() {
+        "task_gate" | "team_gate"
+            if team_settings.enabled && team_task_id.is_some() =>
         {
-            tracing::warn!(
-                interaction_id = %interaction_id2,
-                session_id = %session_for_dispatch,
-                "resume interaction failed: {e:#}"
-            );
-        }
-    });
+            let task_id = team_task_id.expect("is_some guard");
+            // 编排器的 dispatch_role 内部会自己抢名额。
+            // 进编排器之前必须先释放 answer_and_resume 持有的 guard，
+            // 否则 try_acquire 拿不到名额，任务会被静默跳过。
+            dispatch_guard.release().await;
 
-    Ok(())
+            let interaction_id_for_trigger = interaction_id2.clone();
+            let answer_for_trigger = answer2.clone();
+            let api_fail = api_for_resume.clone();
+            let msg_id_fail = message_id.clone();
+            let card_mid_fail = card_message_id.clone();
+            let chat_id_fail = chat_id2.clone();
+            let topic_id_fail = topic_id2.clone();
+            let restore = restore_card;
+            tokio::spawn(async move {
+                let result = crate::team_task::orchestrator::advance(
+                    &state2,
+                    &task_id,
+                    crate::team_task::orchestrator::Trigger::GateAnswered {
+                        interaction_id: interaction_id_for_trigger.clone(),
+                        answer: answer_for_trigger,
+                    },
+                )
+                .await;
+                if let Err(e) = result {
+                    tracing::warn!(
+                        interaction_id = %interaction_id_for_trigger,
+                        task_id = %task_id,
+                        session_id = %session_for_dispatch,
+                        "team_task advance 失败，回滚交互单: {e:#}"
+                    );
+                    let _ = force_interaction_pending(&state2, &interaction_id_for_trigger).await;
+                    if restore {
+                        if let Some(ref api) = api_fail {
+                            // team_gate 与 task_gate 共用恢复逻辑：把卡片刷回可点状态。
+                            if let Err(ce) = restore_task_gate_card(
+                                &state2,
+                                api,
+                                &interaction_id_for_trigger,
+                                card_mid_fail.as_deref(),
+                                &chat_id_fail,
+                                &topic_id_fail,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    interaction_id = %interaction_id_for_trigger,
+                                    "restore gate card failed: {ce:#}"
+                                );
+                            }
+                            let _ = api
+                                .reply_text(
+                                    &msg_id_fail,
+                                    &format!(
+                                        "派发失败，已恢复待确认，可重新点击按钮。原因：{e:#}"
+                                    ),
+                                    topic_id_fail != "main",
+                                )
+                                .await;
+                        }
+                    }
+                }
+            });
+            Ok(())
+        }
+        "task_gate" => {
+            // 旧路径：开关关闭或没有 team_task_id 时与今天完全一致。
+            if answer == "跳过" {
+                handle_task_gate_skip(
+                    state,
+                    &answered_row,
+                    api_for_resume.as_ref(),
+                    &message_id,
+                    in_thread,
+                    dispatch_guard,
+                )
+                .await;
+                return Ok(());
+            }
+            tokio::spawn(async move {
+                if let Err(e) = resume_task_gate(ResumeInteraction {
+                    state: state2,
+                    api: api_for_resume,
+                    user_id: user_id2,
+                    session_id: session_for_dispatch.clone(),
+                    interaction_id: interaction_id2.clone(),
+                    text: answer2,
+                    message_id,
+                    chat_id: chat_id2,
+                    topic_id: topic_id2,
+                    in_thread,
+                    card_message_id,
+                    restore_card_on_fail: restore_card,
+                    dispatch_guard,
+                })
+                .await
+                {
+                    tracing::warn!(
+                        interaction_id = %interaction_id2,
+                        session_id = %session_for_dispatch,
+                        "resume task_gate failed: {e:#}"
+                    );
+                }
+            });
+            Ok(())
+        }
+        "team_gate" => {
+            // 有 team_gate 但拿不到 task_id：异常路径。
+            dispatch_guard.release().await;
+            tracing::warn!(
+                interaction_id = %interaction_id,
+                "team_gate 应答缺少 resume_ref.team_task_id，标 failed"
+            );
+            let _ = state
+                .db
+                .update_interaction_status(
+                    interaction_id,
+                    "failed",
+                    None,
+                    Some("缺少 team_task_id，无法推进流水线"),
+                )
+                .await;
+            if let Some(ref api) = api_for_resume {
+                let _ = api
+                    .reply_text(
+                        &message_id,
+                        "团队任务数据异常（缺少任务 id），请在看板查看或联系管理员。",
+                        in_thread,
+                    )
+                    .await;
+            }
+            Err(AnswerResumeError::new(
+                "team_gate 缺少 team_task_id，无法派发",
+            ))
+        }
+        _ => {
+            tokio::spawn(async move {
+                if let Err(e) = resume_interaction_on_session(ResumeInteraction {
+                    state: state2,
+                    api: api_for_resume,
+                    user_id: user_id2,
+                    session_id: session_for_dispatch.clone(),
+                    interaction_id: interaction_id2.clone(),
+                    text: answer2,
+                    message_id,
+                    chat_id: chat_id2,
+                    topic_id: topic_id2,
+                    in_thread,
+                    card_message_id,
+                    restore_card_on_fail: restore_card,
+                    dispatch_guard,
+                })
+                .await
+                {
+                    tracing::warn!(
+                        interaction_id = %interaction_id2,
+                        session_id = %session_for_dispatch,
+                        "resume interaction failed: {e:#}"
+                    );
+                }
+            });
+            Ok(())
+        }
+    }
 }
 
 /// 跳过 = 不继续执行（不保证第一轮无副作用：CLI bypass-approvals，可能已改文件）。

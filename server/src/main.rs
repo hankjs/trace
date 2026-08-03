@@ -235,6 +235,25 @@ async fn run_server() -> Result<()> {
     // 启动定时任务调度器（cron 驱动的系统主动工作入口）
     scheduler::start(state.clone());
 
+    // 团队任务：run 终态回调 worker（channel 解耦，避免 cli_agent ↔ orchestrator 类型环）
+    team_task::orchestrator::start_run_finished_worker();
+
+    // 进程重启后 CLI thread 已不可信，一律标失败而不是尝试续跑
+    // （与 scheduler 收尾遗留 running job_run 同一模式）。
+    {
+        let settings = team_task::settings::effective(&state).await;
+        if settings.enabled {
+            let s = state.clone();
+            tokio::spawn(async move {
+                match s.db.fail_stale_team_tasks().await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::warn!("team_task: 收尾 {n} 条进程重启遗留的运行中任务"),
+                    Err(e) => tracing::warn!("team_task: 收尾僵尸任务失败: {e:#}"),
+                }
+            });
+        }
+    }
+
     // 启动 kimi 托管通知消费循环（client 通知 → 微信推送）
     tokio::spawn(weixin::kimi::run_notification_consumer(state.clone()));
 
@@ -580,6 +599,15 @@ async fn run_server() -> Result<()> {
             get(scheduler::routes::job_runs),
         )
         .route("/api/admin/jobs/{id}/run", post(scheduler::routes::run_job))
+        // 团队任务运行时配置（DB 优先，admin 可改、即时生效）
+        .route(
+            "/api/admin/team-task/config",
+            get(team_task::routes::get_config),
+        )
+        .route(
+            "/api/admin/team-task/config",
+            patch(team_task::routes::update_config),
+        )
         // 交互单管理（列表/详情/手动应答/取消；应答会真派发 resume）
         .route(
             "/api/admin/interactions",

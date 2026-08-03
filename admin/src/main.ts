@@ -24,6 +24,7 @@ const router = createRouter({
     { path: '/feishu', component: () => import('./views/FeishuBot.vue') },
     { path: '/chat-records', component: () => import('./views/ChatRecords.vue') },
     { path: '/jobs', component: () => import('./views/Jobs.vue') },
+    { path: '/team-task', component: () => import('./views/TeamTask.vue') },
     { path: '/interactions', component: () => import('./views/Interactions.vue') },
     { path: '/interactions/:id', component: () => import('./views/Interactions.vue') },
     { path: '/terminals', component: () => import('./views/Terminals.vue') },

@@ -715,6 +715,18 @@ export const api = {
     })
   },
 
+  // 团队任务运行时配置（DB 优先，改完即时生效）
+  getTeamTaskConfig() {
+    return request<TeamTaskConfigResponse>('/api/admin/team-task/config')
+  },
+
+  updateTeamTaskConfig(data: Partial<TeamTaskConfig>) {
+    return request<TeamTaskConfigResponse>('/api/admin/team-task/config', {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    })
+  },
+
   chatGenerate(prompt: string, context?: string) {
     return fetch('/api/admin/chat/generate', {
       method: 'POST',
@@ -725,6 +737,30 @@ export const api = {
       body: JSON.stringify({ prompt, context }),
     })
   },
+}
+
+/** 团队任务运行时配置（与后端 TeamTaskSettings 对齐） */
+export interface TeamTaskConfig {
+  task_gate_enabled: boolean
+  enabled: boolean
+  roles: string[]
+  gates: string[]
+  max_dev_rounds: number
+  dashboard_base_url: string | null
+  updated_by: string | null
+}
+
+export interface TeamTaskOption {
+  id: string
+  label: string
+}
+
+export interface TeamTaskConfigResponse {
+  config: TeamTaskConfig
+  /** db = 已在 admin 改过；config_file = 还在用 config.toml 默认值 */
+  source: 'db' | 'config_file'
+  role_options: TeamTaskOption[]
+  gate_options: TeamTaskOption[]
 }
 
 export interface ClientAgentInfo {

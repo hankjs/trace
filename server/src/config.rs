@@ -58,8 +58,9 @@ pub struct ServerAgentConfig {
     pub deploy_use_sudo: bool,
     #[serde(default = "default_deploy_approval_ttl_secs")]
     pub approval_ttl_secs: u64,
-    /// 两阶段任务闸门：代码任务先只产出分析，用户点「开始修」后才真正执行。
-    /// 默认关闭——开启后所有飞书代码任务都多一轮交互，需显式 opt-in。
+    /// 两阶段任务闸门的**初始默认值**。
+    /// 运行时真正生效的值在数据库（settings 表，admin「团队任务」页可改），
+    /// 见 `team_task::settings::effective`。这里只在 DB 尚无配置时作兜底。
     ///
     /// 与 `enabled` 解耦：client-only 链路在 `server_agent.enabled = false` 时
     /// 同样要能用闸门。调用方不得写成 `enabled && task_gate_enabled`。
@@ -160,27 +161,26 @@ fn default_quant_a2a_base_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
 
-/// 团队任务流水线配置。所有字段都有默认值，因此 config.toml 不写 [team_task]
-/// 段也能启动（此时 enabled = false，行为与未接入前完全一致）。
+/// 团队任务流水线的**初始默认值**。运行时真正生效的配置在数据库
+/// （settings 表，admin 可改），见 `team_task::settings::effective`。
+/// 这里的值只在 DB 里还没有配置时作为兜底，便于升级上线时行为不变。
+///
+/// config.toml 不写 `[team_task]` 段也能启动（默认 enabled = false）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct TeamTaskConfig {
-    /// 总开关。关闭时 task_gate 走原来的单角色两阶段路径，行为与今天一致。
+    /// 总开关默认值。关闭时 task_gate 走原来的单角色两阶段路径。
     #[serde(default)]
     pub enabled: bool,
-    /// 参与流水线的角色，按数组顺序流转。可裁剪成 ["developer"] 只跑单角色。
-    /// 未知角色名在启动校验时拒绝（见 validate），不静默丢弃。
+    /// 参与流水线的角色默认顺序。可裁剪成 ["developer"] 只跑单角色。
     #[serde(default = "default_team_roles")]
     pub roles: Vec<String>,
-    /// 需要人工确认的边界。默认只保留现有的开发前闸门，其余自动流转——
-    /// 一上来每个角色边界都弹卡片，四次点击才跑完一个任务，体验会劝退。
+    /// 需要人工确认的边界默认值。默认只保留开发前闸门。
     #[serde(default = "default_team_gates")]
     pub gates: Vec<String>,
-    /// 评审打回后最多重新开发几轮，超出即 failed。
-    /// 没有上限的话，评审和开发能在一个错误理解上互相打回到 token 烧穿。
+    /// 评审打回后最多重新开发几轮的默认上限。
     #[serde(default = "default_max_dev_rounds")]
     pub max_dev_rounds: i32,
-    /// 看板外部可访问地址，用于飞书卡片深链。留空则卡片不渲染看板链接行，
-    /// 而不是拼出一个坏链接（与 server.admin_base_url 同款约定）。
+    /// 看板外部可访问地址默认值。
     #[serde(default)]
     pub dashboard_base_url: Option<String>,
 }

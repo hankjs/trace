@@ -25,9 +25,12 @@ pub struct RolePromptInput<'a> {
 /// 上游角色交接给本角色的产物（来自 team_task_runs 的 handoff / summary 列）。
 #[derive(Debug, Clone)]
 pub struct UpstreamHandoff<'a> {
-    /// 上游角色 id，如 "developer"
+    /// 上游角色 id，如 "developer"（看板/日志用；当前 prompt 正文未引用）
+    #[allow(dead_code)]
     pub role: &'a str,
     pub summary: Option<&'a str>,
+    /// 上游 verdict（看板用；prompt 侧主要看 summary/blocking）
+    #[allow(dead_code)]
     pub verdict: Option<Verdict>,
     pub blocking: Option<&'a str>,
     pub changed_files: Option<i32>,

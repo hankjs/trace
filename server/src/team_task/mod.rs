@@ -6,13 +6,12 @@
 //!
 //! 派发 run、发卡片、读写 DB 都在后续的 `orchestrator` 里，不要写进这里。
 //!
-//! 当前尚无调用方（第 2 步只落纯函数），bin 编译会把公开 API 当成 dead_code；
-//! 单测覆盖它们，这里 allow 避免污染构建日志。接入编排器后可去掉。
-#![allow(dead_code)]
-
+pub mod orchestrator;
 pub mod roles;
+pub mod routes;
+pub mod settings;
 
-use crate::config::TeamTaskConfig;
+use hank_db::TeamTaskSettings;
 
 // ---------------------------------------------------------------------------
 // 角色注册表
@@ -166,6 +165,7 @@ pub enum Trigger<'a> {
     RunFinished {
         role: &'a str,
         /// 该角色本轮轮次（编排器透传审计；状态机派发轮次写在 Decision 里，不读此字段）
+        #[allow(dead_code)]
         round: i32,
         outcome: RunOutcome,
     },
@@ -265,12 +265,12 @@ fn trigger_kind(t: &Trigger<'_>) -> &'static str {
     }
 }
 
-fn cfg_has_gate(cfg: &TeamTaskConfig, boundary: GateBoundary) -> bool {
+fn cfg_has_gate(cfg: &TeamTaskSettings, boundary: GateBoundary) -> bool {
     cfg.gates.iter().any(|g| g == boundary.as_str())
 }
 
 /// 状态机唯一判定点。纯函数：同样的输入永远给同样的输出，可单测全分支。
-pub fn decide_next(input: &DecideInput<'_>, cfg: &TeamTaskConfig) -> Decision {
+pub fn decide_next(input: &DecideInput<'_>, cfg: &TeamTaskSettings) -> Decision {
     // --- 规则 A：终态与取消 ---
     if is_terminal(input.status) {
         return Decision::Ignore {
@@ -458,7 +458,7 @@ fn pending_status_to_boundary(status: &str) -> Option<GateBoundary> {
     }
 }
 
-fn dispatch_from_pending_gate(input: &DecideInput<'_>, cfg: &TeamTaskConfig) -> Decision {
+fn dispatch_from_pending_gate(input: &DecideInput<'_>, cfg: &TeamTaskSettings) -> Decision {
     match input.status {
         STATUS_PENDING_REVIEW_GATE => {
             let current = input.current_role.unwrap_or("developer");
@@ -478,9 +478,11 @@ fn dispatch_from_pending_gate(input: &DecideInput<'_>, cfg: &TeamTaskConfig) -> 
             let current = input.current_role.unwrap_or("reviewer");
             match next_role(&cfg.roles, current) {
                 Some(role) => Decision::DispatchRole { role, round: 1 },
-                None => Decision::DispatchRole {
-                    role: "tester".to_string(),
-                    round: 1,
+                // 与 pending_review_gate 兜底口径一致：不要硬编码派发可能不在
+                // cfg.roles 里的角色（配置被裁剪时会静默走错）。
+                None => Decision::Finish {
+                    status: STATUS_FAILED,
+                    reason: Some("没有下一个角色可进入测试".to_string()),
                 },
             }
         }
@@ -645,29 +647,38 @@ fn truncate_chars(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
-    fn auto_cfg() -> TeamTaskConfig {
-        TeamTaskConfig {
+    /// 单测构造辅助：只改 roles/gates/max，其余用合法默认。
+    fn test_settings(
+        roles: Vec<String>,
+        gates: Vec<String>,
+        max_dev_rounds: i32,
+    ) -> TeamTaskSettings {
+        TeamTaskSettings {
+            task_gate_enabled: true,
             enabled: true,
-            roles: default_roles(),
-            gates: vec![],
-            max_dev_rounds: 3,
+            roles,
+            gates,
+            max_dev_rounds,
             dashboard_base_url: None,
+            updated_by: None,
         }
     }
 
-    fn all_gates_cfg() -> TeamTaskConfig {
-        TeamTaskConfig {
-            enabled: true,
-            roles: default_roles(),
-            gates: vec![
+    fn auto_cfg() -> TeamTaskSettings {
+        test_settings(default_roles(), vec![], 3)
+    }
+
+    fn all_gates_cfg() -> TeamTaskSettings {
+        test_settings(
+            default_roles(),
+            vec![
                 "dev_start".into(),
                 "review_start".into(),
                 "dev_restart".into(),
                 "test_start".into(),
             ],
-            max_dev_rounds: 3,
-            dashboard_base_url: None,
-        }
+            3,
+        )
     }
 
     fn default_roles() -> Vec<String> {
@@ -1238,13 +1249,7 @@ mod tests {
 
     #[test]
     fn single_role_developer_pass_done() {
-        let cfg = TeamTaskConfig {
-            enabled: true,
-            roles: vec!["developer".into()],
-            gates: vec![],
-            max_dev_rounds: 3,
-            dashboard_base_url: None,
-        };
+        let cfg = test_settings(vec!["developer".into()], vec![], 3);
         let d = decide_next(
             &DecideInput {
                 status: "running_developer",
@@ -1269,13 +1274,7 @@ mod tests {
 
     #[test]
     fn empty_roles_pending_confirm_fails() {
-        let cfg = TeamTaskConfig {
-            enabled: true,
-            roles: vec![],
-            gates: vec![],
-            max_dev_rounds: 3,
-            dashboard_base_url: None,
-        };
+        let cfg = test_settings(vec![], vec![], 3);
         let d = decide_next(&input_pending_yes(), &cfg);
         assert_eq!(
             d,
@@ -1340,6 +1339,34 @@ mod tests {
             } => assert!(r.contains("review_start") || r.contains("终止"), "reason={r}"),
             other => panic!("expected cancelled, got {other:?}"),
         }
+    }
+
+    /// 回归：pending_test_gate 找不到下一个角色时 Finish{failed}，
+    /// 不要硬编码派发可能不在 cfg.roles 里的 "tester"。
+    #[test]
+    fn pending_test_gate_no_next_role_fails() {
+        // 配置被裁剪成无 tester；current_role 仍是评审（开闸门时不清）
+        let cfg = test_settings(
+            vec!["developer".into(), "reviewer".into()],
+            vec!["test_start".into()],
+            3,
+        );
+        let d = decide_next(
+            &DecideInput {
+                status: STATUS_PENDING_TEST_GATE,
+                current_role: Some("reviewer"),
+                dev_rounds: 1,
+                trigger: Trigger::GateAnswered { answer: "继续测试" },
+            },
+            &cfg,
+        );
+        assert_eq!(
+            d,
+            Decision::Finish {
+                status: STATUS_FAILED,
+                reason: Some("没有下一个角色可进入测试".into()),
+            }
+        );
     }
 
     #[test]

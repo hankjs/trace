@@ -4,7 +4,7 @@ use crate::chat::{ChatTurnHandle, EventBuffer};
 use crate::AppState;
 use anyhow::{anyhow, bail, Context, Result};
 use code_agent::{AgentEvent, FileChange, FileChangeKind, RunStatus};
-use hank_db::{NewInteraction, Session};
+use hank_db::{NewInteraction, NewTeamTask, Session};
 use hank_provider::ContentBlock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -480,15 +480,21 @@ async fn run_remote_cli_turn(
     if user_text.trim().is_empty() {
         bail!("本机 Agent 暂不支持没有文本说明的消息");
     }
-    // 闸门判定：与 server_agent.enabled 无关，只看 task_gate_enabled + 会话条件。
+    // 闸门判定：与 server_agent.enabled 无关，只看运行时 task_gate_enabled + 会话条件。
     let metadata = parse_metadata(session.metadata.as_deref());
     let source = metadata["source"].as_str();
     let existing_thread = metadata["agent_thread_id"].as_str();
+    // 已挂团队任务流水线时不再弹闸门：每个角色独占空 thread，再判会无限循环。
+    let in_team_pipeline = metadata["team_task_id"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty());
+    let team_settings = crate::team_task::settings::effective(state).await;
     let gate_mode = should_gate_turn(
-        state.config.server_agent.task_gate_enabled,
+        team_settings.task_gate_enabled,
         agent_kind,
         source,
         existing_thread,
+        in_team_pipeline,
     );
     let prompt = if gate_mode {
         local_agent_analysis_prompt(&user_text, agent_kind)
@@ -554,6 +560,14 @@ async fn run_remote_cli_turn(
                     Some(&format!("{error:#}")),
                 )
                 .await;
+                // 角色 run 在 body 内以 Err 提前退出时，也要通知编排器；
+                // body 内 Ok 路径的回调见 execute_remote_turn 出口。
+                crate::team_task::orchestrator::enqueue_run_finished(
+                    state_task.clone(),
+                    session_id_task.clone(),
+                    false,
+                    None,
+                );
             }
             emit(
                 &state_task,
@@ -599,6 +613,7 @@ struct RemoteAgentResult {
     stderr: String,
 }
 
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_remote_turn(
     state: &Arc<AppState>,
@@ -615,6 +630,73 @@ async fn execute_remote_turn(
     agent_kind: &str,
     cancel_token: CancellationToken,
 ) -> Result<()> {
+    // 只在最外层出口回调编排器一次——在每个 finalize_open_task_gate 旁边
+    // 各加一次会让一次 run 推进多次状态机。
+    let outcome = execute_remote_turn_body(
+        state,
+        session_id,
+        session,
+        backend,
+        client_id,
+        user_id,
+        work_dir,
+        user_text,
+        prompt,
+        gate_mode,
+        agent_kind,
+        cancel_token,
+    )
+    .await;
+
+    match outcome {
+        // 闸门轮成功落了交互单：任务停在 pending_confirm，等用户点按钮，不回调。
+        Ok(RemoteTurnEnd {
+            finished_as_gate: true,
+            ..
+        }) => Ok(()),
+        Ok(RemoteTurnEnd {
+            succeeded,
+            final_text,
+            finished_as_gate: false,
+        }) => {
+            // 只入队，不 await advance——打断
+            // execute_remote_turn → advance → run_cli_turn → execute_remote_turn 类型环。
+            crate::team_task::orchestrator::enqueue_run_finished(
+                state.clone(),
+                session_id.to_string(),
+                succeeded,
+                final_text,
+            );
+            Ok(())
+        }
+        // Err 路径由 spawn 调用方入队（gate_mode 下跳过）。
+        Err(e) => Err(e),
+    }
+}
+
+/// execute_remote_turn 内部结果：用于最外层统一回调编排器。
+struct RemoteTurnEnd {
+    /// 成功落了 task_gate 闸门单——不该由 run 终态推进状态机
+    finished_as_gate: bool,
+    succeeded: bool,
+    final_text: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_remote_turn_body(
+    state: &Arc<AppState>,
+    session_id: &str,
+    session: &Session,
+    backend: &str,
+    client_id: &str,
+    user_id: &str,
+    work_dir: &str,
+    user_text: &str,
+    prompt: &str,
+    gate_mode: bool,
+    agent_kind: &str,
+    cancel_token: CancellationToken,
+) -> Result<RemoteTurnEnd> {
     let run_id = Uuid::new_v4().to_string();
     emit(
         state,
@@ -779,7 +861,11 @@ async fn execute_remote_turn(
             tracing::warn!(session_id, "touch remote cli session failed: {error:#}");
         }
         emit(state, session_id, AgentEvent::TurnComplete).await;
-        return Ok(());
+        return Ok(RemoteTurnEnd {
+            finished_as_gate: false,
+            succeeded: false,
+            final_text: None,
+        });
     }
 
     let parsed = tool_result
@@ -818,6 +904,14 @@ async fn execute_remote_turn(
             result.cancelled || result.exit_code.is_some_and(|code| code != 0)
         })
         || offline_error.is_some();
+
+    // 供最外层统一回调编排器：只在这里汇总，不在每个 finalize 旁各调一次。
+    let mut turn_end = RemoteTurnEnd {
+        finished_as_gate: false,
+        succeeded: false,
+        final_text: None,
+    };
+
     match terminal {
         Terminal::Cancelled => {
             if let Some(extra) = offline_error.as_deref() {
@@ -874,6 +968,10 @@ async fn execute_remote_turn(
                 "本机 Agent 输出超过整流安全上限（已保留截断前内容）",
             )
             .await;
+            let partial = run_state.final_text.trim();
+            if !partial.is_empty() {
+                turn_end.final_text = Some(partial.to_string());
+            }
         }
         Terminal::Completed if !remote_failed && run_state.failed_message.is_none() => {
             let final_text = if run_state.final_text.trim().is_empty() {
@@ -958,7 +1056,9 @@ async fn execute_remote_turn(
                 false
             };
 
-            if !gated {
+            if gated {
+                turn_end.finished_as_gate = true;
+            } else {
                 // 第二轮（或非闸门轮）正常完成：若有 executing 的 task_gate 交互单，标 done。
                 finalize_open_task_gate(state, session_id, "done", Some(final_text.as_str()), None)
                     .await;
@@ -969,7 +1069,7 @@ async fn execute_remote_turn(
                         "{final_text}\n\n---\n⚠️ 本轮只做了只读分析，没有修改代码（{reason}）。\
                          需要执行请再发一次指令。"
                     ),
-                    None => final_text,
+                    None => final_text.clone(),
                 };
                 emit(
                     state,
@@ -986,6 +1086,8 @@ async fn execute_remote_turn(
                     },
                 )
                 .await;
+                turn_end.succeeded = true;
+                turn_end.final_text = Some(final_text);
             }
         }
         Terminal::Completed => {
@@ -1020,13 +1122,17 @@ async fn execute_remote_turn(
                     .await;
             }
             emit_failed(state, session_id, &run_id, &message).await;
+            let partial = run_state.final_text.trim();
+            if !partial.is_empty() {
+                turn_end.final_text = Some(partial.to_string());
+            }
         }
     }
     if let Err(error) = state.db.touch_session(session_id).await {
         tracing::warn!(session_id, "touch remote cli session failed: {error:#}");
     }
     emit(state, session_id, AgentEvent::TurnComplete).await;
-    Ok(())
+    Ok(turn_end)
 }
 
 async fn handle_remote_event(
@@ -2272,12 +2378,21 @@ fn local_agent_prompt(user_text: &str, agent_kind: &str) -> String {
 ///
 /// 注意：`task_gate_enabled` 与 `server_agent.enabled` 解耦——后者关闭时
 /// client-only 链路仍可开闸门，调用方不要再加 `&& cfg.enabled`。
+/// `in_team_pipeline`：会话已挂在团队任务流水线上（metadata.team_task_id 非空）。
+/// 此时不再弹闸门——闸门是流水线的入口，入口已经过了，后续每个角色的 thread
+/// 都是空的，再判会无限循环。
 fn should_gate_turn(
     task_gate_enabled: bool,
     agent_kind: &str,
     source: Option<&str>,
     existing_thread_id: Option<&str>,
+    in_team_pipeline: bool,
 ) -> bool {
+    // 团队任务流水线内：每个角色独占空 thread，若再走闸门会再次只读分析 +
+    // 落 task_gate，流水线永远走不到真正的执行。
+    if in_team_pipeline {
+        return false;
+    }
     if !task_gate_enabled {
         return false;
     }
@@ -2368,15 +2483,71 @@ async fn finish_as_task_gate(
     let goal: String = user_text.chars().take(2000).collect();
     let options_json = serde_json::to_string(&["开始修", "跳过"])
         .unwrap_or_else(|_| r#"["开始修","跳过"]"#.to_string());
-    let resume_ref = serde_json::json!({
+
+    // 旧路径字段必须保留（backend/thread_id/…）；team_task_id 仅在开关打开且
+    // 建行成功时注入。没有 resume_ref 局部更新 API，所以先尝试建 team_tasks，
+    // 成功后再把 id 写进 resume_ref 一并落交互单。
+    let mut resume_ref = serde_json::json!({
         "backend": backend,
         "thread_id": thread_id,
         "exec_client_id": client_id,
         "agent_kind": agent_kind,
         "dirty_files": dirty_files,
-    })
-    .to_string();
+    });
 
+    let team_settings = crate::team_task::settings::effective(state).await;
+    if team_settings.enabled {
+        // 建 team_tasks 失败时降级走旧 task_gate 路径——分析已经跑完了，
+        // 因为建一行记录失败就把用户的分析结果丢掉不合理。
+        let title: String = user_text.chars().take(50).collect();
+        let issue_key = parse_issue_key(user_text);
+        match state
+            .db
+            .create_team_task(NewTeamTask {
+                session_id,
+                user_id,
+                source: "feishu",
+                issue_key: issue_key.as_deref(),
+                title: &title,
+                goal: Some(&goal),
+                analysis: Some(analysis),
+                backend,
+                exec_client_id: Some(client_id),
+                agent_kind,
+                account_id,
+                chat_id,
+                topic_id,
+            })
+            .await
+        {
+            Ok(task) => {
+                resume_ref["team_task_id"] = serde_json::Value::String(task.id.clone());
+                if let Err(e) =
+                    write_session_team_task_id(state, session_id, &task.id).await
+                {
+                    tracing::warn!(
+                        session_id,
+                        task_id = %task.id,
+                        "写入 sessions.metadata.team_task_id 失败: {e:#}"
+                    );
+                }
+                tracing::info!(
+                    task_id = %task.id,
+                    task_no = %task.task_no,
+                    session_id,
+                    "team_task 行已创建（pending_confirm）"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    session_id,
+                    "创建 team_tasks 行失败，降级走旧 task_gate 路径: {e:#}"
+                );
+            }
+        }
+    }
+
+    let resume_ref_str = resume_ref.to_string();
     let row = state
         .db
         .create_interaction(NewInteraction {
@@ -2391,7 +2562,7 @@ async fn finish_as_task_gate(
             goal: Some(&goal),
             analysis: Some(analysis),
             options: &options_json,
-            resume_ref: Some(&resume_ref),
+            resume_ref: Some(&resume_ref_str),
             expires_at: None,
         })
         .await
@@ -2415,6 +2586,64 @@ async fn finish_as_task_gate(
         },
     )
     .await;
+    Ok(())
+}
+
+/// 从用户原文解析 issue key。优先 `#KEY`（设计文档 §6.7），其次 `「KEY」`。
+/// 仅匹配大写字母与数字，长度 4–12。
+fn parse_issue_key(text: &str) -> Option<String> {
+    // 1) #([A-Z0-9]{4,12})
+    let mut rest = text;
+    while let Some(idx) = rest.find('#') {
+        let after = &rest[idx + 1..];
+        if let Some(key) = take_issue_token(after) {
+            return Some(key);
+        }
+        rest = &rest[idx + 1..];
+    }
+    // 2) 「KEY」——飞书原文常写成「IK5MOR」优化…
+    let mut rest = text;
+    while let Some(idx) = rest.find('「') {
+        let after = &rest[idx + '「'.len_utf8()..];
+        if let Some(key) = take_issue_token(after) {
+            // 后面紧跟 」或非 token 字符都算命中
+            return Some(key);
+        }
+        rest = &rest[idx + '「'.len_utf8()..];
+    }
+    None
+}
+
+/// 取开头连续的 [A-Z0-9]，长度落在 4..=12 才算合法 key。
+fn take_issue_token(s: &str) -> Option<String> {
+    let token: String = s
+        .chars()
+        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        .collect();
+    let n = token.len(); // ASCII，字节数 = 字符数
+    if (4..=12).contains(&n) {
+        Some(token)
+    } else {
+        None
+    }
+}
+
+async fn write_session_team_task_id(
+    state: &Arc<AppState>,
+    session_id: &str,
+    team_task_id: &str,
+) -> Result<()> {
+    let session = state
+        .db
+        .get_session(session_id)
+        .await?
+        .ok_or_else(|| anyhow!("会话不存在"))?;
+    let mut metadata = parse_metadata(session.metadata.as_deref());
+    metadata["team_task_id"] = serde_json::Value::String(team_task_id.to_string());
+    state
+        .db
+        .update_session_metadata(session_id, &metadata.to_string())
+        .await?;
     Ok(())
 }
 
@@ -2954,42 +3183,149 @@ mod tests {
     }
 
     #[test]
+    fn parse_issue_key_from_chinese_quotes() {
+        assert_eq!(
+            parse_issue_key("「IK5MOR」优化"),
+            Some("IK5MOR".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_issue_key_from_hash_prefix() {
+        assert_eq!(
+            parse_issue_key("修一下 #IK5MOR 的登录超时"),
+            Some("IK5MOR".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_issue_key_none_on_plain_text() {
+        assert_eq!(parse_issue_key("修个 bug"), None);
+    }
+
+    #[test]
+    fn parse_issue_key_first_of_multiple() {
+        assert_eq!(
+            parse_issue_key("#ABC1 然后 #XYZ99"),
+            Some("ABC1".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_issue_key_rejects_lowercase_and_length_bounds() {
+        assert_eq!(parse_issue_key("#ik5mor"), None);
+        assert_eq!(parse_issue_key("#AB3"), None); // 3 位
+        assert_eq!(parse_issue_key("#ABCDEFGHIJKLM"), None); // 13 位
+        assert_eq!(parse_issue_key("#ABCD"), Some("ABCD".to_string())); // 4 位边界
+        assert_eq!(
+            parse_issue_key("#ABCDEFGHIJKL"),
+            Some("ABCDEFGHIJKL".to_string())
+        ); // 12 位边界
+    }
+
+    #[test]
     fn should_gate_turn_hard_off_when_disabled() {
         // 无回归硬判定：开关关闭时恒为 false，路径与现在完全一致。
-        assert!(!should_gate_turn(false, "trace_code", Some("feishu"), None));
-        assert!(!should_gate_turn(false, "quant_code", Some("feishu"), None));
+        assert!(!should_gate_turn(
+            false,
+            "trace_code",
+            Some("feishu"),
+            None,
+            false
+        ));
+        assert!(!should_gate_turn(
+            false,
+            "quant_code",
+            Some("feishu"),
+            None,
+            false
+        ));
         assert!(!should_gate_turn(
             false,
             "general_task",
             Some("feishu"),
-            None
+            None,
+            false
         ));
     }
 
     #[test]
     fn should_gate_turn_requires_code_kind_feishu_and_fresh_thread() {
-        assert!(should_gate_turn(true, "trace_code", Some("feishu"), None));
-        assert!(should_gate_turn(true, "quant_code", Some("feishu"), None));
-        assert!(should_gate_turn(true, "general_task", Some("feishu"), None));
+        assert!(should_gate_turn(
+            true,
+            "trace_code",
+            Some("feishu"),
+            None,
+            false
+        ));
+        assert!(should_gate_turn(
+            true,
+            "quant_code",
+            Some("feishu"),
+            None,
+            false
+        ));
+        assert!(should_gate_turn(
+            true,
+            "general_task",
+            Some("feishu"),
+            None,
+            false
+        ));
         assert!(!should_gate_turn(
             true,
             "conversation",
             Some("feishu"),
-            None
+            None,
+            false
         ));
         assert!(!should_gate_turn(
             true,
             "quant_research",
             Some("feishu"),
-            None
+            None,
+            false
         ));
-        assert!(!should_gate_turn(true, "trace_code", Some("weixin"), None));
-        assert!(!should_gate_turn(true, "trace_code", None, None));
+        assert!(!should_gate_turn(
+            true,
+            "trace_code",
+            Some("weixin"),
+            None,
+            false
+        ));
+        assert!(!should_gate_turn(true, "trace_code", None, None, false));
         assert!(!should_gate_turn(
             true,
             "trace_code",
             Some("feishu"),
-            Some("thread-already-there")
+            Some("thread-already-there"),
+            false
+        ));
+    }
+
+    #[test]
+    fn should_gate_turn_in_team_pipeline_always_false() {
+        // 流水线内每个角色 thread 都是空的，若再弹闸门会无限循环。
+        assert!(!should_gate_turn(
+            true,
+            "trace_code",
+            Some("feishu"),
+            None,
+            true
+        ));
+        assert!(!should_gate_turn(
+            true,
+            "quant_code",
+            Some("feishu"),
+            None,
+            true
+        ));
+        assert!(!should_gate_turn(
+            false,
+            "trace_code",
+            Some("feishu"),
+            None,
+            true
         ));
     }
 

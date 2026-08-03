@@ -25,7 +25,7 @@ const STATUSES: &[&str] = &[
     "expired",
     "cancelled",
 ];
-const KINDS: &[&str] = &["quant_confirm", "ask_user", "task_gate"];
+const KINDS: &[&str] = &["quant_confirm", "ask_user", "task_gate", "team_gate"];
 const CHANNELS: &[&str] = &["feishu", "weixin", "trace_chat"];
 
 #[derive(Debug, Deserialize)]
