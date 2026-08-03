@@ -6,8 +6,9 @@
 use crate::chat::EventEntry;
 use crate::feishu::api::FeishuApi;
 use crate::feishu::card::{
-    build_confirm_card, build_task_card, build_task_gate_card, ConfirmCardOptions, TaskCardOptions,
-    TaskGateCardOptions, TaskStatus, ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
+    build_confirm_card, build_task_card, build_task_gate_card, build_task_title,
+    ConfirmCardOptions, TaskCardAction, TaskCardOptions, TaskGateCardOptions, TaskStatus,
+    ThrottledCardUpdater, CARD_UPDATE_INTERVAL,
 };
 // 滞后/静默时回 EventBuffer 补齐事件的共享实现，微信 pusher 也用同一套。
 use crate::task_state::{drain_buffer, next_event, Incoming, ProgressSnapshot};
@@ -20,11 +21,17 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::broadcast;
 
-/// 最终答案文本截断上限（飞书单条文本消息不宜过长）
-const MAX_FINAL_TEXT_CHARS: usize = 8000;
+/// 最终答案文本截断上限（飞书单条文本消息不宜过长）。
+/// 详情按钮分段发送也用同一上限。
+pub(crate) const MAX_FINAL_TEXT_CHARS: usize = 8000;
 /// 进度上限：任务未结束时最多到 90%，100% 只给真正完成
 const PROGRESS_CAP_RUNNING: u32 = 90;
 
+/// 起飞书进度 pusher。
+///
+/// `task_title` 是用户本轮原话 / 闸门 goal / 团队任务标题等任务摘要；
+/// 参数已多，加到 9 个会触发 too_many_arguments——这是渠道上下文的直传，
+/// 拆结构体收益不大，故 allow。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
     state: Arc<AppState>,
@@ -33,11 +40,12 @@ pub fn spawn(
     chat_id: String,
     topic_id: String,
     session_id: String,
+    task_title: String,
     in_thread: bool,
     rx: broadcast::Receiver<EventEntry>,
 ) {
     tokio::spawn(run(
-        state, api, message_id, chat_id, topic_id, session_id, in_thread, rx,
+        state, api, message_id, chat_id, topic_id, session_id, task_title, in_thread, rx,
     ));
 }
 
@@ -105,6 +113,7 @@ impl Progress {
     }
 }
 
+/// 渠道上下文直传参数较多，见 `spawn` 注释。
 #[allow(clippy::too_many_arguments)]
 async fn run(
     state: Arc<AppState>,
@@ -113,20 +122,28 @@ async fn run(
     chat_id: String,
     topic_id: String,
     session_id: String,
+    task_title: String,
     in_thread: bool,
     mut rx: broadcast::Receiver<EventEntry>,
 ) {
+    // 标题算一次，四处 build_task_card 复用，避免各写一遍。
+    let card_title = build_task_title(&task_title);
+
     // 先回一张蓝色卡片；失败则退化为纯文本模式
     let card_id = match api
         .reply_card(
             &message_id,
             &build_task_card(&TaskCardOptions {
-                title: "Agent 任务".to_string(),
+                title: card_title.clone(),
                 status: TaskStatus::Running,
                 progress: 0,
                 detail: "正在启动执行引擎".to_string(),
                 activities: vec![],
                 footer: None,
+                actions: vec![],
+                session_id: session_id.clone(),
+                chat_id: chat_id.clone(),
+                topic_id: topic_id.clone(),
             }),
             in_thread,
         )
@@ -166,7 +183,7 @@ async fn run(
 
     let push_running = |progress: &Progress| {
         updater.push(build_task_card(&TaskCardOptions {
-            title: "Agent 任务".to_string(),
+            title: card_title.clone(),
             status: TaskStatus::Running,
             progress: progress.percent(),
             detail: progress.detail(),
@@ -179,6 +196,11 @@ async fn run(
                 .cloned()
                 .collect(),
             footer: None,
+            // 运行中态不出现按钮，避免诱导用户在任务未完成时点击
+            actions: vec![],
+            session_id: session_id.clone(),
+            chat_id: chat_id.clone(),
+            topic_id: topic_id.clone(),
         }));
     };
 
@@ -237,7 +259,7 @@ async fn run(
                         );
                         updater
                             .finish(build_task_card(&TaskCardOptions {
-                                title: "Agent 任务".to_string(),
+                                title: card_title.clone(),
                                 status: TaskStatus::Failed,
                                 progress: progress.percent(),
                                 detail: "任务已结束，但未收到完成事件".to_string(),
@@ -246,6 +268,10 @@ async fn run(
                                     .filter(|s| !s.is_empty())
                                     .collect(),
                                 footer: None,
+                                actions: vec![],
+                                session_id: session_id.clone(),
+                                chat_id: chat_id.clone(),
+                                topic_id: topic_id.clone(),
                             }))
                             .await;
                         let tail = if final_text.trim().is_empty() {
@@ -453,7 +479,7 @@ async fn run(
                     if is_task_gate {
                         updater
                             .finish(build_task_card(&TaskCardOptions {
-                                title: "Agent 任务".to_string(),
+                                title: card_title.clone(),
                                 status: TaskStatus::Waiting,
                                 progress: progress.percent(),
                                 detail: "已完成只读分析，等待你确认是否开始修".to_string(),
@@ -462,6 +488,10 @@ async fn run(
                                     .filter(|s| !s.is_empty())
                                     .collect(),
                                 footer: None,
+                                actions: vec![],
+                                session_id: session_id.clone(),
+                                chat_id: chat_id.clone(),
+                                topic_id: topic_id.clone(),
                             }))
                             .await;
                     }
@@ -489,9 +519,35 @@ async fn run(
                         input_tokens,
                         output_tokens
                     );
+                    // 详情全文进表而不进 callback value：value 有大小限制，且客户端可改。
+                    // 写库失败不影响卡片主体，只是没有详情按钮——不能让它整轮失败。
+                    // 存未截断全文：详情按钮的价值就在于绕过进度卡的长度限制。
+                    let detail_actions = match state
+                        .db
+                        .create_feishu_card_actions(
+                            &session_id,
+                            &[("detail".to_string(), "查看详情".to_string(), body.clone())],
+                        )
+                        .await
+                    {
+                        Ok(ids) => ids
+                            .into_iter()
+                            .next()
+                            .map(|id| TaskCardAction {
+                                label: "查看详情".to_string(),
+                                action: "task_detail".to_string(),
+                                action_id: id,
+                            })
+                            .into_iter()
+                            .collect(),
+                        Err(e) => {
+                            tracing::warn!(session_id, "写入卡片详情 payload 失败: {e:#}");
+                            vec![]
+                        }
+                    };
                     updater
                         .finish(build_task_card(&TaskCardOptions {
-                            title: "Agent 任务".to_string(),
+                            title: card_title.clone(),
                             status: TaskStatus::Success,
                             progress: 100,
                             detail: "执行完成".to_string(),
@@ -500,6 +556,10 @@ async fn run(
                                 .filter(|s| !s.is_empty())
                                 .collect(),
                             footer: Some(footer.clone()),
+                            actions: detail_actions,
+                            session_id: session_id.clone(),
+                            chat_id: chat_id.clone(),
+                            topic_id: topic_id.clone(),
                         }))
                         .await;
                     send_final_text(
@@ -519,9 +579,10 @@ async fn run(
                 AgentEvent::RunFailed { message, .. } => {
                     // 保留失败前的真实进度和工具摘要：写死 0% 会让"跑了很久才失败"
                     // 看起来像"根本没跑起来"，掩盖了实际执行到哪一步。
+                    // 失败终态不加详情按钮（没有总结可展开）。
                     updater
                         .finish(build_task_card(&TaskCardOptions {
-                            title: "Agent 任务".to_string(),
+                            title: card_title.clone(),
                             status: TaskStatus::Failed,
                             progress: progress.percent(),
                             detail: message.clone(),
@@ -530,6 +591,10 @@ async fn run(
                                 .filter(|s| !s.is_empty())
                                 .collect(),
                             footer: None,
+                            actions: vec![],
+                            session_id: session_id.clone(),
+                            chat_id: chat_id.clone(),
+                            topic_id: topic_id.clone(),
                         }))
                         .await;
                     let _ = api
@@ -541,12 +606,16 @@ async fn run(
                 AgentEvent::RunCancelled { .. } => {
                     updater
                         .finish(build_task_card(&TaskCardOptions {
-                            title: "Agent 任务".to_string(),
+                            title: card_title.clone(),
                             status: TaskStatus::Failed,
                             progress: progress.percent(),
                             detail: "任务已取消".to_string(),
                             activities: vec![],
                             footer: None,
+                            actions: vec![],
+                            session_id: session_id.clone(),
+                            chat_id: chat_id.clone(),
+                            topic_id: topic_id.clone(),
                         }))
                         .await;
                     let _ = api.reply_text(&message_id, "任务已取消", in_thread).await;

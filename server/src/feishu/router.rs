@@ -1329,6 +1329,16 @@ async fn dispatch_task_content(
         auth_token: jwt,
         extra_prompt_segments,
     };
+    // 卡片标题：优先用 content 里的文本；纯图片等多模态块取不到文本时传空串，
+    // build_task_title 会回落「Agent 任务」。必须在 content move 进 run_chat_turn 之前取。
+    let task_title: String = content
+        .iter()
+        .filter_map(|block| match block {
+            hank_provider::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
     let turn = run_chat_turn(state, &session_id, content, opts).await;
     // run_chat_turn 返回时 active_tasks 已登记（或本轮启动失败），
     // 派发名额可以还了，后续并发由 active_tasks 继续挡。
@@ -1342,6 +1352,7 @@ async fn dispatch_task_content(
                 msg.chat_id.clone(),
                 topic,
                 session_id.clone(),
+                task_title,
                 msg.in_thread(),
                 handle.event_rx,
             );

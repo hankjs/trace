@@ -11,10 +11,11 @@
 feishu/router.rs（消息解析、话题=会话、/命令、派发）
         │ run_chat_turn（native）/ cli_agent::run_cli_turn（本机 CLI）
         ▼
-feishu/pusher.rs（事件流 → 任务卡片 2s 节流刷新）
+feishu/pusher.rs（事件流 → 任务卡片 2s 节流刷新；终态卡可挂「查看详情」等按钮）
         │ AskUser → agent_interactions 落表 → 确认卡片 / task_gate 大卡片
         ▼
-feishu/callback.rs（按钮回调 → interaction_flow::answer_and_resume）
+feishu/callback.rs（按钮回调 → interaction_flow::answer_and_resume；
+                    终态卡 task_detail / task_suggest）
         │ 原子应答 → 在交互单冻结的 session 上 resume
         ▼
 interaction_flow.rs（quant_confirm / ask_user → run_chat_turn；
@@ -24,7 +25,8 @@ interaction_flow.rs（quant_confirm / ask_user → run_chat_turn；
 - **话题 = 会话**：`feishu_chats` 表把 `account_id:chat_id:topic_id`（topic = thread_id || root_id || "main"）映射到 server session，重启不丢
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
-- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`（历史字段，已无读写路径）。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）。交互单进入终态（取代 / 取消 / 过期）时会同步把飞书卡片改成灰色终态，改卡失败只记日志、不影响库状态
+- **任务进度卡**：标题带任务摘要（超长截断到 24 字）；终态绿卡可挂「查看详情」等按钮。按钮 callback value 只带 `feishu_card_actions` 主键 id，真正的详情全文 / 建议动作 prompt 存服务端（避免客户端改写指令、也避免 value 超长），启动时清理 30 天前的 payload
+- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`（历史字段，已无读写路径）。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）。交互单进入终态（应答 / 取代 / 取消 / 过期）时会同步把飞书卡片改成灰色终态，四条路径共用 `patch_card_to_done`，标题走 `interaction_card_title` 统一约定；admin 手动应答与取消同样会改卡（按交互单的 `account_id` 解析账号），改卡失败只记日志、不影响库状态
 - **交互单管理入口**：`server/src/interactions.rs`（admin REST：列表 / 详情 / 手动应答 / 取消）与 `server/src/interaction_flow.rs`（应答派发；飞书按钮与 admin 手动应答共用同一条链路，避免顺序漂移）
 - **两阶段任务闸门（task_gate）**：见下文「两阶段任务闸门」小节。默认关闭（`[server_agent].task_gate_enabled`），与 `server_agent.enabled` 解耦。
 - **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。五种 `agent_kind`：`conversation`（纯对话、无工具）、`quant_research`（A 股研究、仅 quant 工具，需 `quant_a2a.enabled`）、`trace_code` / `quant_code` / `general_task`（代码与文件任务）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。`conversation` 与 `quant_research` 强制 `native`：前者无工具，后者只挂 `quant_*` + `ask_user` + `web_fetch`，均无工作区、不绑 `exec_client_id`。
@@ -98,7 +100,7 @@ admin_base_url = "https://your-host"   # 留空则卡片不渲染深链行
 
 | 操作 | 说明 |
 |------|------|
-| `@机器人 帮我做 xxx` | 派任务：蓝卡片出现，进度 2s 节流原地刷新，结束变绿/红 |
+| `@机器人 帮我做 xxx` | 派任务：蓝卡片出现（标题带任务摘要），进度 2s 节流原地刷新，结束变绿/红；完成后可点「查看详情」在话题内获取完整总结（不受进度卡长度限制） |
 | 直接问行情 / 信号 / 回测 | 路由到 `quant_research`（需 `quant_a2a.enabled`）：server 侧 native，挂 `quant_*` 工具，无代码工作区 |
 | 发送截图 | 图片下载后作为多模态输入交给当前话题 Agent |
 | 话题内继续追问 | 同一会话续接（`feishu_chats` 映射），上下文不断 |

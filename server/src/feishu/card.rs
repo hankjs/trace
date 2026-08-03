@@ -33,6 +33,7 @@ impl TaskStatus {
 }
 
 pub struct TaskCardOptions {
+    /// 任务摘要标题（经 `build_task_title` 压成单行并截断），不再写死「Agent 任务」。
     pub title: String,
     pub status: TaskStatus,
     pub progress: u32,
@@ -40,6 +41,41 @@ pub struct TaskCardOptions {
     pub activities: Vec<String>,
     /// 底部附加信息（耗时/token 统计等），仅完成态展示
     pub footer: Option<String>,
+    /// 终态卡按钮。运行中态必须传空 vec——进度卡上出现按钮会诱导用户
+    /// 在任务还没跑完时点击。
+    pub actions: Vec<TaskCardAction>,
+    /// 回调 value 需要的会话定位字段；运行中态照常填，只是没按钮用不到。
+    pub session_id: String,
+    pub chat_id: String,
+    pub topic_id: String,
+}
+
+/// 卡片按钮：label 给用户看，action_id 是 feishu_card_actions 主键。
+pub struct TaskCardAction {
+    pub label: String,
+    /// 回调 action 名：task_detail / task_suggest
+    pub action: String,
+    pub action_id: String,
+}
+
+/// 任务摘要 → 卡片标题。header 是 plain_text，换行/控制字符会弄坏布局，
+/// 必须压成单行；超长按 chars() 截断（不能按 byte，中文会截出半个字）。
+pub fn build_task_title(summary: &str) -> String {
+    const MAX: usize = 24;
+    let one_line: String = summary
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = one_line.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        return "Agent 任务".to_string();
+    }
+    let short: String = trimmed.chars().take(MAX).collect();
+    if trimmed.chars().count() > MAX {
+        format!("任务 · {short}…")
+    } else {
+        format!("任务 · {short}")
+    }
 }
 
 /// 进度条字符（10 格）。`pub` 供 team_task 主卡复用，避免复制一份。
@@ -70,6 +106,45 @@ pub fn build_task_card(opts: &TaskCardOptions) -> Value {
         .map(|f| format!("\n\n{f}"))
         .unwrap_or_default();
 
+    let mut elements = vec![json!({
+        "tag": "markdown",
+        "content": format!(
+            "**状态：** {}\n\n**进度：** {} {}%\n\n**当前：** {}{}{}",
+            label,
+            build_progress_bar(progress),
+            progress,
+            opts.detail,
+            activity_text,
+            footer_text
+        )
+    })];
+    if !opts.actions.is_empty() {
+        // 独立 action 名（task_detail / task_suggest），避免和交互单 answer 按钮混淆。
+        let buttons: Vec<Value> = opts
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                json!({
+                    "tag": "button",
+                    "text": { "tag": "plain_text", "content": a.label },
+                    "type": if i == 0 { "primary" } else { "default" },
+                    "behaviors": [{
+                        "type": "callback",
+                        "value": {
+                            "action": a.action,
+                            "action_id": a.action_id,
+                            "session_id": opts.session_id,
+                            "chat_id": opts.chat_id,
+                            "topic_id": opts.topic_id,
+                        }
+                    }]
+                })
+            })
+            .collect();
+        elements.push(json!({ "tag": "action", "actions": buttons }));
+    }
+
     json!({
         "schema": "2.0",
         "config": {
@@ -82,20 +157,7 @@ pub fn build_task_card(opts: &TaskCardOptions) -> Value {
         },
         "body": {
             "direction": "vertical",
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": format!(
-                        "**状态：** {}\n\n**进度：** {} {}%\n\n**当前：** {}{}{}",
-                        label,
-                        build_progress_bar(progress),
-                        progress,
-                        opts.detail,
-                        activity_text,
-                        footer_text
-                    )
-                }
-            ]
+            "elements": elements
         }
     })
 }
@@ -610,6 +672,10 @@ mod tests {
             detail: "正在读取文件".into(),
             activities: vec!["步骤一".into()],
             footer: None,
+            actions: vec![],
+            session_id: "s1".into(),
+            chat_id: "c1".into(),
+            topic_id: "main".into(),
         });
         assert_eq!(card["schema"], "2.0");
         assert_eq!(card["header"]["template"], "blue");
@@ -617,6 +683,73 @@ mod tests {
         let content = card["body"]["elements"][0]["content"].as_str().unwrap();
         assert!(content.contains("30%"));
         assert!(content.contains("步骤一"));
+        // 运行中态传空 actions 时 body 只有 markdown 一个 element
+        assert_eq!(card["body"]["elements"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn task_card_with_actions() {
+        let card = build_task_card(&TaskCardOptions {
+            title: "任务 · 完成了".into(),
+            status: TaskStatus::Success,
+            progress: 100,
+            detail: "执行完成".into(),
+            activities: vec![],
+            footer: None,
+            actions: vec![TaskCardAction {
+                label: "查看详情".into(),
+                action: "task_detail".into(),
+                action_id: "act-1".into(),
+            }],
+            session_id: "s1".into(),
+            chat_id: "c1".into(),
+            topic_id: "t1".into(),
+        });
+        let elements = card["body"]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+        let btn = &elements[1]["actions"][0];
+        assert_eq!(btn["behaviors"][0]["value"]["action"], "task_detail");
+        assert_eq!(btn["behaviors"][0]["value"]["action_id"], "act-1");
+        assert_eq!(btn["behaviors"][0]["value"]["session_id"], "s1");
+        assert_eq!(btn["type"], "primary");
+    }
+
+    #[test]
+    fn build_task_title_short() {
+        assert_eq!(
+            build_task_title("帮我 review 登录"),
+            "任务 · 帮我 review 登录"
+        );
+    }
+
+    #[test]
+    fn build_task_title_truncates_long_chinese() {
+        // 超长中文 → 截断到 24 字 + 省略号，不能出现半个字
+        let long = "帮我仔细检查一下用户登录模块的实现细节是否正确以及有没有遗漏";
+        assert!(long.chars().count() > 24);
+        let title = build_task_title(long);
+        assert!(title.starts_with("任务 · "));
+        assert!(title.ends_with('…'));
+        let body = title.trim_start_matches("任务 · ").trim_end_matches('…');
+        assert_eq!(body.chars().count(), 24);
+        // 截断后的前缀应与原文一致（按 char 截，不是按 byte）
+        let expected: String = long.chars().take(24).collect();
+        assert_eq!(body, expected);
+        assert!(!title.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn build_task_title_flattens_control_chars() {
+        assert_eq!(
+            build_task_title("第一行\n第二行\t中间"),
+            "任务 · 第一行 第二行 中间"
+        );
+    }
+
+    #[test]
+    fn build_task_title_blank_falls_back() {
+        assert_eq!(build_task_title("   \n\t  "), "Agent 任务");
+        assert_eq!(build_task_title(""), "Agent 任务");
     }
 
     #[test]

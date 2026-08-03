@@ -206,6 +206,21 @@ pub struct AgentInteraction {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 飞书卡片按钮的服务端 payload。
+///
+/// 按钮 callback value 只带这张表的 id：value 是客户端回传的，
+/// 把 prompt 明文放进去等于允许客户端改写待执行指令。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FeishuCardAction {
+    pub id: String,
+    pub session_id: String,
+    /// detail = 展开总结全文；suggest = 以 payload 为 prompt 起新一轮
+    pub kind: String,
+    pub label: String,
+    pub payload: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// 启动收尾扫表的结果。
 #[derive(Debug, Default)]
 pub struct StaleInteractionSweep {
@@ -1335,6 +1350,25 @@ impl Database {
                 INDEX idx_ai_status (status, updated_at),
                 INDEX idx_ai_session (session_id, created_at),
                 INDEX idx_ai_user (user_id, created_at)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // 飞书卡片按钮的服务端 payload。
+        // 按钮 callback value 只带本表 id：value 由客户端回传，把 prompt / 详情全文
+        // 明文放进 value 等于允许客户端改写待执行指令，且易超长。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS feishu_card_actions (
+                id VARCHAR(36) PRIMARY KEY,
+                session_id VARCHAR(36) NOT NULL,
+                -- detail = 展开总结全文；suggest = 以 payload 为 prompt 起新一轮
+                kind VARCHAR(32) NOT NULL,
+                label VARCHAR(64) NOT NULL DEFAULT '',
+                payload MEDIUMTEXT NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                INDEX idx_fca_session (session_id, created_at),
+                INDEX idx_fca_created (created_at)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -4713,6 +4747,55 @@ impl Database {
         Ok(rows)
     }
 
+    // ─── 飞书卡片按钮 payload（feishu_card_actions）────────────────────────
+
+    /// 批量写入一张卡片的按钮 payload，返回各自的 id（顺序与入参一致）。
+    ///
+    /// `items` 为 `(kind, label, payload)`；条数通常 ≤4，逐条 INSERT 即可。
+    pub async fn create_feishu_card_actions(
+        &self,
+        session_id: &str,
+        items: &[(String, String, String)],
+    ) -> Result<Vec<String>> {
+        let mut ids = Vec::with_capacity(items.len());
+        for (kind, label, payload) in items {
+            let id = Uuid::new_v4().to_string();
+            db_retry!(sqlx::query(
+                "INSERT INTO feishu_card_actions (id, session_id, kind, label, payload, created_at)
+                     VALUES (?, ?, ?, ?, ?, NOW())"
+            )
+            .bind(&id)
+            .bind(session_id)
+            .bind(kind)
+            .bind(label)
+            .bind(payload)
+            .execute(&self.pool))?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    pub async fn get_feishu_card_action(&self, id: &str) -> Result<Option<FeishuCardAction>> {
+        let row = db_retry!(sqlx::query_as::<_, FeishuCardAction>(
+            "SELECT id, session_id, kind, label, payload, created_at
+                 FROM feishu_card_actions WHERE id = ?"
+        )
+        .bind(id)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 清理 30 天前的卡片 payload。卡片本身在飞书侧不会消失，
+    /// 但点很久以前的按钮属于异常操作，查不到 payload 时回 toast 提示即可。
+    /// 返回删除行数。
+    pub async fn cleanup_feishu_card_actions(&self) -> Result<u64> {
+        let res = db_retry!(sqlx::query(
+            "DELETE FROM feishu_card_actions WHERE created_at < NOW() - INTERVAL 30 DAY"
+        )
+        .execute(&self.pool))?;
+        Ok(res.rows_affected())
+    }
+
     // ─── 团队任务流水线（team_tasks / team_task_runs / team_task_events）────────
 
     /// SELECT 列清单，与 TeamTask / FromRow 字段顺序一致；不用 SELECT *。
@@ -4934,17 +5017,16 @@ impl Database {
 
     /// dev_rounds = dev_rounds + 1，返回递增后的值，供 max_dev_rounds 上限判定。
     pub async fn bump_team_task_dev_rounds(&self, task_id: &str) -> Result<i32> {
-        db_retry!(
-            sqlx::query(
-                "UPDATE team_tasks SET dev_rounds = dev_rounds + 1, updated_at = NOW() WHERE id = ?"
-            )
-            .bind(task_id)
-            .execute(&self.pool)
-        )?;
-        let (rounds,): (i32,) =
-            db_retry!(sqlx::query_as("SELECT dev_rounds FROM team_tasks WHERE id = ?")
-                .bind(task_id)
-                .fetch_one(&self.pool))?;
+        db_retry!(sqlx::query(
+            "UPDATE team_tasks SET dev_rounds = dev_rounds + 1, updated_at = NOW() WHERE id = ?"
+        )
+        .bind(task_id)
+        .execute(&self.pool))?;
+        let (rounds,): (i32,) = db_retry!(sqlx::query_as(
+            "SELECT dev_rounds FROM team_tasks WHERE id = ?"
+        )
+        .bind(task_id)
+        .fetch_one(&self.pool))?;
         Ok(rounds)
     }
 
@@ -4987,9 +5069,7 @@ impl Database {
                     .fetch_optional(&self.pool))?;
                 Ok(row)
             }
-            Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("23000") => {
-                Ok(None)
-            }
+            Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("23000") => Ok(None),
             Err(e) => Err(anyhow::Error::from(e)),
         }
     }
@@ -5885,8 +5965,7 @@ mod tests {
             no.len()
         );
         assert!(
-            no.chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            no.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "task_no should be base36 + underscores: {no}"
         );
     }

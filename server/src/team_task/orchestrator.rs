@@ -847,6 +847,7 @@ async fn spawn_role_pusher_if_possible(
         chat_id,
         topic_id,
         task.session_id.clone(),
+        task.title.clone(),
         in_thread,
         event_rx,
     );

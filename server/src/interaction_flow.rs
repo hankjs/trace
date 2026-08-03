@@ -599,6 +599,12 @@ async fn resume_task_gate(args: ResumeInteraction) -> Result<()> {
     let turn = cli_agent::run_cli_turn(&state, &session_id, session, content, &backend).await;
     dispatch_guard.release().await;
 
+    // 卡片标题用闸门 goal，空则回落交互单 title
+    let task_title = if !goal.is_empty() {
+        goal.clone()
+    } else {
+        row.title.clone()
+    };
     match turn {
         Ok(handle) => {
             if let Some(api) = api {
@@ -609,6 +615,7 @@ async fn resume_task_gate(args: ResumeInteraction) -> Result<()> {
                     chat_id,
                     topic_id,
                     session_id,
+                    task_title,
                     in_thread,
                     handle.event_rx,
                 );
@@ -961,6 +968,11 @@ async fn resume_interaction_on_session(args: ResumeInteraction) -> Result<()> {
     let content = vec![hank_provider::ContentBlock::Text { text: text.clone() }];
     let turn = run_chat_turn(&state, &session_id, content, opts).await;
     dispatch_guard.release().await;
+    // confirm / ask_user resume：卡片标题用交互单问题文案（goal 或 resume_ref.question）
+    let task_title = match state.db.get_interaction(&interaction_id).await {
+        Ok(Some(row)) => interaction_card_question(&row),
+        _ => String::new(),
+    };
     match turn {
         Ok(handle) => {
             if let Some(api) = api {
@@ -971,6 +983,7 @@ async fn resume_interaction_on_session(args: ResumeInteraction) -> Result<()> {
                     chat_id,
                     topic_id,
                     session_id,
+                    task_title,
                     in_thread,
                     handle.event_rx,
                 );

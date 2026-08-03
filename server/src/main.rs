@@ -247,6 +247,12 @@ async fn run_server() -> Result<()> {
         Err(e) => tracing::warn!("启动收尾 expire_stale_interactions 失败: {e:#}"),
     }
 
+    match state.db.cleanup_feishu_card_actions().await {
+        Ok(n) if n > 0 => tracing::info!(count = n, "启动收尾：清理过期飞书卡片按钮 payload"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("清理飞书卡片按钮 payload 失败: {e:#}"),
+    }
+
     // 启动微信 bot 长轮询（为每个 enabled 账号起一个 monitor task）
     weixin::monitor::start_monitors(state.clone());
 
