@@ -856,6 +856,21 @@ async fn toast_for_unanswerable(
                         .db
                         .update_interaction_status(interaction_id, "expired", None, None)
                         .await;
+                    // 尽力而为：库状态已标 expired，卡片改灰失败不影响 toast 文案。
+                    if let Err(e) = close_interaction_card(
+                        state,
+                        interaction_id,
+                        row.card_message_id.as_deref(),
+                        "已超时",
+                        "系统",
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            interaction_id = %interaction_id,
+                            "惰性过期改写飞书卡片失败: {e:#}"
+                        );
+                    }
                     "待确认已超时".to_string()
                 } else {
                     "这个操作已经提交过了".to_string()
@@ -1108,39 +1123,111 @@ pub(crate) fn admin_interaction_url(state: &AppState, interaction_id: &str) -> O
         .map(|base| build_admin_interaction_url(base, interaction_id))
 }
 
-/// 把被新一轮取代的闸门卡片改成灰色终态，让按钮不再邀请点击。
+/// 交互单 kind → 卡片标题。终态改写与可点卡片必须用同一套标题，
+/// 否则同一张卡片在不同阶段标题会跳变。
+pub(crate) fn interaction_card_title(kind: &str) -> &'static str {
+    match kind {
+        "task_gate" => "新任务 · 待确认是否开始修",
+        "team_gate" => "团队任务闸门",
+        "quant_confirm" => "高成本操作确认",
+        "ask_user" => "需要你的输入",
+        _ => "待确认",
+    }
+}
+
+/// 终态卡片正文用的问题文案。闸门类的语义主体是 goal；
+/// quant_confirm / ask_user 的原问句在 resume_ref.question。
+pub(crate) fn interaction_card_question(row: &AgentInteraction) -> String {
+    interaction_card_question_parts(
+        &row.kind,
+        row.goal.as_deref(),
+        row.resume_ref.as_deref(),
+        &row.title,
+    )
+}
+
+/// 纯函数版：便于单测，不依赖 AgentInteraction 构造。
+fn interaction_card_question_parts(
+    kind: &str,
+    goal: Option<&str>,
+    resume_ref: Option<&str>,
+    title: &str,
+) -> String {
+    if kind == "task_gate" || kind == "team_gate" {
+        return goal
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| title.to_string());
+    }
+    resume_ref
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|v| v["question"].as_str().map(str::to_string))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| title.to_string())
+}
+
+/// 把某张仍可点的飞书卡片改成灰色终态，让按钮不再邀请点击。
+///
+/// `choice_label` 是终态文案（如「已取消」「已超时」「已作废」），
+/// `operator_label` 是执行者展示名（如「管理员」「系统」）。
+///
+/// 尽力而为：非飞书渠道、账号已删、卡片 id 为空都直接返回 Ok。
+/// 库状态才是权威，卡片只是镜像；改卡失败不能让取消/过期本身失败。
+pub(crate) async fn close_interaction_card(
+    state: &Arc<AppState>,
+    interaction_id: &str,
+    card_message_id: Option<&str>,
+    choice_label: &str,
+    operator_label: &str,
+) -> Result<()> {
+    let Some(row) = state.db.get_interaction(interaction_id).await? else {
+        return Ok(());
+    };
+    if row.channel != "feishu" {
+        return Ok(());
+    }
+    let card_mid = card_message_id
+        .filter(|s| !s.is_empty())
+        .or(row.card_message_id.as_deref().filter(|s| !s.is_empty()));
+    let Some(card_mid) = card_mid else {
+        return Ok(());
+    };
+    let Some(account_id) = row.account_id.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    let Some(account) = state.db.get_feishu_account(account_id).await? else {
+        // 账号被删是正常终局，不是错误。
+        return Ok(());
+    };
+    let api = FeishuApi::new_archived(&account, state.db.clone());
+    let question = interaction_card_question(&row);
+    let card = build_confirm_done_card(
+        interaction_card_title(&row.kind),
+        &question,
+        choice_label,
+        operator_label,
+        Some(interaction_id),
+    );
+    api.update_card(card_mid, &card).await
+}
+
+/// 闸门单被同会话新一轮取代时的卡片改写。
+///
+/// 标题统一走 interaction_card_title，取代语义体现在正文的「已作废」上，
+/// 避免同一张卡片在不同阶段标题跳变。
 pub(crate) async fn close_superseded_gate_card(
     state: &Arc<AppState>,
     interaction_id: &str,
     card_message_id: &str,
 ) -> Result<()> {
-    let row = state
-        .db
-        .get_interaction(interaction_id)
-        .await?
-        .ok_or_else(|| anyhow!("交互单不存在"))?;
-    let Some(account_id) = row.account_id.as_deref().filter(|s| !s.is_empty()) else {
-        return Ok(());
-    };
-    let account = state
-        .db
-        .get_feishu_account(account_id)
-        .await?
-        .ok_or_else(|| anyhow!("飞书账号不存在"))?;
-    let api = FeishuApi::new_archived(&account, state.db.clone());
-    let question = row
-        .goal
-        .clone()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| row.title.clone());
-    let card = build_confirm_done_card(
-        "新任务 · 已被新一轮取代",
-        &question,
+    close_interaction_card(
+        state,
+        interaction_id,
+        Some(card_message_id),
         "已作废",
         "系统",
-        Some(interaction_id),
-    );
-    api.update_card(card_message_id, &card).await
+    )
+    .await
 }
 
 fn card_action_claim_id(
@@ -1161,7 +1248,10 @@ fn card_action_claim_id(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_admin_interaction_url, card_action_claim_id};
+    use super::{
+        build_admin_interaction_url, card_action_claim_id, interaction_card_question_parts,
+        interaction_card_title,
+    };
 
     #[test]
     fn card_action_claim_is_scoped_to_the_card() {
@@ -1193,5 +1283,82 @@ mod tests {
         let url = build_admin_interaction_url("https://example.com/", "ia-9");
         assert_eq!(url, "https://example.com/admin/interactions/ia-9");
         assert!(!url.contains("//admin"));
+    }
+
+    #[test]
+    fn card_title_matches_live_card_titles() {
+        // 终态卡与可点卡必须同标题，否则同一张卡片标题会跳变。
+        assert_eq!(
+            interaction_card_title("task_gate"),
+            "新任务 · 待确认是否开始修"
+        );
+        assert_eq!(interaction_card_title("team_gate"), "团队任务闸门");
+        assert_eq!(interaction_card_title("quant_confirm"), "高成本操作确认");
+        assert_eq!(interaction_card_title("ask_user"), "需要你的输入");
+        assert_eq!(interaction_card_title("unknown_kind"), "待确认");
+    }
+
+    #[test]
+    fn card_question_prefers_goal_for_gates() {
+        assert_eq!(
+            interaction_card_question_parts(
+                "task_gate",
+                Some("修登录超时"),
+                Some(r#"{"question":"应被忽略"}"#),
+                "fallback-title",
+            ),
+            "修登录超时"
+        );
+        assert_eq!(
+            interaction_card_question_parts("team_gate", Some("推进评审"), None, "t"),
+            "推进评审"
+        );
+    }
+
+    #[test]
+    fn card_question_reads_resume_ref_for_confirm() {
+        assert_eq!(
+            interaction_card_question_parts(
+                "quant_confirm",
+                Some("应被忽略"),
+                Some(r#"{"question":"是否继续回测？"}"#),
+                "fallback-title",
+            ),
+            "是否继续回测？"
+        );
+        assert_eq!(
+            interaction_card_question_parts(
+                "ask_user",
+                None,
+                Some(r#"{"question":"用哪个分支？"}"#),
+                "fallback-title",
+            ),
+            "用哪个分支？"
+        );
+    }
+
+    #[test]
+    fn card_question_falls_back_to_title() {
+        assert_eq!(
+            interaction_card_question_parts("task_gate", None, None, "标题回落"),
+            "标题回落"
+        );
+        assert_eq!(
+            interaction_card_question_parts("task_gate", Some(""), None, "标题回落"),
+            "标题回落"
+        );
+        assert_eq!(
+            interaction_card_question_parts(
+                "quant_confirm",
+                None,
+                Some(r#"{"other":1}"#),
+                "标题回落",
+            ),
+            "标题回落"
+        );
+        assert_eq!(
+            interaction_card_question_parts("ask_user", None, Some("not-json"), "标题回落"),
+            "标题回落"
+        );
     }
 }

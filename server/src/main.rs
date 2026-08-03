@@ -202,22 +202,46 @@ async fn run_server() -> Result<()> {
     // 一次性收尾：过期 pending → expired；卡住的 answered 僵尸 → pending；
     // executing 僵尸 → failed（执行进程已随重启消失，不能永远留在中间态）。
     // 不进 scheduler——scheduler_enabled=false 时也要跑；与部署恢复同级。
+    // 飞书长连接尚未启动，但 close_interaction_card 走 REST（自取 tenant token），
+    // 与长连接无关，可直接改写过期卡片。
     match state.db.expire_stale_interactions().await {
-        Ok((expired, reverted, failed)) => {
-            if expired > 0 {
-                tracing::info!(count = expired, "启动收尾：已过期交互单标记为 expired");
-            }
-            if reverted > 0 {
+        Ok(sweep) => {
+            if !sweep.expired.is_empty() {
                 tracing::info!(
-                    count = reverted,
+                    count = sweep.expired.len(),
+                    "启动收尾：已过期交互单标记为 expired"
+                );
+            }
+            if sweep.reverted > 0 {
+                tracing::info!(
+                    count = sweep.reverted,
                     "启动收尾：answered 僵尸退回 pending（派发未完成可重试）"
                 );
             }
-            if failed > 0 {
+            if sweep.failed > 0 {
                 tracing::info!(
-                    count = failed,
+                    count = sweep.failed,
                     "启动收尾：executing 僵尸标记为 failed（执行进程已中断）"
                 );
+            }
+            for (interaction_id, card_message_id) in &sweep.expired {
+                if card_message_id.as_deref().map_or(true, str::is_empty) {
+                    continue;
+                }
+                if let Err(e) = interaction_flow::close_interaction_card(
+                    &state,
+                    interaction_id,
+                    card_message_id.as_deref(),
+                    "已超时",
+                    "系统",
+                )
+                .await
+                {
+                    tracing::warn!(
+                        interaction_id = %interaction_id,
+                        "过期回收改写飞书卡片失败: {e:#}"
+                    );
+                }
             }
         }
         Err(e) => tracing::warn!("启动收尾 expire_stale_interactions 失败: {e:#}"),

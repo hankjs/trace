@@ -168,11 +168,20 @@ pub async fn cancel_interaction(
         ));
     }
     match state.db.cancel_interaction(&id, &claims.sub).await {
-        Ok(true) => match state.db.get_interaction(&id).await {
-            Ok(Some(updated)) => R::ok(updated),
-            Ok(None) => R::no_content(),
-            Err(e) => R::internal_error(e),
-        },
+        Ok(true) => {
+            // 尽力而为：卡片改灰失败不影响取消结果（库状态是权威）。
+            if let Err(e) =
+                interaction_flow::close_interaction_card(&state, &id, None, "已取消", "管理员")
+                    .await
+            {
+                tracing::warn!(interaction_id = %id, "取消后改写飞书卡片失败: {e:#}");
+            }
+            match state.db.get_interaction(&id).await {
+                Ok(Some(updated)) => R::ok(updated),
+                Ok(None) => R::no_content(),
+                Err(e) => R::internal_error(e),
+            }
+        }
         Ok(false) => R::bad_request("取消失败：交互单可能已被应答或状态已变"),
         Err(e) => R::internal_error(e),
     }

@@ -206,6 +206,18 @@ pub struct AgentInteraction {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 启动收尾扫表的结果。
+#[derive(Debug, Default)]
+pub struct StaleInteractionSweep {
+    /// 被标 expired 的 pending 行：`(交互单 id, card_message_id)`。
+    /// 带出卡片 id 是为了让渠道把还亮着按钮的卡片改成终态。
+    pub expired: Vec<(String, Option<String>)>,
+    /// answered 僵尸退回 pending 的条数
+    pub reverted: u64,
+    /// executing 僵尸标 failed 的条数
+    pub failed: u64,
+}
+
 /// 创建交互单的入参（字段多，避免位置参数触发 too_many_arguments）。
 #[derive(Debug, Clone)]
 pub struct NewInteraction<'a> {
@@ -4560,16 +4572,29 @@ impl Database {
     ///
     /// 僵尸判定都带时间窗，避免误伤「正在派发 / 正在执行」的行。executing 的窗
     /// 取 2 小时，比单轮超时（默认 30 分钟）宽出足够余量。
-    /// 返回 `(expired 条数, reverted 条数, failed 条数)`。
-    pub async fn expire_stale_interactions(&self) -> Result<(u64, u64, u64)> {
-        let expired = db_retry!(sqlx::query(
-            "UPDATE agent_interactions
-                 SET status = 'expired', updated_at = NOW()
+    ///
+    /// 带出 expired 行的 `(id, card_message_id)`，供飞书渠道把仍可点的卡片改成终态。
+    /// SELECT 与 UPDATE 之间不加事务：这是启动期尽力而为的清扫，
+    /// 与 `supersede_pending_task_gates` 口径一致。
+    pub async fn expire_stale_interactions(&self) -> Result<StaleInteractionSweep> {
+        // 先 SELECT 后 UPDATE：需要卡片 id 给上层改写，不能只拿 rows_affected。
+        let expired: Vec<(String, Option<String>)> = db_retry!(sqlx::query_as(
+            "SELECT id, card_message_id FROM agent_interactions
                  WHERE status = 'pending'
                    AND expires_at IS NOT NULL
                    AND expires_at <= NOW()"
         )
-        .execute(&self.pool))?;
+        .fetch_all(&self.pool))?;
+        if !expired.is_empty() {
+            db_retry!(sqlx::query(
+                "UPDATE agent_interactions
+                     SET status = 'expired', updated_at = NOW()
+                     WHERE status = 'pending'
+                       AND expires_at IS NOT NULL
+                       AND expires_at <= NOW()"
+            )
+            .execute(&self.pool))?;
+        }
         let reverted = db_retry!(sqlx::query(
             "UPDATE agent_interactions
                  SET status = 'pending', answer = NULL, answered_by = NULL,
@@ -4588,11 +4613,11 @@ impl Database {
                    AND updated_at < NOW() - INTERVAL 2 HOUR"
         )
         .execute(&self.pool))?;
-        Ok((
-            expired.rows_affected(),
-            reverted.rows_affected(),
-            failed.rows_affected(),
-        ))
+        Ok(StaleInteractionSweep {
+            expired,
+            reverted: reverted.rows_affected(),
+            failed: failed.rows_affected(),
+        })
     }
 
     /// 交互单列表（admin）。筛选项均为可选，传 None 表示不限。

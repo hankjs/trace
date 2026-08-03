@@ -24,7 +24,7 @@ interaction_flow.rs（quant_confirm / ask_user → run_chat_turn；
 - **话题 = 会话**：`feishu_chats` 表把 `account_id:chat_id:topic_id`（topic = thread_id || root_id || "main"）映射到 server session，重启不丢
 - **账号管理**：凭证存 `feishu_accounts` 表，admin REST 增删启停（与 weixin_accounts 同模式）；启用即起长连接，停用即断
 - **用户绑定**：`feishu_bindings` 表，一次性 6 位绑定码流程（与微信相同），无需手配 open_id
-- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`（历史字段，已无读写路径）。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）
+- **确认闸门 / 交互单落表**：`quant_confirm` 与 `ask_user` 统一写入 `agent_interactions` 表（有稳定主键），不再寄生在进程内 map 或 `sessions.pending_ask_user`（历史字段，已无读写路径）。飞书确认卡片展示任务编号、会话短 id 与 admin 深链；按钮回调按 `interaction_id` 原子应答，并在交互单冻结的 `session_id` 上 resume——话题 reuse policy 判 Recreate 重建 session 后点确认也不会丢单。微信仍是文本白名单（回复"确认"），TTL 写在行的 `expires_at`（微信 5 分钟，飞书/网页不过期）。交互单进入终态（取代 / 取消 / 过期）时会同步把飞书卡片改成灰色终态，改卡失败只记日志、不影响库状态
 - **交互单管理入口**：`server/src/interactions.rs`（admin REST：列表 / 详情 / 手动应答 / 取消）与 `server/src/interaction_flow.rs`（应答派发；飞书按钮与 admin 手动应答共用同一条链路，避免顺序漂移）
 - **两阶段任务闸门（task_gate）**：见下文「两阶段任务闸门」小节。默认关闭（`[server_agent].task_gate_enabled`），与 `server_agent.enabled` 解耦。
 - **执行模式**：新话题始终由路由 Agent 确定 `agent_kind` 与 `agent_backend`（**不依赖** `[server_agent].enabled`）。五种 `agent_kind`：`conversation`（纯对话、无工具）、`quant_research`（A 股研究、仅 quant 工具，需 `quant_a2a.enabled`）、`trace_code` / `quant_code` / `general_task`（代码与文件任务）。`codex` / `claude` / `grok` / `kimi` **一律 client-only**：必须绑定在线且上报了对应 backend 的 `hank-cli`；节点不存在、离线或能力不匹配时直接失败，**绝不**回退 server bubblewrap、native 或另一节点。`[server_agent].enabled` 只管 server 侧 worktree / bubblewrap / `/diff` `/test` `/deploy` `/rollback`；关闭时 client-only hank-cli 链路仍然可用。`conversation` 与 `quant_research` 强制 `native`：前者无工具，后者只挂 `quant_*` + `ask_user` + `web_fetch`，均无工作区、不绑 `exec_client_id`。
@@ -382,6 +382,4 @@ history 托管方式不同）。主卡上的「在看板查看」链接与此一
 - 普通文件附件下载（当前已支持图片输入和 `[file:]` 图片回传）
 - 更多 job：agent 整理的简报（cron 驱动 run_chat_turn）、失败 @人告警、巡检类任务
 - 多 bot 互相 @ 协作（agent-os 文档后半程的团队作战）
-- 取消交互单时同步把飞书卡片改成终态（`task_gate` 被新一轮取代时已会改灰；
-  admin 手动取消、过期回收等路径的卡片仍可点，点了会被拒但不会误执行）
 - admin 交互单详情的 `analysis` 渲染 markdown（当前纯文本展示）
