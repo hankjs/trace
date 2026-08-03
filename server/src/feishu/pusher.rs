@@ -125,6 +125,37 @@ impl Progress {
     }
 }
 
+/// 本会话是否走「静默模式」：只在受理、要决策、出终态时发卡，中途不刷进度。
+///
+/// quant 因子调研是长时研究（单个 `evaluate_factor` 上限 600s），逐工具刷卡
+/// 会把异步任务演成同步直播，刷屏且没有信息量。代码类任务反过来——用户要盯
+/// 着改了哪些文件，所以只对 `quant_research` 静默。
+///
+/// 判定口径与 `chat.rs` 的 `research_agent` 一致（同读 metadata.agent_kind）。
+async fn is_quiet_session(state: &AppState, session_id: &str) -> bool {
+    let metadata = match state.db.get_session(session_id).await {
+        Ok(Some(session)) => session.metadata,
+        _ => return false,
+    };
+    quiet_from_metadata(metadata.as_deref())
+}
+
+/// 会话 metadata → 是否静默。纯函数，便于单测。
+fn quiet_from_metadata(metadata: Option<&str>) -> bool {
+    metadata
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|value| {
+            value["agent_kind"]
+                .as_str()
+                .map(|kind| kind == "quant_research")
+        })
+        .unwrap_or(false)
+}
+
+/// 静默模式首卡文案：明确「不用等这张卡」，避免用户守着一张不动的卡。
+const QUIET_ACK_DETAIL: &str =
+    "已受理，正在后台调研。需要你决策时会单独发卡，完成后推送结论；/stop 可取消";
+
 /// 渠道上下文直传参数较多，见 `spawn` 注释。
 #[allow(clippy::too_many_arguments)]
 async fn run(
@@ -141,12 +172,18 @@ async fn run(
 ) {
     // 标题算一次，四处 build_task_card 复用，避免各写一遍。
     let card_title = build_task_title(&task_title);
+    // 静默模式：首卡定稿后不再刷进度（详见 is_quiet_session）。
+    let quiet = is_quiet_session(&state, &session_id).await;
 
     let running_card = build_task_card(&TaskCardOptions {
         title: card_title.clone(),
         status: TaskStatus::Running,
         progress: 0,
-        detail: "正在启动执行引擎".to_string(),
+        detail: if quiet {
+            QUIET_ACK_DETAIL.to_string()
+        } else {
+            "正在启动执行引擎".to_string()
+        },
         activities: vec![],
         footer: None,
         actions: vec![],
@@ -201,7 +238,12 @@ async fn run(
     let mut output_tokens: u32 = 0;
     let started = Instant::now();
 
+    // 静默模式下不推运行中卡；但 publish 照旧写快照，
+    // 用户主动问「进度怎样了」时 running_reply 仍能答出当前工具与已用时。
     let push_running = |progress: &Progress| {
+        if quiet {
+            return;
+        }
         updater.push(build_task_card(&TaskCardOptions {
             title: card_title.clone(),
             status: TaskStatus::Running,
@@ -367,6 +409,10 @@ async fn run(
                         || interaction.as_ref().is_some_and(|r| r.kind == "task_gate");
                     // 多问题：questions 非空走独立卡（逐题按钮 + 文字「1A 2B」提示）
                     let is_multi = !questions.is_empty();
+                    // 高成本量化操作确认；下面收尾文案要用，故与 is_task_gate 同层判定。
+                    let is_quant_confirm = kind
+                        .as_deref()
+                        .is_some_and(|k| k.starts_with("quant_confirm:"));
                     let card = if is_task_gate {
                         let resume: Value = interaction
                             .as_ref()
@@ -419,15 +465,12 @@ async fn run(
                             admin_url,
                         })
                     } else {
-                        let is_quant = kind
-                            .as_deref()
-                            .is_some_and(|k| k.starts_with("quant_confirm:"));
-                        let title = if is_quant {
+                        let title = if is_quant_confirm {
                             "高成本操作确认"
                         } else {
                             "需要你的输入"
                         };
-                        let hint = if is_quant {
+                        let hint = if is_quant_confirm {
                             Some(
                                 "点「确认」执行本次；点「本会话全部同意」等同「确认50次」；\
                                  不同意可直接回复你的意见。也可文字回复「确认N次」（N≤50）"
@@ -509,29 +552,36 @@ async fn run(
                     progress.push_activity("等待用户确认".to_string());
                     publish(&progress).await;
 
-                    // 闸门第一轮到此为止（cli_agent 紧接着发 TurnComplete，本 pusher 会退出）。
-                    // 必须把进度卡 finish 掉：cancel() 只关闭 updater、不改卡片，
-                    // 蓝色「运行中」会永久冻在 90% 以下，和闸门大卡并列烂尾。
-                    // 第二轮由 resume_task_gate 另起一个 pusher 和一张新卡，不受影响。
-                    if is_task_gate {
-                        updater
-                            .finish(build_task_card(&TaskCardOptions {
-                                title: card_title.clone(),
-                                status: TaskStatus::Waiting,
-                                progress: progress.percent(),
-                                detail: "已完成只读分析，等待你确认是否开始修".to_string(),
-                                activities: vec![progress.summary_line()]
-                                    .into_iter()
-                                    .filter(|s| !s.is_empty())
-                                    .collect(),
-                                footer: None,
-                                actions: vec![],
-                                session_id: session_id.clone(),
-                                chat_id: chat_id.clone(),
-                                topic_id: topic_id.clone(),
-                            }))
-                            .await;
-                    }
+                    // 等人作答时本轮就结束了（code-agent 发出 AskUser 后 break，
+                    // 紧接着 TurnComplete，本 pusher 随即退出）。必须把进度卡 finish
+                    // 掉：cancel() 只关闭 updater、不改卡片，蓝色「运行中」会永久冻在
+                    // 90% 以下，和确认卡并列烂尾。
+                    // 这对 task_gate / quant_confirm / 普通 ask_user 一律成立——早先只
+                    // 处理了 task_gate，另两条留着烂尾卡。
+                    // 作答后由 interaction_flow 另起 pusher 和新卡，不受影响。
+                    updater
+                        .finish(build_task_card(&TaskCardOptions {
+                            title: card_title.clone(),
+                            status: TaskStatus::Waiting,
+                            progress: progress.percent(),
+                            detail: if is_task_gate {
+                                "已完成只读分析，等待你确认是否开始修".to_string()
+                            } else if is_quant_confirm {
+                                "等待你确认高成本操作".to_string()
+                            } else {
+                                "等待你的回答".to_string()
+                            },
+                            activities: vec![progress.summary_line()]
+                                .into_iter()
+                                .filter(|s| !s.is_empty())
+                                .collect(),
+                            footer: None,
+                            actions: vec![],
+                            session_id: session_id.clone(),
+                            chat_id: chat_id.clone(),
+                            topic_id: topic_id.clone(),
+                        }))
+                        .await;
                 }
                 AgentEvent::SuggestedActions { actions } => {
                     // 同一轮多次调用以最后一次为准：模型改主意时不该叠加出 6 个按钮。
@@ -880,5 +930,27 @@ mod tests {
             Some("image/png")
         );
         assert_eq!(image_media_type(b"not-an-image"), None);
+    }
+
+    /// 只有 quant_research 静默：代码类任务要看进度，误静默会让用户以为卡死。
+    #[test]
+    fn only_quant_research_is_quiet() {
+        assert!(quiet_from_metadata(Some(
+            r#"{"agent_kind":"quant_research","source":"feishu"}"#
+        )));
+        for kind in ["trace_code", "quant_code", "conversation", "general_task"] {
+            let raw = format!(r#"{{"agent_kind":"{kind}"}}"#);
+            assert!(!quiet_from_metadata(Some(&raw)), "{kind} 不该静默");
+        }
+    }
+
+    /// metadata 缺失/不是 JSON/没有 agent_kind 时按非静默兜底：
+    /// 宁可多刷卡，也不能让任务看起来没动静。
+    #[test]
+    fn missing_or_broken_metadata_is_not_quiet() {
+        assert!(!quiet_from_metadata(None));
+        assert!(!quiet_from_metadata(Some("")));
+        assert!(!quiet_from_metadata(Some("not json")));
+        assert!(!quiet_from_metadata(Some(r#"{"source":"feishu"}"#)));
     }
 }
