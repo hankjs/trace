@@ -199,6 +199,8 @@ export interface StrategyAstNode {
   ascending?: boolean
   /** top_n */
   n?: number
+  /** cs_rank / cs_zscore / cs_demean: 截面分组字段,如 industry;null 表示全截面 */
+  group_by?: string | null
 }
 
 /** entry / native_exit 的规则形状:{condition, reason_code} */

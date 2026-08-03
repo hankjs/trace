@@ -45,7 +45,7 @@ export interface ExpressionSlot {
   list?: boolean
 }
 
-type ScalarParam = 'name' | 'value' | 'window' | 'shift' | 'periods' | 'n' | 'ascending'
+type ScalarParam = 'name' | 'value' | 'window' | 'shift' | 'periods' | 'n' | 'ascending' | 'group_by'
 
 export interface ExpressionOpDef {
   op: string
@@ -61,6 +61,8 @@ export interface ExpressionOpDef {
     periods?: number
     n?: number
     ascending?: boolean
+    /** null = 全截面,无分组 */
+    group_by?: string | null
   }
 }
 
@@ -240,6 +242,7 @@ export function defaultNode(op: string, slotType: ExpressionValueType): Strategy
   if (def.defaults?.periods !== undefined) node.periods = def.defaults.periods
   if (def.defaults?.n !== undefined) node.n = def.defaults.n
   if (def.defaults?.ascending !== undefined) node.ascending = def.defaults.ascending
+  if (def.defaults && 'group_by' in def.defaults) node.group_by = def.defaults.group_by ?? null
   return node
 }
 
@@ -266,7 +269,7 @@ export function switchNodeOp(
     const child = previous[slot.key]
     if (child && !Array.isArray(child) && nodeType(child) === slot.type) setChild(next, slot.key, child)
   }
-  const scalarKeys = ['window', 'shift', 'periods', 'n', 'ascending', 'name'] as const
+  const scalarKeys = ['window', 'shift', 'periods', 'n', 'ascending', 'name', 'group_by'] as const
   for (const key of scalarKeys) {
     if (next[key] !== undefined && previous[key] !== undefined) {
       ;(next as unknown as Record<string, unknown>)[key] = previous[key]
