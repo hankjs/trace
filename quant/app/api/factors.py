@@ -151,6 +151,8 @@ def _factor_out(def_: FactorDef) -> dict[str, Any]:
         "min_bars": def_.min_bars,
         "enabled": bool(def_.enabled),
         "is_system": bool(def_.is_system),
+        "owner_id": getattr(def_, "owner_id", None),
+        "parent_factor_key": getattr(def_, "parent_factor_key", None),
         "created_at": (
             def_.created_at.isoformat(sep=" ") if def_.created_at else None
         ),
@@ -230,6 +232,7 @@ def create_factor(body: FactorCreateIn,
         expression_hash=result.expression_hash or "",
         min_bars=result.min_bars or 1,
         enabled=body.enabled,
+        owner_id=user_id_from_claims(_claims),
     )
     db.add(def_)
     try:
@@ -312,12 +315,21 @@ def preview_factor(body: FactorPreviewIn,
 
     result = validate_expression(
         expr, require_type="number", available_fields=_available_fields(db),
+        mode="time_series",
     )
     if not result.valid:
+        mode_issues = [
+            i for i in result.capability.issues
+            if i.code == "expression_mode_mismatch"
+        ]
+        message = (
+            "截面因子无法在 ≤5 标的上抽查（截面样本不足），请改用 factor.evaluate"
+            if mode_issues else "表达式校验失败"
+        )
         raise HTTPException(
             422,
             {
-                "message": "表达式校验失败",
+                "message": message,
                 "capability": result.capability.model_dump(mode="json"),
                 "errors": [issue.message for issue in result.capability.issues],
             },
@@ -423,6 +435,9 @@ def backfill_factors(body: FactorBackfillIn,
             "start": str(body.start),
             "end": str(body.end),
             "codes": body.codes,
+            # REST 端点已 require_admin,传一致入参形状给 handler 归属守卫
+            "owner_id": user_id,
+            "is_admin": True,
         },
     )
     return {"task": task_payload(task)}

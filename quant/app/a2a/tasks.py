@@ -39,6 +39,8 @@ HIGH_COST_SKILLS = frozenset({
     "experiment.trial",
     "experiment.trial_batch",
     "factor.evaluate",
+    "factor.backfill",
+    "factor.correlation",
 })
 
 # skill -> quant_task.type，用于互斥/幂等查找
@@ -47,6 +49,8 @@ SKILL_TO_QUANT_TASK_TYPE: dict[str, str] = {
     "experiment.trial": "experiment_trial",
     "experiment.trial_batch": "experiment_trial_batch",
     "factor.evaluate": "factor_evaluation",
+    "factor.backfill": "factor_backfill",
+    "factor.correlation": "factor_correlation",
 }
 
 _QUANT_TASK_TYPE_TO_SKILL = {v: k for k, v in SKILL_TO_QUANT_TASK_TYPE.items()}

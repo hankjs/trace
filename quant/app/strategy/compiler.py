@@ -947,5 +947,8 @@ def _coerce_position_dtype(value: pd.Series) -> pd.Series:
 
 __all__ = [
     "COMPILER_VERSION", "PortfolioCompilation", "SingleCompilation", "StateTransition",
+    # _portfolio_fields 导出给因子截面求值复用:两套帧构造会在字段对齐与
+    # reindex 语义上悄悄分叉,只新增调用方、不改函数体。
+    "_portfolio_fields",
     "compile_portfolio", "compile_single", "component_versions_for_spec",
 ]

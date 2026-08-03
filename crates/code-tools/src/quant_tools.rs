@@ -12,7 +12,7 @@ use crate::quant_grant::QuantGrantStore;
 /// 高成本 quant 工具执行超时（回测 / trial / 因子评估可能持续数分钟）。
 const QUANT_LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// 一次性构造全部 21 个 `quant_*` 工具。
+/// 一次性构造全部 24 个 `quant_*` 工具。
 pub fn quant_tools(
     base_url: impl Into<String>,
     token: impl Into<String>,
@@ -328,7 +328,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_validate_factor",
                 skill: "factor.validate",
-                description: "校验因子表达式是否合法、系统是否支持。",
+                description: "校验因子表达式是否合法、系统是否支持。返回 mode 字段标明表达式是时序还是横截面。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -345,7 +345,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_preview_factor",
                 skill: "factor.preview",
-                description: "在少量标的（≤5）上计算因子序列，仅抽查，不代表全市场有效性。",
+                description: "在少量标的（≤5）上计算因子序列，仅抽查，不代表全市场有效性。只支持时序因子；横截面因子（含 cs_rank / cs_zscore / cs_demean / rank / top_n）会被拒绝，请直接用 quant_evaluate_factor。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -365,7 +365,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_evaluate_factor",
                 skill: "factor.evaluate",
-                description: "全市场（或指定池）因子有效性评估：IC/RankIC/ICIR（含 Newey-West t 值）、IC 衰减曲线、分层多空收益与多重检验提示。建议始终传 neutralize:[\"industry\",\"market_cap\"]——裸 IC 混着行业与市值暴露，低 PE 类因子的 IC 往往主要来自行业效应。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
+                description: "全市场（或指定池）因子有效性评估：IC/RankIC/ICIR（含 Newey-West t 值）、IC 衰减曲线、分层多空收益与多重检验提示。支持横截面因子：cs_rank 等算子可写出行业内排名、截面标准化类因子，按调仓日全池现算。建议始终传 neutralize:[\"industry\",\"market_cap\"]——裸 IC 混着行业与市值暴露，低 PE 类因子的 IC 往往主要来自行业效应。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -466,7 +466,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_save_factor_draft",
                 skill: "factor.save_draft",
-                description: "保存因子草稿（enabled=false），仅 admin 可用。",
+                description: "保存因子草稿（enabled=false，归属调用者）。可带 parent_factor_key 记录变体谱系。保存后需 quant_backfill_factor 回填历史值才能按 factor_key 评估。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -474,7 +474,8 @@ pub fn quant_tools(
                         "name": { "type": "string" },
                         "expression": { "type": "object" },
                         "description": { "type": "string" },
-                        "category": { "type": "string" }
+                        "category": { "type": "string" },
+                        "parent_factor_key": { "type": ["string", "null"] }
                     },
                     "required": ["key", "name", "expression"]
                 }),
@@ -482,6 +483,95 @@ pub fn quant_tools(
                 artifact_name: "factor_draft",
             },
             |_| "保存因子草稿".to_string(),
+        ),
+        mk(
+            ToolSpec {
+                tool_name: "quant_backfill_factor",
+                skill: "factor.backfill",
+                description: "把自己保存的因子草稿的历史值算进因子日值表。保存草稿后必须先回填，否则按 factor_key 评估会读空并以「有效样本过少」失败。只能回填自己的草稿。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "factor_key": { "type": "string", "description": "必填，只能是自己保存的草稿 key" },
+                        "start": { "type": "string" },
+                        "end": { "type": "string" },
+                        "codes": { "type": "array", "items": { "type": "string" } },
+                        "confirmed": { "type": "boolean", "description": "由拦截层注入，模型勿填" },
+                        "client_request_id": { "type": "string" }
+                    },
+                    "required": ["factor_key", "start", "end"]
+                }),
+                high_cost: true,
+                artifact_name: "factor_backfill",
+            },
+            |input| {
+                let key = input["factor_key"].as_str().unwrap_or("?");
+                let start = input["start"].as_str().unwrap_or("?");
+                let end = input["end"].as_str().unwrap_or("?");
+                format!("回填因子 {}，区间 {} ~ {}", key, start, end)
+            },
+        ),
+        mk(
+            ToolSpec {
+                tool_name: "quant_factor_correlation",
+                skill: "factor.correlation",
+                description: "检验待检因子相对已有因子集是否有增量：逐调仓日截面相关性、IC 序列相关性、以及对对照因子回归后的残差 IC（含 Newey-West t 值）。残差 IC 不显著即无增量，此时裸 IC 好看也不得推荐。跑出第二个因子后必须调用。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "expression": { "type": ["object", "null"] },
+                        "factor_key": { "type": ["string", "null"] },
+                        "benchmark_keys": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "对照因子 key 列表，最多 20 个。省略则取全部启用的系统因子（超过 20 个会报错要求显式指定）。"
+                        },
+                        "start": { "type": "string" },
+                        "end": { "type": "string" },
+                        "pool_id": { "type": ["string", "integer", "null"] },
+                        "codes": { "type": "array", "items": { "type": "string" } },
+                        "rebalance": { "type": "string", "enum": ["weekly", "monthly"], "description": "默认 weekly" },
+                        "neutralize": {
+                            "type": "array",
+                            "items": { "type": "string", "enum": ["industry", "market_cap"] },
+                            "description": "与 quant_evaluate_factor 同口径；待检与对照因子用同一口径中性化，否则相关性无意义。"
+                        },
+                        "confirmed": { "type": "boolean", "description": "由拦截层注入，模型勿填" },
+                        "client_request_id": { "type": "string" }
+                    },
+                    "required": ["start", "end"]
+                }),
+                high_cost: true,
+                artifact_name: "factor_correlation",
+            },
+            |input| {
+                let key = input["factor_key"].as_str().map(|s| s.to_string())
+                    .unwrap_or_else(|| "表达式".to_string());
+                let n = input["benchmark_keys"].as_array().map(|a| a.len()).unwrap_or(0);
+                format!("检验因子 {} 相对 {} 个对照因子的增量", key, n)
+            },
+        ),
+        mk(
+            ToolSpec {
+                tool_name: "quant_get_factor_correlation",
+                skill: "factor.correlation_get",
+                description: "按 correlation_id 取单次因子相关性检验详情。",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "correlation_id": { "type": ["integer", "string"] }
+                    },
+                    "required": ["correlation_id"]
+                }),
+                high_cost: false,
+                artifact_name: "factor_correlation",
+            },
+            |input| {
+                let id = input["correlation_id"].as_i64().map(|v| v.to_string())
+                    .or_else(|| input["correlation_id"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "?".to_string());
+                format!("查看因子相关性检验 {}", id)
+            },
         ),
         mk(
             ToolSpec {
@@ -1010,6 +1100,8 @@ mod tests {
             "quant_run_trial_batch",
             "quant_run_backtest",
             "quant_evaluate_factor",
+            "quant_backfill_factor",
+            "quant_factor_correlation",
         ] {
             let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
             assert!(tool.description().contains("模型应直接调用"), "{name}");
@@ -1030,6 +1122,7 @@ mod tests {
         for name in [
             "quant_list_factor_evaluations",
             "quant_get_factor_evaluation",
+            "quant_get_factor_correlation",
         ] {
             let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
             assert!(
@@ -1041,10 +1134,7 @@ mod tests {
             .iter()
             .find(|tool| tool.name() == "quant_get_factor_evaluation")
             .unwrap();
-        assert_eq!(
-            get.input_schema()["required"],
-            json!(["evaluation_id"]),
-        );
+        assert_eq!(get.input_schema()["required"], json!(["evaluation_id"]),);
     }
 
     #[test]

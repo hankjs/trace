@@ -30,10 +30,17 @@ from ..data.universe import (
     MissingPoolHistoryError,
     resolve_pool_during,
 )
-from ..factors.engine import evaluate_factor
+from ..factors.engine import evaluate_factor, evaluate_factor_cross_section
+from ..factors.defs import load_all_defs
 from ..models import FactorDaily, FactorDef, FactorEvaluation, Stock, TradeCalendar
 from ..strategy.multiple_testing import factor_multiplicity_report
-from ..strategy.spec import parse_expression, validate_expression, _walk_expression
+from ..strategy.operators import CROSS_SECTION_OPS
+from ..strategy.spec import (
+    expression_mode,
+    parse_expression,
+    validate_expression,
+    _walk_expression,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +253,73 @@ def _load_expression_factor_values(
             if not math.isfinite(v):
                 continue
             out[(code, d)] = v
+    return out
+
+
+def _load_cross_section_factor_values(
+    db: Session,
+    expression: dict[str, Any],
+    codes: list[str],
+    rebalance_dates: list[date],
+    lookback_start: date,
+    end: date,
+    stocks: dict[str, Stock],
+    cancel_event: threading.Event | None,
+    min_bars: int = 1,
+) -> dict[tuple[str, date], float]:
+    """只在调仓日按全池截面现算因子值。
+
+    截面因子不落 FactorDaily(依赖当期全池),评估时直接按调仓点求值。
+    每次只构造该调仓日所需回看窗口,峰值内存与全区间无关。
+    """
+    needed = _used_fields(expression)
+    extra_fields = sorted(needed & set(SNAPSHOT_SPEC_FIELDS))
+    industries = {
+        code: (stocks[code].industry or "")
+        for code in codes
+        if code in stocks
+    }
+    out: dict[tuple[str, date], float] = {}
+    window_days = max(min_bars * 2, 60)
+
+    for day in rebalance_dates:
+        _check_cancel(cancel_event)
+        # 回看窗口:自然日近似,load_bars_df_bulk 会按 date 过滤
+        win_start = day - timedelta(days=window_days * 2)
+        if win_start < lookback_start:
+            win_start = lookback_start
+        frames = load_bars_df_bulk(
+            db, codes, start=win_start, end=day,
+            extra_fields=extra_fields or None,
+        )
+        if not frames:
+            continue
+        try:
+            cs_frame = evaluate_factor_cross_section(
+                expression, frames, industries=industries,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("截面因子求值失败 day=%s", day)
+            continue
+        # 取该调仓日那一行
+        day_ts = pd.Timestamp(day)
+        if day_ts not in cs_frame.index:
+            # 尝试按 date 归一化匹配
+            matched = [i for i in cs_frame.index if pd.Timestamp(i).date() == day]
+            if not matched:
+                continue
+            day_ts = matched[0]
+        row = cs_frame.loc[day_ts]
+        for code, value in row.items():
+            if value is None or pd.isna(value):
+                continue
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(v):
+                continue
+            out[(str(code), day)] = v
     return out
 
 
@@ -628,10 +702,27 @@ def evaluate_factor_efficacy(
     if not eval_codes:
         raise ValueError("评估域内没有可用股票")
 
-    # ad-hoc 表达式先校验
+    # ad-hoc 表达式先校验;factor_key 路径也需要 expression 以判定截面模式
     expr_hash: str | None = None
+    min_bars = 1
     lookback_start = start - timedelta(days=200)
-    if expression is not None:
+    resolved_expression: dict[str, Any] | None = expression
+    is_cross_section = False
+    group_by_used: str | None = None
+
+    if factor_key is not None:
+        # factor_key 可只对应日值表键(无 FactorDef 行),此时按时序读库路径走;
+        # 有定义时再看表达式模式以决定截面现算 vs 读库。
+        defs = {d.key: d for d in load_all_defs(db)}
+        snap = defs.get(factor_key)
+        if snap is not None:
+            resolved_expression = dict(snap.expression or {})
+            expr_hash = snap.expression_hash
+            min_bars = snap.min_bars or 1
+            lookback_start = start - timedelta(days=max(min_bars * 2, 200))
+        else:
+            resolved_expression = None
+    elif expression is not None:
         validation = validate_expression(
             expression, require_type="number",
             available_fields=_available_fields(db),
@@ -645,12 +736,21 @@ def evaluate_factor_efficacy(
         expr_hash = validation.expression_hash
         min_bars = validation.min_bars or 1
         lookback_start = start - timedelta(days=max(min_bars * 2, 200))
+        resolved_expression = expression
+
+    if resolved_expression is not None:
+        parsed_for_mode = parse_expression(resolved_expression)
+        is_cross_section = expression_mode(parsed_for_mode) == "cross_section"
+        for node in _walk_expression(parsed_for_mode):
+            if node.op in CROSS_SECTION_OPS and node.group_by:
+                group_by_used = node.group_by
+                break
 
     # 预先落库运行中状态,便于 A2A/REST 查询进度
     row = FactorEvaluation(
         user_id=user_id,
         factor_key=factor_key,
-        expression=expression,
+        expression=expression if expression is not None else resolved_expression,
         expression_hash=expr_hash,
         start=start,
         end=end,
@@ -683,9 +783,16 @@ def evaluate_factor_efficacy(
         )
         stocks = _stocks_for_codes(db, eval_codes)
 
-        # 读取/计算因子值
+        # 读取/计算因子值:截面因子不落日值表,按调仓日全池现算
         all_rebalance_dates = set(dates)
-        if factor_key is not None:
+        if is_cross_section:
+            assert resolved_expression is not None
+            factor_values = _load_cross_section_factor_values(
+                db, resolved_expression, eval_codes, dates,
+                lookback_start, end, stocks, cancel_event,
+                min_bars=min_bars,
+            )
+        elif factor_key is not None:
             factor_values = _load_saved_factor_values(
                 db, factor_key, eval_codes, all_rebalance_dates,
             )
@@ -916,6 +1023,15 @@ def evaluate_factor_efficacy(
                     else "IC/分层/多空均基于截面回归残差"
                 ),
             },
+            "cross_section": {
+                "is_cross_section": is_cross_section,
+                "group_by": group_by_used,
+                "note": (
+                    "截面因子按调仓日全池现算,不经因子日值表;"
+                    "行业分组用当前行业(非 PIT),历史分组存在轻微前视"
+                    if is_cross_section else None
+                ),
+            },
             "layers": layer_summary,
             "long_short": {
                 "annual_return": None if ls_annual is None else round(ls_annual, 4),
@@ -958,6 +1074,8 @@ def evaluate_factor_efficacy(
         raise
 
 
+# 下划线前缀的名字同样导出:correlation.py 需要与本模块**逐字一致**的截面
+# 取样与统计口径。复制一份实现会让两处的 IC 定义悄悄漂移,那比暴露私有名危险。
 __all__ = [
     "DEFAULT_HORIZONS",
     "MAX_HORIZONS",
@@ -968,4 +1086,17 @@ __all__ = [
     "evaluate_factor_efficacy",
     "normalize_horizons",
     "normalize_neutralize",
+    "_check_cancel",
+    "_ic_series",
+    "_is_eligible",
+    "_load_expression_factor_values",
+    "_load_price_matrix",
+    "_load_saved_factor_values",
+    "_neutralize_cross_section",
+    "_newey_west_tstat",
+    "_period_market_caps",
+    "_rebalance_dates",
+    "_resolve_universe",
+    "_stocks_for_codes",
+    "_trading_days",
 ]

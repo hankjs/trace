@@ -46,6 +46,10 @@ _PCT = _money(9, 4)         # 涨跌幅
 _EQUITY = _money(18, 8)     # 回测净值:累计乘除需高小数位
 _WEIGHT = _money(12, 8)     # 组合目标权重:保留足够精度使权重和可审计
 _MARKET_CAP = _money(20, 2)  # 总市值
+# 系统预置池/预置策略/系统因子的 owner_id。用哨兵 UUID 而不是某个真实用户:
+# 预置内容不该因为 admin 被删或换人而失去归属,也不该让「属于某人」与
+# 「系统级」两种语义混淆。该值不对应 users 表的行,故 owner_id 不加 users 外键。
+SYSTEM_OWNER_ID = "00000000-0000-0000-0000-000000000000"
 # 复权因子:baostock 权威值给 6 位小数(如 0.792993 / 6.081667),
 # 精度必须高于 _PRICE —— 用 close/raw_close 两个 4 位小数相除只能得到
 # 约 4~5 位有效精度,那是反推的固有损失,权威值不该再被截断。
@@ -319,6 +323,17 @@ class FactorDef(Base):
     min_bars: Mapped[int] = mapped_column(Integer, default=1)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     is_system: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 归属模型与 Pool / Strategy 一致(见 alembic 0011):可见性 =
+    # is_system OR owner_id 是我。系统因子归 SYSTEM_OWNER_ID 哨兵,
+    # 不用 NULL 表达「无主」。
+    owner_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, default=SYSTEM_OWNER_ID, index=True,
+    )
+    # 变体溯源:与策略侧 parent_strategy_id 对齐,记录本因子从哪个因子派生。
+    # 只存 key 不存 id:因子 key 是稳定的业务标识,且不加外键(父因子可被删)。
+    parent_factor_key: Mapped[str | None] = mapped_column(
+        String(64), nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.now, onupdate=datetime.now,
@@ -472,12 +487,6 @@ class BacktestEquity(Base):
     )
     date: Mapped[date] = mapped_column(Date)
     equity: Mapped[float] = mapped_column(_EQUITY)
-
-
-# 系统预置池/预置策略的 owner_id。用哨兵 UUID 而不是某个真实用户:预置内容
-# 不该因为 admin 被删或换人而失去归属,也不该让「属于某人」与「系统级」两种
-# 语义混淆。该值不对应 users 表的行,故 owner_id 不加 users 外键。
-SYSTEM_OWNER_ID = "00000000-0000-0000-0000-000000000000"
 
 
 class Experiment(Base):
@@ -962,3 +971,37 @@ class FactorEvaluation(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class FactorCorrelation(Base):
+    """因子相关性与正交性检验结果:因子值相关、IC 相关、正交化残差 IC。
+
+    与 FactorEvaluation 分表:两者的核心判据不同(单因子有效性 vs 相对增量),
+    塞一张表会让 result JSON 的形状随 kind 分叉,查询与前端都要分支。
+    """
+
+    __tablename__ = "quant_factor_correlation"
+
+    id: Mapped[int] = mapped_column(_BIG_PK, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    # 待检因子:key 与 expression 二选一,与 FactorEvaluation 同口径
+    factor_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    expression: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    expression_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # 对照因子集:必须落库,否则「相对什么无增量」这个结论不可复现
+    benchmark_keys: Mapped[list] = mapped_column(JSON, nullable=False)
+    start: Mapped[date] = mapped_column(Date, nullable=False)
+    end: Mapped[date] = mapped_column(Date, nullable=False)
+    pool_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    rebalance: Mapped[str] = mapped_column(String(16), nullable=False)
+    neutralize: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    universe: Mapped[dict] = mapped_column(JSON, nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(16), default="done", nullable=False, index=True,
+    )
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+

@@ -18,7 +18,12 @@ from pydantic import (
     BaseModel, ConfigDict, Field, ValidationError, model_serializer, model_validator,
 )
 
-from .operators import OPERATORS, compute_min_bars
+from .operators import (
+    CROSS_SECTION_OPS,
+    OPERATORS,
+    SUPPORTED_GROUP_BY,
+    compute_min_bars,
+)
 
 SCHEMA_VERSION = 1
 MAX_AST_DEPTH = 12
@@ -100,6 +105,9 @@ class Expression(StrictModel):
     periods: int | None = None
     ascending: bool | None = None
     n: int | None = None
+    # 截面分组维度(cs_* 必填键,允许 null)。与 rolling_* 的 shift 同款:
+    # 键必填但值可为 null,保证 frozenset 形状精确相等。
+    group_by: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -153,6 +161,11 @@ class Expression(StrictModel):
             raise ValueError(f"shift.periods 必须在 1 到 {MAX_WINDOW} 之间")
         if self.op == "top_n" and (self.n is None or not 1 <= self.n <= 500):
             raise ValueError("top_n.n 必须在 1 到 500 之间")
+        if self.op in CROSS_SECTION_OPS and self.group_by is not None:
+            if self.group_by not in SUPPORTED_GROUP_BY:
+                raise ValueError(
+                    f"group_by 只支持 {sorted(SUPPORTED_GROUP_BY)}，收到 {self.group_by!r}"
+                )
         self._validate_types()
         return self
 
@@ -536,6 +549,9 @@ class ExpressionValidationResult(StrictModel):
     min_bars: int | None
     used_fields: list[str]
     capability: CapabilityReport
+    # 成功时填 expression_mode(expr);失败时 None。agent 需知道时序/横截面
+    # 才能选对后续 skill(preview 只接受时序,evaluate 两种都行)。
+    mode: str | None = None
 
 
 def _iter_spec_expressions(spec: StrategySpec):
@@ -641,6 +657,8 @@ def resolve_capabilities(
     _scan_raw_capabilities(value, "$", add)
     _scan_holding_rules(value, add)
     _scan_overlay_requirements(value, add)
+    # 在 parse 之前扫 cs_*:parse 可能因类型错误先失败,掩盖 factor_only 拒绝
+    _scan_factor_only_ops(value, "$", add)
     try:
         spec = parse_strategy_spec(value)
     except (ValidationError, ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -676,7 +694,6 @@ def resolve_capabilities(
                     "field_not_available",
                     f"本次数据快照缺少字段 {requirement.field}",
                 )
-
     if not issues:
         return CapabilityReport(status=CapabilityStatus.SUPPORTED, issues=[])
     priority = {
@@ -731,11 +748,25 @@ def _resolve_expression_capability_status(
     return CapabilityReport(status=status, issues=issues)
 
 
+def expression_mode(expr: Expression) -> str:
+    """判定表达式是「时序」还是「横截面」。
+
+    含任何 CROSS_SECTION_OPS 或 rank / top_n 即为横截面 —— 这些算子沿 code
+    轴计算,必须拿到 date×code 帧。时序上下文里出现它们会静默算错(Series
+    上 rank(axis=1) 无意义),所以必须在校验期拦下而不是等求值抛异常。
+    """
+    for node in _walk_expression(expr):
+        if node.op in CROSS_SECTION_OPS or node.op in {"rank", "top_n"}:
+            return "cross_section"
+    return "time_series"
+
+
 def validate_expression(
     value: Any,
     *,
     require_type: str = "number",
     available_fields: set[str] | frozenset[str] | None = None,
+    mode: str | None = None,  # None = 不限制;"time_series" / "cross_section"
 ) -> ExpressionValidationResult:
     """对单个表达式子树做解析、能力、AST 与类型校验。"""
     issues: list[CapabilityIssue] = []
@@ -793,6 +824,17 @@ def validate_expression(
                         f"本次数据快照缺少字段 {node.name}",
                     )
 
+        if mode is not None:
+            actual = expression_mode(expr)
+            if actual != mode:
+                add(
+                    CapabilityStatus.MISSING_ENGINE,
+                    "$",
+                    "expression_mode_mismatch",
+                    f"该上下文只接受{'时序' if mode == 'time_series' else '横截面'}"
+                    f"表达式，但表达式是{'横截面' if actual == 'cross_section' else '时序'}的",
+                )
+
         if not issues:
             try:
                 actual_type = expr._validate_types()
@@ -820,6 +862,7 @@ def validate_expression(
                 if node.op == "field" and node.name is not None
             }),
             capability=CapabilityReport(status=CapabilityStatus.SUPPORTED, issues=[]),
+            mode=expression_mode(expr),
         )
 
     capability = _resolve_expression_capability_status(issues)
@@ -831,7 +874,29 @@ def validate_expression(
         min_bars=None,
         used_fields=[],
         capability=capability,
+        mode=None,
     )
+
+
+def _scan_factor_only_ops(value: Any, path: str, add) -> None:
+    """StrategySpec 拒绝 cs_*:组合侧横截面由 rank/top_n 承担,本期不扩。"""
+    if isinstance(value, dict):
+        op = value.get("op")
+        if isinstance(op, str) and op in CROSS_SECTION_OPS:
+            add(
+                CapabilityStatus.MISSING_ENGINE,
+                path,
+                "factor_only_operator",
+                f"操作符 {op} 只能用于因子表达式,不能出现在 StrategySpec 里",
+            )
+        for key, child in value.items():
+            child_path = f"{path}.{key}" if path != "$" else f"$.{key}"
+            if isinstance(key, int):
+                child_path = f"{path}[{key}]"
+            _scan_factor_only_ops(child, child_path, add)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _scan_factor_only_ops(child, f"{path}[{index}]", add)
 
 
 def _scan_raw_capabilities(value: Any, path: str, add) -> None:
@@ -976,7 +1041,7 @@ __all__ = [
     "SUPPORTED_FIELDS", "SUPPORTED_OPERATORS", "SinglePositioningSpec", "StrategySpec",
     "StrategyCapabilityError", "StrategyValidationResult", "UniverseSpec",
     "ValidationSpec", "canonical_expression_json", "canonical_spec_json",
-    "expression_hash", "parse_expression", "parse_strategy_spec",
+    "expression_hash", "expression_mode", "parse_expression", "parse_strategy_spec",
     "resolve_capabilities", "strategy_spec_hash", "validate_expression",
     "validate_strategy_spec",
 ]

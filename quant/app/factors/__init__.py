@@ -4,6 +4,10 @@
 """
 from __future__ import annotations
 
+from .correlation import (
+    compute_factor_correlation,
+    get_correlation,
+)
 from .defs import (
     factor_catalog_fields,
     invalidate_factor_cache,
@@ -20,9 +24,11 @@ from .engine import (
 __all__ = [
     "bars_fields",
     "build_reason_tree",
+    "compute_factor_correlation",
     "evaluate_def_last",
     "evaluate_factor",
     "factor_catalog_fields",
+    "get_correlation",
     "invalidate_factor_cache",
     "load_all_defs",
     "load_enabled_defs",

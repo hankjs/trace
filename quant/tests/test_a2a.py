@@ -237,6 +237,8 @@ def test_catalog_get_strategy_authoring_contract_is_directly_validatable(client)
     operators = {item["op"]: item for item in authoring["operators"]}
     assert operators["gt"]["required_keys"] == ["left", "op", "right"]
     assert operators["ma"]["required_keys"] == ["input", "op", "window"]
+    assert operators["cs_rank"]["context"] == "factor_only"
+    assert operators["gt"]["context"] == "strategy_and_factor"
 
     example = authoring["examples"]["ma_cross"]
     validated = _send(
@@ -451,25 +453,42 @@ def test_factor_preview_clamps_codes_and_reports_truncated(client):
     assert preview["note"] == "spot_check_only_not_market_efficacy"
 
 
-def test_factor_save_draft_requires_admin(client):
-    result = _send(
+def test_factor_save_draft_allows_client_rejects_nobody(client):
+    """can_client 可存草稿;既非 client 也非 admin 仍被全局授权拒绝。"""
+    ok = _send(
         client,
         _token(CLIENT_CLAIMS),
         "factor.save_draft",
         {
-            "key": "test_factor",
+            "key": "test_factor_client",
             "name": "测试因子",
             "expression": {"op": "field", "name": "close"},
         },
     )
-    assert _state(result) == "failed"
-    assert "仅管理员可用" in _fail_text(result)
+    assert _state(ok) == "completed"
+    draft = _artifact_data(ok, "factor_draft")["factor_draft"]
+    assert draft["enabled"] is False
+    assert draft["is_system"] is False
+    assert draft["owner_id"] == CLIENT_CLAIMS["sub"]
+
+    denied = _send(
+        client,
+        _token(NOBODY_CLAIMS),
+        "factor.save_draft",
+        {
+            "key": "test_factor_nobody",
+            "name": "测试因子",
+            "expression": {"op": "field", "name": "close"},
+        },
+    )
+    assert _state(denied) == "failed"
+    assert "访问权限" in _fail_text(denied)
 
 
 def test_factor_save_draft_rejects_enabled_true(client):
     result = _send(
         client,
-        _token(ADMIN_CLAIMS),
+        _token(CLIENT_CLAIMS),
         "factor.save_draft",
         {
             "key": "test_factor_enabled",

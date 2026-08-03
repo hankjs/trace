@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import FactorDef
+from ..models import SYSTEM_OWNER_ID, FactorDef
 
 _CACHE_TTL_SECONDS = 60
 
@@ -38,6 +38,8 @@ class FactorDefSnapshot:
     min_bars: int
     enabled: bool
     is_system: bool
+    owner_id: str
+    parent_factor_key: str | None
     created_at: Any = None
     updated_at: Any = None
 
@@ -59,9 +61,25 @@ def _snapshot(row: FactorDef) -> FactorDefSnapshot:
         min_bars=row.min_bars or 1,
         enabled=bool(row.enabled),
         is_system=bool(row.is_system),
+        owner_id=row.owner_id or SYSTEM_OWNER_ID,
+        parent_factor_key=row.parent_factor_key,
         created_at=row.created_at,
         updated_at=row.updated_at,
     )
+
+
+def can_write_factor(
+    def_: FactorDef | FactorDefSnapshot,
+    *,
+    user_id: str,
+    is_admin: bool,
+) -> bool:
+    """能否改动这个因子定义。admin 全通;普通用户只能动自己的非系统因子。"""
+    if is_admin:
+        return True
+    if bool(def_.is_system):
+        return False
+    return def_.owner_id == user_id
 
 
 def _now() -> float:
@@ -159,6 +177,7 @@ def factor_catalog_fields(db: Session) -> dict[str, dict[str, Any]]:
 
 __all__ = [
     "FactorDefSnapshot",
+    "can_write_factor",
     "factor_catalog_fields",
     "invalidate_factor_cache",
     "load_all_defs",

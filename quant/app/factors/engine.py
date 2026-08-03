@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from ..strategy.components import build_reason_tree, evaluate_expression
+from ..strategy.operators import INDUSTRY_FIELD_KEY
 from ..strategy.spec import Expression, parse_expression
 
 
@@ -35,6 +36,39 @@ def evaluate_factor(expr: Expression | dict[str, Any] | str,
     return evaluate_expression(parsed, fields)
 
 
+def evaluate_factor_cross_section(
+    expr: Expression | dict[str, Any] | str,
+    pool_dfs: dict[str, pd.DataFrame],
+    *,
+    industries: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """在横截面上求值因子,返回 date×code 帧。
+
+    复用组合策略侧既有的帧构造路径(compiler._portfolio_fields),不另建一套
+    横截面引擎 —— 两套实现会在字段对齐与 reindex 语义上悄悄分叉。
+    """
+    from ..strategy.compiler import _portfolio_fields
+
+    parsed = parse_expression(expr)
+    if not pool_dfs:
+        raise ValueError("pool_dfs 不能为空")
+    # 统一日期轴:取全池日期并集并排序,与 compile_portfolio 的 index 同口径
+    all_dates: list = []
+    for frame in pool_dfs.values():
+        if "date" in frame.columns:
+            all_dates.extend(pd.DatetimeIndex(frame["date"]).tolist())
+    if not all_dates:
+        raise ValueError("pool_dfs 中没有可用日期")
+    index = pd.DatetimeIndex(sorted(set(all_dates)))
+    fields = _portfolio_fields(index, pool_dfs)
+    if industries is not None:
+        fields[INDUSTRY_FIELD_KEY] = pd.Series(industries)
+    result = evaluate_expression(parsed, fields)
+    if not isinstance(result, pd.DataFrame):
+        raise ValueError("横截面求值必须返回 date×code 帧;该表达式可能是时序的")
+    return result
+
+
 def evaluate_def_last(def_: Any, df: pd.DataFrame) -> float | None:
     """对单个 FactorDef 求最后一个交易日的因子值。
 
@@ -56,4 +90,5 @@ __all__ = [
     "build_reason_tree",
     "evaluate_def_last",
     "evaluate_factor",
+    "evaluate_factor_cross_section",
 ]

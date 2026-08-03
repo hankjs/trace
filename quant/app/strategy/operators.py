@@ -20,6 +20,20 @@ COMPONENT_VERSION = "strategy-components-v1"
 # rolling_std 固定 ddof=0(总体标准差,与波动率实务一致);zscore 复用同口径。
 ROLLING_STD_DDOF = 0
 
+# 横截面算子:沿 code 轴计算,只能作用于 date×code 帧。与 rank / top_n 同类,
+# 但后两者是组合选股用的(输出排名/布尔),cs_* 是因子加工用的(输出标准化值)。
+CROSS_SECTION_OPS = frozenset({"cs_rank", "cs_zscore", "cs_demean"})
+# 截面分组维度。只支持行业:市值是连续变量,分组要先分箱,箱界是另一个
+# 自由度(需求明确不做无界搜索),本期不引入。
+SUPPORTED_GROUP_BY = frozenset({"industry"})
+# 分组维度的保留注入键。不进 SUPPORTED_FIELDS:行业是字符串标签,不是价量
+# 数据,暴露成 field 会让整套数值算子对它可用而语义无意义。field.name 的
+# 正则不允许下划线开头,所以这个键不可能与用户表达式里的字段撞名。
+INDUSTRY_FIELD_KEY = "__industry__"
+# 组内有效样本少于此数则该组输出 NaN:样本不足时的分位/z 值是噪声,
+# 与 _neutralize_cross_section 的 n<5 降级同源。
+MIN_GROUP_SIZE = 3
+
 Vector = pd.Series | pd.DataFrame
 
 
@@ -219,6 +233,79 @@ def _eval_top_n(expr: "Expression", fields: Mapping[str, Vector], recurse: Calla
     return value.rank(axis=1, ascending=False, method="first") <= expr.n
 
 
+def _cross_section_frame(expr: "Expression", fields, recurse) -> pd.DataFrame:
+    """取出 cs_* 的输入并确保是横截面帧。"""
+    assert expr.input is not None
+    value = recurse(expr.input, fields)
+    if not isinstance(value, pd.DataFrame):
+        raise ValueError(
+            f"{expr.op} 只能用于横截面(date×code 帧);时序表达式请改用 "
+            "rolling_rank(窗口内分位)或 zscore(窗口内标准化)"
+        )
+    return value
+
+
+def _row_transform(row: pd.Series, kind: str) -> pd.Series:
+    """单行(单日)截面变换。"""
+    if kind == "cs_rank":
+        return row.rank(pct=True, na_option="keep")
+    if kind == "cs_zscore":
+        mean = row.mean(skipna=True)
+        std = row.std(skipna=True, ddof=ROLLING_STD_DDOF)
+        if std is None or (isinstance(std, float) and (not math.isfinite(std) or std == 0)):
+            return pd.Series(np.nan, index=row.index)
+        return (row - mean) / std
+    if kind == "cs_demean":
+        return row - row.mean(skipna=True)
+    raise ValueError(f"未知截面算子 {kind}")
+
+
+def _apply_cross_section(
+    frame: pd.DataFrame, kind: str, groups: pd.Series | None,
+) -> pd.DataFrame:
+    """逐行(逐日)做截面变换;groups 非空时在组内做。"""
+    if groups is None:
+        return frame.apply(lambda row: _row_transform(row, kind), axis=1)
+
+    # groups: index=code, value=行业。对齐到 frame 列顺序。
+    aligned = groups.reindex(frame.columns)
+    out = pd.DataFrame(np.nan, index=frame.index, columns=frame.columns)
+    for gname, cols in aligned.groupby(aligned).groups.items():
+        col_list = list(cols)
+        if not col_list:
+            continue
+        sub = frame[col_list]
+        # 组内有效样本门槛按行判断
+        def _group_row(row: pd.Series) -> pd.Series:
+            valid = row.notna().sum()
+            if valid < MIN_GROUP_SIZE:
+                return pd.Series(np.nan, index=row.index)
+            return _row_transform(row, kind)
+
+        out[col_list] = sub.apply(_group_row, axis=1)
+    return out
+
+
+def _make_cross_section_eval(op_name: str) -> Callable:
+    def _eval(expr: "Expression", fields: Mapping[str, Vector], recurse: Callable) -> Any:
+        frame = _cross_section_frame(expr, fields, recurse)
+        groups = None
+        if expr.group_by is not None:
+            if expr.group_by != "industry":
+                raise ValueError(
+                    f"group_by 只支持 {sorted(SUPPORTED_GROUP_BY)},收到 {expr.group_by!r}"
+                )
+            raw = fields.get(INDUSTRY_FIELD_KEY)
+            if raw is None:
+                raise ValueError("截面分组需要行业数据，当前求值上下文未提供")
+            if not isinstance(raw, pd.Series):
+                raise ValueError("行业分组数据必须是 code→industry 的 Series")
+            groups = raw
+        return _apply_cross_section(frame, op_name, groups)
+
+    return _eval
+
+
 def _max_children(_expr: "Expression", child_windows: list[int]) -> int:
     return max(child_windows) if child_windows else 0
 
@@ -340,6 +427,17 @@ _OPERATORS: list[OperatorSpec] = [
         evaluate=_eval_top_n,
         min_window=_max_children,
     ),
+    *[
+        OperatorSpec(
+            op=op,
+            fields=frozenset({"op", "input", "group_by"}),
+            arg_types={"input": "number"},
+            result_type="number",
+            evaluate=_make_cross_section_eval(op),
+            min_window=_max_children,
+        )
+        for op in ("cs_rank", "cs_zscore", "cs_demean")
+    ],
 ]
 
 OPERATORS: dict[str, OperatorSpec] = {spec.op: spec for spec in _OPERATORS}
@@ -364,6 +462,7 @@ def compute_min_bars(expr: "Expression") -> int:
 
 
 __all__ = [
-    "COMPONENT_VERSION", "OPERATORS", "OperatorSpec", "ROLLING_STD_DDOF",
-    "Vector", "compute_min_bars",
+    "COMPONENT_VERSION", "CROSS_SECTION_OPS", "INDUSTRY_FIELD_KEY",
+    "MIN_GROUP_SIZE", "OPERATORS", "OperatorSpec", "ROLLING_STD_DDOF",
+    "SUPPORTED_GROUP_BY", "Vector", "compute_min_bars",
 ]

@@ -34,7 +34,7 @@ quant 已具备完整 REST、领域服务与 **Experiment / Trial 试验账本**
 | 层级 | 交付内容 | 说明 |
 |------|---------|------|
 | **A. 策略研究 Agent** | 端到端：假设 → experiment → trial → 对比 → 小结 | 普通 `can_client` 可用；默认路径 E（§2.1） |
-| **B. 因子提炼工具链** | validate / preview / **evaluate（IC·RankIC·分层）** / save_draft | evaluate 为高成本 skill；save_draft 仍 admin |
+| **B. 因子提炼工具链** | validate / preview / **evaluate（IC·RankIC·分层）** / save_draft / **backfill** | evaluate 与 backfill 为高成本 skill；save_draft 开放 can_client |
 | **C. 系统缺口闭环** | 审计缺口列（含运行期失败）+ findings 强制落表 + 管理端聚合 | 反哺 `06-gap-and-roadmap` 类补强优先级 |
 | **D. 微信入口** | 同一 Orchestrator；确认更严、无批量授权 | 与其余三层同批交付，不互相阻塞 |
 
@@ -73,7 +73,7 @@ quant 已具备完整 REST、领域服务与 **Experiment / Trial 试验账本**
 | 8 | 成本字段 | **`costs` 对齐引擎** | `commission` / `stamp_tax` / `slippage`（价格比例）；无 `initial_cash`、无 `slippage_bps` |
 | 9 | 策略草稿落库 | **`strategy.save_draft`，免确认** | `enabled=false` + 列 `research_status=unverified`；可选 `parent_strategy_id` 谱系；闸门留在高成本 skill；复用 `_check_quota` |
 | 10 | **严肃验证主链** | **`experiment.*` 一等 skill** | 对齐 `app/api/experiments.py` / `app/experiment/service.py`：冻结规格 + trial 账本 + 失败不可抹；多轮参数迭代 **优先 experiment**，禁止只靠连建草稿冒充试验 |
-| 11 | 因子范围 | **卫生 + 有效性评估全链** | `factor.validate` + `factor.preview`（少量多标的）+ **`factor.evaluate`（IC/RankIC/分层，高成本，§8.13）** + `factor.save_draft`；validate/preview/evaluate 开放 `can_client`（前两个 REST 同步放宽，属本期实现任务），`save_draft` 仍 `can_admin` |
+| 11 | 因子范围 | **卫生 + 有效性评估全链** | `factor.validate` + `factor.preview`（少量多标的）+ **`factor.evaluate`（IC/RankIC/分层，高成本，§8.13）** + `factor.save_draft` + **`factor.backfill`（高成本，§8.12a）**；validate/preview/evaluate/save_draft/backfill 开放 `can_client`（backfill 仅自己的非系统草稿） |
 | 12 | 迭代记忆 | **`experiment.get` / `experiment.list` + `backtest.list`** | trial 级记忆为主，run 列表为辅；不能只靠对话上下文 |
 | 13 | 批量确认 | **会话级授权（仅对话入口）** | 「本会话最多 N 次高成本执行」（含 `backtest.run` 与 `experiment.trial` / `trial_batch` 内每次回测）；微信单次；共用日配额 |
 | 14 | 证据推进 | **trial 不自动改 `evidence_status`** | 对齐现网：达标只生成 promotion 待办；`backtest.run` 成功仍走 `advance_after_backtest`（与 REST 单次回测路径一致） |
@@ -242,7 +242,7 @@ SDK 选型（拍板）：
 ### 4.6 短任务 vs 长任务的 A2A Task 存储
 
 **短任务**（不写 `quant_task`）：  
-`strategy.validate` / `strategy.save_draft` / `catalog.get` / `market.data_quality` / `selection.screen` / `backtest.get` / `backtest.list` / `factor.validate` / `factor.preview` / `factor.save_draft` / `experiment.create` / `experiment.get` / `experiment.list` / `system.gap_summary` / `system.report_finding`
+`strategy.validate` / `strategy.save_draft` / `catalog.get` / `market.data_quality` / `selection.screen` / `backtest.get` / `backtest.list` / `factor.validate` / `factor.preview` / `factor.save_draft` / `factor.evaluation_list` / `factor.evaluation_get` / `factor.correlation_get` / `experiment.create` / `experiment.get` / `experiment.list` / `system.gap_summary` / `system.report_finding`
 
 | 项 | 约定 |
 |----|---------|
@@ -260,6 +260,8 @@ SDK 选型（拍板）：
 | `experiment.trial` | REST 现网为 **同步** `create_trial_and_run`。A2A：**后台线程执行同一 service**，A2A Task 进程内（或可选映射 `quant_task` 若实现方便）推 SSE；**占用与 `backtest.run` 同一用户互斥槽**（同时只能跑一个高成本任务），避免双路径打满 CPU | Cancel：若尚未开始跑引擎可 canceled；已进入 `run_backtest` 则同 running 不可中断 |
 | `experiment.trial_batch` | 顺序执行多个 trial（硬上限见 §8.11）；整批一个 A2A Task，进度事件带 `trial_index` | 同上互斥；pending 可整批取消，已开始的当前 trial 走检查点中断 |
 | `factor.evaluate` | A2A Task ↔ `quant_task`（新 domain 长任务，§8.13）；全市场计算后台线程执行 `app/factors/evaluation.py` | 与回测共用互斥槽；Cancel 检查点按标的批次（§4.5） |
+| `factor.backfill` | A2A Task ↔ `quant_task` type=`factor_backfill`（§8.12a）；仅本人非系统草稿 | 与回测共用互斥槽 |
+| `factor.correlation` | A2A Task ↔ `quant_task` type=`factor_correlation`（§8.13b）；对照集≤20 | 与回测共用互斥槽 |
 
 > 实现注意：不要在 A2A 层复制撮合逻辑；trial 必须调用 `create_trial_and_run`（或抽出的同函数），保证失败也落 trial、promotion 语义与 REST 一致。
 >
@@ -315,7 +317,7 @@ Authorization: Bearer <user_jwt>
 |-------|------|
 | `strategy.save_draft` | `enabled=false` 草稿；防刷靠策略配额 |
 | `experiment.create` | 冻结注册，不跑回测；防刷靠读/写限速 + 用户 experiment 数量常识（超限可后续加配额） |
-| `factor.save_draft` | admin 草稿因子 `enabled=false`；对齐 REST 创建但默认不启用 |
+| `factor.save_draft` | 草稿因子 `enabled=false`，归属调用者；对齐 REST 创建但默认不启用 |
 | 全部 read skill | — |
 
 闸门实现要求（Trace 侧，写死）：
@@ -882,7 +884,7 @@ Authorization: Bearer <user_jwt>
 
 **artifact `factor_validation`**：与 `ExpressionValidationResult` 逐字对齐（`valid` / `capability` / 规范化哈希、`min_bars` 等，字段名以现网 `validate_expression` 返回为准）。
 
-- **授权：`can_client`**。**本期起 REST 与 A2A 同步由 admin 放宽至 client**（validate/preview 为只读轻量计算，属本期实现任务；写类 `save_draft` 仍 admin，§8.12）。
+- **授权：`can_client`**。**本期起 REST 与 A2A 同步由 admin 放宽至 client**（validate/preview 为只读轻量计算；`save_draft` / `backfill` 亦开放 can_client，见 §8.12 / §8.12a）。
 - 不落库、不触发全市场计算。
 - 失败写入审计 `failure_kind` / `missing_capability`（§12）。
 
@@ -1041,19 +1043,61 @@ Authorization: Bearer <user_jwt>
   "name": "20日动量草稿",
   "expression": {},
   "description": "",
-  "category": "momentum"
+  "category": "momentum",
+  "parent_factor_key": null
 }
 ```
 
 | 规则 | 说明 |
 |------|------|
-| 授权 | **仅 `can_admin`** |
+| 授权 | **`can_client`**；`owner_id` 记调用者，`is_system` 固定 false |
 | 落库 | `enabled=false`（A2A 固定；payload 出现 `enabled:true` → 校验错误，防 agent 启用未验证因子进夜间管道） |
+| 谱系 | 可选 `parent_factor_key`：父因子须存在且当前用户可读（系统因子或本人草稿） |
 | 校验 | 先走表达式 validate；失败不落库 |
 | 冲突 | key 已存在 → 校验错误 |
 | 确认 | 不需要 |
 
-**artifact `factor_draft`**：对齐 REST factor out（`key`, `expression_hash`, `min_bars`, `enabled: false`, …）。
+**artifact `factor_draft`**：对齐 REST factor out（`key`, `expression_hash`, `min_bars`, `enabled: false`, `owner_id`, `parent_factor_key`, …）。
+
+---
+
+### 8.12a `factor.backfill`（高成本）
+
+把本人草稿的历史值算进 `quant_factor_daily`，以便后续按 `factor_key` 做 `factor.evaluate`。
+
+**payload**
+
+```json
+{
+  "factor_key": "draft_mom_20",
+  "start": "2024-01-01",
+  "end": "2025-12-31",
+  "codes": [],
+  "confirmed": true,
+  "client_request_id": "<optional>"
+}
+```
+
+| 规则 | 说明 |
+|------|------|
+| 授权 | **`can_client`**，且只能回填**自己的非系统草稿**；系统因子 / 他人草稿 / 省略 `factor_key`（全量）均拒绝 |
+| 已启用草稿 | 非 admin 不得回填 `enabled=true` 的因子（会改动夜间管道读取的因子值） |
+| 高成本 | 走 `confirmed=true` 闸门、日配额计 1、`client_request_id` 幂等；互斥槽与 `factor.evaluate` 等共用 |
+| 区间 | 复用 `validate_backtest_window`（最长 10 年，禁止未来日） |
+| quant_task | type = `factor_backfill`（复用既有 handler，skill 层包 artifact） |
+
+**artifact `factor_backfill`**
+
+```json
+{
+  "factor_key": "draft_mom_20",
+  "window": { "start": "2024-01-01", "end": "2025-12-31" },
+  "days": 240,
+  "rows_written": 1200,
+  "skipped": 10,
+  "detail_ref": { "task_id": 42 }
+}
+```
 
 ---
 
@@ -1145,6 +1189,22 @@ Authorization: Bearer <user_jwt>
 | 多重检验 | `multiplicity` 按「本次 horizon 数 × (近 30 天该账号已完成评估数 + 1)」估算累计检验次数并给 Bonferroni 阈值；`survives_bonferroni=false` 时 Orchestrator 必须明说未通过校正。agent 不得靠穷举表达式「刷」出高 IC 后只报喜 |
 | 显著性口径 | IC 序列有自相关，t 值走 **Newey-West**（滞后阶 `floor(4*(n/100)^(2/9))`），p 值用正态近似；`n_periods < 6` 时 t/p 返回 `null` 而非硬算 |
 | 中性化口径 | 行业哑变量丢弃一列作基准组，空行业单独归类；市值缺失按截面中位数补后取 log。最小二乘解不出（奇异/样本 < 5）时按未中性化处理，并体现在 `neutralization.applied_periods < total_periods` |
+
+#### 8.13b `factor.correlation` / `factor.correlation_get`
+
+待检因子相对对照因子集的增量检验（高成本 / 只读配套）。
+
+| 规则 | 说明 |
+|------|------|
+| 授权 | `can_client`；`correlation_get` 仅本人行 |
+| 高成本 | `factor.correlation` 需 `confirmed=true`、日配额、互斥槽；`correlation_get` 免确认 |
+| 对照上限 | `benchmark_keys` ≤20；省略则取全部启用系统因子（>20 报错，不静默截断） |
+| 区间 | 最长 10 年 |
+| 三层判据 | 因子值截面 Pearson/Spearman → IC 序列相关 → 正交化残差 IC（Newey-West） |
+| 判定 | 服务端 `verdict`：`no_increment` / `has_increment` / `inconclusive`；残差 IC 不显著 = 无增量 |
+| 中性化 | 与 `factor.evaluate` 同口径，待检与对照同一期同一 modes |
+
+**判读**：`verdict=no_increment` 时不得因裸 IC 好看推荐；因子值低相关但 `ic_correlation` 高 = 同一收益来源。
 
 #### 8.13a `factor.evaluation_list` / `factor.evaluation_get`（只读）
 
@@ -1309,7 +1369,10 @@ Task working → artifact* → completed → close
 | `quant_evaluate_factor` | `factor.evaluate` | **是** |
 | `quant_list_factor_evaluations` | `factor.evaluation_list` | 否 |
 | `quant_get_factor_evaluation` | `factor.evaluation_get` | 否 |
-| `quant_save_factor_draft` | `factor.save_draft` | 否（admin） |
+| `quant_save_factor_draft` | `factor.save_draft` | 否 |
+| `quant_backfill_factor` | `factor.backfill` | **是** |
+| `quant_factor_correlation` | `factor.correlation` | **是** |
+| `quant_get_factor_correlation` | `factor.correlation_get` | 否 |
 | `quant_gap_summary` | `system.gap_summary` | 否 |
 | `quant_report_finding` | `system.report_finding` | 否 |
 
@@ -1447,6 +1510,9 @@ quant/app/a2a/
     factor_preview.py
     factor_evaluate.py
     factor_save_draft.py
+    factor_backfill.py
+    factor_correlation.py
+    factor_correlation_get.py
     screen.py
     gap_summary.py
     report_finding.py
@@ -1467,7 +1533,7 @@ quant/app/a2a/
 | 项 | 要求 |
 |----|------|
 | 鉴权 | 除 Card 外全部 Bearer；仅请求入口验签（§5.1） |
-| 授权 | `can_client`：策略/实验/回测/因子 validate·preview·evaluate；`factor.save_draft` 与 `gap_summary.scope=global`：**can_admin**；跨用户不可读 |
+| 授权 | `can_client`：策略/实验/回测/因子 validate·preview·evaluate·save_draft·backfill；`gap_summary.scope=global`：**can_admin**；跨用户不可读；backfill 仅本人非系统草稿 |
 | 限额 | 高成本：互斥 + 日 50（可配置）+ 10 年区间；trial_batch ≤8；evaluate layers ≤10。读/create/draft/finding：默认 60 次/用户/分钟（可配置） |
 | 取消 | pending 即取消；running 经引擎检查点协作中断，状态一致无半写（§4.5） |
 | 部署 | 单实例 quant |

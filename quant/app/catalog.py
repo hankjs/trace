@@ -644,7 +644,7 @@ A2A_CATALOG_SECTIONS = (*BASE_CATALOG_SECTIONS, "strategy_authoring")
 
 def _strategy_authoring_catalog() -> dict[str, Any]:
     """给 Agent 的紧凑 StrategySpec 编写契约，全部来自运行时真源。"""
-    from .strategy.operators import OPERATORS
+    from .strategy.operators import CROSS_SECTION_OPS, OPERATORS
     from .strategy.presets import SYSTEM_STRATEGY_SPECS
     from .strategy.spec import (
         MAX_AST_DEPTH, MAX_AST_NODES, MAX_WINDOW, SCHEMA_VERSION,
@@ -660,10 +660,19 @@ def _strategy_authoring_catalog() -> dict[str, Any]:
                 "required_keys": sorted(spec.fields),
                 "argument_types": deepcopy(spec.arg_types),
                 "result_type": spec.result_type,
+                # 标明适用上下文:cs_* 是因子加工算子,只能用在 factor.evaluate
+                # 的表达式里。目录是全量派生的,不标注 agent 会拿它写 StrategySpec。
+                "context": (
+                    "factor_only" if op in CROSS_SECTION_OPS else "strategy_and_factor"
+                ),
                 "version": spec.version,
             }
             for op, spec in sorted(OPERATORS.items())
         ],
+        "operator_context_note": (
+            "context=factor_only 的算子(cs_rank / cs_zscore / cs_demean)只能用于"
+            "因子表达式,不能出现在 StrategySpec 里"
+        ),
         "limits": {
             "max_ast_depth": MAX_AST_DEPTH,
             "max_ast_nodes": MAX_AST_NODES,

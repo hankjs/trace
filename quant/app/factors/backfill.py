@@ -17,9 +17,9 @@ from ..data.ingest import SNAPSHOT_SPEC_FIELDS, load_bars_df_bulk
 from ..data.universe import current_pool, pool_at
 from ..models import FactorDaily, FactorDef, Task, TradeCalendar
 from ..selection.pipeline import LOOKBACK_DAYS
-from ..strategy.spec import _walk_expression, parse_expression
+from ..strategy.spec import expression_mode, _walk_expression, parse_expression
 from ..tasks import register_handler
-from .defs import invalidate_factor_cache, load_all_defs, load_enabled_defs
+from .defs import can_write_factor, invalidate_factor_cache, load_all_defs, load_enabled_defs
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +128,8 @@ def run_factor_backfill_task(db: Session, task: Task) -> dict[str, Any]:
     end = date.fromisoformat(params["end"])
     factor_key = params.get("factor_key")
     explicit_codes = params.get("codes")
+    owner_id = params.get("owner_id")
+    is_admin = bool(params.get("is_admin"))
 
     if factor_key:
         def_ = db.execute(
@@ -135,8 +137,21 @@ def run_factor_backfill_task(db: Session, task: Task) -> dict[str, Any]:
         ).scalar_one_or_none()
         if def_ is None:
             raise ValueError(f"因子 {factor_key} 不存在")
+        # 归属守卫:非 admin 只能回填自己的非系统因子。owner_id 为 None 表示
+        # 调用方未声明身份(旧调用路径),按 is_admin 处理。
+        if owner_id is not None and not can_write_factor(
+            def_, user_id=owner_id, is_admin=is_admin,
+        ):
+            raise ValueError(f"无权回填因子 {factor_key}")
+        # 截面因子依赖当期全池,逐股回填算不出来
+        if expression_mode(parse_expression(def_.expression)) == "cross_section":
+            raise ValueError(
+                "截面因子不支持回填:截面值依赖当期全池,请直接用 factor.evaluate"
+            )
         defs = [def_]
     else:
+        if owner_id is not None and not is_admin:
+            raise ValueError("回填全部启用因子仅管理员可用")
         defs = load_enabled_defs(db)
 
     if not defs:

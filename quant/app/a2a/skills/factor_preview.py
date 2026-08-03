@@ -61,9 +61,20 @@ def handle(payload: dict[str, Any], ctx: A2AContext, cancel_event=None) -> dict[
     if expression is None:
         raise ValueError("payload 必须包含 expression")
     result = validate_expression(
-        expression, require_type="number", available_fields=_available_fields(ctx.db),
+        expression, require_type="number",
+        available_fields=_available_fields(ctx.db),
+        mode="time_series",
     )
     if not result.valid:
+        # 截面因子在 ≤5 标的上没有有意义的截面样本,明确指路
+        codes_msg = [
+            i.message for i in result.capability.issues
+            if i.code == "expression_mode_mismatch"
+        ]
+        if codes_msg:
+            raise ValueError(
+                "截面因子无法在 ≤5 标的上抽查（截面样本不足），请改用 factor.evaluate"
+            )
         raise ValueError("表达式校验失败")
 
     codes: list[str] = []

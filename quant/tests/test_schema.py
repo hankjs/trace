@@ -58,7 +58,7 @@ def test_migration_chain_is_single_linear_head(migrated_db):
     from app.migrations import current_heads, expected_heads
 
     heads = expected_heads()
-    assert heads == {"0026_factor_eval_neutralize"}
+    assert heads == {"0028_factor_correlation"}
     assert current_heads(migrated_db) == heads
 
 
@@ -86,6 +86,7 @@ def test_all_expected_tables_exist(migrated_db):
         "quant_a2a_audit",
         "quant_research_finding",
         "quant_factor_evaluation",
+        "quant_factor_correlation",
         "quant_research_plan",
         "quant_research_plan_item",
         "quant_selection_config",
@@ -304,12 +305,33 @@ def test_factor_daily_uses_json_values(migrated_db):
     assert "uq_factor_code_date" in unique
 
 
+def test_factor_correlation_shape(migrated_db):
+    columns = _columns(migrated_db, "quant_factor_correlation")
+    expected = {
+        "id", "user_id", "factor_key", "expression", "expression_hash",
+        "benchmark_keys", "start", "end", "pool_id", "codes", "rebalance",
+        "neutralize", "universe", "result", "status", "error",
+        "created_at", "finished_at",
+    }
+    assert set(columns) == expected
+    assert bool(columns["user_id"]["nullable"]) is False
+    assert bool(columns["benchmark_keys"]["nullable"]) is False
+    assert bool(columns["universe"]["nullable"]) is False
+    index_names = {
+        i["name"] for i in inspect(migrated_db).get_indexes("quant_factor_correlation")
+    }
+    assert any("user_id" in name for name in index_names)
+    assert any("factor_key" in name for name in index_names)
+    assert any("status" in name for name in index_names)
+
+
 def test_factor_def_shape(migrated_db):
     columns = _columns(migrated_db, "quant_factor_def")
     expected = {
         "id", "key", "name", "description", "category", "unit",
         "direction", "limits", "value_type", "input_scale", "expression",
         "expression_hash", "min_bars", "enabled", "is_system",
+        "owner_id", "parent_factor_key",
         "created_at", "updated_at",
     }
     assert set(columns) == expected
@@ -321,6 +343,9 @@ def test_factor_def_shape(migrated_db):
     assert bool(columns["min_bars"]["nullable"]) is False
     assert bool(columns["enabled"]["nullable"]) is False
     assert bool(columns["is_system"]["nullable"]) is False
+    assert str(columns["owner_id"]["type"]).upper() == "VARCHAR(36)"
+    assert bool(columns["owner_id"]["nullable"]) is False
+    assert bool(columns["parent_factor_key"]["nullable"]) is True
 
     unique = {
         u["name"]
@@ -330,6 +355,7 @@ def test_factor_def_shape(migrated_db):
 
     index_names = {i["name"] for i in inspect(migrated_db).get_indexes("quant_factor_def")}
     assert any("expression_hash" in name for name in index_names)
+    assert any("owner_id" in name for name in index_names)
 
 
 def test_selection_config_shape(migrated_db):

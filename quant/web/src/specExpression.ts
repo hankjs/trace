@@ -161,6 +161,18 @@ export const EXPRESSION_OPS: ExpressionOpDef[] = [
     op: 'top_n', label: '横截面 Top N', result: 'bool', crossSectional: true,
     slots: [INPUT_SLOT], params: ['n'], defaults: { n: 10 },
   },
+  {
+    op: 'cs_rank', label: '截面分位', result: 'number', crossSectional: true,
+    slots: [INPUT_SLOT], params: ['group_by'], defaults: { group_by: null },
+  },
+  {
+    op: 'cs_zscore', label: '截面标准化', result: 'number', crossSectional: true,
+    slots: [INPUT_SLOT], params: ['group_by'], defaults: { group_by: null },
+  },
+  {
+    op: 'cs_demean', label: '截面去均值', result: 'number', crossSectional: true,
+    slots: [INPUT_SLOT], params: ['group_by'], defaults: { group_by: null },
+  },
 ]
 
 const OP_INDEX = new Map(EXPRESSION_OPS.map((def) => [def.op, def]))

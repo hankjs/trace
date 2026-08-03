@@ -14,9 +14,10 @@ from app.strategy.operators import OPERATORS, OperatorSpec, compute_min_bars
 from app.strategy.spec import SUPPORTED_OPERATORS, _OP_FIELDS, Expression
 
 
-def test_registry_has_31_ops():
-    """注册表包含全部受控操作符(与历史 _OP_FIELDS 条目数一致)。"""
+def test_registry_has_33_ops():
+    """注册表包含全部受控操作符(30 个历史 + 3 个 cs_* 截面因子算子)。"""
     assert len(OPERATORS) == len(_OP_FIELDS)
+    assert len(OPERATORS) == 33
     assert SUPPORTED_OPERATORS == frozenset(OPERATORS)
 
 

@@ -163,11 +163,9 @@ class QuantAgentExecutor(AgentExecutor):
                     f"{', '.join(sorted(SKILL_IDS))}"
                 )
 
-            # 全局授权：除 Card 外全部需登录；factor.save_draft / gap_summary.global 需 admin
+            # 全局授权：除 Card 外全部需登录；gap_summary.global 需 admin
             if not can_client(claims):
                 raise ValueError("没有量化研究系统访问权限")
-            if skill == "factor.save_draft" and not can_admin(claims):
-                raise ValueError("factor.save_draft 仅管理员可用")
             if skill == "system.gap_summary":
                 scope = payload.get("scope", "me")
                 if scope == "global" and not can_admin(claims):
