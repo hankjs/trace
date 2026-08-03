@@ -43,6 +43,7 @@ interface TermInstance {
   fit: FitAddon;
   search: SearchAddon;
   unlisten: UnlistenFn;
+  unlistenExit: UnlistenFn;
   observer: ResizeObserver | null;
 }
 
@@ -215,6 +216,11 @@ async function attachInstance(id: string, replay?: string, retries = 3) {
     term.write(e.payload);
   });
 
+  // shell 退出（如输入 exit）：关闭对应 pane
+  const unlistenExit = await listen(`term-exit/${id}`, () => {
+    closePane(id);
+  });
+
   term.onData((data) => {
     invoke("term_write", { id, data }).catch(() => {});
   });
@@ -227,7 +233,7 @@ async function attachInstance(id: string, replay?: string, retries = 3) {
 
   term.attachCustomKeyEventHandler((e) => handleKey(e, id));
 
-  const inst: TermInstance = { term, fit, search, unlisten, observer: null };
+  const inst: TermInstance = { term, fit, search, unlisten, unlistenExit, observer: null };
   const observer = new ResizeObserver(() => {
     if (el.clientWidth === 0 || el.clientHeight === 0) return;
     fit.fit();
@@ -248,6 +254,7 @@ function disposeInstance(id: string) {
   if (!inst) return;
   inst.observer?.disconnect();
   inst.unlisten();
+  inst.unlistenExit();
   inst.term.dispose();
   instances.delete(id);
   unregisterTerm(id);
@@ -572,9 +579,21 @@ onMounted(async () => {
   // 1) 收养 store 之外的 PTY 会话（如微信/远程创建的），每个一个单 pane tab
   try {
     const list = await invoke<TermInfo[]>("term_list");
+    const byId = new Map(list.map((t) => [t.id, t]));
+    // 视图未挂载期间 PTY 已退出的 pane：树里清理掉（exit 事件只在挂载时监听）
+    for (const tab of [...tabs.value]) {
+      for (const leafId of allLeaves(tab.root)) {
+        if (!byId.get(leafId)?.alive) await closePane(leafId);
+      }
+    }
     const known = new Set(tabs.value.flatMap((t) => allLeaves(t.root)));
     for (const info of list) {
       if (known.has(info.id)) continue;
+      // 已死的会话不收养，顺手在后端释放
+      if (!info.alive) {
+        invoke("term_close", { id: info.id }).catch(() => {});
+        continue;
+      }
       paneCwds.set(info.id, info.cwd);
       tabs.value.push({
         id: info.id,

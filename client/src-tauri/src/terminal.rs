@@ -477,12 +477,15 @@ pub fn term_create(
         });
     }
 
-    // wait 线程：子进程退出后标记 alive=false
+    // wait 线程：子进程退出后标记 alive=false，并发 term-exit 事件让前端关闭面板
     {
         let alive = alive.clone();
+        let app = app.clone();
+        let exit_event = format!("term-exit/{id}");
         std::thread::spawn(move || {
             let _ = child.wait();
             alive.store(false, Ordering::SeqCst);
+            let _ = app.emit(&exit_event, ());
         });
     }
 
