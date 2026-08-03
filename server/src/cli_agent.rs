@@ -613,7 +613,6 @@ struct RemoteAgentResult {
     stderr: String,
 }
 
-
 #[allow(clippy::too_many_arguments)]
 async fn execute_remote_turn(
     state: &Arc<AppState>,
@@ -2522,9 +2521,7 @@ async fn finish_as_task_gate(
         {
             Ok(task) => {
                 resume_ref["team_task_id"] = serde_json::Value::String(task.id.clone());
-                if let Err(e) =
-                    write_session_team_task_id(state, session_id, &task.id).await
-                {
+                if let Err(e) = write_session_team_task_id(state, session_id, &task.id).await {
                     tracing::warn!(
                         session_id,
                         task_id = %task.id,

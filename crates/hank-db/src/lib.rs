@@ -4544,11 +4544,7 @@ impl Database {
     ///
     /// answer 列是 VARCHAR(64)：多问题完整串写入前会截断，完整版放这里供 resume 使用。
     /// 仅 pending 可写。
-    pub async fn set_interaction_final_answer(
-        &self,
-        id: &str,
-        final_answer: &str,
-    ) -> Result<bool> {
+    pub async fn set_interaction_final_answer(&self, id: &str, final_answer: &str) -> Result<bool> {
         let result = db_retry!(sqlx::query(
             "UPDATE agent_interactions
                 SET resume_ref = JSON_SET(COALESCE(resume_ref, '{}'), '$.final_answer', ?),

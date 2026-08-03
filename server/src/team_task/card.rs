@@ -143,10 +143,7 @@ fn format_run_line(run: &TeamStageRun) -> String {
 
     if is_reject {
         let reason = summary_short.unwrap_or_else(|| "打回".into());
-        return format!(
-            "❌ {} 第{}轮 · 打回：{}",
-            run.role_label, run.round, reason
-        );
+        return format!("❌ {} 第{}轮 · 打回：{}", run.role_label, run.round, reason);
     }
     if is_failed {
         let reason = summary_short.unwrap_or_else(|| "失败".into());
@@ -366,18 +363,16 @@ fn runs_to_stage(runs: &[TeamTaskRun]) -> Vec<TeamStageRun> {
 }
 
 async fn assemble_options(state: &Arc<AppState>, task: &TeamTask) -> TeamStageCardOptions {
-    let runs = state
-        .db
-        .list_team_runs(&task.id)
+    let runs = state.db.list_team_runs(&task.id).await.unwrap_or_default();
+    let progress = state
+        .tasks
+        .progress(&task.session_id)
         .await
-        .unwrap_or_default();
-    let progress = state.tasks.progress(&task.session_id).await.map(|p| {
-        TeamStageProgress {
+        .map(|p| TeamStageProgress {
             percent: p.percent,
             detail: p.detail,
             activities: p.activities,
-        }
-    });
+        });
     let settings = super::settings::effective(state).await;
     let dashboard_url = settings
         .dashboard_base_url
@@ -482,11 +477,7 @@ pub async fn sync_team_card(state: &Arc<AppState>, task_id: &str) {
         .unwrap_or("main");
     let in_thread = topic_id != "main";
 
-    if let Some(card_mid) = task
-        .card_message_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    {
+    if let Some(card_mid) = task.card_message_id.as_deref().filter(|s| !s.is_empty()) {
         if let Err(e) = api.update_card(card_mid, &card).await {
             tracing::warn!(%task_id, "sync_team_card: update_card 失败: {e:#}");
         }
@@ -494,11 +485,7 @@ pub async fn sync_team_card(state: &Arc<AppState>, task_id: &str) {
     }
 
     // 首次：需要 origin_message_id 才能 reply
-    let Some(origin) = task
-        .origin_message_id
-        .as_deref()
-        .filter(|s| !s.is_empty())
-    else {
+    let Some(origin) = task.origin_message_id.as_deref().filter(|s| !s.is_empty()) else {
         tracing::warn!(
             %task_id,
             "sync_team_card: card_message_id 与 origin_message_id 皆空，无法建主卡"
@@ -692,10 +679,7 @@ mod tests {
         let text = card_text(&card);
         // 目标区最多 500 字 + 前后缀；整卡不应含 600 个「测」
         let count = text.matches('测').count();
-        assert!(
-            count <= 500,
-            "goal 应按字符截断到 500，实际出现 {count} 次"
-        );
+        assert!(count <= 500, "goal 应按字符截断到 500，实际出现 {count} 次");
         // 截断后仍是合法 JSON / 合法 UTF-8
         assert!(serde_json::to_string(&card).is_ok());
     }

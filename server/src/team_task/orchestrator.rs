@@ -10,8 +10,8 @@
 
 use super::roles::{RolePromptInput, UpstreamHandoff};
 use super::{
-    decide_next, parse_handoff, role_def, role_prompt, DecideInput, Decision, GateBoundary, Handoff,
-    RunOutcome, Trigger as DecideTrigger, Verdict,
+    decide_next, parse_handoff, role_def, role_prompt, DecideInput, Decision, GateBoundary,
+    Handoff, RunOutcome, Trigger as DecideTrigger, Verdict,
 };
 use crate::cli_agent;
 use crate::AppState;
@@ -223,16 +223,9 @@ pub async fn advance(state: &Arc<AppState>, task_id: &str, trigger: Trigger) -> 
             outcome,
             final_text,
         } => {
-            let verdict = finalize_run(
-                state,
-                &task,
-                role,
-                *round,
-                outcome,
-                final_text.as_deref(),
-            )
-            .await
-            .context("收尾 team_task_run")?;
+            let verdict = finalize_run(state, &task, role, *round, outcome, final_text.as_deref())
+                .await
+                .context("收尾 team_task_run")?;
             let outcome_for_decide = match outcome {
                 RunOutcome::Failed => RunOutcome::Failed,
                 RunOutcome::Finished(_) => RunOutcome::Finished(verdict),
@@ -460,11 +453,7 @@ fn handoff_to_json(h: &Handoff) -> String {
 
 /// 开人工闸门：落 team_gate 交互单 + emit AskUser 让 pusher 出卡片，
 /// 任务状态改 pending_*_gate。
-async fn open_gate(
-    state: &Arc<AppState>,
-    task: &TeamTask,
-    boundary: GateBoundary,
-) -> Result<()> {
+async fn open_gate(state: &Arc<AppState>, task: &TeamTask, boundary: GateBoundary) -> Result<()> {
     let options = gate_options(boundary);
     let options_json =
         serde_json::to_string(&options).unwrap_or_else(|_| r#"["继续","终止"]"#.to_string());
@@ -788,7 +777,6 @@ async fn dispatch_role(
     }
 }
 
-
 /// 起飞书进度 pusher。进度卡是附加功能：没有主卡 / 账号停用 / 查不到时只 warn，
 /// 不阻断任务执行。调用方须先 `sync_team_card` 再调本函数，否则
 /// `card_message_id` 仍为空会跳过首个角色的进度。
@@ -953,10 +941,7 @@ pub async fn retry_from_current_role(state: &Arc<AppState>, task_id: &str) -> Re
         .ok_or_else(|| anyhow!("团队任务不存在: {task_id}"))?;
 
     if task.status != super::STATUS_FAILED {
-        return Err(anyhow!(
-            "仅 failed 状态可重试，当前 status={}",
-            task.status
-        ));
+        return Err(anyhow!("仅 failed 状态可重试，当前 status={}", task.status));
     }
 
     let latest = state
@@ -973,13 +958,7 @@ pub async fn retry_from_current_role(state: &Arc<AppState>, task_id: &str) -> Re
     // 先把状态改回 running_*，再派发；dispatch_role 内部会再写一次
     state
         .db
-        .update_team_task_status(
-            task_id,
-            role_def.running_status,
-            Some(&role),
-            None,
-            None,
-        )
+        .update_team_task_status(task_id, role_def.running_status, Some(&role), None, None)
         .await
         .context("重试前更新任务状态")?;
 
@@ -1209,11 +1188,7 @@ mod tests {
 
     #[test]
     fn pick_upstream_reviewer_takes_latest_developer() {
-        let roles = vec![
-            "developer".into(),
-            "reviewer".into(),
-            "tester".into(),
-        ];
+        let roles = vec!["developer".into(), "reviewer".into(), "tester".into()];
         let runs = vec![
             dummy_run("developer", 1, "finished"),
             dummy_run("developer", 2, "finished"),
@@ -1226,11 +1201,7 @@ mod tests {
 
     #[test]
     fn pick_upstream_tester_takes_latest_reviewer() {
-        let roles = vec![
-            "developer".into(),
-            "reviewer".into(),
-            "tester".into(),
-        ];
+        let roles = vec!["developer".into(), "reviewer".into(), "tester".into()];
         let runs = vec![
             dummy_run("developer", 1, "finished"),
             dummy_run("reviewer", 1, "finished"),
@@ -1242,11 +1213,7 @@ mod tests {
 
     #[test]
     fn pick_upstream_developer_first_round_none() {
-        let roles = vec![
-            "developer".into(),
-            "reviewer".into(),
-            "tester".into(),
-        ];
+        let roles = vec!["developer".into(), "reviewer".into(), "tester".into()];
         // 首轮开发：还没有评审 finished
         let runs = vec![dummy_run("developer", 1, "running")];
         assert!(pick_upstream_run(&runs, "developer", &roles).is_none());
@@ -1254,11 +1221,7 @@ mod tests {
 
     #[test]
     fn pick_upstream_developer_round2_takes_reviewer() {
-        let roles = vec![
-            "developer".into(),
-            "reviewer".into(),
-            "tester".into(),
-        ];
+        let roles = vec!["developer".into(), "reviewer".into(), "tester".into()];
         // 打回场景：开发第 2 轮取评审那轮
         let runs = vec![
             dummy_run("developer", 1, "finished"),
@@ -1271,22 +1234,14 @@ mod tests {
 
     #[test]
     fn pick_upstream_empty_runs_none() {
-        let roles = vec![
-            "developer".into(),
-            "reviewer".into(),
-            "tester".into(),
-        ];
+        let roles = vec!["developer".into(), "reviewer".into(), "tester".into()];
         assert!(pick_upstream_run(&[], "reviewer", &roles).is_none());
         assert!(pick_upstream_run(&[], "developer", &roles).is_none());
     }
 
     #[test]
     fn pick_upstream_ignores_non_finished() {
-        let roles = vec![
-            "developer".into(),
-            "reviewer".into(),
-            "tester".into(),
-        ];
+        let roles = vec!["developer".into(), "reviewer".into(), "tester".into()];
         let runs = vec![
             dummy_run("developer", 1, "failed"),
             dummy_run("developer", 2, "running"),
@@ -1294,4 +1249,3 @@ mod tests {
         assert!(pick_upstream_run(&runs, "reviewer", &roles).is_none());
     }
 }
-

@@ -94,11 +94,7 @@ fn parse_ask_user_questions(input: &Value) -> Vec<AskUserQuestion> {
         if out.len() >= MAX_QUESTIONS {
             break;
         }
-        let id = item
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .trim();
+        let id = item.get("id").and_then(|v| v.as_str()).unwrap_or("").trim();
         let question = item
             .get("question")
             .and_then(|v| v.as_str())
@@ -971,11 +967,12 @@ impl AgentSession {
                         // Detect ask_user tool — emit event and break
                         if name == "ask_user" {
                             let questions = parse_ask_user_questions(input);
-                            let has_single = input.get("question").and_then(|v| v.as_str()).is_some()
-                                || input
-                                    .get("options")
-                                    .and_then(|v| v.as_array())
-                                    .is_some_and(|a| !a.is_empty());
+                            let has_single =
+                                input.get("question").and_then(|v| v.as_str()).is_some()
+                                    || input
+                                        .get("options")
+                                        .and_then(|v| v.as_array())
+                                        .is_some_and(|a| !a.is_empty());
                             if !questions.is_empty() && has_single {
                                 tracing::warn!(
                                     "ask_user: 同时传了 questions 与 question/options，以 questions 为准"
@@ -984,15 +981,10 @@ impl AgentSession {
                             let (question, options) = if !questions.is_empty() {
                                 // 多问题：question 取第一题题干供 title/单行展示；
                                 // options 留空（扁平全集由落表层写）
-                                (
-                                    questions[0].question.clone(),
-                                    Vec::new(),
-                                )
+                                (questions[0].question.clone(), Vec::new())
                             } else {
-                                let question = input["question"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string();
+                                let question =
+                                    input["question"].as_str().unwrap_or_default().to_string();
                                 let options = input["options"]
                                     .as_array()
                                     .map(|arr| {
@@ -1271,7 +1263,10 @@ impl AgentSession {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_safe_question_id, parse_ask_user_questions, parse_suggested_actions, quant_confirm_prompt};
+    use super::{
+        is_safe_question_id, parse_ask_user_questions, parse_suggested_actions,
+        quant_confirm_prompt,
+    };
     use serde_json::json;
 
     #[test]

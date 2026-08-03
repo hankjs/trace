@@ -514,88 +514,86 @@ pub async fn run_chat_turn(
 
         // 文字回复路径：仍为 pending，在此原子应答；按钮回调路径：已是 answered。
         // 多问题文字作答先校验格式——失败直接回用户、保持 pending，不启 agent。
-        let (answer_blocked, multi_answer_pairs) = if pending["status"].as_str() == Some("pending")
-            && !interaction_id.is_empty()
-        {
-            if !multi_questions.is_empty() {
-                match parse_multi_answer(&multi_questions, &content_text) {
-                    Ok(pairs) => {
-                        let full =
-                            format_multi_answer_token_string(&multi_questions, &pairs);
-                        // answer 列 VARCHAR(64)：完整串另存 final_answer，列内截断
-                        let for_db = truncate_answer_for_column(&full);
-                        if let Err(e) = state
-                            .db
-                            .set_interaction_final_answer(&interaction_id, &full)
-                            .await
-                        {
-                            tracing::warn!(
-                                interaction_id = %interaction_id,
-                                "set_interaction_final_answer 失败: {e:#}"
-                            );
-                        }
-                        match state
-                            .db
-                            .answer_interaction(&interaction_id, &for_db, answered_by)
-                            .await
-                        {
-                            Ok(Some(_)) => (None, Some(pairs)),
-                            Ok(None) => {
-                                let expired = pending_expires_at_is_past(&pending);
-                                (
-                                    Some(if expired {
-                                        "待确认已超时，未执行。如需执行请重新发起。".to_string()
-                                    } else {
-                                        "这个操作已经提交过了。".to_string()
-                                    }),
-                                    None,
-                                )
-                            }
-                            Err(e) => {
+        let (answer_blocked, multi_answer_pairs) =
+            if pending["status"].as_str() == Some("pending") && !interaction_id.is_empty() {
+                if !multi_questions.is_empty() {
+                    match parse_multi_answer(&multi_questions, &content_text) {
+                        Ok(pairs) => {
+                            let full = format_multi_answer_token_string(&multi_questions, &pairs);
+                            // answer 列 VARCHAR(64)：完整串另存 final_answer，列内截断
+                            let for_db = truncate_answer_for_column(&full);
+                            if let Err(e) = state
+                                .db
+                                .set_interaction_final_answer(&interaction_id, &full)
+                                .await
+                            {
                                 tracing::warn!(
                                     interaction_id = %interaction_id,
-                                    "answer_interaction 失败: {e:#}"
+                                    "set_interaction_final_answer 失败: {e:#}"
                                 );
-                                (Some(format!("确认写入失败：{e:#}")), None)
+                            }
+                            match state
+                                .db
+                                .answer_interaction(&interaction_id, &for_db, answered_by)
+                                .await
+                            {
+                                Ok(Some(_)) => (None, Some(pairs)),
+                                Ok(None) => {
+                                    let expired = pending_expires_at_is_past(&pending);
+                                    (
+                                        Some(if expired {
+                                            "待确认已超时，未执行。如需执行请重新发起。".to_string()
+                                        } else {
+                                            "这个操作已经提交过了。".to_string()
+                                        }),
+                                        None,
+                                    )
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        interaction_id = %interaction_id,
+                                        "answer_interaction 失败: {e:#}"
+                                    );
+                                    (Some(format!("确认写入失败：{e:#}")), None)
+                                }
                             }
                         }
+                        // 格式错误：交互单保持 pending 等重答；不注入 tool_result、不启 agent。
+                        Err(msg) => {
+                            return Err(ChatTurnError::UserFacing(msg));
+                        }
                     }
-                    // 格式错误：交互单保持 pending 等重答；不注入 tool_result、不启 agent。
-                    Err(msg) => {
-                        return Err(ChatTurnError::UserFacing(msg));
+                } else {
+                    let for_db = truncate_answer_for_column(&content_text);
+                    match state
+                        .db
+                        .answer_interaction(&interaction_id, &for_db, answered_by)
+                        .await
+                    {
+                        Ok(Some(_)) => (None, None),
+                        Ok(None) => {
+                            let expired = pending_expires_at_is_past(&pending);
+                            (
+                                Some(if expired {
+                                    "待确认已超时，未执行。如需执行请重新发起。".to_string()
+                                } else {
+                                    "这个操作已经提交过了。".to_string()
+                                }),
+                                None,
+                            )
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                interaction_id = %interaction_id,
+                                "answer_interaction 失败: {e:#}"
+                            );
+                            (Some(format!("确认写入失败：{e:#}")), None)
+                        }
                     }
                 }
             } else {
-                let for_db = truncate_answer_for_column(&content_text);
-                match state
-                    .db
-                    .answer_interaction(&interaction_id, &for_db, answered_by)
-                    .await
-                {
-                    Ok(Some(_)) => (None, None),
-                    Ok(None) => {
-                        let expired = pending_expires_at_is_past(&pending);
-                        (
-                            Some(if expired {
-                                "待确认已超时，未执行。如需执行请重新发起。".to_string()
-                            } else {
-                                "这个操作已经提交过了。".to_string()
-                            }),
-                            None,
-                        )
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            interaction_id = %interaction_id,
-                            "answer_interaction 失败: {e:#}"
-                        );
-                        (Some(format!("确认写入失败：{e:#}")), None)
-                    }
-                }
-            }
-        } else {
-            (None, None)
-        };
+                (None, None)
+            };
 
         let content = if let Some(msg) = answer_blocked {
             msg
@@ -1534,17 +1532,15 @@ pub fn parse_multi_answer(
             .map(|id| format!("第 {id} 题"))
             .collect::<Vec<_>>()
             .join("、");
-        return Err(format!("还没答完：缺 {ids}。请补全后重发，或点卡片按钮逐题作答。"));
+        return Err(format!(
+            "还没答完：缺 {ids}。请补全后重发，或点卡片按钮逐题作答。"
+        ));
     }
 
     // 按 questions 顺序输出
     Ok(questions
         .iter()
-        .filter_map(|q| {
-            found
-                .get(&q.id)
-                .map(|opt| (q.id.clone(), opt.clone()))
-        })
+        .filter_map(|q| found.get(&q.id).map(|opt| (q.id.clone(), opt.clone())))
         .collect())
 }
 
@@ -1580,7 +1576,13 @@ pub fn format_multi_answer_human(
             .map(|q| q.question.as_str())
             .unwrap_or(qid.as_str());
         // 题干取首行，避免多行题干把 tool_result 撑爆
-        let q_one: String = q_text.lines().next().unwrap_or(q_text).chars().take(40).collect();
+        let q_one: String = q_text
+            .lines()
+            .next()
+            .unwrap_or(q_text)
+            .chars()
+            .take(40)
+            .collect();
         parts.push(format!("{q_one}→ {opt_text}"));
     }
     parts.join("；")
@@ -1912,10 +1914,7 @@ mod tests {
         assert!(parse_multi_answer(&sample_multi_questions(), "3A 1A 2B").is_ok());
         // 只有非法题号 → 无法解析或缺题
         let err = parse_multi_answer(&sample_multi_questions(), "3A").unwrap_err();
-        assert!(
-            err.contains("无法解析") || err.contains("缺"),
-            "err={err}"
-        );
+        assert!(err.contains("无法解析") || err.contains("缺"), "err={err}");
     }
 
     #[test]

@@ -147,9 +147,7 @@ pub fn developer_prompt(input: &RolePromptInput<'_>) -> String {
         s.push_str("\n本轮请按上面的分析执行代码修改。\n");
     }
 
-    s.push_str(
-        "\n完成后请自行验证（编译 / 跑与改动相关的测试），确认无回归再结束。\n",
-    );
+    s.push_str("\n完成后请自行验证（编译 / 跑与改动相关的测试），确认无回归再结束。\n");
     s.push_str(&workspace_constraints(input.agent_kind));
     s.push_str(&handoff_requirement(false));
     s
@@ -551,5 +549,3 @@ blocking: auth_test 失败
         }
     }
 }
-
-

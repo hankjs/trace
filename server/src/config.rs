@@ -289,10 +289,7 @@ database_url = "mysql://u:p@localhost/db"
     fn team_task_absent_uses_defaults() {
         let cfg: Config = toml::from_str(MIN_SERVER).expect("parse");
         assert!(!cfg.team_task.enabled);
-        assert_eq!(
-            cfg.team_task.roles,
-            vec!["developer", "reviewer", "tester"]
-        );
+        assert_eq!(cfg.team_task.roles, vec!["developer", "reviewer", "tester"]);
         assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
         assert_eq!(cfg.team_task.max_dev_rounds, 3);
         assert!(cfg.team_task.dashboard_base_url.is_none());
@@ -303,10 +300,7 @@ database_url = "mysql://u:p@localhost/db"
         let toml = format!("{MIN_SERVER}\n[team_task]\nenabled = true\n");
         let cfg: Config = toml::from_str(&toml).expect("parse");
         assert!(cfg.team_task.enabled);
-        assert_eq!(
-            cfg.team_task.roles,
-            vec!["developer", "reviewer", "tester"]
-        );
+        assert_eq!(cfg.team_task.roles, vec!["developer", "reviewer", "tester"]);
         assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
         assert_eq!(cfg.team_task.max_dev_rounds, 3);
         assert!(cfg.team_task.dashboard_base_url.is_none());

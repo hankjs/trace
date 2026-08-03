@@ -95,10 +95,7 @@ pub const STATUS_CANCELLED: &str = "cancelled";
 
 /// 是否终态。终态任务收到任何 Trigger 都应 Ignore。
 pub fn is_terminal(status: &str) -> bool {
-    matches!(
-        status,
-        STATUS_DONE | STATUS_FAILED | STATUS_CANCELLED
-    )
+    matches!(status, STATUS_DONE | STATUS_FAILED | STATUS_CANCELLED)
 }
 
 /// 是否某角色运行中（status 形如 running_*）。
@@ -326,9 +323,7 @@ pub fn decide_next(input: &DecideInput<'_>, cfg: &TeamTaskSettings) -> Decision 
                 let current = input.current_role.unwrap_or("");
                 if *role != current {
                     return Decision::Ignore {
-                        reason: format!(
-                            "陈旧回调: current_role={current}, finished_role={role}"
-                        ),
+                        reason: format!("陈旧回调: current_role={current}, finished_role={role}"),
                     };
                 }
                 let label = role_label(role);
@@ -365,15 +360,12 @@ pub fn decide_next(input: &DecideInput<'_>, cfg: &TeamTaskSettings) -> Decision 
                         },
                     },
                     RunOutcome::Finished(Verdict::Reject) => {
-                        let needs_verdict =
-                            role_def(role).map(|d| d.needs_verdict).unwrap_or(true);
+                        let needs_verdict = role_def(role).map(|d| d.needs_verdict).unwrap_or(true);
                         // 开发不该有 reject 语义，静默当打回会掩盖真 bug
                         if !needs_verdict {
                             return Decision::Finish {
                                 status: STATUS_FAILED,
-                                reason: Some(
-                                    "开发角色返回 reject，prompt 或解析异常".to_string(),
-                                ),
+                                reason: Some("开发角色返回 reject，prompt 或解析异常".to_string()),
                             };
                         }
                         if input.dev_rounds >= cfg.max_dev_rounds {
@@ -683,11 +675,7 @@ mod tests {
     }
 
     fn default_roles() -> Vec<String> {
-        vec![
-            "developer".into(),
-            "reviewer".into(),
-            "tester".into(),
-        ]
+        vec!["developer".into(), "reviewer".into(), "tester".into()]
     }
 
     fn input_pending_yes() -> DecideInput<'static> {
@@ -695,7 +683,9 @@ mod tests {
             status: STATUS_PENDING_CONFIRM,
             current_role: None,
             dev_rounds: 0,
-            trigger: Trigger::GateAnswered { answer: "开始修" },
+            trigger: Trigger::GateAnswered {
+                answer: "开始修"
+            },
         }
     }
 
@@ -712,10 +702,7 @@ mod tests {
             role_def("reviewer").unwrap().running_status,
             "running_reviewer"
         );
-        assert_eq!(
-            role_def("tester").unwrap().running_status,
-            "running_tester"
-        );
+        assert_eq!(role_def("tester").unwrap().running_status, "running_tester");
         assert!(role_def("docs").is_none());
         assert!(role_def("").is_none());
     }
@@ -776,7 +763,15 @@ mod tests {
 
     #[test]
     fn gate_answer_yes_no_unknown() {
-        for a in ["开始修", "继续", "继续评审", "重新开发", "继续测试", "确认", "是"] {
+        for a in [
+            "开始修",
+            "继续",
+            "继续评审",
+            "重新开发",
+            "继续测试",
+            "确认",
+            "是",
+        ] {
             assert_eq!(gate_answer_is_yes(a), Some(true), "yes: {a}");
         }
         for a in ["跳过", "终止", "取消", "否"] {
@@ -903,7 +898,9 @@ mod tests {
                 status: STATUS_PENDING_REVIEW_GATE,
                 current_role: Some("developer"),
                 dev_rounds: 1,
-                trigger: Trigger::GateAnswered { answer: "继续评审" },
+                trigger: Trigger::GateAnswered {
+                    answer: "继续评审"
+                },
             },
             &cfg,
         );
@@ -942,7 +939,9 @@ mod tests {
                 status: STATUS_PENDING_DEV_GATE,
                 current_role: Some("reviewer"),
                 dev_rounds: 1,
-                trigger: Trigger::GateAnswered { answer: "重新开发" },
+                trigger: Trigger::GateAnswered {
+                    answer: "重新开发"
+                },
             },
             &cfg,
         );
@@ -981,7 +980,9 @@ mod tests {
                 status: STATUS_PENDING_TEST_GATE,
                 current_role: Some("reviewer"),
                 dev_rounds: 1,
-                trigger: Trigger::GateAnswered { answer: "继续测试" },
+                trigger: Trigger::GateAnswered {
+                    answer: "继续测试"
+                },
             },
             &cfg,
         );
@@ -1212,7 +1213,9 @@ mod tests {
                     status,
                     current_role: None,
                     dev_rounds: 1,
-                    trigger: Trigger::GateAnswered { answer: "开始修" },
+                    trigger: Trigger::GateAnswered {
+                        answer: "开始修"
+                    },
                 },
                 &cfg,
             );
@@ -1311,7 +1314,9 @@ mod tests {
                 status: STATUS_PENDING_CONFIRM,
                 current_role: None,
                 dev_rounds: 0,
-                trigger: Trigger::GateAnswered { answer: "随便点点" },
+                trigger: Trigger::GateAnswered {
+                    answer: "随便点点"
+                },
             },
             &cfg,
         );
@@ -1337,7 +1342,10 @@ mod tests {
             Decision::Finish {
                 status: STATUS_CANCELLED,
                 reason: Some(r),
-            } => assert!(r.contains("review_start") || r.contains("终止"), "reason={r}"),
+            } => assert!(
+                r.contains("review_start") || r.contains("终止"),
+                "reason={r}"
+            ),
             other => panic!("expected cancelled, got {other:?}"),
         }
     }
@@ -1357,7 +1365,9 @@ mod tests {
                 status: STATUS_PENDING_TEST_GATE,
                 current_role: Some("reviewer"),
                 dev_rounds: 1,
-                trigger: Trigger::GateAnswered { answer: "继续测试" },
+                trigger: Trigger::GateAnswered {
+                    answer: "继续测试"
+                },
             },
             &cfg,
         );

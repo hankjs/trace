@@ -291,10 +291,7 @@ pub async fn retry_task(
     };
 
     if !can_retry(&task.status) {
-        return R::bad_request(format!(
-            "仅 failed 状态可重试，当前 status={}",
-            task.status
-        ));
+        return R::bad_request(format!("仅 failed 状态可重试，当前 status={}", task.status));
     }
 
     match orchestrator::retry_from_current_role(&state, &task.id).await {

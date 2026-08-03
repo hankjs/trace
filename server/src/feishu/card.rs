@@ -1060,14 +1060,8 @@ mod tests {
         let action_count = elements.iter().filter(|e| e["tag"] == "action").count();
         assert_eq!(action_count, 3);
         // 第一个按钮 action 为 answer_multi
-        let first_btn = &elements
-            .iter()
-            .find(|e| e["tag"] == "action")
-            .unwrap()["actions"][0];
-        assert_eq!(
-            first_btn["behaviors"][0]["value"]["action"],
-            "answer_multi"
-        );
+        let first_btn = &elements.iter().find(|e| e["tag"] == "action").unwrap()["actions"][0];
+        assert_eq!(first_btn["behaviors"][0]["value"]["action"], "answer_multi");
         assert_eq!(first_btn["behaviors"][0]["value"]["choice_token"], "1A");
         assert!(first_btn["text"]["content"]
             .as_str()

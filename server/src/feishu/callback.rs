@@ -10,7 +10,9 @@
 
 use crate::chat::{flatten_question_options, format_multi_answer_token_string};
 use crate::feishu::api::FeishuApi;
-use crate::feishu::card::{build_confirm_done_card, build_multi_question_card, MultiQuestionCardOptions};
+use crate::feishu::card::{
+    build_confirm_done_card, build_multi_question_card, MultiQuestionCardOptions,
+};
 use crate::feishu::router::{self, IncomingMessage};
 use crate::interaction_flow::{self, ChannelCardContext};
 use crate::AppState;
@@ -404,11 +406,7 @@ async fn handle_answer_multi(
     // 全答完：拼完整串 → answer_and_resume（会改终态卡，此处不要再 update_card）
     let pairs: Vec<(String, String)> = questions
         .iter()
-        .filter_map(|q| {
-            answered
-                .get(&q.id)
-                .map(|opt| (q.id.clone(), opt.clone()))
-        })
+        .filter_map(|q| answered.get(&q.id).map(|opt| (q.id.clone(), opt.clone())))
         .collect();
     let full = format_multi_answer_token_string(&questions, &pairs);
     if let Err(e) = state

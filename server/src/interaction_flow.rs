@@ -165,10 +165,7 @@ pub async fn answer_and_resume(
             .set_interaction_final_answer(interaction_id, answer)
             .await
         {
-            tracing::warn!(
-                interaction_id,
-                "set_interaction_final_answer 失败: {e:#}"
-            );
+            tracing::warn!(interaction_id, "set_interaction_final_answer 失败: {e:#}");
         }
     }
     let answered_row = match state

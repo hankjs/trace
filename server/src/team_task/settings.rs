@@ -55,9 +55,7 @@ pub fn defaults_from_config(cfg: &Config) -> TeamTaskSettings {
 /// 即使 `enabled = false` 也严格校验——不能让 admin 存一份坏配置进去等着以后炸。
 pub fn validate(s: &TeamTaskSettings) -> Result<(), String> {
     if s.enabled && !s.task_gate_enabled {
-        return Err(
-            "多角色流水线依赖两阶段闸门，请同时开启闸门".to_string(),
-        );
+        return Err("多角色流水线依赖两阶段闸门，请同时开启闸门".to_string());
     }
 
     if s.enabled && s.roles.is_empty() {
@@ -203,7 +201,10 @@ mod tests {
         let mut s = valid_settings();
         s.roles = vec!["developer".into(), "designer".into()];
         let err = validate(&s).unwrap_err();
-        assert!(err.contains("designer") || err.contains("未知角色"), "{err}");
+        assert!(
+            err.contains("designer") || err.contains("未知角色"),
+            "{err}"
+        );
         assert!(err.contains("developer"), "{err}");
     }
 
@@ -220,7 +221,10 @@ mod tests {
         let mut s = valid_settings();
         s.gates = vec!["dev_start".into(), "final_accept".into()];
         let err = validate(&s).unwrap_err();
-        assert!(err.contains("final_accept") || err.contains("未知"), "{err}");
+        assert!(
+            err.contains("final_accept") || err.contains("未知"),
+            "{err}"
+        );
     }
 
     #[test]
