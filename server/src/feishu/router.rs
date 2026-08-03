@@ -109,7 +109,10 @@ impl IncomingMessage {
 
 // ── 消息解析（纯函数，可单测）──
 
-/// 从消息 content 提取纯文本（text 直接取；post 遍历富文本段落拼 text/at）。
+/// 从消息 content 提取纯文本。
+///
+/// text 直接取；post 遍历富文本段落，取 text / a / code / code_block / md 的正文，
+/// br 转换行，at 转 `@显示名`。代码块必须收——用户常把报错日志粘成 code_block。
 pub fn extract_text(message_type: &str, content: &str) -> String {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) else {
         return String::new();
@@ -134,11 +137,17 @@ pub fn extract_text(message_type: &str, content: &str) -> String {
                 };
                 for el in elements {
                     match el["tag"].as_str() {
-                        Some("text") => {
+                        // code_block / code / a / md 都带 text 字段，语义上都是用户输入的
+                        // 正文。漏掉 code_block 会让「贴一段报错日志 @机器人」变成空文本，
+                        // 然后被当成"不支持的消息类型"回绝——静默丢用户输入比报错更糟。
+                        Some("text") | Some("a") | Some("code") | Some("code_block")
+                        | Some("md") => {
                             if let Some(t) = el["text"].as_str() {
                                 out.push_str(t);
                             }
                         }
+                        // 富文本换行是独立元素，不补的话多行日志会被拼成一整行。
+                        Some("br") => out.push('\n'),
                         Some("at") => {
                             if let Some(name) = el["user_name"].as_str() {
                                 out.push_str(&format!("@{name}"));
@@ -1974,6 +1983,29 @@ mod tests {
     fn extract_text_from_post_message() {
         let content = r#"{"title":"","content":[[{"tag":"text","text":"帮我看看 "},{"tag":"at","user_id":"ou_1","user_name":"bot"},{"tag":"text","text":" 这段代码"}]]}"#;
         assert_eq!(extract_text("post", content), "帮我看看 @bot 这段代码");
+    }
+
+    #[test]
+    fn extract_text_from_post_with_code_block() {
+        // 用户把报错日志粘成代码块：漏掉 code_block 会让文本变空，
+        // 然后被当成"不支持的消息类型"回绝。
+        let content = r#"{"title":"","content":[[{"tag":"text","text":"这个报错怎么修 "},{"tag":"code_block","text":"panic at line 3"}]]}"#;
+        assert_eq!(
+            extract_text("post", content),
+            "这个报错怎么修 panic at line 3"
+        );
+    }
+
+    #[test]
+    fn extract_text_from_post_with_link_md_and_br() {
+        let content = r#"{"title":"","content":[[{"tag":"a","text":"文档","href":"https://x"},{"tag":"br"},{"tag":"code","text":"cargo test"},{"tag":"md","text":" 看这里"}]]}"#;
+        assert_eq!(extract_text("post", content), "文档\ncargo test 看这里");
+    }
+
+    #[test]
+    fn extract_text_from_post_ignores_unknown_tag() {
+        let content = r#"{"title":"","content":[[{"tag":"text","text":"前"},{"tag":"emotion","emoji_type":"SMILE"},{"tag":"text","text":"后"}]]}"#;
+        assert_eq!(extract_text("post", content), "前后");
     }
 
     #[test]
