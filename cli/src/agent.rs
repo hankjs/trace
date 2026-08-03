@@ -20,6 +20,9 @@ use tokio::sync::{mpsc, Mutex, Notify};
 
 use crate::api::ApiClient;
 
+// 必须与 server 侧 hank_db::AgentBackend::ALL 保持一致（wire format 契约）。
+// cli 是独立 Cargo 项目、不依赖 workspace crate，所以无法共享类型，
+// 加后端时两处都要改。
 const SUPPORTED_BACKENDS: [&str; 4] = ["codex", "claude", "grok", "kimi"];
 const MAX_PROMPT_BYTES: usize = 256 * 1024;
 /// 单行上限：stream-json 里一条 tool_result 可能带整个文件内容。超限只丢这一行，

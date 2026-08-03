@@ -164,6 +164,52 @@ pub struct Deployment {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 外部 Agent CLI 后端。
+///
+/// 为什么要类型：后端清单曾在五处各自硬编码（cli/agent.rs、remote_exec.rs、
+/// cli_agent.rs、chat.rs、feishu/router.rs），加一个后端要改五处且编译器不提醒。
+/// 收敛到 enum 后，加变体会让所有穷尽 match 编译失败，漏一处就过不了。
+///
+/// wire format 是 `as_str()` 的返回值：DB 的 agent_backend 列、hank-cli 上报的
+/// agent_backends、路由 Agent 返回的 JSON 都用这些字符串，**不可更改**。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentBackend {
+    Codex,
+    Claude,
+    Grok,
+    Kimi,
+}
+
+impl AgentBackend {
+    /// 全部变体。加变体时这里也要加——它是 `remote_exec` 白名单等处的唯一来源。
+    pub const ALL: [AgentBackend; 4] = [Self::Codex, Self::Claude, Self::Grok, Self::Kimi];
+
+    /// 默认优先级顺序（原 PREFERRED_EXTERNAL_BACKEND_ORDER）。
+    pub const PREFERRED_ORDER: [AgentBackend; 4] =
+        [Self::Codex, Self::Claude, Self::Grok, Self::Kimi];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Grok => "grok",
+            Self::Kimi => "kimi",
+        }
+    }
+
+    /// 严格解析：未知值返回 None（不做任何猜测或回落）。
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|b| b.as_str() == value)
+    }
+}
+
+impl std::fmt::Display for AgentBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Agent 交互单：确认闸门 / ask_user / 任务闸门的统一载体。
 ///
 /// 为什么不能寄生在 session 上：此前 quant_confirm 存进程内 map、ask_user 存
@@ -6003,7 +6049,34 @@ pub fn generate_task_no(now_ms: u64, rand_seed: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::generate_task_no;
+    use super::{generate_task_no, AgentBackend};
+
+    #[test]
+    fn agent_backend_parse_accepts_known_wire_values() {
+        assert_eq!(AgentBackend::parse("codex"), Some(AgentBackend::Codex));
+        assert_eq!(AgentBackend::parse("claude"), Some(AgentBackend::Claude));
+        assert_eq!(AgentBackend::parse("grok"), Some(AgentBackend::Grok));
+        assert_eq!(AgentBackend::parse("kimi"), Some(AgentBackend::Kimi));
+    }
+
+    #[test]
+    fn agent_backend_parse_rejects_unknown_and_case_variants() {
+        // 严格解析：native 是路由侧概念，不是外部 CLI；大小写必须精确匹配 wire format。
+        assert_eq!(AgentBackend::parse("native"), None);
+        assert_eq!(AgentBackend::parse(""), None);
+        assert_eq!(AgentBackend::parse("Codex"), None);
+        assert_eq!(AgentBackend::parse("CLAUDE"), None);
+    }
+
+    #[test]
+    fn agent_backend_as_str_roundtrips_with_parse() {
+        for backend in AgentBackend::ALL {
+            assert_eq!(AgentBackend::parse(backend.as_str()), Some(backend));
+            assert_eq!(backend.to_string(), backend.as_str());
+        }
+        assert_eq!(AgentBackend::ALL.len(), 4);
+        assert_eq!(AgentBackend::PREFERRED_ORDER.len(), 4);
+    }
 
     #[test]
     fn task_no_format_and_max_len() {
