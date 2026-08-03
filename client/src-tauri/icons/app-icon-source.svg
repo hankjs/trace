@@ -1,53 +1,11 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" fill="none">
   <!--
-    Trace app icon — precision bot / agent mark
-    Quiet Instrument: amber-gold on deep slate (DESIGN.md)
+    Trace app icon — 已弃用为矢量源。
+    真源：assets/brand/trace-bot-logo.png（及 app-icon-source.png）
+    重新生成：cd client && pnpm exec tauri icon src-tauri/icons/app-icon-source.png
   -->
-  <defs>
-    <linearGradient id="bg" x1="512" y1="0" x2="512" y2="1024" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#2a2d32"/>
-      <stop offset="100%" stop-color="#1a1c1f"/>
-    </linearGradient>
-    <linearGradient id="metal" x1="280" y1="240" x2="744" y2="780" gradientUnits="userSpaceOnUse">
-      <stop offset="0%" stop-color="#e0b86a"/>
-      <stop offset="55%" stop-color="#d4a24e"/>
-      <stop offset="100%" stop-color="#b8893a"/>
-    </linearGradient>
-  </defs>
-
-  <rect width="1024" height="1024" fill="url(#bg)"/>
-
-  <!-- Antenna: stem + node (agent signal) -->
-  <rect x="498" y="148" width="28" height="108" rx="14" fill="url(#metal)"/>
-  <circle cx="512" cy="148" r="32" fill="url(#metal)"/>
-  <circle cx="512" cy="148" r="14" fill="#1f2124"/>
-
-  <!-- Head outer shell -->
-  <rect x="248" y="256" width="528" height="480" rx="128" fill="url(#metal)"/>
-
-  <!-- Recessed face plate -->
-  <rect x="304" y="312" width="416" height="368" rx="96" fill="#1f2124"/>
-
-  <!-- Sensor eyes — vertical pill LEDs -->
-  <rect x="364" y="392" width="80" height="140" rx="40" fill="url(#metal)"/>
-  <rect x="580" y="392" width="80" height="140" rx="40" fill="url(#metal)"/>
-
-  <!-- Status readout (instrument bar, not a smile) -->
-  <rect x="392" y="568" width="240" height="24" rx="12" fill="url(#metal)"/>
-  <!-- Micro tick marks on readout -->
-  <rect x="424" y="572" width="6" height="16" rx="2" fill="#1f2124" opacity="0.55"/>
-  <rect x="456" y="572" width="6" height="16" rx="2" fill="#1f2124" opacity="0.55"/>
-  <rect x="488" y="572" width="6" height="16" rx="2" fill="#1f2124" opacity="0.55"/>
-  <rect x="520" y="572" width="6" height="16" rx="2" fill="#1f2124" opacity="0.55"/>
-  <rect x="552" y="572" width="6" height="16" rx="2" fill="#1f2124" opacity="0.55"/>
-  <rect x="584" y="572" width="6" height="16" rx="2" fill="#1f2124" opacity="0.55"/>
-
-  <!-- Side hinges / ears -->
-  <rect x="208" y="408" width="40" height="140" rx="18" fill="url(#metal)"/>
-  <rect x="776" y="408" width="40" height="140" rx="18" fill="url(#metal)"/>
-
-  <!-- Neck plate -->
-  <rect x="440" y="720" width="144" height="40" rx="12" fill="url(#metal)"/>
-  <!-- Base shoulder bar -->
-  <rect x="360" y="756" width="304" height="36" rx="14" fill="url(#metal)"/>
+  <rect width="1024" height="1024" fill="#1f2124"/>
+  <text x="512" y="520" text-anchor="middle" fill="#d4a24e" font-size="48" font-family="system-ui">
+    See app-icon-source.png
+  </text>
 </svg>

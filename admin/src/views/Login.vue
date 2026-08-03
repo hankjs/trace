@@ -8,6 +8,7 @@ const username = ref('')
 const password = ref('')
 const error = ref('')
 const loading = ref(false)
+const faviconUrl = `${import.meta.env.BASE_URL}favicon.png`
 
 async function handleLogin() {
   if (!username.value || !password.value) return
@@ -34,7 +35,10 @@ async function handleLogin() {
 <template>
   <div class="min-h-screen flex items-center justify-center bg-surface">
     <div class="w-72">
-      <div class="text-sm font-medium text-text-secondary mb-8">Trace Admin</div>
+      <div class="flex items-center gap-2.5 mb-8">
+        <img :src="faviconUrl" alt="" width="28" height="28" class="rounded-[7px] shrink-0" />
+        <span class="text-sm font-medium text-text-secondary tracking-tight">Trace Admin</span>
+      </div>
 
       <form @submit.prevent="handleLogin" class="space-y-3">
         <input

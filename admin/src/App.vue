@@ -8,6 +8,8 @@ const route = useRoute()
 const router = useRouter()
 const { visible, generating, output, close, generate, confirm } = useAiGenerate()
 const aiPrompt = ref('')
+// 品牌标：public/favicon.png，经 base `/admin/` 提供
+const faviconUrl = `${import.meta.env.BASE_URL}favicon.png`
 
 const nav = [
   { to: '/', label: '概览', icon: '◫' },
@@ -49,7 +51,10 @@ function handleGenerate() {
   </div>
   <div v-else class="flex min-h-screen">
     <aside class="w-52 shrink-0 border-r border-border-subtle px-3 py-5 flex flex-col">
-      <div class="px-2 mb-5 text-sm font-medium text-text-secondary tracking-tight">Trace</div>
+      <div class="px-2 mb-5 flex items-center gap-2">
+        <img :src="faviconUrl" alt="" width="20" height="20" class="rounded-[5px] shrink-0" />
+        <span class="text-sm font-medium text-text-secondary tracking-tight">Trace</span>
+      </div>
       <nav class="flex flex-col gap-1 flex-1">
         <RouterLink
           v-for="item in nav"

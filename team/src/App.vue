@@ -18,7 +18,8 @@ function logout() {
   <div v-else class="min-h-screen flex flex-col">
     <header class="border-b border-border-subtle px-6 py-3 flex items-center justify-between">
       <div class="flex items-center gap-4">
-        <RouterLink to="/" class="text-sm font-medium text-text-secondary tracking-tight hover:text-text-primary">
+        <RouterLink to="/" class="flex items-center gap-2 text-sm font-medium text-text-secondary tracking-tight hover:text-text-primary">
+          <img src="/favicon.png" alt="" width="20" height="20" class="rounded-[5px] shrink-0" />
           Trace Team
         </RouterLink>
         <span class="text-[12px] text-text-tertiary">团队任务看板</span>
