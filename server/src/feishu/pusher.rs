@@ -30,7 +30,9 @@ const PROGRESS_CAP_RUNNING: u32 = 90;
 /// 起飞书进度 pusher。
 ///
 /// `task_title` 是用户本轮原话 / 闸门 goal / 团队任务标题等任务摘要；
-/// 参数已多，加到 9 个会触发 too_many_arguments——这是渠道上下文的直传，
+/// `existing_card_id` 为 router 已发的首响「已收到」卡 message_id，有则复用
+/// 同一张卡原地更新到运行中/终态，无则自己 `reply_card` 新建。
+/// 参数已多，加到 10 个会触发 too_many_arguments——这是渠道上下文的直传，
 /// 拆结构体收益不大，故 allow。
 #[allow(clippy::too_many_arguments)]
 pub fn spawn(
@@ -41,11 +43,21 @@ pub fn spawn(
     topic_id: String,
     session_id: String,
     task_title: String,
+    existing_card_id: Option<String>,
     in_thread: bool,
     rx: broadcast::Receiver<EventEntry>,
 ) {
     tokio::spawn(run(
-        state, api, message_id, chat_id, topic_id, session_id, task_title, in_thread, rx,
+        state,
+        api,
+        message_id,
+        chat_id,
+        topic_id,
+        session_id,
+        task_title,
+        existing_card_id,
+        in_thread,
+        rx,
     ));
 }
 
@@ -123,38 +135,43 @@ async fn run(
     topic_id: String,
     session_id: String,
     task_title: String,
+    existing_card_id: Option<String>,
     in_thread: bool,
     mut rx: broadcast::Receiver<EventEntry>,
 ) {
     // 标题算一次，四处 build_task_card 复用，避免各写一遍。
     let card_title = build_task_title(&task_title);
 
-    // 先回一张蓝色卡片；失败则退化为纯文本模式
-    let card_id = match api
-        .reply_card(
-            &message_id,
-            &build_task_card(&TaskCardOptions {
-                title: card_title.clone(),
-                status: TaskStatus::Running,
-                progress: 0,
-                detail: "正在启动执行引擎".to_string(),
-                activities: vec![],
-                footer: None,
-                actions: vec![],
-                session_id: session_id.clone(),
-                chat_id: chat_id.clone(),
-                topic_id: topic_id.clone(),
-            }),
-            in_thread,
-        )
-        .await
-    {
-        Ok(id) => Some(id),
-        Err(e) => {
-            tracing::warn!("feishu: reply card failed, fallback to text: {e:#}");
-            let _ = api.reply_text(&message_id, "已开始执行", in_thread).await;
-            None
+    let running_card = build_task_card(&TaskCardOptions {
+        title: card_title.clone(),
+        status: TaskStatus::Running,
+        progress: 0,
+        detail: "正在启动执行引擎".to_string(),
+        activities: vec![],
+        footer: None,
+        actions: vec![],
+        session_id: session_id.clone(),
+        chat_id: chat_id.clone(),
+        topic_id: topic_id.clone(),
+    });
+
+    // 复用 router 已发的首响卡（同一张卡从「已收到」原地更新到终态，
+    // 不给用户多发消息）；没有则退化为自己新建。
+    let card_id = match existing_card_id {
+        Some(id) => {
+            if let Err(e) = api.update_card(&id, &running_card).await {
+                tracing::warn!("feishu: update ack card to running failed: {e:#}");
+            }
+            Some(id)
         }
+        None => match api.reply_card(&message_id, &running_card, in_thread).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                tracing::warn!("feishu: reply card failed, fallback to text: {e:#}");
+                let _ = api.reply_text(&message_id, "已开始执行", in_thread).await;
+                None
+            }
+        },
     };
 
     let api_for_updates = api.clone();

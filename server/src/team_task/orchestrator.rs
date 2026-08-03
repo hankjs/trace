@@ -837,6 +837,7 @@ async fn spawn_role_pusher_if_possible(
         topic_id,
         task.session_id.clone(),
         task.title.clone(),
+        None, // 团队任务不经路由首响，无已有进度卡
         in_thread,
         event_rx,
     );

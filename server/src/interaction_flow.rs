@@ -615,6 +615,7 @@ async fn resume_task_gate(args: ResumeInteraction) -> Result<()> {
                     topic_id,
                     session_id,
                     task_title,
+                    None, // resume 不经路由 LLM，无首响卡
                     in_thread,
                     handle.event_rx,
                 );
@@ -983,6 +984,7 @@ async fn resume_interaction_on_session(args: ResumeInteraction) -> Result<()> {
                     topic_id,
                     session_id,
                     task_title,
+                    None, // resume 不经路由 LLM，无首响卡
                     in_thread,
                     handle.event_rx,
                 );

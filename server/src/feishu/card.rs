@@ -14,6 +14,9 @@ pub const CARD_UPDATE_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskStatus {
+    /// 已收到消息、正在判定任务类型（路由 Agent 分类中）。
+    /// 分类要调一次 LLM，实测可能 60~90s，必须先给用户反馈。
+    Received,
     Running,
     Success,
     Failed,
@@ -24,6 +27,7 @@ pub enum TaskStatus {
 impl TaskStatus {
     fn style(self) -> (&'static str, &'static str) {
         match self {
+            TaskStatus::Received => ("blue", "已收到"),
             TaskStatus::Running => ("blue", "运行中"),
             TaskStatus::Success => ("green", "已完成"),
             TaskStatus::Failed => ("red", "执行失败"),
@@ -119,30 +123,30 @@ pub fn build_task_card(opts: &TaskCardOptions) -> Value {
         )
     })];
     if !opts.actions.is_empty() {
+        // schema 2.0 的 update_card（PATCH /im/v1/messages/{id}）拒绝 `"tag":"action"`
+        // 容器：飞书报 230099 / 200861「cards of schema V2 no longer support this capability;
+        // unsupported tag action」。reply_card（POST 新建）校验较松，confirm 等仍走
+        // tag:action 且线上正常——本函数是唯一走 update_card 且带按钮的路径，
+        // 必须把 button 直接作为 body element 平铺，不要改回 tag:action。
         // 独立 action 名（task_detail / task_suggest），避免和交互单 answer 按钮混淆。
-        let buttons: Vec<Value> = opts
-            .actions
-            .iter()
-            .enumerate()
-            .map(|(i, a)| {
-                json!({
-                    "tag": "button",
-                    "text": { "tag": "plain_text", "content": a.label },
-                    "type": if i == 0 { "primary" } else { "default" },
-                    "behaviors": [{
-                        "type": "callback",
-                        "value": {
-                            "action": a.action,
-                            "action_id": a.action_id,
-                            "session_id": opts.session_id,
-                            "chat_id": opts.chat_id,
-                            "topic_id": opts.topic_id,
-                        }
-                    }]
-                })
-            })
-            .collect();
-        elements.push(json!({ "tag": "action", "actions": buttons }));
+        for (i, a) in opts.actions.iter().enumerate() {
+            elements.push(json!({
+                "tag": "button",
+                "text": { "tag": "plain_text", "content": a.label },
+                "type": if i == 0 { "primary" } else { "default" },
+                "width": "default",
+                "behaviors": [{
+                    "type": "callback",
+                    "value": {
+                        "action": a.action,
+                        "action_id": a.action_id,
+                        "session_id": opts.session_id,
+                        "chat_id": opts.chat_id,
+                        "topic_id": opts.topic_id,
+                    }
+                }]
+            }));
+        }
     }
 
     json!({
@@ -811,6 +815,7 @@ mod tests {
 
     #[test]
     fn task_card_with_actions() {
+        // schema 2.0 的 update_card 拒绝 tag:action（230099/200861），这里锁住不要改回去。
         let card = build_task_card(&TaskCardOptions {
             title: "任务 · 完成了".into(),
             status: TaskStatus::Success,
@@ -818,22 +823,61 @@ mod tests {
             detail: "执行完成".into(),
             activities: vec![],
             footer: None,
-            actions: vec![TaskCardAction {
-                label: "查看详情".into(),
-                action: "task_detail".into(),
-                action_id: "act-1".into(),
-            }],
+            actions: vec![
+                TaskCardAction {
+                    label: "查看详情".into(),
+                    action: "task_detail".into(),
+                    action_id: "act-1".into(),
+                },
+                TaskCardAction {
+                    label: "继续".into(),
+                    action: "task_suggest".into(),
+                    action_id: "act-2".into(),
+                },
+            ],
             session_id: "s1".into(),
             chat_id: "c1".into(),
             topic_id: "t1".into(),
         });
         let elements = card["body"]["elements"].as_array().unwrap();
-        assert_eq!(elements.len(), 2);
-        let btn = &elements[1]["actions"][0];
+        // markdown + 两个 button element（各占一行，无 action 容器）
+        assert_eq!(elements.len(), 3);
+        assert!(
+            elements.iter().all(|e| e["tag"] != "action"),
+            "body 不得出现 tag:action，update_card 会拒（230099/200861）"
+        );
+        let btn = &elements[1];
+        assert_eq!(btn["tag"], "button");
         assert_eq!(btn["behaviors"][0]["value"]["action"], "task_detail");
         assert_eq!(btn["behaviors"][0]["value"]["action_id"], "act-1");
         assert_eq!(btn["behaviors"][0]["value"]["session_id"], "s1");
         assert_eq!(btn["type"], "primary");
+        assert_eq!(elements[2]["tag"], "button");
+        assert_eq!(elements[2]["type"], "default");
+        assert_eq!(
+            elements[2]["behaviors"][0]["value"]["action"],
+            "task_suggest"
+        );
+    }
+
+    #[test]
+    fn task_card_received_status() {
+        let card = build_task_card(&TaskCardOptions {
+            title: "任务 · 测试".into(),
+            status: TaskStatus::Received,
+            progress: 0,
+            detail: "已收到，正在判断任务类型".into(),
+            activities: vec![],
+            footer: None,
+            actions: vec![],
+            session_id: String::new(),
+            chat_id: "c1".into(),
+            topic_id: "main".into(),
+        });
+        assert_eq!(card["header"]["template"], "blue");
+        let content = card["body"]["elements"][0]["content"].as_str().unwrap();
+        assert!(content.contains("已收到"));
+        assert!(content.contains("正在判断任务类型"));
     }
 
     #[test]

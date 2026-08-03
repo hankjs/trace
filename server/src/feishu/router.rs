@@ -7,7 +7,10 @@
 
 use crate::chat::{run_chat_turn, ChatTurnOpts};
 use crate::feishu::api::FeishuApi;
-use crate::feishu::card::{build_deployment_card, DeploymentCardOptions};
+use crate::feishu::card::{
+    build_deployment_card, build_task_card, build_task_title, DeploymentCardOptions,
+    TaskCardOptions, TaskStatus,
+};
 use crate::feishu::pusher;
 use crate::provider_registry;
 use crate::AppState;
@@ -1237,6 +1240,53 @@ async fn dispatch_task_content(
 ) -> Result<()> {
     let topic = msg.topic_id();
 
+    // 卡片标题：优先用 content 里的文本；纯图片等多模态块取不到文本时传空串，
+    // build_task_title 会回落「Agent 任务」。首响卡与 pusher 共用同一值，
+    // 必须在 content move 进 run_chat_turn 之前取。
+    let task_title: String = content
+        .iter()
+        .filter_map(|block| match block {
+            hank_provider::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // 新话题的路由分类要 60~90s，期间没有 session_id 可用于 try_acquire。
+    // 用话题 key 占位，避免用户重复发送时起第二个 run（线上实测会冒出两张卡）。
+    // try_acquire 接受任意字符串 key，这里与 session 级共用同一套 API。
+    let topic_key = format!("{}:{}:{}", account.id, msg.chat_id, topic);
+    let Some(topic_guard) = state.tasks.try_acquire(&topic_key).await else {
+        // 尚无 session_id，不能用 running_reply；固定文案即可。
+        api.reply_text(&msg.message_id, "上一条还在处理中，请稍候", msg.in_thread())
+            .await?;
+        return Ok(());
+    };
+
+    // 首响：路由 Agent 分类要调 LLM（实测 60~90s），必须先给用户可见反馈，
+    // 否则用户以为机器人没收到、重复发送 → 冒出多张卡片。
+    // 这张卡后续由 pusher 原地更新为运行中/终态，不新增消息。
+    // 发卡失败不阻断任务，退化为原有行为（pusher 自己新建）。
+    let ack_card_id = api
+        .reply_card(
+            &msg.message_id,
+            &build_task_card(&TaskCardOptions {
+                title: build_task_title(&task_title),
+                status: TaskStatus::Received,
+                progress: 0,
+                detail: "已收到，正在判断任务类型".to_string(),
+                activities: vec![],
+                footer: None,
+                actions: vec![],
+                session_id: String::new(), // 尚未有 session
+                chat_id: msg.chat_id.clone(),
+                topic_id: topic.clone(),
+            }),
+            msg.in_thread(),
+        )
+        .await
+        .ok();
+
     // 找/建 feishu_chats 映射的 session。任何初始化错误都要转成用户可见回复，
     // 不能只让 WS 后台任务记一条日志后静默结束。
     let session_result = match state
@@ -1263,7 +1313,10 @@ async fn dispatch_task_content(
     };
     let session_id = match session_result {
         Ok(Some(session_id)) => session_id,
-        Ok(None) => return Ok(()),
+        Ok(None) => {
+            // topic_guard Drop 释放；ack 卡可能仍在「已收到」，属快速路径放弃
+            return Ok(());
+        }
         Err(e) => {
             tracing::warn!("feishu: create session workspace failed: {e:#}");
             // 节点缺失、旧 server 会话等错误需要原文回传，不能吞成模糊提示。
@@ -1286,6 +1339,7 @@ async fn dispatch_task_content(
     // 只查 active_tasks 不够：run_chat_turn 要先做工作区准备/鉴权/git link 才登记，
     // 这段空窗（秒级）内到达的第二条消息会通过检查、起第二个并发 run（实测表现为
     // 同一话题冒出两张任务卡片）。所以先原子抢派发名额，拿不到就当作"在执行中"。
+    // 话题级占位在 session 级名额拿到后立刻释放，避免两层互相卡住。
     let dispatch_guard = state.tasks.try_acquire(&session_id).await;
     let Some(dispatch_guard) = dispatch_guard else {
         api.reply_text(
@@ -1296,6 +1350,9 @@ async fn dispatch_task_content(
         .await?;
         return Ok(());
     };
+    // 拿到 session 级名额后立刻释放话题级，后续并发由 session 级 + active_tasks 挡。
+    topic_guard.release().await;
+
     if state.active_tasks.read().await.contains_key(&session_id) {
         dispatch_guard.release().await;
         api.reply_text(
@@ -1350,16 +1407,6 @@ async fn dispatch_task_content(
         auth_token: jwt,
         extra_prompt_segments,
     };
-    // 卡片标题：优先用 content 里的文本；纯图片等多模态块取不到文本时传空串，
-    // build_task_title 会回落「Agent 任务」。必须在 content move 进 run_chat_turn 之前取。
-    let task_title: String = content
-        .iter()
-        .filter_map(|block| match block {
-            hank_provider::ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
     let turn = run_chat_turn(state, &session_id, content, opts).await;
     // run_chat_turn 返回时 active_tasks 已登记（或本轮启动失败），
     // 派发名额可以还了，后续并发由 active_tasks 继续挡。
@@ -1374,6 +1421,7 @@ async fn dispatch_task_content(
                 topic,
                 session_id.clone(),
                 task_title,
+                ack_card_id,
                 msg.in_thread(),
                 handle.event_rx,
             );
