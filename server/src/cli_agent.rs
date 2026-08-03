@@ -4,7 +4,7 @@ use crate::chat::{ChatTurnHandle, EventBuffer};
 use crate::AppState;
 use anyhow::{anyhow, bail, Context, Result};
 use code_agent::{AgentEvent, FileChange, FileChangeKind, RunStatus};
-use hank_db::{NewInteraction, NewTeamTask, Session};
+use hank_db::{AgentBackend, NewInteraction, NewTeamTask, Session};
 use hank_provider::ContentBlock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -224,14 +224,15 @@ pub(crate) const CLAUDE_EXTRA_ENV_KEYS: &[&str] = &[
 ];
 pub(crate) const CODEX_EXTRA_ENV_KEYS: &[&str] = &[];
 
-/// 返回后端允许的 auth_kind 与附加环境变量白名单，未知后端返回 None。
+/// 返回后端允许的 auth_kind 与附加环境变量白名单。
+/// grok / kimi 当前没有 admin 侧凭据校验，显式返回 None（与历史行为一致）。
 pub(crate) fn backend_env_whitelist(
-    backend: &str,
+    backend: AgentBackend,
 ) -> Option<(&'static [&'static str], &'static [&'static str])> {
     match backend {
-        "claude" => Some((CLAUDE_AUTH_KINDS, CLAUDE_EXTRA_ENV_KEYS)),
-        "codex" => Some((CODEX_AUTH_KINDS, CODEX_EXTRA_ENV_KEYS)),
-        _ => None,
+        AgentBackend::Claude => Some((CLAUDE_AUTH_KINDS, CLAUDE_EXTRA_ENV_KEYS)),
+        AgentBackend::Codex => Some((CODEX_AUTH_KINDS, CODEX_EXTRA_ENV_KEYS)),
+        AgentBackend::Grok | AgentBackend::Kimi => None,
     }
 }
 
@@ -270,7 +271,10 @@ struct CliAuth {
 /// 把 admin 存在库里的配置行翻译成 CliAuth。纯函数，不碰环境变量和数据库，
 /// 便于单测优先级与白名单过滤。返回 None 表示这行不可用（没有凭据），
 /// 调用方据此继续往下走 env / provider 兜底。
-fn auth_from_db_config(backend: &str, config: &hank_db::AgentCliProfileRecord) -> Option<CliAuth> {
+fn auth_from_db_config(
+    backend: AgentBackend,
+    config: &hank_db::AgentCliProfileRecord,
+) -> Option<CliAuth> {
     let api_key = config.api_key.trim();
     if api_key.is_empty() {
         return None;
@@ -291,15 +295,18 @@ fn auth_from_db_config(backend: &str, config: &hank_db::AgentCliProfileRecord) -
     if !base_url.is_empty() {
         match backend {
             // Codex 第三方端点通过命令行组装完整 custom Responses provider。
-            "codex" => auth.base_url = Some(base_url.to_string()),
-            _ => auth.env.push(("ANTHROPIC_BASE_URL", base_url.to_string())),
+            AgentBackend::Codex => auth.base_url = Some(base_url.to_string()),
+            // Grok/Kimi 当前 whitelist 返回 None 到不了这里；分支仅为穷尽并保持「非 codex 走 ANTHROPIC_BASE_URL」。
+            AgentBackend::Claude | AgentBackend::Grok | AgentBackend::Kimi => {
+                auth.env.push(("ANTHROPIC_BASE_URL", base_url.to_string()))
+            }
         }
     }
 
     let model = config.model.trim();
     if !model.is_empty() {
         auth.model = Some(model.to_string());
-        if backend == "claude" {
+        if backend == AgentBackend::Claude {
             // Claude 除了 --model 参数也读这个环境变量，保持与 env 文件路径一致。
             auth.env.push(("ANTHROPIC_MODEL", model.to_string()));
         }
@@ -327,6 +334,10 @@ pub async fn run_cli_turn(
     content: Vec<ContentBlock>,
     backend: &str,
 ) -> Result<ChatTurnHandle> {
+    // 边界处解析一次：DB / session metadata 的 wire 字符串 → 类型化后端。
+    // 不默认回落到 Codex——未知值说明数据损坏或版本不匹配，必须明确失败。
+    let backend = AgentBackend::parse(backend)
+        .ok_or_else(|| anyhow!("不支持的外部 Agent 后端: {backend}"))?;
     Uuid::parse_str(session_id).context("外部 Agent session_id 不是 UUID")?;
     let session = session.ok_or_else(|| anyhow!("外部 Agent 会话不存在"))?;
     let metadata = parse_metadata(session.metadata.as_deref());
@@ -396,14 +407,13 @@ pub async fn run_cli_turn(
 
     let state_task = state.clone();
     let session_id_task = session_id.to_string();
-    let backend = backend.to_string();
     let work_dir_task = work_dir.clone();
     tokio::spawn(async move {
         let result = execute_turn(
             &state_task,
             &session_id_task,
             &session,
-            &backend,
+            backend,
             &work_dir_task,
             &state_dir,
             git_link.as_ref(),
@@ -414,7 +424,7 @@ pub async fn run_cli_turn(
         )
         .await;
         if let Err(error) = result {
-            tracing::error!(session_id = %session_id_task, backend, "external agent failed: {error:#}");
+            tracing::error!(session_id = %session_id_task, %backend, "external agent failed: {error:#}");
             emit(
                 &state_task,
                 &session_id_task,
@@ -450,7 +460,7 @@ async fn run_remote_cli_turn(
     session_id: &str,
     session: Session,
     content: Vec<ContentBlock>,
-    backend: &str,
+    backend: AgentBackend,
     client_id: &str,
     agent_kind: &str,
 ) -> Result<ChatTurnHandle> {
@@ -461,7 +471,9 @@ async fn run_remote_cli_turn(
     if !crate::remote_exec::is_client_online(state, &user_id, client_id).await {
         bail!("绑定的 hank-cli 节点不在线；请在对应电脑启动 hank-cli 后重试");
     }
-    if !crate::remote_exec::client_reports_backend(state, &user_id, client_id, backend).await {
+    if !crate::remote_exec::client_reports_backend(state, &user_id, client_id, backend.as_str())
+        .await
+    {
         bail!(
             "绑定的 hank-cli 节点未上报 {backend} 能力；请检查本机 agent_backends 后重试，不会切换节点或回退 server"
         );
@@ -527,7 +539,6 @@ async fn run_remote_cli_turn(
 
     let state_task = state.clone();
     let session_id_task = session_id.to_string();
-    let backend = backend.to_string();
     let client_id = client_id.to_string();
     let agent_kind = agent_kind.to_string();
     tokio::spawn(async move {
@@ -535,7 +546,7 @@ async fn run_remote_cli_turn(
             &state_task,
             &session_id_task,
             &session,
-            &backend,
+            backend,
             &client_id,
             &user_id,
             &display_cwd,
@@ -547,7 +558,7 @@ async fn run_remote_cli_turn(
         )
         .await;
         if let Err(error) = result {
-            tracing::error!(session_id = %session_id_task, backend, "remote cli agent failed: {error:#}");
+            tracing::error!(session_id = %session_id_task, %backend, "remote cli agent failed: {error:#}");
             // execute_remote_turn 在落 assistant 消息 / 启动 agent_run 之前就可能失败，
             // 此时第二轮的闸门单还挂在 executing——不收尾它会永久卡住（重启兜底也只回收
             // pending/answered），且 active_task_gate_id 残留会污染后续轮次。
@@ -618,7 +629,7 @@ async fn execute_remote_turn(
     state: &Arc<AppState>,
     session_id: &str,
     session: &Session,
-    backend: &str,
+    backend: AgentBackend,
     client_id: &str,
     user_id: &str,
     work_dir: &str,
@@ -686,7 +697,7 @@ async fn execute_remote_turn_body(
     state: &Arc<AppState>,
     session_id: &str,
     session: &Session,
-    backend: &str,
+    backend: AgentBackend,
     client_id: &str,
     user_id: &str,
     work_dir: &str,
@@ -706,7 +717,7 @@ async fn execute_remote_turn_body(
             cwd: Some(work_dir.to_string()),
             model: format!("{backend}@hank-cli"),
             permission_mode: "client-workspace".to_string(),
-            tools: vec![backend.to_string()],
+            tools: vec![backend.as_str().to_string()],
         },
     )
     .await;
@@ -884,15 +895,15 @@ async fn execute_remote_turn_body(
         persist_thread_id(state, session_id, thread_id).await?;
     }
     let resolved_model = run_state.model.clone().unwrap_or_default();
-    if session.provider != backend || session.model != resolved_model {
+    if session.provider != backend.as_str() || session.model != resolved_model {
         if let Err(error) = state
             .db
-            .update_session_provider_model(session_id, backend, &resolved_model)
+            .update_session_provider_model(session_id, backend.as_str(), &resolved_model)
             .await
         {
             tracing::warn!(
                 session_id,
-                backend,
+                %backend,
                 "回写本机 Agent provider/model 失败: {error:#}"
             );
         }
@@ -1137,7 +1148,7 @@ async fn execute_remote_turn_body(
 async fn handle_remote_event(
     state: &Arc<AppState>,
     session_id: &str,
-    backend: &str,
+    backend: AgentBackend,
     auth: &CliAuth,
     event: serde_json::Value,
     run_state: &mut CliRunState,
@@ -1156,7 +1167,7 @@ async fn execute_turn(
     state: &Arc<AppState>,
     session_id: &str,
     session: &Session,
-    backend: &str,
+    backend: AgentBackend,
     work_dir: &Path,
     state_dir: &Path,
     git_link: Option<&GitLink>,
@@ -1170,7 +1181,7 @@ async fn execute_turn(
     // 未显式配置模型时只能先报后端名，等 CLI 首个事件自报模型后再回写 sessions.model。
     let display_model = match auth.model.as_deref() {
         Some(model) => format!("{backend}/{model}"),
-        None => backend.to_string(),
+        None => backend.as_str().to_string(),
     };
     emit(
         state,
@@ -1181,7 +1192,7 @@ async fn execute_turn(
             cwd: Some(work_dir.display().to_string()),
             model: display_model,
             permission_mode: "external-bwrap".to_string(),
-            tools: vec![backend.to_string()],
+            tools: vec![backend.as_str().to_string()],
         },
     )
     .await;
@@ -1312,15 +1323,15 @@ async fn execute_turn(
         .clone()
         .or_else(|| auth.model.clone())
         .unwrap_or_default();
-    if session.provider != backend || session.model != resolved_model {
+    if session.provider != backend.as_str() || session.model != resolved_model {
         if let Err(error) = state
             .db
-            .update_session_provider_model(session_id, backend, &resolved_model)
+            .update_session_provider_model(session_id, backend.as_str(), &resolved_model)
             .await
         {
             tracing::warn!(
                 session_id,
-                backend,
+                %backend,
                 "回写外部 Agent provider/model 失败: {error:#}"
             );
         }
@@ -1455,7 +1466,7 @@ struct CliCommand {
 
 fn build_command(
     state: &Arc<AppState>,
-    backend: &str,
+    backend: AgentBackend,
     work_dir: &Path,
     state_dir: &Path,
     git_link: Option<&GitLink>,
@@ -1464,9 +1475,12 @@ fn build_command(
 ) -> Result<CliCommand> {
     let cfg = &state.config.server_agent;
     let executable = match backend {
-        "codex" => Path::new(&cfg.agent_cli_root).join("codex/current/bin/codex"),
-        "claude" => Path::new(&cfg.agent_cli_root).join("claude/current/bin/claude"),
-        _ => bail!("不支持的外部 Agent 后端: {backend}"),
+        AgentBackend::Codex => Path::new(&cfg.agent_cli_root).join("codex/current/bin/codex"),
+        AgentBackend::Claude => Path::new(&cfg.agent_cli_root).join("claude/current/bin/claude"),
+        // server bubblewrap 路径历史上只支持 codex/claude 可执行文件；保留原错误文案。
+        AgentBackend::Grok | AgentBackend::Kimi => {
+            bail!("不支持的外部 Agent 后端: {backend}")
+        }
     };
     let mut launcher_environment = vec![
         ("HOME".to_string(), "/agent-home".to_string()),
@@ -1575,7 +1589,7 @@ fn build_command(
     command.arg(executable);
 
     match backend {
-        "codex" => {
+        AgentBackend::Codex => {
             if let Some(base_url) = auth.base_url.as_deref() {
                 for value in codex_provider_overrides(base_url)? {
                     command.args(["-c", &value]);
@@ -1613,7 +1627,7 @@ fn build_command(
                 command.arg("-");
             }
         }
-        "claude" => {
+        AgentBackend::Claude => {
             command.args([
                 "-p",
                 "--output-format",
@@ -1640,7 +1654,10 @@ fn build_command(
                 command.args(["--model", model]);
             }
         }
-        _ => unreachable!(),
+        // 上一段 executable match 已对 Grok/Kimi bail，理论上到不了这里。
+        AgentBackend::Grok | AgentBackend::Kimi => {
+            bail!("不支持的外部 Agent 后端: {backend}")
+        }
     }
     #[cfg(unix)]
     command.as_std_mut().process_group(0);
@@ -1679,7 +1696,7 @@ fn codex_provider_overrides(base_url: &str) -> Result<Vec<String>> {
 async fn handle_json_line(
     state: &Arc<AppState>,
     session_id: &str,
-    backend: &str,
+    backend: AgentBackend,
     auth: &CliAuth,
     line: &str,
     run: &mut CliRunState,
@@ -1687,16 +1704,18 @@ async fn handle_json_line(
     let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
         tracing::warn!(
             session_id,
-            backend,
+            %backend,
             "ignored malformed external agent JSONL"
         );
         return;
     };
+    // 穷尽 match：加后端时这里必须适配，禁止静默丢弃事件。
     match backend {
-        "codex" => handle_codex_event(state, session_id, auth, &value, run).await,
-        "claude" | "grok" => handle_claude_event(state, session_id, auth, &value, run).await,
-        "kimi" => handle_generic_event(state, session_id, auth, &value, run).await,
-        _ => {}
+        AgentBackend::Codex => handle_codex_event(state, session_id, auth, &value, run).await,
+        AgentBackend::Claude | AgentBackend::Grok => {
+            handle_claude_event(state, session_id, auth, &value, run).await
+        }
+        AgentBackend::Kimi => handle_generic_event(state, session_id, auth, &value, run).await,
     }
 }
 
@@ -2039,10 +2058,14 @@ async fn handle_claude_event(
     }
 }
 
-async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAuth> {
+async fn resolve_cli_auth(state: &Arc<AppState>, backend: AgentBackend) -> Result<CliAuth> {
     // 优先用 admin 在库里启用的那份配置，切换后下一轮任务即生效，不必重启 systemd。
     // 没有启用行或该行没填 key 时继续往下用环境文件兜底。
-    if let Ok(Some(config)) = state.db.get_active_agent_cli_profile(backend).await {
+    if let Ok(Some(config)) = state
+        .db
+        .get_active_agent_cli_profile(backend.as_str())
+        .await
+    {
         if let Some(auth) = auth_from_db_config(backend, &config) {
             return Ok(auth);
         }
@@ -2050,8 +2073,8 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
 
     let mut auth = CliAuth::default();
     let relevant_keys: &[&str] = match backend {
-        "codex" => &["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"],
-        "claude" => &[
+        AgentBackend::Codex => &["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"],
+        AgentBackend::Claude => &[
             "ANTHROPIC_API_KEY",
             "ANTHROPIC_AUTH_TOKEN",
             "CLAUDE_CODE_OAUTH_TOKEN",
@@ -2062,7 +2085,9 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
         ],
-        _ => bail!("不支持的外部 Agent 后端: {backend}"),
+        AgentBackend::Grok | AgentBackend::Kimi => {
+            bail!("不支持的外部 Agent 后端: {backend}")
+        }
     };
     for key in relevant_keys {
         if let Ok(value) = std::env::var(key) {
@@ -2082,14 +2107,15 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
         }
     }
     let has_runtime_key = match backend {
-        "codex" => auth.env.iter().any(|(key, _)| *key == "OPENAI_API_KEY"),
-        "claude" => auth.env.iter().any(|(key, _)| {
+        AgentBackend::Codex => auth.env.iter().any(|(key, _)| *key == "OPENAI_API_KEY"),
+        AgentBackend::Claude => auth.env.iter().any(|(key, _)| {
             matches!(
                 *key,
                 "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN" | "CLAUDE_CODE_OAUTH_TOKEN"
             )
         }),
-        _ => false,
+        // 上一段已对 Grok/Kimi bail，到不了这里；显式 false 仅为穷尽。
+        AgentBackend::Grok | AgentBackend::Kimi => false,
     };
     if has_runtime_key {
         return Ok(auth);
@@ -2099,16 +2125,16 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
     let provider = providers.into_iter().find(|provider| {
         provider.enabled
             && match backend {
-                "claude" => provider.provider_type == "anthropic",
-                "codex" => codex_provider_is_compatible(provider),
-                _ => false,
+                AgentBackend::Claude => provider.provider_type == "anthropic",
+                AgentBackend::Codex => codex_provider_is_compatible(provider),
+                AgentBackend::Grok | AgentBackend::Kimi => false,
             }
     });
     let provider = provider.ok_or_else(|| match backend {
-        "codex" => anyhow!(
+        AgentBackend::Codex => anyhow!(
             "codex 没有 Responses API 凭据：请在 admin 的「Agent CLI」页配置，或在 /opt/hank/agent-cli.env 配置 OPENAI_API_KEY 与兼容 Responses API 的 OPENAI_BASE_URL"
         ),
-        _ => anyhow!(
+        AgentBackend::Claude | AgentBackend::Grok | AgentBackend::Kimi => anyhow!(
             "{backend} 没有可用凭据：请在 admin 的「Agent CLI」页配置，或配置 /opt/hank/agent-cli.env 或启用对应 provider"
         ),
     })?;
@@ -2117,25 +2143,24 @@ async fn resolve_cli_auth(state: &Arc<AppState>, backend: &str) -> Result<CliAut
     }
     auth.model = Some(crate::provider_registry::resolve_default_model(&provider));
     match backend {
-        "codex" => {
+        AgentBackend::Codex => {
             auth.env.push(("OPENAI_API_KEY", provider.api_key));
             if !provider.base_url.trim().is_empty() {
                 auth.base_url = Some(provider.base_url);
             }
         }
-        "claude" => {
+        AgentBackend::Claude => {
             auth.env.push(("ANTHROPIC_API_KEY", provider.api_key));
             if !provider.base_url.trim().is_empty() {
                 auth.env.push(("ANTHROPIC_BASE_URL", provider.base_url));
             }
         }
-        _ => bail!("不支持的外部 Agent 后端: {backend}"),
+        AgentBackend::Grok | AgentBackend::Kimi => {
+            bail!("不支持的外部 Agent 后端: {backend}")
+        }
     }
     Ok(auth)
 }
-
-/// 外部 Agent 后端的固定优先级（新话题默认选择时使用）。
-const PREFERRED_EXTERNAL_BACKEND_ORDER: [&str; 4] = ["codex", "claude", "grok", "kimi"];
 
 /// 从「当前用户在线节点已上报的 backend 能力」中按固定优先级选默认外部 Agent。
 /// 只认 codex/claude/grok/kimi；未知值忽略。无可用能力时返回 None，由调用方走明确失败路径。
@@ -2143,41 +2168,45 @@ const PREFERRED_EXTERNAL_BACKEND_ORDER: [&str; 4] = ["codex", "claude", "grok", 
 /// 不读 server DB/env/provider 凭据：client-only 路径能否执行取决于本机 hank-cli 节点能力。
 pub(crate) fn preferred_backend_from_online_capabilities<'a>(
     available: impl IntoIterator<Item = &'a str>,
-) -> Option<&'static str> {
+) -> Option<AgentBackend> {
     let available: std::collections::HashSet<&str> = available
         .into_iter()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .collect();
-    PREFERRED_EXTERNAL_BACKEND_ORDER
+    AgentBackend::PREFERRED_ORDER
         .into_iter()
-        .find(|backend| available.contains(backend))
+        .find(|backend| available.contains(backend.as_str()))
 }
 
 /// 新话题未明确指定 CLI 时，优先选择当前用户在线 hank-cli 节点实际具备的后端。
-/// 无在线能力时返回 "codex" 作为确定失败路径（create_feishu_session 会报缺少对应节点）。
-pub(crate) async fn preferred_backend(state: &AppState, user_id: &str) -> &'static str {
+/// 无在线能力时返回 Codex 作为确定失败路径（create_feishu_session 会报缺少对应节点）。
+pub(crate) async fn preferred_backend(state: &AppState, user_id: &str) -> AgentBackend {
     // 探测在线节点实际具备的 backend；pick_online_agent_client 自身读 hub 读锁，线程安全。
     let mut available = Vec::new();
-    for backend in PREFERRED_EXTERNAL_BACKEND_ORDER {
-        if crate::remote_exec::pick_online_agent_client(state, user_id, backend)
+    for backend in AgentBackend::PREFERRED_ORDER {
+        if crate::remote_exec::pick_online_agent_client(state, user_id, backend.as_str())
             .await
             .is_some()
         {
-            available.push(backend);
+            available.push(backend.as_str());
         }
     }
     // 统一走 helper：codex → claude → grok → kimi；无能力时仍回落 codex 明确失败路径。
-    preferred_backend_from_online_capabilities(available).unwrap_or("codex")
+    preferred_backend_from_online_capabilities(available).unwrap_or(AgentBackend::Codex)
 }
 
 /// 计算某后端当前实际生效的凭据来源，供 admin 页展示「库里的配置是否真的在用」。
 /// 与 resolve_cli_auth 的优先级保持一致：库 → 环境文件 → provider 记录。
 pub(crate) async fn effective_auth_source(
     state: &Arc<AppState>,
-    backend: &str,
+    backend: AgentBackend,
 ) -> Option<AuthSource> {
-    if let Ok(Some(config)) = state.db.get_active_agent_cli_profile(backend).await {
+    if let Ok(Some(config)) = state
+        .db
+        .get_active_agent_cli_profile(backend.as_str())
+        .await
+    {
         if auth_from_db_config(backend, &config).is_some() {
             return Some(AuthSource::Db);
         }
@@ -2191,9 +2220,9 @@ pub(crate) async fn effective_auth_source(
     }
     let providers = state.db.list_providers_ordered().await.unwrap_or_default();
     let has_provider = providers.iter().any(|provider| match backend {
-        "claude" => provider.enabled && provider.provider_type == "anthropic",
-        "codex" => codex_provider_is_compatible(provider),
-        _ => false,
+        AgentBackend::Claude => provider.enabled && provider.provider_type == "anthropic",
+        AgentBackend::Codex => codex_provider_is_compatible(provider),
+        AgentBackend::Grok | AgentBackend::Kimi => false,
     });
     has_provider.then_some(AuthSource::Provider)
 }
@@ -2210,15 +2239,16 @@ fn codex_provider_is_compatible(provider: &hank_db::ProviderRecord) -> bool {
         )
 }
 
-async fn validate_runtime(state: &Arc<AppState>, backend: &str) -> Result<()> {
+async fn validate_runtime(state: &Arc<AppState>, backend: AgentBackend) -> Result<()> {
     let cfg = &state.config.server_agent;
+    // 注意：grok / kimi 历史上共用 codex 的状态目录与可执行文件名。这里保持原行为，
+    // 是否该各自独立目录属于行为变更，不在本次重构范围。
     let executable = Path::new(&cfg.agent_cli_root)
-        .join(backend)
+        .join(backend.as_str())
         .join("current/bin")
-        .join(if backend == "claude" {
-            "claude"
-        } else {
-            "codex"
+        .join(match backend {
+            AgentBackend::Claude => "claude",
+            AgentBackend::Codex | AgentBackend::Grok | AgentBackend::Kimi => "codex",
         });
     if !executable.is_file() {
         bail!("{backend} 尚未离线安装: {}", executable.display());
@@ -2447,7 +2477,7 @@ async fn finish_as_task_gate(
     session_id: &str,
     user_id: &str,
     client_id: &str,
-    backend: &str,
+    backend: AgentBackend,
     agent_kind: &str,
     user_text: &str,
     analysis: &str,
@@ -2510,7 +2540,7 @@ async fn finish_as_task_gate(
                 title: &title,
                 goal: Some(&goal),
                 analysis: Some(analysis),
-                backend,
+                backend: backend.as_str(),
                 exec_client_id: Some(client_id),
                 agent_kind,
                 account_id,
@@ -3345,23 +3375,23 @@ mod tests {
         // 本机只有 claude 时，即使 server 有 codex 凭据，也应选 claude。
         assert_eq!(
             preferred_backend_from_online_capabilities(["claude"]),
-            Some("claude")
+            Some(AgentBackend::Claude)
         );
         assert_eq!(
             preferred_backend_from_online_capabilities(["kimi", "claude", "grok"]),
-            Some("claude")
+            Some(AgentBackend::Claude)
         );
         assert_eq!(
             preferred_backend_from_online_capabilities(["kimi", "grok"]),
-            Some("grok")
+            Some(AgentBackend::Grok)
         );
         assert_eq!(
             preferred_backend_from_online_capabilities(["codex", "claude"]),
-            Some("codex")
+            Some(AgentBackend::Codex)
         );
         assert_eq!(
             preferred_backend_from_online_capabilities(["kimi"]),
-            Some("kimi")
+            Some(AgentBackend::Kimi)
         );
         assert_eq!(
             preferred_backend_from_online_capabilities(std::iter::empty::<&str>()),
@@ -3550,12 +3580,13 @@ mod tests {
     fn db_config_is_skipped_when_keyless() {
         let mut config = db_config("claude");
         config.api_key = "   ".to_string();
-        assert!(auth_from_db_config("claude", &config).is_none());
+        assert!(auth_from_db_config(AgentBackend::Claude, &config).is_none());
 
         config.api_key = "relay-secret".to_string();
-        assert!(auth_from_db_config("claude", &config).is_some());
-        // 未知后端不允许通过，避免注入到不存在的 CLI。
-        assert!(auth_from_db_config("gemini", &config).is_none());
+        assert!(auth_from_db_config(AgentBackend::Claude, &config).is_some());
+        // grok/kimi 无 admin 凭据白名单，与未知后端一样拒绝。
+        assert!(auth_from_db_config(AgentBackend::Grok, &config).is_none());
+        assert!(auth_from_db_config(AgentBackend::Kimi, &config).is_none());
     }
 
     /// 第三方 Anthropic 中转要 ANTHROPIC_AUTH_TOKEN，官方 key 要 ANTHROPIC_API_KEY，
@@ -3564,7 +3595,7 @@ mod tests {
     fn claude_auth_kind_selects_env_var_name() {
         let mut config = db_config("claude");
         config.auth_kind = "ANTHROPIC_AUTH_TOKEN".to_string();
-        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &config).expect("配置可用");
         assert!(auth
             .env
             .iter()
@@ -3573,12 +3604,12 @@ mod tests {
 
         // auth_kind 为空（历史行）时退回该后端第一个白名单变量。
         config.auth_kind = String::new();
-        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &config).expect("配置可用");
         assert!(auth.env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
 
         // 白名单外的变量名不被接受，回退到默认值而不是注入任意环境变量。
         config.auth_kind = "AWS_SECRET_ACCESS_KEY".to_string();
-        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &config).expect("配置可用");
         assert!(auth.env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
         assert!(!auth
             .env
@@ -3591,7 +3622,7 @@ mod tests {
     fn base_url_routing_differs_between_backends() {
         let mut codex = db_config("codex");
         codex.base_url = "https://relay.example.com/v1".to_string();
-        let auth = auth_from_db_config("codex", &codex).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Codex, &codex).expect("配置可用");
         assert_eq!(
             auth.base_url.as_deref(),
             Some("https://relay.example.com/v1")
@@ -3600,7 +3631,7 @@ mod tests {
 
         let mut claude = db_config("claude");
         claude.base_url = "https://relay.example.com".to_string();
-        let auth = auth_from_db_config("claude", &claude).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &claude).expect("配置可用");
         assert!(auth.base_url.is_none());
         assert!(auth.env.iter().any(
             |(key, value)| *key == "ANTHROPIC_BASE_URL" && value == "https://relay.example.com"
@@ -3618,7 +3649,7 @@ mod tests {
             "PATH": "/tmp/bin",
         })
         .to_string();
-        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &config).expect("配置可用");
         assert!(
             auth.env
                 .iter()
@@ -3636,7 +3667,7 @@ mod tests {
 
         // extra_env 是坏 JSON 时不应让整行失效，凭据仍要能用。
         config.extra_env = "not json".to_string();
-        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &config).expect("配置可用");
         assert!(auth.env.iter().any(|(key, _)| *key == "ANTHROPIC_API_KEY"));
     }
 
@@ -3646,7 +3677,7 @@ mod tests {
     fn db_model_populates_both_flag_and_env_for_claude() {
         let mut config = db_config("claude");
         config.model = "claude-opus-5".to_string();
-        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &config).expect("配置可用");
         assert_eq!(auth.model.as_deref(), Some("claude-opus-5"));
         assert!(auth
             .env
@@ -3656,7 +3687,7 @@ mod tests {
         // codex 只用 --model 参数，不注入 OPENAI_MODEL。
         let mut codex = db_config("codex");
         codex.model = "gpt-5.6".to_string();
-        let auth = auth_from_db_config("codex", &codex).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Codex, &codex).expect("配置可用");
         assert_eq!(auth.model.as_deref(), Some("gpt-5.6"));
         assert!(!auth.env.iter().any(|(key, _)| *key == "OPENAI_MODEL"));
     }
@@ -3665,7 +3696,7 @@ mod tests {
     #[test]
     fn db_sourced_secret_is_redacted_from_output() {
         let config = db_config("claude");
-        let auth = auth_from_db_config("claude", &config).expect("配置可用");
+        let auth = auth_from_db_config(AgentBackend::Claude, &config).expect("配置可用");
         let redacted = redact_secrets("error: bad key relay-secret", &auth);
         assert!(!redacted.contains("relay-secret"));
         assert!(redacted.contains("[redacted]"));

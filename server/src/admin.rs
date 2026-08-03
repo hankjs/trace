@@ -635,16 +635,17 @@ pub async fn list_agent_cli_configs(State(state): State<Arc<AppState>>) -> impl 
         Err(e) => return R::internal_error(e),
     };
     let mut views = Vec::new();
-    for backend in ["claude", "codex"] {
+    // 只检查 claude/codex：grok/kimi 没有 admin 侧凭据校验（历史行为保持）。
+    for backend in [hank_db::AgentBackend::Claude, hank_db::AgentBackend::Codex] {
         let Some((auth_kinds, extra_keys)) = crate::cli_agent::backend_env_whitelist(backend)
         else {
             continue;
         };
         views.push(AgentCliBackendView {
-            backend: backend.to_string(),
+            backend: backend.as_str().to_string(),
             profiles: stored
                 .iter()
-                .filter(|row| row.backend == backend)
+                .filter(|row| row.backend == backend.as_str())
                 .map(to_profile_view)
                 .collect(),
             effective_source: crate::cli_agent::effective_auth_source(&state, backend).await,
@@ -663,6 +664,9 @@ fn validate_profile_fields(
     model: Option<&str>,
     extra_env: Option<serde_json::Value>,
 ) -> Result<(&'static str, String, String, String), String> {
+    let Some(backend) = hank_db::AgentBackend::parse(backend) else {
+        return Err(format!("不支持的外部 Agent 后端: {backend}"));
+    };
     let Some((auth_kinds, extra_keys)) = crate::cli_agent::backend_env_whitelist(backend) else {
         return Err(format!("不支持的外部 Agent 后端: {backend}"));
     };
@@ -900,7 +904,10 @@ pub async fn deactivate_agent_cli_profiles(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     Path(backend): Path<String>,
 ) -> impl IntoResponse {
-    if crate::cli_agent::backend_env_whitelist(&backend).is_none() {
+    let Some(parsed) = hank_db::AgentBackend::parse(&backend) else {
+        return R::bad_request(format!("不支持的外部 Agent 后端: {backend}"));
+    };
+    if crate::cli_agent::backend_env_whitelist(parsed).is_none() {
         return R::bad_request(format!("不支持的外部 Agent 后端: {backend}"));
     }
     if let Err(e) = state.db.deactivate_agent_cli_profiles(&backend).await {
@@ -923,16 +930,17 @@ async fn fetch_endpoint_models(
     api_key: &str,
     backend: &str,
 ) -> Vec<String> {
+    let is_claude = hank_db::AgentBackend::parse(backend) == Some(hank_db::AgentBackend::Claude);
     // 路径要和推理请求保持一致：claude 的 base 不含 /v1（推理走 {base}/v1/messages），
     // codex 的 base 已含 /v1（推理走 {base}/responses）。
-    let url = if backend == "claude" {
+    let url = if is_claude {
         format!("{base}/v1/models")
     } else {
         format!("{base}/models")
     };
     let request = client.get(url);
     // Anthropic 用 x-api-key，OpenAI 兼容端点用 Bearer；中转通常两者都收，各按本协议发。
-    let request = if backend == "claude" {
+    let request = if is_claude {
         request
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
@@ -987,7 +995,8 @@ pub async fn test_agent_cli_profile(
     };
     let api_key = config.api_key.trim();
     let base_url = config.base_url.trim().trim_end_matches('/');
-    let is_claude = config.backend == "claude";
+    let is_claude =
+        hank_db::AgentBackend::parse(&config.backend) == Some(hank_db::AgentBackend::Claude);
     let base = if !base_url.is_empty() {
         base_url
     } else if is_claude {

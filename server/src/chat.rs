@@ -215,7 +215,7 @@ pub async fn run_chat_turn(
         .unwrap_or("native");
     // 外部代码 Agent：client-only 会话在 cli_agent 内强制 remote agent_run；
     // server bubblewrap 路径仅保留兼容，飞书不再创建。
-    if matches!(agent_backend, "codex" | "claude" | "grok" | "kimi") {
+    if hank_db::AgentBackend::parse(agent_backend).is_some() {
         return crate::cli_agent::run_cli_turn(
             state,
             &session_id,

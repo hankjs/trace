@@ -354,11 +354,11 @@ pub async fn register_client(
 }
 
 fn sanitize_agent_backends(backends: Vec<String>) -> Vec<String> {
-    const ALLOWED: [&str; 4] = ["codex", "claude", "grok", "kimi"];
+    // 白名单唯一来源是 AgentBackend::ALL，不再各自维护一份清单。
     let mut clean = Vec::new();
     for backend in backends {
         let backend = backend.trim().to_ascii_lowercase();
-        if ALLOWED.contains(&backend.as_str()) && !clean.contains(&backend) {
+        if hank_db::AgentBackend::parse(&backend).is_some() && !clean.contains(&backend) {
             clean.push(backend);
         }
     }

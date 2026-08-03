@@ -247,6 +247,10 @@ impl AgentKind {
     }
 }
 
+/// 路由 Agent 对新话题选择的执行后端。
+///
+/// 比 `hank_db::AgentBackend` 多一个 `Native`：表示走 server 内建 Agent（无外部 CLI）。
+/// 外部变体的 wire 字符串委托给 `hank_db::AgentBackend`，避免再维护一份清单。
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AgentBackend {
@@ -258,22 +262,30 @@ enum AgentBackend {
 }
 
 impl AgentBackend {
-    fn as_str(self) -> &'static str {
+    /// 转成跨模块的外部后端类型；Native 无对应值（它不是外部 CLI）。
+    fn external(self) -> Option<hank_db::AgentBackend> {
         match self {
-            Self::Native => "native",
-            Self::Codex => "codex",
-            Self::Claude => "claude",
-            Self::Grok => "grok",
-            Self::Kimi => "kimi",
+            Self::Native => None,
+            Self::Codex => Some(hank_db::AgentBackend::Codex),
+            Self::Claude => Some(hank_db::AgentBackend::Claude),
+            Self::Grok => Some(hank_db::AgentBackend::Grok),
+            Self::Kimi => Some(hank_db::AgentBackend::Kimi),
         }
     }
 
-    fn preferred(value: &str) -> Self {
-        match value {
-            "claude" => Self::Claude,
-            "grok" => Self::Grok,
-            "kimi" => Self::Kimi,
-            _ => Self::Codex,
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            other => other.external().expect("非 Native 必有外部值").as_str(),
+        }
+    }
+
+    fn from_external(backend: hank_db::AgentBackend) -> Self {
+        match backend {
+            hank_db::AgentBackend::Codex => Self::Codex,
+            hank_db::AgentBackend::Claude => Self::Claude,
+            hank_db::AgentBackend::Grok => Self::Grok,
+            hank_db::AgentBackend::Kimi => Self::Kimi,
         }
     }
 }
@@ -1014,7 +1026,7 @@ async fn handle_command(
 /// 仍走本机节点；开启时仅额外允许 native conversation 使用 server 侧无工具会话。
 async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTopicDecision {
     let default_backend =
-        AgentBackend::preferred(crate::cli_agent::preferred_backend(state, user_id).await);
+        AgentBackend::from_external(crate::cli_agent::preferred_backend(state, user_id).await);
     let server_agent_enabled = state.config.server_agent.enabled;
     // quant_a2a 关闭时路由 prompt 不得出现 quant_research，避免模型凭常识乱猜该类型。
     let quant_enabled = state.config.quant_a2a.as_ref().is_some_and(|c| c.enabled);
@@ -1532,7 +1544,7 @@ fn archive_account_name(account: &FeishuAccount) -> &str {
 }
 
 fn is_external_agent_backend(backend: &str) -> bool {
-    matches!(backend, "codex" | "claude" | "grok" | "kimi")
+    hank_db::AgentBackend::parse(backend).is_some()
 }
 
 fn parse_session_metadata_json(metadata: &str) -> Option<serde_json::Value> {
