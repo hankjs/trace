@@ -1073,6 +1073,8 @@ Authorization: Bearer <user_jwt>
   "codes": [],
   "layers": 10,
   "rebalance": "weekly",
+  "neutralize": ["industry", "market_cap"],
+  "horizons": [1, 5, 10, 20],
   "confirmed": true,
   "client_request_id": "<optional>"
 }
@@ -1085,6 +1087,8 @@ Authorization: Bearer <user_jwt>
 | `pool_id` / `codes` | 可选限定股票池（互斥规则同 `_prepare_backtest`）；缺省 = 全 A 可交易域（剔除 ST / 停牌 / 上市不足 60 日，口径在 artifact `universe.filters` 回显） |
 | `layers` | 分层数，默认 10，硬上限 **10**（clamp） |
 | `rebalance` | `weekly`（默认）/ `monthly` |
+| `neutralize` | 可选截面中性化维度子集：`industry`（`quant_stock.industry` 哑变量）/ `market_cap`（PIT 总市值取 log）。开启后 **IC、分层、多空、换手全部基于回归残差**；非法值直接报错。缺省 = 裸 IC，口径在 artifact `neutralization` 回显 |
+| `horizons` | 可选前瞻期（交易日）列表，默认 `[1,5,10,20]`，每个 1..60，最多 6 个；传 `[]` 关闭衰减计算。仅影响 `ic_decay`，主 IC 仍按调仓间隔计算 |
 | `confirmed` | 必须 `true`（§5.4） |
 | `client_request_id` | 可选幂等键，语义同 §8.4 |
 
@@ -1096,7 +1100,30 @@ Authorization: Bearer <user_jwt>
   "factor_key": "mom_20",
   "universe": { "size": 5100, "filters": ["st", "suspended", "lt_60d"] },
   "window": { "start": "2024-01-01", "end": "2025-12-31", "rebalance": "weekly" },
-  "ic": { "ic_mean": 0.031, "icir": 0.42, "rank_ic_mean": 0.045, "positive_ratio": 0.57, "n_periods": 96 },
+  "ic": {
+    "ic_mean": 0.031, "icir": 0.42, "icir_annual": 3.03,
+    "rank_ic_mean": 0.045, "rank_icir": 0.51,
+    "positive_ratio": 0.57, "n_periods": 96,
+    "ic_t_stat": 2.41, "ic_p_value": 0.0159,
+    "rank_ic_t_stat": 2.88, "rank_ic_p_value": 0.004,
+    "t_stat_method": "newey_west_normal_approx"
+  },
+  "ic_decay": [
+    { "horizon_days": 1, "ic_mean": 0.031, "rank_ic_mean": 0.045, "icir": 0.42, "ic_t_stat": 2.41, "ic_p_value": 0.0159, "n_periods": 96 },
+    { "horizon_days": 20, "ic_mean": 0.008, "rank_ic_mean": 0.011, "icir": 0.09, "ic_t_stat": 0.61, "ic_p_value": 0.5418, "n_periods": 92 }
+  ],
+  "neutralization": {
+    "modes": ["industry", "market_cap"],
+    "applied_periods": 96,
+    "total_periods": 96,
+    "note": "IC/分层/多空均基于截面回归残差"
+  },
+  "multiplicity": {
+    "n_tests_estimated": 8, "n_prior_evaluations": 1, "n_horizons": 4,
+    "lookback_days": 30, "alpha": 0.05, "bonferroni_alpha": 0.00625,
+    "best_p_value": 0.004, "survives_bonferroni": true,
+    "disclaimer": "..."
+  },
   "layers": [
     { "layer": 1, "annual_return": 0.21, "excess": 0.09 },
     { "layer": 10, "annual_return": -0.04, "excess": -0.16 }
@@ -1114,8 +1141,21 @@ Authorization: Bearer <user_jwt>
 | 执行模型 | 长任务：A2A Task ↔ `quant_task`；与回测共用互斥槽、日配额（计 1 次）、Cancel 检查点（§4.5 / §4.6） |
 | 授权 | `can_client` |
 | 落库 | 评估结果落 **`quant_factor_evaluation`** 表（可复现、可复查；REST 读端点同期提供，看板可展示） |
-| 话术边界 | 结果为**历史样本内统计**；artifact 强制带 `n_periods` / 覆盖率；Orchestrator 摘要须带样本期与多重检验提示（§10.2 #12），禁止表述为「未来持续有效」 |
-| 多重检验 | 同一 factor 反复 evaluate 计入 multiplicity 提示（与 experiment multiplicity 同源口径）；agent 不得靠穷举表达式「刷」出高 IC 后只报喜 |
+| 话术边界 | 结果为**历史样本内统计**；artifact 强制带 `n_periods` / 覆盖率；Orchestrator 摘要须带样本期、中性化口径、IC t 值与多重检验提示（§10.2 #12 / #17-20），禁止表述为「未来持续有效」 |
+| 多重检验 | `multiplicity` 按「本次 horizon 数 × (近 30 天该账号已完成评估数 + 1)」估算累计检验次数并给 Bonferroni 阈值；`survives_bonferroni=false` 时 Orchestrator 必须明说未通过校正。agent 不得靠穷举表达式「刷」出高 IC 后只报喜 |
+| 显著性口径 | IC 序列有自相关，t 值走 **Newey-West**（滞后阶 `floor(4*(n/100)^(2/9))`），p 值用正态近似；`n_periods < 6` 时 t/p 返回 `null` 而非硬算 |
+| 中性化口径 | 行业哑变量丢弃一列作基准组，空行业单独归类；市值缺失按截面中位数补后取 log。最小二乘解不出（奇异/样本 < 5）时按未中性化处理，并体现在 `neutralization.applied_periods < total_periods` |
+
+#### 8.13a `factor.evaluation_list` / `factor.evaluation_get`（只读）
+
+多轮因子提炼的记忆面，与 `experiment.list` / `backtest.list` 同级定位：没有它，agent 跑完一次评估后只能靠对话上下文记住 `evaluation_id`，一压缩就丢，横向对比无从谈起。
+
+| skill | payload | artifact | 说明 |
+|-------|---------|----------|------|
+| `factor.evaluation_list` | `factor_key?` / `status?` / `limit`(默认 20，上限 50) / `before_id?` | `factor_evaluation_list = { items, has_more, note }` | items 为**摘要**：IC 头部指标、`ic_t_stat` / `ic_p_value`、中性化口径、horizons、`survives_bonferroni`。不含分层收益与衰减明细——列 20 条全量会吃光 agent 上下文 |
+| `factor.evaluation_get` | `evaluation_id`（必填） | `factor_evaluation = { ...详情 }` | 全量 result（分层、`ic_decay`、`multiplicity`） |
+
+规则：两者均 `can_client`、**非高成本**（不走确认闸门，否则多轮对比每次都要用户点同意）、只返回本人行（他人 id 按不存在处理，防探测）。REST 侧 `GET /api/factors/evaluations[/{id}]` 与之共用 `app/factors/listing.py`，避免口径漂移。
 
 ---
 
@@ -1267,6 +1307,8 @@ Task working → artifact* → completed → close
 | `quant_validate_factor` | `factor.validate` | 否 |
 | `quant_preview_factor` | `factor.preview` | 否 |
 | `quant_evaluate_factor` | `factor.evaluate` | **是** |
+| `quant_list_factor_evaluations` | `factor.evaluation_list` | 否 |
+| `quant_get_factor_evaluation` | `factor.evaluation_get` | 否 |
 | `quant_save_factor_draft` | `factor.save_draft` | 否（admin） |
 | `quant_gap_summary` | `system.gap_summary` | 否 |
 | `quant_report_finding` | `system.report_finding` | 否 |

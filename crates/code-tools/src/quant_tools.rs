@@ -12,7 +12,7 @@ use crate::quant_grant::QuantGrantStore;
 /// 高成本 quant 工具执行超时（回测 / trial / 因子评估可能持续数分钟）。
 const QUANT_LONG_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// 一次性构造全部 19 个 `quant_*` 工具。
+/// 一次性构造全部 21 个 `quant_*` 工具。
 pub fn quant_tools(
     base_url: impl Into<String>,
     token: impl Into<String>,
@@ -365,7 +365,7 @@ pub fn quant_tools(
             ToolSpec {
                 tool_name: "quant_evaluate_factor",
                 skill: "factor.evaluate",
-                description: "全市场（或指定池）因子有效性评估：IC/RankIC/ICIR/分层多空收益。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
+                description: "全市场（或指定池）因子有效性评估：IC/RankIC/ICIR（含 Newey-West t 值）、IC 衰减曲线、分层多空收益与多重检验提示。建议始终传 neutralize:[\"industry\",\"market_cap\"]——裸 IC 混着行业与市值暴露，低 PE 类因子的 IC 往往主要来自行业效应。模型应直接调用，系统确认闸门会自动暂停并询问用户，不要先调用 ask_user。",
                 input_schema: json!({
                     "type": "object",
                     "properties": {
@@ -377,6 +377,16 @@ pub fn quant_tools(
                         "codes": { "type": "array", "items": { "type": "string" } },
                         "layers": { "type": "integer", "description": "默认 10，最大 10" },
                         "rebalance": { "type": "string", "enum": ["weekly", "monthly"], "description": "默认 weekly" },
+                        "neutralize": {
+                            "type": "array",
+                            "items": { "type": "string", "enum": ["industry", "market_cap"] },
+                            "description": "截面中性化维度。开启后 IC/分层/多空全部基于回归残差；省略为裸 IC，结论必须声明含行业与市值暴露。"
+                        },
+                        "horizons": {
+                            "type": "array",
+                            "items": { "type": "integer" },
+                            "description": "前瞻期（交易日）列表，用于 IC 衰减曲线，默认 [1,5,10,20]，每个 1..60，最多 6 个。传 [] 关闭衰减计算。"
+                        },
                         "confirmed": { "type": "boolean", "description": "由拦截层注入，模型勿填" },
                         "client_request_id": { "type": "string" }
                     },
@@ -392,7 +402,64 @@ pub fn quant_tools(
                 let start = input["start"].as_str().unwrap_or("?");
                 let end = input["end"].as_str().unwrap_or("?");
                 let layers = input["layers"].as_u64().unwrap_or(10);
-                format!("评估因子 {}，区间 {} ~ {}，{} 层分层", key, start, end, layers)
+                let neutral = input["neutralize"]
+                    .as_array()
+                    .filter(|a| !a.is_empty())
+                    .map(|a| {
+                        let modes: Vec<&str> = a.iter().filter_map(|v| v.as_str()).collect();
+                        format!("，中性化 {}", modes.join("+"))
+                    })
+                    .unwrap_or_else(|| "，未中性化".to_string());
+                format!(
+                    "评估因子 {}，区间 {} ~ {}，{} 层分层{}",
+                    key, start, end, layers, neutral
+                )
+            },
+        ),
+        mk(
+            ToolSpec {
+                tool_name: "quant_list_factor_evaluations",
+                skill: "factor.evaluation_list",
+                description: "列出本人历史因子评估（摘要：IC 头部指标、t 值、中性化口径、前瞻期）。多轮提炼必须用它做横向对比，不要靠对话记忆回忆上一轮跑了什么。",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "factor_key": { "type": ["string", "null"], "description": "按因子 key 过滤，可选" },
+                        "status": { "type": "string", "enum": ["running", "done", "failed", "cancelled"] },
+                        "limit": { "type": "integer", "description": "默认 20，最大 50" },
+                        "before_id": { "type": ["integer", "string", "null"], "description": "游标分页" }
+                    }
+                }),
+                high_cost: false,
+                artifact_name: "factor_evaluation_list",
+            },
+            |input| match input["factor_key"].as_str() {
+                Some(key) => format!("列出因子 {} 的历史评估", key),
+                None => "列出历史因子评估".to_string(),
+            },
+        ),
+        mk(
+            ToolSpec {
+                tool_name: "quant_get_factor_evaluation",
+                skill: "factor.evaluation_get",
+                description: "按 evaluation_id 取单次因子评估详情（含分层收益、IC 衰减曲线与多重检验报告）。",
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "evaluation_id": { "type": ["integer", "string"], "description": "评估 ID" }
+                    },
+                    "required": ["evaluation_id"]
+                }),
+                high_cost: false,
+                artifact_name: "factor_evaluation",
+            },
+            |input| {
+                let id = input["evaluation_id"]
+                    .as_i64()
+                    .map(|v| v.to_string())
+                    .or_else(|| input["evaluation_id"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "?".to_string());
+                format!("查看因子评估 {}", id)
             },
         ),
         mk(
@@ -948,6 +1015,62 @@ mod tests {
             assert!(tool.description().contains("模型应直接调用"), "{name}");
             assert!(tool.description().contains("不要先调用 ask_user"), "{name}");
         }
+    }
+
+    #[test]
+    fn test_factor_evaluation_read_tools_are_registered_and_low_cost() {
+        let tools = quant_tools(
+            "http://x",
+            "token",
+            "s1",
+            "trace_chat",
+            Arc::new(QuantGrantStore::new()),
+        );
+        // 只读记忆面不得走确认闸门,否则多轮对比每次都要用户点同意
+        for name in [
+            "quant_list_factor_evaluations",
+            "quant_get_factor_evaluation",
+        ] {
+            let tool = tools.iter().find(|tool| tool.name() == name).unwrap();
+            assert!(
+                !tool.description().contains("模型应直接调用"),
+                "{name} 不该带高成本话术"
+            );
+        }
+        let get = tools
+            .iter()
+            .find(|tool| tool.name() == "quant_get_factor_evaluation")
+            .unwrap();
+        assert_eq!(
+            get.input_schema()["required"],
+            json!(["evaluation_id"]),
+        );
+    }
+
+    #[test]
+    fn test_evaluate_factor_exposes_neutralize_and_horizons() {
+        let tools = quant_tools(
+            "http://x",
+            "token",
+            "s1",
+            "trace_chat",
+            Arc::new(QuantGrantStore::new()),
+        );
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name() == "quant_evaluate_factor")
+            .unwrap();
+        let schema = tool.input_schema();
+        assert_eq!(
+            schema["properties"]["neutralize"]["items"]["enum"],
+            json!(["industry", "market_cap"]),
+        );
+        assert!(schema["properties"]["horizons"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("最多 6 个"));
+        // 描述必须提示默认中性化,否则模型大概率省略该参数拿裸 IC 下结论
+        assert!(tool.description().contains("neutralize"));
     }
 
     #[test]

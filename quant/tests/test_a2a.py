@@ -180,7 +180,10 @@ def test_agent_card_is_public(client):
     assert card["protocolVersion"] == "0.3"
     assert card["capabilities"]["streaming"] is True
     assert card["capabilities"]["pushNotifications"] is False
-    assert len(card["skills"]) == 19
+    # Card 必须与注册表严格一致:少一个 skill 就是 agent 发现不到的能力
+    from app.a2a.skills import SKILL_IDS
+    assert {s["id"] for s in card["skills"]} == set(SKILL_IDS)
+    assert len(card["skills"]) == len(SKILL_IDS)
 
 
 def test_missing_jwt_returns_failed_task(client):
@@ -477,6 +480,136 @@ def test_factor_save_draft_rejects_enabled_true(client):
     )
     assert _state(result) == "failed"
     assert "enabled:true" in _fail_text(result)
+
+
+def _seed_evaluation(client, *, user_id: str, factor_key: str, status: str = "done"):
+    """直接落一行评估,用于只读 skill 测试(不跑真实评估)。"""
+    from app.models import FactorEvaluation
+
+    with app_db.SessionLocal() as db:
+        row = FactorEvaluation(
+            user_id=user_id,
+            factor_key=factor_key,
+            expression=None,
+            expression_hash="hash-1",
+            start=date(2024, 1, 2),
+            end=date(2024, 3, 29),
+            layers=10,
+            rebalance="weekly",
+            neutralize=["industry"],
+            horizons=[1, 5],
+            universe={"size": 300, "filters": ["st"]},
+            status=status,
+            result={
+                "ic": {
+                    "ic_mean": 0.031,
+                    "rank_ic_mean": 0.028,
+                    "icir": 0.42,
+                    "ic_t_stat": 2.4,
+                    "ic_p_value": 0.0164,
+                    "n_periods": 12,
+                },
+                "ic_decay": [
+                    {"horizon_days": 1, "ic_mean": 0.031, "n_periods": 12},
+                    {"horizon_days": 5, "ic_mean": 0.019, "n_periods": 11},
+                ],
+                "multiplicity": {"survives_bonferroni": False},
+                "layers": [{"layer": 1, "total_return": -0.02}],
+            },
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return row.id
+
+
+def test_factor_evaluation_list_returns_summary_only(client):
+    eval_id = _seed_evaluation(client, user_id="user-a", factor_key="mom_20")
+    result = _send(
+        client, _token(CLIENT_CLAIMS), "factor.evaluation_list", {"limit": 10},
+    )
+    assert _state(result) == "completed"
+    listing = _artifact_data(result, name="factor_evaluation_list")[
+        "factor_evaluation_list"
+    ]
+    assert listing["has_more"] is False
+    assert len(listing["items"]) == 1
+    item = listing["items"][0]
+    assert item["id"] == eval_id
+    assert item["factor_key"] == "mom_20"
+    assert item["neutralize"] == ["industry"]
+    assert item["horizons"] == [1, 5]
+    assert item["ic"]["ic_t_stat"] == 2.4
+    assert item["survives_bonferroni"] is False
+    # layers 是分层数口径,应保留;但分层收益/衰减明细与 result 全量不进摘要,
+    # 否则 agent 列 20 条历史就把上下文吃光
+    assert item["layers"] == 10
+    assert "result" not in item
+    assert "ic_decay" not in item
+    assert "long_short" not in item
+
+
+def test_factor_evaluation_list_filters_by_factor_key(client):
+    _seed_evaluation(client, user_id="user-a", factor_key="mom_20")
+    _seed_evaluation(client, user_id="user-a", factor_key="rev_5")
+    result = _send(
+        client,
+        _token(CLIENT_CLAIMS),
+        "factor.evaluation_list",
+        {"factor_key": "rev_5"},
+    )
+    listing = _artifact_data(result, name="factor_evaluation_list")[
+        "factor_evaluation_list"
+    ]
+    assert [i["factor_key"] for i in listing["items"]] == ["rev_5"]
+
+
+def test_factor_evaluation_get_returns_full_result(client):
+    eval_id = _seed_evaluation(client, user_id="user-a", factor_key="mom_20")
+    result = _send(
+        client,
+        _token(CLIENT_CLAIMS),
+        "factor.evaluation_get",
+        {"evaluation_id": eval_id},
+    )
+    assert _state(result) == "completed"
+    detail = _artifact_data(result, name="factor_evaluation")["factor_evaluation"]
+    assert detail["id"] == eval_id
+    assert detail["result"]["ic_decay"][1]["horizon_days"] == 5
+    assert detail["result"]["layers"]
+
+
+def test_factor_evaluation_get_hides_other_users_rows(client):
+    """他人评估按不存在处理,避免 id 探测。"""
+    eval_id = _seed_evaluation(client, user_id="user-b", factor_key="mom_20")
+    result = _send(
+        client,
+        _token(CLIENT_CLAIMS),
+        "factor.evaluation_get",
+        {"evaluation_id": eval_id},
+    )
+    assert _state(result) == "failed"
+    assert "不存在" in _fail_text(result)
+
+
+def test_factor_evaluation_get_requires_evaluation_id(client):
+    result = _send(
+        client, _token(CLIENT_CLAIMS), "factor.evaluation_get", {},
+    )
+    assert _state(result) == "failed"
+    assert "evaluation_id" in _fail_text(result)
+
+
+def test_factor_evaluation_list_is_not_high_cost(client):
+    """只读 skill 不得走确认闸门,否则多轮对比每次都要用户点同意。"""
+    from app.a2a.tasks import HIGH_COST_SKILLS
+
+    assert "factor.evaluation_list" not in HIGH_COST_SKILLS
+    assert "factor.evaluation_get" not in HIGH_COST_SKILLS
+    result = _send(
+        client, _token(CLIENT_CLAIMS), "factor.evaluation_list", {},
+    )
+    assert _state(result) == "completed"
 
 
 def test_report_finding_dedups_and_limits_batch(client):

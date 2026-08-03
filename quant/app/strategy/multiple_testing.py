@@ -64,4 +64,45 @@ def multiplicity_report(
     }
 
 
-__all__ = ["multiplicity_report"]
+def factor_multiplicity_report(
+    *,
+    n_prior_evaluations: int,
+    n_horizons: int,
+    best_p_value: float | None,
+    lookback_days: int,
+    alpha: float = 0.05,
+) -> dict[str, Any]:
+    """因子评估的多重检验提示。
+
+    试验次数取「本次评估的 horizon 数 × (近期评估次数 + 1)」:agent 一天能跑
+    几十个表达式再挑最好的那个,只看单次 p 值必然高估显著性。这里给出
+    Bonferroni 校正后的阈值与是否仍然显著的判定,让「挑出来的最优」自带折扣。
+
+    n_prior_evaluations 为同一用户 lookback_days 内已完成的评估数(不含本次)。
+    """
+    n_tests = max(1, n_horizons) * max(1, n_prior_evaluations + 1)
+    bonferroni_alpha = alpha / n_tests
+    survives: bool | None = None
+    if best_p_value is not None:
+        survives = bool(best_p_value <= bonferroni_alpha)
+
+    return {
+        "n_tests_estimated": n_tests,
+        "n_prior_evaluations": n_prior_evaluations,
+        "n_horizons": max(1, n_horizons),
+        "lookback_days": lookback_days,
+        "alpha": alpha,
+        "bonferroni_alpha": round(bonferroni_alpha, 8),
+        "best_p_value": None if best_p_value is None else round(best_p_value, 6),
+        "survives_bonferroni": survives,
+        "disclaimer": (
+            f"近 {lookback_days} 天该账号已完成 {n_prior_evaluations} 次因子评估,"
+            f"本次覆盖 {max(1, n_horizons)} 个前瞻期,估算累计检验约 {n_tests} 次。"
+            f"名义水平 {alpha} 经 Bonferroni 粗校正后单次阈值约 {bonferroni_alpha:.6f}。"
+            "IC 显著不等于策略可用:未扣交易成本,未做样本外验证,"
+            "也未做完整 Reality Check / Deflated Sharpe。"
+        ),
+    }
+
+
+__all__ = ["factor_multiplicity_report", "multiplicity_report"]

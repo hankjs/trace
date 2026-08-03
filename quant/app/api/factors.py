@@ -21,6 +21,11 @@ from ..data.ingest import BAR_FIELDS, SNAPSHOT_SPEC_FIELDS, load_bars_df
 from ..db import get_db
 from ..factors import build_reason_tree, evaluate_factor, invalidate_factor_cache
 from ..factors.backfill import run_factor_backfill_task
+from ..factors.listing import (
+    EvaluationNotFoundError,
+    evaluation_detail,
+)
+from ..factors.listing import get_evaluation as get_evaluation_detail
 from ..models import FactorDef, FactorEvaluation, SelectionConfig
 from ..selection.config import (
     SelectionConfigUpdateIn,
@@ -423,48 +428,33 @@ def backfill_factors(body: FactorBackfillIn,
     return {"task": task_payload(task)}
 
 
-def _evaluation_out(row: FactorEvaluation) -> dict[str, Any]:
-    return {
-        "id": row.id,
-        "factor_key": row.factor_key,
-        "expression": row.expression,
-        "expression_hash": row.expression_hash,
-        "start": str(row.start),
-        "end": str(row.end),
-        "pool_id": row.pool_id,
-        "codes": row.codes,
-        "layers": row.layers,
-        "rebalance": row.rebalance,
-        "universe": row.universe,
-        "result": row.result,
-        "status": row.status,
-        "error": row.error,
-        "created_at": (
-            row.created_at.isoformat(sep=" ") if row.created_at else None
-        ),
-        "finished_at": (
-            row.finished_at.isoformat(sep=" ") if row.finished_at else None
-        ),
-    }
-
-
 @router.get("/evaluations")
 def list_evaluations(
     limit: int = Query(default=20, ge=1, le=50),
     before_id: int | None = Query(default=None),
+    factor_key: str | None = Query(default=None),
+    status: str | None = Query(default=None),
     db: Session = Depends(get_db),
     claims: dict = Depends(require_client),
 ):
-    """列出本人因子评估结果,limit 上限 50,before_id 游标分页。"""
+    """列出本人因子评估结果,limit 上限 50,before_id 游标分页。
+
+    看板历史依赖 items[].result 全量,故这里保留详情形状;A2A 侧走摘要口径
+    (`factor.evaluation_list`)以省 agent 上下文。
+    """
     user_id = user_id_from_claims(claims)
     q = select(FactorEvaluation).where(FactorEvaluation.user_id == user_id)
+    if factor_key:
+        q = q.where(FactorEvaluation.factor_key == factor_key)
+    if status:
+        q = q.where(FactorEvaluation.status == status)
     if before_id is not None:
         q = q.where(FactorEvaluation.id < before_id)
     q = q.order_by(FactorEvaluation.id.desc()).limit(limit + 1)
     rows = list(db.execute(q).scalars().all())
     has_more = len(rows) > limit
     return {
-        "items": [_evaluation_out(row) for row in rows[:limit]],
+        "items": [evaluation_detail(row) for row in rows[:limit]],
         "has_more": has_more,
     }
 
@@ -477,15 +467,12 @@ def get_evaluation(
 ):
     """获取本人单条因子评估详情;非本人按 404 防探测。"""
     user_id = user_id_from_claims(claims)
-    row = db.execute(
-        select(FactorEvaluation).where(
-            FactorEvaluation.id == evaluation_id,
-            FactorEvaluation.user_id == user_id,
+    try:
+        return get_evaluation_detail(
+            db, user_id=user_id, evaluation_id=evaluation_id,
         )
-    ).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(404, f"评估 {evaluation_id} 不存在")
-    return _evaluation_out(row)
+    except EvaluationNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
 
 
 __all__ = ["router"]

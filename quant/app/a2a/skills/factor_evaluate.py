@@ -4,7 +4,11 @@ from __future__ import annotations
 from datetime import date
 from typing import Any
 
-from ...factors.evaluation import evaluate_factor_efficacy
+from ...factors.evaluation import (
+    normalize_horizons,
+    normalize_neutralize,
+    evaluate_factor_efficacy,
+)
 from ...tasks import (
     TaskConflictError,
     register_handler,
@@ -67,6 +71,8 @@ def _factor_evaluation_handler(db, task, *, cancel_event=None):
         codes=codes,
         layers=int(p.get("layers", 10)),
         rebalance=p["rebalance"],
+        neutralize=p.get("neutralize"),
+        horizons=p.get("horizons"),
         cancel_event=cancel_event,
     )
     return _build_evaluation_artifact(row)
@@ -93,6 +99,13 @@ def handle(payload: dict[str, Any], ctx: A2AContext, cancel_event=None) -> dict[
     if codes:
         codes = [str(c).lower() for c in codes]
 
+    # 口径参数先在提交前校验:非法值应当立即报错,而不是等 worker 起来才失败
+    neutralize = normalize_neutralize(payload.get("neutralize"))
+    horizons = (
+        normalize_horizons(payload.get("horizons"))
+        if "horizons" in payload else None
+    )
+
     try:
         task = submit_task(
             ctx.db,
@@ -108,6 +121,8 @@ def handle(payload: dict[str, Any], ctx: A2AContext, cancel_event=None) -> dict[
                 "codes": codes,
                 "layers": layers,
                 "rebalance": rebalance,
+                "neutralize": neutralize,
+                "horizons": horizons,
                 "client_request_id": payload.get("client_request_id"),
             },
         )

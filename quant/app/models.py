@@ -950,6 +950,10 @@ class FactorEvaluation(Base):
     codes: Mapped[list | None] = mapped_column(JSON, nullable=True)
     layers: Mapped[int] = mapped_column(Integer, nullable=False)
     rebalance: Mapped[str] = mapped_column(String(16), nullable=False)
+    # 中性化维度与前瞻期列表:必须与结果同行留存,否则两次评估的 IC 差异
+    # 无法归因(是因子变了还是口径变了),历史行不可复现。
+    neutralize: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    horizons: Mapped[list | None] = mapped_column(JSON, nullable=True)
     universe: Mapped[dict] = mapped_column(JSON, nullable=False)
     result: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(

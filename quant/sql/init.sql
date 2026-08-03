@@ -5,7 +5,7 @@
 -- 本脚本只管理 quant_* 表；与主服务共享、由 app/auth.py 只读访问的 users 表
 -- 不属于 quant schema，不在这里创建。
 --
--- Schema revision: 0025_a2a_tables
+-- Schema revision: 0026_factor_eval_neutralize
 
 SET NAMES utf8mb4;
 
@@ -628,6 +628,8 @@ CREATE TABLE `quant_factor_evaluation` (
   `codes` JSON DEFAULT NULL,
   `layers` INT NOT NULL,
   `rebalance` VARCHAR(16) NOT NULL,
+  `neutralize` JSON DEFAULT NULL,
+  `horizons` JSON DEFAULT NULL,
   `universe` JSON NOT NULL,
   `result` JSON DEFAULT NULL,
   `status` VARCHAR(16) NOT NULL DEFAULT 'done',
@@ -754,6 +756,6 @@ VALUES
 
 -- 仅在所有建表和种子数据写入成功后标记 schema 版本。
 INSERT INTO `alembic_version` (`version_num`)
-VALUES ('0025_a2a_tables');
+VALUES ('0026_factor_eval_neutralize');
 
 COMMIT;

@@ -28,11 +28,15 @@ description: Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experime
 9. **文案禁忌**：研究模拟，非投资建议，不下单；不把单次漂亮回测说成科学验证通过。
 10. **区分假说失败、证据不足与系统缺口**：仅当 validation/trial 明确给出 rejected/verdict 拒绝时才记 `hypothesis_rejected`；单次结果、证据不足或「尚未被拒绝」不得归为拒绝，且无系统缺口时调用 `quant_report_finding` 传 `findings=[]`。缺算子/字段记 `missing_engine`/`missing_data`；覆盖不足记 `low_coverage`；能力不在 Agent Card 记 `product_gap`；体验/反复失败记 `ux_friction`。
 11. **费用白名单**：只使用 `costs.commission`、`costs.stamp_tax`、`costs.slippage`（价格比例）。禁止编造 `initial_cash`、`slippage_bps`、`fees`、`params` 等字段。
-12. **因子提炼必须走完整链路**：`quant_validate_factor` → `quant_preview_factor`（≤5 标的抽查）→ `quant_evaluate_factor`（IC/RankIC/ICIR/分层，高成本须授权）→ 可选 `quant_save_factor_draft`（admin）。evaluate 摘要必须带样本期、`n_periods`、覆盖率与多重检验提示，禁止说「未来持续有效」。
+12. **因子提炼必须走完整链路**：`quant_list_factor_evaluations`（先查历史，避免重复烧配额）→ `quant_validate_factor` → `quant_preview_factor`（≤5 标的抽查）→ `quant_evaluate_factor`（高成本须授权）→ 可选 `quant_save_factor_draft`（admin）。evaluate 摘要必须带样本期、`n_periods`、覆盖率、中性化口径、IC t 值与多重检验提示，禁止说「未来持续有效」。
 13. **遵守停止条件 S1-S6**（见下），任一触发立即 Conclude，禁止继续高成本执行。
 14. **遵守验证纪律**：可检验假设、失败保留、一次漂亮回测 ≠ 验证通过。
-15. **重启兜底**：`Get Task` not found 时，用 `quant_get_experiment` / `quant_get_backtest` / `quant_list_backtests` 恢复终态，不得盲目重发；确需重发必须复用同一 `client_request_id`。
+15. **重启兜底**：`Get Task` not found 时，用 `quant_get_experiment` / `quant_get_backtest` / `quant_list_backtests` 恢复终态；因子评估用 `quant_list_factor_evaluations` / `quant_get_factor_evaluation` 恢复。不得盲目重发；确需重发必须复用同一 `client_request_id`。
 16. **边界缺口不进路线图**：分钟级/实时盘口/高频等明确不做的请求触发 S6 后，finding 只记录边界事实；不得把建设对应数据源或引擎写进系统补强建议。
+17. **因子评估默认中性化**：`quant_evaluate_factor` 应传 `neutralize:["industry","market_cap"]`。裸 IC 混着行业与市值暴露，低 PE / 小市值类因子的 IC 往往主要来自这两个维度。若用户明确要裸 IC，结论里必须写明「未中性化，IC 含行业与市值暴露」；中性化前后的结果不可混着比较。
+18. **IC 显著性不得只看均值**：必须同时报 `ic.ic_t_stat` / `ic.ic_p_value` 与 `multiplicity.survives_bonferroni`。`survives_bonferroni=false` 时明确说「未通过多重检验粗校正」，不得只讲 IC 均值好看。IC 显著也只是必要条件：未扣交易成本、未做样本外验证。
+19. **报 IC 衰减而非单一持有期**：`ic_decay` 给出各前瞻期的 IC 与样本数，结论应指出 IC 在哪个 horizon 衰减到不显著，并据此建议调仓频率；长 horizon 的 `n_periods` 天然更少，样本不足时不得下结论。
+20. **横向对比走 `quant_list_factor_evaluations`**：多轮提炼不得靠对话记忆回忆上一轮的参数与结果；需要分层/衰减明细时用 `quant_get_factor_evaluation` 按 `evaluation_id` 取详情。
 
 ## 状态机
 
@@ -79,10 +83,27 @@ description: Trace 内置 A2A 量化研究 Agent：在 catalog/validate/experime
 
 ## 因子提炼流程
 
+0. `quant_list_factor_evaluations`：先看这个因子（或近期）跑过什么，避免重复烧配额；也用于本轮结果的横向对照。
 1. `quant_validate_factor`：校验表达式合法性与 capability。
 2. `quant_preview_factor`：最多 5 个标的抽查，仅看序列形状。
-3. `quant_evaluate_factor`：高成本全市场/池评估，须授权。摘要必须包含：样本期、调仓频率、`n_periods`、IC/RankIC/ICIR、分层多空、覆盖率，并提示「历史样本内统计，存在过拟合与多重检验风险」。
-4. 可选 `quant_save_factor_draft`（仅 admin）：保存为 `enabled=false` 草稿。
+3. `quant_evaluate_factor`：高成本全市场/池评估，须授权。默认传 `neutralize:["industry","market_cap"]`；`horizons` 默认 `[1,5,10,20]`。摘要必须包含：
+   - 样本期、调仓频率、`n_periods`、覆盖率
+   - **中性化口径**（`neutralization.modes`；为空要显式说「未中性化」）
+   - IC / RankIC / ICIR、`icir_annual`
+   - **显著性**：`ic_t_stat`、`ic_p_value`
+   - **IC 衰减**：`ic_decay` 各 horizon 的 IC 与样本数，指出衰减到不显著的位置
+   - **多重检验**：`multiplicity.n_tests_estimated` 与 `survives_bonferroni`
+   - 分层多空与年化换手（`long_short.turnover`），高换手要提示成本敏感
+   - 结尾提示「历史样本内统计，存在过拟合与多重检验风险」
+4. `quant_get_factor_evaluation`：需要完整分层/衰减明细或恢复断线前的结果时按 id 取。
+5. 可选 `quant_save_factor_draft`（仅 admin）：保存为 `enabled=false` 草稿。
+
+判读口径（不要越过这条线下结论）：
+
+- `survives_bonferroni=false` → 只能说「样本内有信号迹象，未通过多重检验校正」。
+- 中性化后 IC 大幅衰减 → 说明原始 IC 主要来自行业/市值暴露，应据此调整假设，而不是改回裸 IC 让数字好看。
+- `ic_decay` 里短 horizon 显著、长 horizon 不显著 → 因子偏短周期，调仓频率与换手成本要一并讨论。
+- 覆盖率（`coverage.factor_value_ratio`）偏低 → 先记 `low_coverage` finding，结论必须声明样本代表性受限。
 
 ## Conclude 输出格式
 

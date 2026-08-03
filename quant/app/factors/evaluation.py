@@ -8,12 +8,12 @@ import logging
 import math
 import threading
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ..backtest.engine import TRADING_DAYS
@@ -32,6 +32,7 @@ from ..data.universe import (
 )
 from ..factors.engine import evaluate_factor
 from ..models import FactorDaily, FactorDef, FactorEvaluation, Stock, TradeCalendar
+from ..strategy.multiple_testing import factor_multiplicity_report
 from ..strategy.spec import parse_expression, validate_expression, _walk_expression
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,19 @@ logger = logging.getLogger(__name__)
 MAX_LAYERS = 10
 DEFAULT_FILTERS = ["st", "suspended", "lt_60d"]
 MIN_LIST_DAYS = 60
+
+# 支持的中性化维度。industry 取 quant_stock.industry(当前状态,见下方说明),
+# market_cap 取估值快照的 total_market_cap(point-in-time)。
+NEUTRALIZE_MODES = ("industry", "market_cap")
+
+# 前瞻期(交易日)上限与默认值。horizons 用于 IC 衰减曲线:
+# 同一因子在不同持有期的 IC 变化决定它该配什么调仓频率。
+MAX_HORIZON_DAYS = 60
+MAX_HORIZONS = 6
+DEFAULT_HORIZONS = (1, 5, 10, 20)
+
+# 多重检验回溯窗口:统计同一账号近期评估次数作为试验次数下界
+MULTIPLICITY_LOOKBACK_DAYS = 30
 
 
 class EvaluationCancelledError(Exception):
@@ -140,9 +154,16 @@ def _load_price_matrix(
     codes: list[str],
     start: date,
     end: date,
+    *,
+    extra_fields: list[str] | None = None,
 ) -> dict[str, pd.DataFrame]:
-    """批量读取日线,返回 {code: DataFrame indexed by date}。"""
-    frames = load_bars_df_bulk(db, codes, start=start, end=end)
+    """批量读取日线,返回 {code: DataFrame indexed by date}。
+
+    extra_fields 走快照 PIT 合并(如市值中性化需要的 market_cap)。
+    """
+    frames = load_bars_df_bulk(
+        db, codes, start=start, end=end, extra_fields=extra_fields,
+    )
     result: dict[str, pd.DataFrame] = {}
     for code, df in frames.items():
         if df.empty:
@@ -286,6 +307,98 @@ def _ic_series(factors: np.ndarray, returns: np.ndarray) -> tuple[float | None, 
     return float(ic), float(rank_ic)
 
 
+def _neutralize_cross_section(
+    values: np.ndarray,
+    *,
+    industries: list[str],
+    market_caps: np.ndarray | None,
+    modes: list[str],
+) -> np.ndarray:
+    """对单期截面因子值做中性化,返回残差。
+
+    行业以哑变量进入(丢弃一列避免与截距共线),市值取 log 后进入。
+    最小二乘解不出来(奇异矩阵/样本过少)时原样返回,由调用方按未中性化处理 ——
+    宁可少一层处理,也不能拿 NaN 冒充残差。
+    """
+    n = len(values)
+    if n < 5 or not modes:
+        return values
+
+    columns: list[np.ndarray] = [np.ones(n)]
+    if "industry" in modes:
+        # 空行业单独归一类,避免全部塞进基准组导致行业效应残留
+        labels = [ind or "__unknown__" for ind in industries]
+        uniq = sorted(set(labels))
+        if len(uniq) > 1:
+            # 丢弃第一类作基准组
+            for name in uniq[1:]:
+                columns.append(
+                    np.fromiter((1.0 if l == name else 0.0 for l in labels),
+                                dtype=float, count=n)
+                )
+    if "market_cap" in modes and market_caps is not None:
+        caps = np.asarray(market_caps, dtype=float)
+        # 市值缺失或非正时用截面中位数补,log 化压缩量级
+        positive = caps[np.isfinite(caps) & (caps > 0)]
+        if len(positive) >= 3:
+            fill = float(np.median(positive))
+            caps = np.where(np.isfinite(caps) & (caps > 0), caps, fill)
+            columns.append(np.log(caps))
+
+    if len(columns) <= 1:
+        # 除截距外没有任何有效解释变量,中性化退化为去均值,无意义
+        return values
+
+    design = np.column_stack(columns)
+    if design.shape[0] <= design.shape[1]:
+        return values
+    try:
+        coef, *_ = np.linalg.lstsq(design, values, rcond=None)
+    except np.linalg.LinAlgError:
+        return values
+    residual = values - design @ coef
+    if not np.all(np.isfinite(residual)):
+        return values
+    return residual
+
+
+def _newey_west_tstat(series: np.ndarray) -> tuple[float | None, float | None]:
+    """IC 序列均值的 Newey-West t 值与双尾 p 值。
+
+    IC 序列有自相关(尤其是 horizon 跨越多个调仓间隔时),普通 t 检验会高估
+    显著性。滞后阶数按 Newey-West 常用经验值 floor(4*(n/100)^(2/9))。
+    p 值用正态近似(样本量小时略偏乐观,已在 disclaimer 里声明)。
+    """
+    n = len(series)
+    if n < 6:
+        return None, None
+    mean = float(series.mean())
+    demeaned = series - mean
+    gamma0 = float(np.dot(demeaned, demeaned) / n)
+    if gamma0 <= 0:
+        return None, None
+
+    max_lag = int(math.floor(4 * (n / 100) ** (2 / 9)))
+    max_lag = max(0, min(max_lag, n - 2))
+    variance = gamma0
+    for lag in range(1, max_lag + 1):
+        gamma = float(np.dot(demeaned[lag:], demeaned[:-lag]) / n)
+        weight = 1 - lag / (max_lag + 1)
+        variance += 2 * weight * gamma
+    if variance <= 0:
+        return None, None
+
+    se = math.sqrt(variance / n)
+    if se <= 0:
+        return None, None
+    t_stat = mean / se
+    if not math.isfinite(t_stat):
+        return None, None
+    # 双尾 p:正态近似,erfc(|t|/sqrt(2))
+    p_value = math.erfc(abs(t_stat) / math.sqrt(2))
+    return float(t_stat), float(p_value)
+
+
 def _annualize(total_return: float, days: int) -> float | None:
     """按自然日年化;天数过短返回 None。"""
     if days <= 0 or total_return is None:
@@ -302,6 +415,175 @@ def _max_drawdown(equity: pd.Series) -> float:
     return float(dd.min())
 
 
+def _period_market_caps(
+    price_matrix: dict[str, pd.DataFrame],
+    code_list: list[str],
+    day: date,
+) -> np.ndarray:
+    """取当期截面的 PIT 总市值;缺失记 NaN 由中性化侧按中位数补。"""
+    caps: list[float] = []
+    for code in code_list:
+        frame = price_matrix.get(code)
+        value = float("nan")
+        if frame is not None and "market_cap" in frame.columns:
+            try:
+                raw = frame.at[day, "market_cap"]
+            except KeyError:
+                raw = None
+            if raw is not None and not pd.isna(raw):
+                value = float(raw)
+        caps.append(value)
+    return np.array(caps, dtype=float)
+
+
+def _horizon_returns(
+    price_matrix: dict[str, pd.DataFrame],
+    code_list: list[str],
+    current: date,
+    horizon: int,
+    trading_days: list[date],
+    day_index: dict[date, int],
+) -> np.ndarray:
+    """当期截面向前 horizon 个交易日的收益;取不到未来价则记 NaN。
+
+    末尾若不足 horizon 个交易日,整期为 NaN,该期不进入对应 horizon 的 IC 序列 ——
+    长 horizon 的 n_periods 天然少于短 horizon,这是样本事实,不做补齐。
+    """
+    base = day_index.get(current)
+    out: list[float] = []
+    target: date | None = None
+    if base is not None and base + horizon < len(trading_days):
+        target = trading_days[base + horizon]
+    for code in code_list:
+        value = float("nan")
+        frame = price_matrix.get(code)
+        if target is not None and frame is not None:
+            try:
+                cur_price = frame.at[current, "close"]
+                fut_price = frame.at[target, "close"]
+            except KeyError:
+                cur_price = fut_price = None
+            if (
+                cur_price is not None and fut_price is not None
+                and not pd.isna(cur_price) and not pd.isna(fut_price)
+                and float(cur_price) > 0 and float(fut_price) > 0
+            ):
+                value = float(fut_price) / float(cur_price) - 1
+        out.append(value)
+    return np.array(out, dtype=float)
+
+
+def _count_prior_evaluations(
+    db: Session, *, user_id: str, exclude_id: int | None,
+) -> int:
+    """同一用户近期已完成的评估数,作为多重检验的试验次数下界。
+
+    只数 done:失败/取消的评估没有产出可挑选的指标,不构成「多看了一眼」。
+    """
+    since = datetime.now() - timedelta(days=MULTIPLICITY_LOOKBACK_DAYS)
+    q = select(func.count(FactorEvaluation.id)).where(
+        FactorEvaluation.user_id == user_id,
+        FactorEvaluation.status == "done",
+        FactorEvaluation.created_at >= since,
+    )
+    if exclude_id is not None:
+        q = q.where(FactorEvaluation.id != exclude_id)
+    return int(db.execute(q).scalar() or 0)
+
+
+def _best_p_value(
+    primary_p: float | None, ic_decay: list[dict[str, Any]],
+) -> float | None:
+    """本次评估里最小的 p 值(最容易被当成结论的那个)。"""
+    candidates = [p for p in [primary_p] if p is not None]
+    candidates.extend(
+        item["ic_p_value"] for item in ic_decay
+        if item.get("ic_p_value") is not None
+    )
+    return min(candidates) if candidates else None
+
+
+def _build_ic_decay(
+    horizon_days: list[int],
+    horizon_ics: dict[int, list[float]],
+    horizon_rank_ics: dict[int, list[float]],
+) -> list[dict[str, Any]]:
+    """组装 IC 衰减曲线;每个 horizon 带自己的 t 值与样本数。"""
+    items: list[dict[str, Any]] = []
+    for h in horizon_days:
+        series = np.array(horizon_ics.get(h) or [], dtype=float)
+        rank_series = np.array(horizon_rank_ics.get(h) or [], dtype=float)
+        if len(series) == 0:
+            items.append({
+                "horizon_days": h,
+                "ic_mean": None,
+                "rank_ic_mean": None,
+                "icir": None,
+                "ic_t_stat": None,
+                "ic_p_value": None,
+                "n_periods": 0,
+            })
+            continue
+        mean = float(series.mean())
+        std = float(series.std())
+        t_stat, p_value = _newey_west_tstat(series)
+        items.append({
+            "horizon_days": h,
+            "ic_mean": round(mean, 4),
+            "rank_ic_mean": (
+                round(float(rank_series.mean()), 4) if len(rank_series) else None
+            ),
+            "icir": None if std <= 0 else round(mean / std, 4),
+            "ic_t_stat": None if t_stat is None else round(t_stat, 4),
+            "ic_p_value": None if p_value is None else round(p_value, 6),
+            "n_periods": int(len(series)),
+        })
+    return items
+
+
+def normalize_neutralize(neutralize: list[str] | None) -> list[str]:
+    """校验并去重中性化维度;非法值直接报错而不是静默忽略。"""
+    if not neutralize:
+        return []
+    if isinstance(neutralize, str):
+        neutralize = [neutralize]
+    modes: list[str] = []
+    for item in neutralize:
+        mode = str(item).strip().lower()
+        if mode not in NEUTRALIZE_MODES:
+            raise ValueError(
+                f"不支持的 neutralize 维度 {item!r};可用值: {list(NEUTRALIZE_MODES)}"
+            )
+        if mode not in modes:
+            modes.append(mode)
+    return modes
+
+
+def normalize_horizons(horizons: list[int] | None) -> list[int]:
+    """校验前瞻期列表;越界直接报错,避免 agent 以为跑了 250 日其实被截断。"""
+    if horizons is None:
+        return list(DEFAULT_HORIZONS)
+    if isinstance(horizons, int):
+        horizons = [horizons]
+    if not horizons:
+        return []
+    out: list[int] = []
+    for item in horizons:
+        try:
+            days = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"horizons 必须是整数交易日,收到 {item!r}") from exc
+        if days < 1 or days > MAX_HORIZON_DAYS:
+            raise ValueError(
+                f"horizon {days} 越界,只支持 1..{MAX_HORIZON_DAYS} 个交易日"
+            )
+        if days not in out:
+            out.append(days)
+    if len(out) > MAX_HORIZONS:
+        raise ValueError(f"horizons 最多 {MAX_HORIZONS} 个,收到 {len(out)} 个")
+    return sorted(out)
+
+
 def evaluate_factor_efficacy(
     db: Session,
     *,
@@ -314,9 +596,16 @@ def evaluate_factor_efficacy(
     codes: list[str] | None = None,
     layers: int = 10,
     rebalance: str = "weekly",
+    neutralize: list[str] | None = None,
+    horizons: list[int] | None = None,
     cancel_event: threading.Event | None = None,
 ) -> FactorEvaluation:
     """评估因子有效性并落库,返回 FactorEvaluation 行。
+
+    neutralize: 截面中性化维度子集,取值见 NEUTRALIZE_MODES。开启后 IC、分层与
+    多空全部基于残差因子计算 —— 裸 IC 里混着行业与市值暴露,低 PE 类因子的
+    IC 往往主要来自行业效应,不中性化会把行业 beta 误读成 alpha。
+    horizons: 前瞻期(交易日)列表,用于 IC 衰减曲线;主 IC 仍按调仓间隔计算。
 
     取消检查点:按标的批次(每 200 只)与每个调仓日截面检查 cancel_event,
     置位则抛出 EvaluationCancelledError,调用方负责将行标 cancelled 且不写 result。
@@ -327,6 +616,9 @@ def evaluate_factor_efficacy(
         raise ValueError("rebalance 只支持 weekly 或 monthly")
     validate_backtest_window(start, end)
     layers = max(1, min(int(layers), MAX_LAYERS))
+
+    modes = normalize_neutralize(neutralize)
+    horizon_days = normalize_horizons(horizons)
 
     # 解析评估域
     eval_codes, universe = _resolve_universe(
@@ -366,6 +658,8 @@ def evaluate_factor_efficacy(
         codes=eval_codes if codes else None,
         layers=layers,
         rebalance=rebalance,
+        neutralize=modes or None,
+        horizons=horizon_days or None,
         universe=universe,
         status="running",
     )
@@ -378,10 +672,15 @@ def evaluate_factor_efficacy(
         dates = _rebalance_dates(trading_days, rebalance)
         if len(dates) < 2:
             raise ValueError("区间内调仓点不足,无法计算 IC")
+        day_index = {d: i for i, d in enumerate(trading_days)}
 
-        # 统一价格矩阵(含预热段,避免表达式求值缺历史)
+        # 统一价格矩阵(含预热段,避免表达式求值缺历史)。
+        # 市值中性化需要 PIT 总市值,一并挂到价格帧上。
         price_start = min(lookback_start, start)
-        price_matrix = _load_price_matrix(db, eval_codes, price_start, end)
+        price_extra = ["market_cap"] if "market_cap" in modes else None
+        price_matrix = _load_price_matrix(
+            db, eval_codes, price_start, end, extra_fields=price_extra,
+        )
         stocks = _stocks_for_codes(db, eval_codes)
 
         # 读取/计算因子值
@@ -401,6 +700,12 @@ def evaluate_factor_efficacy(
         period_rank_ics: list[float] = []
         layer_period_returns: list[dict[int, float]] = []
         full_sample_returns: list[float] = []
+        # 顶/底组合成分按期留存,供换手率计算复用(必须与分层同一份因子值,
+        # 否则中性化后会出现「分层用残差、换手用裸值」的错位)
+        period_extremes: list[tuple[set[str], set[str]]] = []
+        horizon_ics: dict[int, list[float]] = {h: [] for h in horizon_days}
+        horizon_rank_ics: dict[int, list[float]] = {h: [] for h in horizon_days}
+        neutralized_periods = 0
         eligible_obs = 0
         valid_obs = 0
 
@@ -440,10 +745,37 @@ def evaluate_factor_efficacy(
 
             factors_arr = np.array(period_factors, dtype=float)
             rets_arr = np.array(period_returns, dtype=float)
+
+            if modes:
+                residual = _neutralize_cross_section(
+                    factors_arr,
+                    industries=[
+                        (stocks[c].industry if c in stocks else "") for c in code_list
+                    ],
+                    market_caps=(
+                        _period_market_caps(price_matrix, code_list, current)
+                        if "market_cap" in modes else None
+                    ),
+                    modes=modes,
+                )
+                if residual is not factors_arr:
+                    neutralized_periods += 1
+                factors_arr = residual
+
             ic, rank_ic = _ic_series(factors_arr, rets_arr)
             if ic is not None:
                 period_ics.append(ic)
                 period_rank_ics.append(rank_ic)
+
+            # IC 衰减:同一截面因子对多个前瞻期的预测力
+            for h in horizon_days:
+                fwd = _horizon_returns(
+                    price_matrix, code_list, current, h, trading_days, day_index,
+                )
+                h_ic, h_rank_ic = _ic_series(factors_arr, fwd)
+                if h_ic is not None:
+                    horizon_ics[h].append(h_ic)
+                    horizon_rank_ics[h].append(h_rank_ic)
 
             full_sample_returns.append(float(np.mean(rets_arr)))
 
@@ -460,6 +792,11 @@ def evaluate_factor_efficacy(
                 idx = order[start_idx:end_idx]
                 layer_rets[layer + 1] = float(np.mean(rets_arr[idx]))
             layer_period_returns.append(layer_rets)
+            # 顶/底成分与分层同源,换手率直接复用,不再二次排序
+            period_extremes.append((
+                {code_list[j] for j in order[-layer_size:]},
+                {code_list[j] for j in order[:layer_size]},
+            ))
 
         if not period_ics:
             raise ValueError("有效样本过少,无法计算 IC")
@@ -473,6 +810,15 @@ def evaluate_factor_efficacy(
         rank_ic_std = float(rank_arr.std())
         rank_icir = rank_ic_mean / rank_ic_std if rank_ic_std > 0 else None
         positive_ratio = float((ic_arr > 0).sum() / len(ic_arr))
+
+        # 显著性:IC 序列均值的 Newey-West t 值(IC 有自相关,普通 t 会高估)
+        ic_t, ic_p = _newey_west_tstat(ic_arr)
+        rank_ic_t, rank_ic_p = _newey_west_tstat(rank_arr)
+        # ICIR 年化:按调仓频率折算,便于跨频率横向比较
+        periods_per_year_nominal = 52.0 if rebalance == "weekly" else 12.0
+        icir_annual = (
+            None if icir is None else icir * math.sqrt(periods_per_year_nominal)
+        )
 
         # 分层收益
         layer_equities: dict[int, list[float]] = {l: [1.0] for l in range(1, layers + 1)}
@@ -504,57 +850,29 @@ def evaluate_factor_efficacy(
         ls_annual = _annualize(ls_total, total_days)
         ls_max_dd = _max_drawdown(ls_eq)
 
-        # 换手率:顶底组合等权,统计每期间权重变化
+        # 换手率:顶底组合等权,统计相邻期权重变化。成分直接取主循环留存的
+        # period_extremes,保证与分层收益基于同一份(可能已中性化的)因子值。
         turnovers: list[float] = []
-        prev_top: set[str] = set()
-        prev_bottom: set[str] = set()
-        for i, current in enumerate(dates[:-1]):
-            if i >= len(layer_period_returns):
-                break
-            # 重建当期顶底 code 集合
-            # 需要按当期因子排序重新计算,这里与上面分层逻辑保持一致
-            # 为了可读性与性能,重算一次当期排序(数据量不大)
-            # 也可在循环中缓存,当前实现优先简洁
-            factors_snapshot = []
-            codes_snapshot = []
-            for code in eval_codes:
-                if not _is_eligible(
-                    current, code, price_matrix, stocks, universe["filters"],
-                ):
-                    continue
-                f = factor_values.get((code, current))
-                if f is None:
-                    continue
-                factors_snapshot.append(f)
-                codes_snapshot.append(code)
-            if len(factors_snapshot) < layers * 2:
-                continue
-            order = np.argsort(np.array(factors_snapshot))
-            layer_size = max(1, len(order) // layers)
-            top_idx = order[-layer_size:]
-            bottom_idx = order[:layer_size]
-            top_set = {codes_snapshot[j] for j in top_idx}
-            bottom_set = {codes_snapshot[j] for j in bottom_idx}
-            if i > 0:
-                # 等权组合,每边权重和为 0.5(长) / -0.5(短)
-                # turnover = sum(|delta w|) / 2
-                union = prev_top | prev_bottom | top_set | bottom_set
-                turnover = 0.0
-                for code in union:
-                    old_w = 0.0
-                    if code in prev_top:
-                        old_w += 0.5 / len(prev_top)
-                    elif code in prev_bottom:
-                        old_w -= 0.5 / len(prev_bottom)
-                    new_w = 0.0
-                    if code in top_set:
-                        new_w += 0.5 / len(top_set)
-                    elif code in bottom_set:
-                        new_w -= 0.5 / len(bottom_set)
-                    turnover += abs(new_w - old_w)
-                turnovers.append(turnover / 2)
-            prev_top = top_set
-            prev_bottom = bottom_set
+        for idx in range(1, len(period_extremes)):
+            prev_top, prev_bottom = period_extremes[idx - 1]
+            top_set, bottom_set = period_extremes[idx]
+            # 等权组合,每边权重和为 0.5(长) / -0.5(短)
+            # turnover = sum(|delta w|) / 2
+            union = prev_top | prev_bottom | top_set | bottom_set
+            turnover = 0.0
+            for code in union:
+                old_w = 0.0
+                if code in prev_top:
+                    old_w += 0.5 / len(prev_top)
+                elif code in prev_bottom:
+                    old_w -= 0.5 / len(prev_bottom)
+                new_w = 0.0
+                if code in top_set:
+                    new_w += 0.5 / len(top_set)
+                elif code in bottom_set:
+                    new_w -= 0.5 / len(bottom_set)
+                turnover += abs(new_w - old_w)
+            turnovers.append(turnover / 2)
 
         avg_turnover = float(np.mean(turnovers)) if turnovers else 0.0
         periods_per_year = len(dates[:-1]) / max(1, total_days / 365)
@@ -562,15 +880,41 @@ def evaluate_factor_efficacy(
 
         # 覆盖率
         coverage_ratio = valid_obs / eligible_obs if eligible_obs else 0.0
+        ic_decay = _build_ic_decay(horizon_days, horizon_ics, horizon_rank_ics)
 
         result = {
             "ic": {
                 "ic_mean": round(ic_mean, 4),
                 "icir": None if icir is None else round(icir, 4),
+                "icir_annual": None if icir_annual is None else round(icir_annual, 4),
                 "rank_ic_mean": round(rank_ic_mean, 4),
                 "rank_icir": None if rank_icir is None else round(rank_icir, 4),
                 "positive_ratio": round(positive_ratio, 4),
                 "n_periods": len(period_ics),
+                "ic_t_stat": None if ic_t is None else round(ic_t, 4),
+                "ic_p_value": None if ic_p is None else round(ic_p, 6),
+                "rank_ic_t_stat": None if rank_ic_t is None else round(rank_ic_t, 4),
+                "rank_ic_p_value": None if rank_ic_p is None else round(rank_ic_p, 6),
+                "t_stat_method": "newey_west_normal_approx",
+            },
+            "ic_decay": ic_decay,
+            "multiplicity": factor_multiplicity_report(
+                n_prior_evaluations=_count_prior_evaluations(
+                    db, user_id=user_id, exclude_id=row.id,
+                ),
+                n_horizons=len(horizon_days),
+                best_p_value=_best_p_value(ic_p, ic_decay),
+                lookback_days=MULTIPLICITY_LOOKBACK_DAYS,
+            ),
+            "neutralization": {
+                "modes": modes,
+                "applied_periods": neutralized_periods,
+                "total_periods": len(period_ics),
+                "note": (
+                    "未中性化:IC 含行业与市值暴露"
+                    if not modes
+                    else "IC/分层/多空均基于截面回归残差"
+                ),
             },
             "layers": layer_summary,
             "long_short": {
@@ -614,12 +958,14 @@ def evaluate_factor_efficacy(
         raise
 
 
-# 避免循环引用:datetime 在函数内导入
-from datetime import datetime  # noqa: E402
-
-
 __all__ = [
+    "DEFAULT_HORIZONS",
+    "MAX_HORIZONS",
+    "MAX_HORIZON_DAYS",
+    "NEUTRALIZE_MODES",
     "EvaluationCancelledError",
     "FactorNotFoundError",
     "evaluate_factor_efficacy",
+    "normalize_horizons",
+    "normalize_neutralize",
 ]
