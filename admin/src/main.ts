@@ -4,6 +4,14 @@ import App from './App.vue'
 import { hasToken } from './composables/api'
 import './style.css'
 
+declare module 'vue-router' {
+  interface RouteMeta {
+    public?: boolean
+    fill?: boolean
+    width?: 'wide' | 'full'
+  }
+}
+
 const router = createRouter({
   history: createWebHistory('/admin/'),
   routes: [
@@ -12,9 +20,9 @@ const router = createRouter({
     { path: '/sessions', component: () => import('./views/Sessions.vue') },
     { path: '/sessions/:id', component: () => import('./views/SessionDetail.vue') },
     { path: '/sessions/:id/timeline', component: () => import('./views/SessionTimeline.vue') },
-    { path: '/sessions/:id/explore', component: () => import('./views/SessionExplore.vue') },
+    { path: '/sessions/:id/explore', component: () => import('./views/SessionExplore.vue'), meta: { width: 'wide' } },
     { path: '/explore', component: () => import('./views/ExploreList.vue') },
-    { path: '/explore/:id', component: () => import('./views/SessionExplore.vue') },
+    { path: '/explore/:id', component: () => import('./views/SessionExplore.vue'), meta: { width: 'wide' } },
     { path: '/prompts', component: () => import('./views/PromptLab.vue') },
     { path: '/users', component: () => import('./views/Users.vue') },
     { path: '/providers', component: () => import('./views/Providers.vue') },
@@ -22,12 +30,12 @@ const router = createRouter({
     { path: '/image-providers', component: () => import('./views/ImageProviders.vue') },
     { path: '/weixin', component: () => import('./views/WeixinBot.vue') },
     { path: '/feishu', component: () => import('./views/FeishuBot.vue') },
-    { path: '/chat-records', component: () => import('./views/ChatRecords.vue') },
+    { path: '/chat-records', component: () => import('./views/ChatRecords.vue'), meta: { fill: true, width: 'wide' } },
     { path: '/jobs', component: () => import('./views/Jobs.vue') },
     { path: '/team-task', component: () => import('./views/TeamTask.vue') },
-    { path: '/interactions', component: () => import('./views/Interactions.vue') },
-    { path: '/interactions/:id', component: () => import('./views/Interactions.vue') },
-    { path: '/terminals', component: () => import('./views/Terminals.vue') },
+    { path: '/interactions', component: () => import('./views/Interactions.vue'), meta: { width: 'wide' } },
+    { path: '/interactions/:id', component: () => import('./views/Interactions.vue'), meta: { width: 'wide' } },
+    { path: '/terminals', component: () => import('./views/Terminals.vue'), meta: { fill: true, width: 'full' } },
     { path: '/notifications', component: () => import('./views/Notifications.vue') },
   ],
 })

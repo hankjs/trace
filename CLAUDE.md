@@ -71,6 +71,7 @@
 ## Admin 页面
 
 base path `/admin/`（history 路由）。飞书卡片深链：`{admin_base_url}/admin/interactions/{id}`。
+左侧菜单按业务域分组（概览 / 会话与追踪 / 渠道 / 任务 / 模型与工具 / 系统），图标统一走 `components/NavIcon.vue`；页面宽度与是否满高由路由 `meta.width`、`meta.fill` 声明，不要在 `App.vue` 里按路径硬编码。
 
 | 路径 | 组件 | 说明 |
 |------|------|------|
