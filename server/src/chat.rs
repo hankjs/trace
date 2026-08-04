@@ -213,18 +213,12 @@ pub async fn run_chat_turn(
         .as_ref()
         .and_then(|metadata| metadata["agent_backend"].as_str())
         .unwrap_or("native");
-    // 外部代码 Agent：client-only 会话在 cli_agent 内强制 remote agent_run；
-    // server bubblewrap 路径仅保留兼容，飞书不再创建。
-    if hank_db::AgentBackend::parse(agent_backend).is_some() {
-        return crate::cli_agent::run_cli_turn(
-            state,
-            &session_id,
-            session_record,
-            content,
-            agent_backend,
-        )
-        .await
-        .map_err(|error| ChatTurnError::ExternalAgent(format!("{error:#}")));
+    // 外部代码 Agent 已移除：历史会话的 metadata 里可能还留着 codex/claude 等
+    // backend，明确拒绝而不是静默降级到 native——否则用户会以为任务在跑。
+    if agent_backend != "native" {
+        return Err(ChatTurnError::ExternalAgent(format!(
+            "外部代码 Agent 已下线（会话 backend = {agent_backend}），请新建 native 会话"
+        )));
     }
 
     // Resolve providers with fallback from DB
@@ -274,10 +268,6 @@ pub async fn run_chat_turn(
         .as_ref()
         .map(|s| s.session_type.clone())
         .unwrap_or_else(|| "chat".to_string());
-    // 远程执行：会话绑定的桌面 client（None = server 本地执行）
-    let exec_client_id = session_record
-        .as_ref()
-        .and_then(|s| s.exec_client_id.clone());
     let session_user_id = session_record.as_ref().and_then(|s| s.user_id.clone());
     let session_metadata = session_record.as_ref().and_then(|s| s.metadata.as_deref());
     let server_agent_session = session_metadata_value
@@ -359,54 +349,39 @@ pub async fn run_chat_turn(
         let checksum_store = new_checksum_store();
         let execution_user =
             server_agent_session.then(|| state.config.server_agent.execution_user.clone());
-        // fs/shell 类工具：绑定 exec_client_id 的会话改用远程代理工具，
-        // 在桌面 client 本地执行；test_runner 远程会话不提供（可用 shell 跑测试）
-        let mut t: Vec<Arc<dyn Tool>> = match (&exec_client_id, &session_user_id) {
-            (Some(client_id), Some(user_id)) => {
-                let mut remote = crate::remote_tools::remote_tool_set(
-                    state.clone(),
-                    user_id,
-                    client_id,
-                    work_dir.clone(),
-                );
-                remote.push(Arc::new(WebFetchTool::new()));
-                remote
-            }
-            _ => {
-                let shell = match &execution_user {
-                    Some(user) => ShellTool::new_as_user(work_dir.clone(), user.clone()),
-                    None => ShellTool::new(work_dir.clone()),
-                };
-                let git = match &execution_user {
-                    Some(user) => GitTool::new_as_user(work_dir.clone(), user.clone()),
-                    None => GitTool::new(work_dir.clone()),
-                };
-                let test_runner = match &execution_user {
-                    Some(user) => TestRunnerTool::new_as_user(work_dir.clone(), user.clone()),
-                    None => TestRunnerTool::new(work_dir.clone()),
-                };
-                vec![
-                    Arc::new(shell),
-                    Arc::new(ReadFileTool::with_checksum_store(
-                        work_dir.clone(),
-                        checksum_store.clone(),
-                    )),
-                    Arc::new(WriteFileTool::with_checksum_store(
-                        work_dir.clone(),
-                        checksum_store.clone(),
-                    )),
-                    Arc::new(StrReplaceTool::with_checksum_store(
-                        work_dir.clone(),
-                        checksum_store.clone(),
-                    )),
-                    Arc::new(ListDirectoryTool::new(work_dir.clone())),
-                    Arc::new(SearchTool::new(work_dir.clone())),
-                    Arc::new(git),
-                    Arc::new(WebFetchTool::new()),
-                    Arc::new(test_runner),
-                ]
-            }
+        // fs/shell 类工具：远程执行通道已移除，一律 server 本地执行
+        let shell = match &execution_user {
+            Some(user) => ShellTool::new_as_user(work_dir.clone(), user.clone()),
+            None => ShellTool::new(work_dir.clone()),
         };
+        let git = match &execution_user {
+            Some(user) => GitTool::new_as_user(work_dir.clone(), user.clone()),
+            None => GitTool::new(work_dir.clone()),
+        };
+        let test_runner = match &execution_user {
+            Some(user) => TestRunnerTool::new_as_user(work_dir.clone(), user.clone()),
+            None => TestRunnerTool::new(work_dir.clone()),
+        };
+        let mut t: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(shell),
+            Arc::new(ReadFileTool::with_checksum_store(
+                work_dir.clone(),
+                checksum_store.clone(),
+            )),
+            Arc::new(WriteFileTool::with_checksum_store(
+                work_dir.clone(),
+                checksum_store.clone(),
+            )),
+            Arc::new(StrReplaceTool::with_checksum_store(
+                work_dir.clone(),
+                checksum_store.clone(),
+            )),
+            Arc::new(ListDirectoryTool::new(work_dir.clone())),
+            Arc::new(SearchTool::new(work_dir.clone())),
+            Arc::new(git),
+            Arc::new(WebFetchTool::new()),
+            Arc::new(test_runner),
+        ];
         t.push(Arc::new(UpdateSpecTool::new(
             base_url.clone(),
             token.clone(),
@@ -425,17 +400,10 @@ pub async fn run_chat_turn(
         t.push(Arc::new(AskUserTool::new()));
         // 收尾建议动作：不中断循环；quant_research 精简工具集不注册（纯查询不该提议代码动作）
         t.push(Arc::new(SuggestActionsTool::new()));
-        // 截图类工具永远 server 本地执行：网页快照用 server 本机 Chrome，
-        // 终端截图由 server 拉 client 快照后本地渲染（无 user_id 的会话无法定位 client，不注册）
+        // 网页快照用 server 本机 Chrome，永远 server 本地执行
         t.push(Arc::new(crate::snap_tools::WebSnapshotTool::new(
             state.config.server.chrome_path.clone(),
         )));
-        if let Some(ref uid) = session_user_id {
-            t.push(Arc::new(crate::snap_tools::TerminalSnapshotTool::new(
-                state.clone(),
-                uid.clone(),
-            )));
-        }
         // Add explore/generate tools if session is bound to a change or is explore type
         if let Some(ref cid) = session_change_id {
             t.push(Arc::new(FinalizeExploreTool::new(
@@ -994,15 +962,7 @@ pub async fn run_chat_turn(
                     sandbox_mode: "workspace-write".to_string(),
                     network_policy: "restricted".to_string(),
                 };
-                // 远程执行会话：向 agent 说明工作目录在用户本地桌面机器上
                 let mut project_segments: Vec<code_agent::PromptSegment> = vec![];
-                if exec_client_id.is_some() {
-                    project_segments.push(code_agent::PromptSegment::Dynamic(
-                        "执行环境说明：工作目录在用户的本地桌面机器上，文件与 shell 类工具\
-                        通过远程执行通道在该机器上运行，所有路径均为该机器的本地路径。"
-                            .to_string(),
-                    ));
-                }
                 project_segments.append(&mut quant_segments);
                 // 渠道注入的额外片段（如飞书 conversation 的链路说明与节点快照）
                 for segment in &extra_prompt_segments {

@@ -22,8 +22,6 @@ const PROGRESS_CAP_RUNNING: u32 = 90;
 const MAX_MEDIA_FILES: usize = 5;
 /// 单个媒体文件大小上限（base64 回传/微信 CDN 均有成本）
 const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
-/// 从 client 远程读取文件的超时
-const REMOTE_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// spawn 一个任务消费事件流并回推微信。
 pub fn spawn(
@@ -32,7 +30,6 @@ pub fn spawn(
     to_user_id: String,
     context_token: String,
     session_id: String,
-    user_id: String,
     rx: broadcast::Receiver<EventEntry>,
 ) {
     tokio::spawn(run(
@@ -41,7 +38,6 @@ pub fn spawn(
         to_user_id,
         context_token,
         session_id,
-        user_id,
         rx,
     ));
 }
@@ -130,7 +126,6 @@ async fn run(
     to_user_id: String,
     context_token: String,
     session_id: String,
-    user_id: String,
     mut rx: broadcast::Receiver<EventEntry>,
 ) {
     let client = IlinkClient::new();
@@ -297,18 +292,8 @@ async fn run(
                         output_tokens,
                     )
                     .await;
-                    send_media_files(
-                        &state,
-                        &client,
-                        &account,
-                        &to_user_id,
-                        &context_token,
-                        &session_id,
-                        &user_id,
-                        &files,
-                        &send,
-                    )
-                    .await;
+                    send_media_files(&client, &account, &to_user_id, &context_token, &files, &send)
+                        .await;
                     finished = true;
                     break;
                 }
@@ -373,88 +358,18 @@ fn extract_file_markers(text: &str) -> (String, Vec<String>) {
     (out.trim().to_string(), files)
 }
 
-/// 极简 base64 解码（标准字符集，容忍末尾 padding），避免新增依赖。
-fn base64_decode(input: &str) -> Result<Vec<u8>> {
-    fn val(b: u8) -> Result<u8> {
-        match b {
-            b'A'..=b'Z' => Ok(b - b'A'),
-            b'a'..=b'z' => Ok(b - b'a' + 26),
-            b'0'..=b'9' => Ok(b - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            _ => Err(anyhow!("invalid base64 char: {}", b as char)),
-        }
-    }
-    let bytes: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let end = chunk.iter().position(|&b| b == b'=').unwrap_or(chunk.len());
-        let mut acc: u32 = 0;
-        for &b in &chunk[..end] {
-            acc = (acc << 6) | val(b)? as u32;
-        }
-        acc <<= 6 * (4 - end);
-        let bytes_in_chunk = end.saturating_sub(1);
-        for i in 0..bytes_in_chunk {
-            out.push((acc >> (16 - 8 * i)) as u8);
-        }
-    }
-    Ok(out)
-}
 
-/// 读取待发送文件的字节：会话绑定桌面 client 时远程回传，否则读 server 本地文件。
-async fn load_media_bytes(
-    state: &AppState,
-    session_id: &str,
-    user_id: &str,
-    path: &str,
-) -> Result<Vec<u8>> {
-    let client_id = state
-        .db
-        .get_session(session_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|s| s.exec_client_id);
-    match client_id {
-        Some(cid) => {
-            let remote = crate::remote_exec::dispatch_tool_call(
-                state,
-                user_id,
-                &cid,
-                "read_file_base64",
-                serde_json::json!({ "path": path }),
-                REMOTE_READ_TIMEOUT,
-            )
-            .await;
-            match remote {
-                Ok(result) if !result.is_error => base64_decode(result.content.trim()),
-                // 远程读不到（超时/断线/client 上不存在该路径）时降级读 server 本地：
-                // server 渲染的截图 PNG（snap_tools）就写在 server 磁盘上
-                other => {
-                    let reason = match other {
-                        Ok(r) => r.content,
-                        Err(e) => format!("{e:#}"),
-                    };
-                    tracing::info!(path, %reason, "weixin: remote read failed, fallback to local file");
-                    Ok(tokio::fs::read(path).await?)
-                }
-            }
-        }
-        None => Ok(tokio::fs::read(path).await?),
-    }
+/// 读取待发送文件的字节（一律 server 本地：agent 与截图都在 server 上跑）。
+async fn load_media_bytes(path: &str) -> Result<Vec<u8>> {
+    Ok(tokio::fs::read(path).await?)
 }
 
 /// 逐个发送标记的媒体文件；失败时降级为文本提示。
-#[allow(clippy::too_many_arguments)]
 async fn send_media_files<F, Fut>(
-    state: &Arc<AppState>,
     client: &IlinkClient,
     account: &WeixinAccount,
     to_user_id: &str,
     context_token: &str,
-    session_id: &str,
-    user_id: &str,
     files: &[String],
     send: &F,
 ) where
@@ -467,7 +382,7 @@ async fn send_media_files<F, Fut>(
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path.clone());
         let result = async {
-            let bytes = load_media_bytes(state, session_id, user_id, path).await?;
+            let bytes = load_media_bytes(path).await?;
             if bytes.is_empty() {
                 return Err(anyhow!("文件为空"));
             }
@@ -531,12 +446,4 @@ mod tests {
         assert_eq!(text, "结果 [file:/tmp/x.png");
     }
 
-    #[test]
-    fn base64_roundtrip() {
-        let data = b"hello weixin media \x00\xff\x10";
-        let encoded = crate::weixin::api::base64_encode(data);
-        assert_eq!(base64_decode(&encoded).unwrap(), data);
-        assert_eq!(base64_decode("aGVsbG8=").unwrap(), b"hello");
-        assert_eq!(base64_decode("aGVsbG8").unwrap(), b"hello");
-    }
 }

@@ -5,6 +5,10 @@
 全栈 AI Agent 桌面应用：Rust (Axum) 后端 + Vue 3 (Tauri 2) 前端。
 支持多 LLM 提供商、WebSocket 实时通信、变更管理、Spec 系统。
 
+执行形态只有 server 本地 native agent：外部代码 Agent（codex / claude / grok / kimi）、
+用户本机 hank-cli 执行节点、agent 自助部署与团队任务流水线均已下线，server 不在任何
+用户机器上跑命令。后端部署为本地交叉编译后推产物，见 `deploy/deploy.sh`。
+
 ## 技术栈
 
 - **前端**: Vue 3.5 + Composition API, Vue Router 4, Tailwind CSS 4, TypeScript, Vite 6, Tauri 2
@@ -24,7 +28,6 @@
 │   ├── scheduler/       # 定时任务调度（cron + job_runs 日志 + admin 手动触发）
 │   ├── interactions.rs  # 交互单 admin REST
 │   ├── interaction_flow.rs # 交互单应答与派发（飞书按钮 / admin 共用）
-│   ├── team_task/       # 团队任务流水线（开发→评审→测试多角色编排，见 docs/feature/team-task-pipeline.md）
 │   ├── changes.rs       # 变更管理 API
 │   ├── specs.rs         # Spec 管理 API
 │   ├── admin.rs         # 管理端点
@@ -46,9 +49,6 @@
 │   ├── views/           # 管理页面（路由级）
 │   ├── components/      # 可复用组件
 │   └── composables/api.ts  # admin API 客户端与类型
-├── team/                # 团队任务看板（独立前端，端口 18789，hash 路由）
-│   └── src/views/       # Login / TaskBoard / TaskDetail
-├── cli/                 # hank-cli：headless 远程终端节点（独立 Cargo 项目，不进 workspace）
 # quant 已迁出：https://github.com/hankjs/quant （本地 ~/projects/hank/quant）
 ├── openspec/            # OpenSpec 集成
 ├── config.toml          # 运行时配置
@@ -84,17 +84,13 @@ base path `/admin/`（history 路由）。飞书卡片深链：`{admin_base_url}
 | `/prompts` | PromptLab.vue | Prompt 实验室 |
 | `/users` | Users.vue | 用户管理 |
 | `/providers` | Providers.vue | LLM Provider |
-| `/agent-cli` | AgentCli.vue | Agent CLI 凭据与配置 |
 | `/image-providers` | ImageProviders.vue | 图像生成 Provider |
 | `/weixin` | WeixinBot.vue | 微信机器人账号与绑定 |
 | `/feishu` | FeishuBot.vue | 飞书机器人账号与绑定 |
 | `/chat-records` | ChatRecords.vue | 渠道消息留档 |
 | `/jobs` | Jobs.vue | 定时任务与执行记录 |
 | `/interactions` | Interactions.vue | 交互单：确认闸门 / ask_user / 任务闸门的状态与手动应答 |
-| `/team-task` | TeamTask.vue | 团队任务流水线配置：闸门/流水线开关、角色顺序、闸门边界（存 DB，即时生效） |
 | `/interactions/:id` | Interactions.vue | 交互单详情（同页） |
-| `/terminals` | Terminals.vue | 远程终端 |
-| `/notifications` | Notifications.vue | 通知 |
 
 ## 前端组件清单
 
@@ -121,10 +117,6 @@ cd client && npm run build      # 构建
 # 管理后台
 cd admin && pnpm dev            # admin 开发服务器
 cd admin && pnpm build          # admin 构建（严格 TS 检查）
-
-# 团队任务看板（独立前端，端口 18789，hash 路由 #/team/:taskNo）
-cd team && pnpm install && pnpm dev
-cd team && pnpm build
 
 # 后端开发
 cargo run -p hank-server        # 启动后端服务

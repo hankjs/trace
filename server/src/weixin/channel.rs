@@ -264,17 +264,6 @@ async fn build_system_prompt(
             .join("\n")
     };
 
-    // 桌面 client 在线状态：决定本地执行类任务能否 dispatch
-    let client_status = match crate::remote_exec::pick_online_client(state, &binding.user_id).await
-    {
-        Some(c) => format!(
-            "在线（主机：{}，工作目录：{}）",
-            c.hostname.as_deref().unwrap_or("未知"),
-            c.work_dir.as_deref().unwrap_or("未设置")
-        ),
-        None => "离线".to_string(),
-    };
-
     format!(
         "你是 Trace 的微信渠道助手。Trace 是一个 AI agent 平台，用户通过微信与你对话，\
         开发任务由背后的 agent 执行。\n\
@@ -293,19 +282,15 @@ async fn build_system_prompt(
         当前渠道状态：\n\
         - 绑定用户：{username}\n\
         - 当前会话：{current}\n\
-        - 桌面 client：{client_status}\n\
         - 最近会话：\n{recent}\n\
         \n\
         要求：\n\
         - 对话中会附带最近的聊天记录（含你之前的回复），\
         用户说「这个」「上面第 1 条」「我是问」这类指代或追问时，结合记录理解，不要重复回答已经答过的内容。\n\
         - text/ack 用中文，简短口语化；不要用 markdown 表格、代码块（微信里显示不好看）。\n\
-        - 桌面 client 在线时，派发的任务在用户本地机器执行，按现有逻辑决策即可。\n\
-        - 桌面 client 离线时：纯查询、闲聊、查会话状态等不需要操作用户本地文件的消息，正常 reply 或 dispatch\
-        （在服务器端执行）；涉及本地文件、代码修改、本地命令的任务不要 dispatch，用 reply 告知\
-        \"你的桌面 client 不在线，请打开 Trace 客户端后重试\"。\n\
-        - 截图/网页快照类请求（如\"截图 kimi 官网\"、\"截图给我看看\"）属于任务，正常 dispatch 即可，\
-        server 端自带截图能力，不要求桌面 client 在线；改写 task 时把\"kimi 官网\"这类口语补全成完整 URL 更好。\n\
+        - 任务一律在服务器端执行；涉及用户本地机器文件、本地命令的请求无法完成，用 reply 说明。\n\
+        - 网页快照类请求（如\"截图 kimi 官网\"）属于任务，正常 dispatch 即可，server 端自带截图能力；\
+        改写 task 时把\"kimi 官网\"这类口语补全成完整 URL 更好。\n\
         - 用户消息若是在回应机器人上一条的回复或命令结果（如\"不是啊\"\"不对\"\"哪有这个\"这类纠正、质疑、追问），\
         选 reply 解释或引导正确使用命令（如 /ls 浏览目录、/cd 设置目录、/new 开新会话），不要 dispatch。\n\
         - 用户问\"你能做什么\"\"有什么功能\"时，只简要概述核心能力（派任务、追问、进度推送、文件回传），\

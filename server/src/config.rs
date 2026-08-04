@@ -13,9 +13,6 @@ pub struct Config {
     pub server_agent: ServerAgentConfig,
     #[serde(default)]
     pub quant_a2a: Option<QuantA2aConfig>,
-    /// 团队任务流水线（开发→评审→测试多角色编排）。默认关闭。
-    #[serde(default)]
-    pub team_task: TeamTaskConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,9 +55,7 @@ pub struct ServerAgentConfig {
     pub deploy_use_sudo: bool,
     #[serde(default = "default_deploy_approval_ttl_secs")]
     pub approval_ttl_secs: u64,
-    /// 两阶段任务闸门的**初始默认值**。
-    /// 运行时真正生效的值在数据库（settings 表，admin「团队任务」页可改），
-    /// 见 `team_task::settings::effective`。这里只在 DB 尚无配置时作兜底。
+    /// 两阶段任务闸门开关。
     ///
     /// 与 `enabled` 解耦：client-only 链路在 `server_agent.enabled = false` 时
     /// 同样要能用闸门。调用方不得写成 `enabled && task_gate_enabled`。
@@ -161,58 +156,6 @@ fn default_quant_a2a_base_url() -> String {
     "http://127.0.0.1:8100".to_string()
 }
 
-/// 团队任务流水线的**初始默认值**。运行时真正生效的配置在数据库
-/// （settings 表，admin 可改），见 `team_task::settings::effective`。
-/// 这里的值只在 DB 里还没有配置时作为兜底，便于升级上线时行为不变。
-///
-/// config.toml 不写 `[team_task]` 段也能启动（默认 enabled = false）。
-#[derive(Debug, Clone, Deserialize)]
-pub struct TeamTaskConfig {
-    /// 总开关默认值。关闭时 task_gate 走原来的单角色两阶段路径。
-    #[serde(default)]
-    pub enabled: bool,
-    /// 参与流水线的角色默认顺序。可裁剪成 ["developer"] 只跑单角色。
-    #[serde(default = "default_team_roles")]
-    pub roles: Vec<String>,
-    /// 需要人工确认的边界默认值。默认只保留开发前闸门。
-    #[serde(default = "default_team_gates")]
-    pub gates: Vec<String>,
-    /// 评审打回后最多重新开发几轮的默认上限。
-    #[serde(default = "default_max_dev_rounds")]
-    pub max_dev_rounds: i32,
-    /// 看板外部可访问地址默认值。
-    #[serde(default)]
-    pub dashboard_base_url: Option<String>,
-}
-
-impl Default for TeamTaskConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            roles: default_team_roles(),
-            gates: default_team_gates(),
-            max_dev_rounds: default_max_dev_rounds(),
-            dashboard_base_url: None,
-        }
-    }
-}
-
-fn default_team_roles() -> Vec<String> {
-    vec![
-        "developer".to_string(),
-        "reviewer".to_string(),
-        "tester".to_string(),
-    ]
-}
-
-fn default_team_gates() -> Vec<String> {
-    vec!["dev_start".to_string()]
-}
-
-fn default_max_dev_rounds() -> i32 {
-    3
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
     pub host: String,
@@ -269,55 +212,5 @@ impl Config {
         }
 
         bail!("No config file found. Create config.toml from config.example.toml")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 最小可反序列化的 [server] 段（必填字段）。
-    const MIN_SERVER: &str = r#"
-[server]
-host = "127.0.0.1"
-port = 3000
-jwt_secret = "test-secret"
-database_url = "mysql://u:p@localhost/db"
-"#;
-
-    #[test]
-    fn team_task_absent_uses_defaults() {
-        let cfg: Config = toml::from_str(MIN_SERVER).expect("parse");
-        assert!(!cfg.team_task.enabled);
-        assert_eq!(cfg.team_task.roles, vec!["developer", "reviewer", "tester"]);
-        assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
-        assert_eq!(cfg.team_task.max_dev_rounds, 3);
-        assert!(cfg.team_task.dashboard_base_url.is_none());
-    }
-
-    #[test]
-    fn team_task_enabled_only_keeps_other_defaults() {
-        let toml = format!("{MIN_SERVER}\n[team_task]\nenabled = true\n");
-        let cfg: Config = toml::from_str(&toml).expect("parse");
-        assert!(cfg.team_task.enabled);
-        assert_eq!(cfg.team_task.roles, vec!["developer", "reviewer", "tester"]);
-        assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
-        assert_eq!(cfg.team_task.max_dev_rounds, 3);
-        assert!(cfg.team_task.dashboard_base_url.is_none());
-    }
-
-    #[test]
-    fn team_task_roles_override_leaves_gates_default() {
-        let toml = format!(
-            r#"{MIN_SERVER}
-[team_task]
-roles = ["developer"]
-"#
-        );
-        let cfg: Config = toml::from_str(&toml).expect("parse");
-        assert!(!cfg.team_task.enabled);
-        assert_eq!(cfg.team_task.roles, vec!["developer"]);
-        assert_eq!(cfg.team_task.gates, vec!["dev_start"]);
-        assert_eq!(cfg.team_task.max_dev_rounds, 3);
     }
 }

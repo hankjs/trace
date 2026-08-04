@@ -183,16 +183,6 @@ pub enum SlashCommand {
     Help,
 }
 
-/// hank-cli 节点快照（用于 /nodes 回复与 conversation prompt 注入）
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HankCliNodeInfo {
-    pub client_id: String,
-    pub hostname: Option<String>,
-    pub online: bool,
-    pub work_dir: Option<String>,
-    pub agent_backends: Vec<String>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceKind {
     None,
@@ -242,60 +232,15 @@ impl AgentKind {
     }
 }
 
-/// 路由 Agent 对新话题选择的执行后端。
-///
-/// 比 `hank_db::AgentBackend` 多一个 `Native`：表示走 server 内建 Agent（无外部 CLI）。
-/// 外部变体的 wire 字符串委托给 `hank_db::AgentBackend`，避免再维护一份清单。
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum AgentBackend {
-    Native,
-    Codex,
-    Claude,
-    Grok,
-    Kimi,
-}
-
-impl AgentBackend {
-    /// 转成跨模块的外部后端类型；Native 无对应值（它不是外部 CLI）。
-    fn external(self) -> Option<hank_db::AgentBackend> {
-        match self {
-            Self::Native => None,
-            Self::Codex => Some(hank_db::AgentBackend::Codex),
-            Self::Claude => Some(hank_db::AgentBackend::Claude),
-            Self::Grok => Some(hank_db::AgentBackend::Grok),
-            Self::Kimi => Some(hank_db::AgentBackend::Kimi),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Native => "native",
-            other => other.external().expect("非 Native 必有外部值").as_str(),
-        }
-    }
-
-    fn from_external(backend: hank_db::AgentBackend) -> Self {
-        match backend {
-            hank_db::AgentBackend::Codex => Self::Codex,
-            hank_db::AgentBackend::Claude => Self::Claude,
-            hank_db::AgentBackend::Grok => Self::Grok,
-            hank_db::AgentBackend::Kimi => Self::Kimi,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct NewTopicDecision {
     agent_kind: AgentKind,
-    agent_backend: AgentBackend,
 }
 
 impl NewTopicDecision {
-    fn fallback(default_backend: AgentBackend) -> Self {
+    fn fallback() -> Self {
         Self {
             agent_kind: AgentKind::GeneralTask,
-            agent_backend: default_backend,
         }
     }
 
@@ -305,19 +250,6 @@ impl NewTopicDecision {
 
     fn workspace_kind(&self) -> WorkspaceKind {
         self.agent_kind.workspace_kind()
-    }
-
-    fn normalized(mut self, default_backend: AgentBackend) -> Self {
-        match self.agent_kind {
-            // conversation / quant_research 都必须走 server 侧 native，才能挂工具或纯对话；
-            // 落到外部 CLI 会被 chat.rs 提前 return 进 cli_agent，quant 工具永远挂不上。
-            AgentKind::Conversation | AgentKind::QuantResearch => {
-                self.agent_backend = AgentBackend::Native
-            }
-            _ if self.agent_backend == AgentBackend::Native => self.agent_backend = default_backend,
-            _ => {}
-        }
-        self
     }
 }
 
@@ -494,7 +426,7 @@ async fn handle_message(
 
     // 斜杠命令
     if let Some(cmd) = parse_command(&msg.text) {
-        return handle_command(&state, &api, &account, &msg, &user_id, cmd).await;
+        return handle_command(&state, &api, &account, &msg, cmd).await;
     }
 
     if let Some(image_key) = image_key {
@@ -645,7 +577,6 @@ async fn handle_command(
     api: &FeishuApi,
     account: &FeishuAccount,
     msg: &IncomingMessage,
-    user_id: &str,
     cmd: SlashCommand,
 ) -> Result<()> {
     let topic = msg.topic_id();
@@ -752,28 +683,15 @@ async fn handle_command(
 // ── 任务派发 ──
 
 /// 新话题先判断是否真的需要工作区，以及工作区是否属于 Trace monorepo。
-/// 分类失败时降级到 general_task + 默认 CLI 后端（client-only），绝不静默建 server worktree。
-/// 默认外部 Agent 后端按当前用户在线 hank-cli 节点能力选择，不看 server 侧凭据。
+/// 分类失败时降级到 general_task，绝不静默建 server worktree。
 ///
-/// client-only hank-cli 路由**不依赖** `[server_agent].enabled`：关闭时代码/文件任务
-/// 仍走本机节点；开启时仅额外允许 native conversation 使用 server 侧无工具会话。
-async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTopicDecision {
-    let default_backend =
-        AgentBackend::from_external(crate::cli_agent::preferred_backend(state, user_id).await);
+/// 外部代码 Agent 已下线，所有会话都在 server 侧 native 执行。
+async fn decide_new_topic(state: &AppState, text: &str) -> NewTopicDecision {
     let server_agent_enabled = state.config.server_agent.enabled;
     // quant_a2a 关闭时路由 prompt 不得出现 quant_research，避免模型凭常识乱猜该类型。
     let quant_enabled = state.config.quant_a2a.as_ref().is_some_and(|c| c.enabled);
-    match try_decide_new_topic(
-        state,
-        text,
-        default_backend,
-        server_agent_enabled,
-        quant_enabled,
-    )
-    .await
-    {
+    match try_decide_new_topic(state, text, server_agent_enabled, quant_enabled).await {
         Ok(decision) => {
-            let decision = decision.normalized(default_backend);
             tracing::info!(
                 ?decision,
                 server_agent_enabled,
@@ -784,7 +702,7 @@ async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTop
         }
         Err(e) => {
             tracing::warn!("feishu: workspace decision failed, fallback to general: {e:#}");
-            NewTopicDecision::fallback(default_backend)
+            NewTopicDecision::fallback()
         }
     }
 }
@@ -792,41 +710,20 @@ async fn decide_new_topic(state: &AppState, user_id: &str, text: &str) -> NewTop
 async fn try_decide_new_topic(
     state: &AppState,
     text: &str,
-    default_backend: AgentBackend,
     server_agent_enabled: bool,
     quant_enabled: bool,
 ) -> Result<NewTopicDecision> {
     let (record, provider) = provider_registry::resolve_default(&state.db)
         .await
         .ok_or_else(|| anyhow!("没有可用的 LLM provider"))?;
+    // 代码/文件任务需要 server 侧工作区；server_agent 关闭时只能纯对话。
     let env_note = if server_agent_enabled {
-        if quant_enabled {
-            "当前环境已开启 server_agent：conversation / quant_research 的 native 可在 server 运行\
-             （conversation 无工具，quant_research 仅 quant 工具）；\
-             代码/文件任务（trace_code/quant_code/general_task）仍必须走用户本机 hank-cli（codex/claude/grok/kimi），\
-             不会在 server bubblewrap 执行。"
-                .to_string()
-        } else {
-            // quant 关闭时保持与历史 prompt 一致，避免无意义的文案漂移。
-            "当前环境已开启 server_agent：conversation 的 native 可在 server 无工具运行；\
-             代码/文件任务（trace_code/quant_code/general_task）仍必须走用户本机 hank-cli（codex/claude/grok/kimi），\
-             不会在 server bubblewrap 执行。"
-                .to_string()
-        }
-    } else if quant_enabled {
-        "当前环境未开启 server_agent，没有 server 侧代码工作区（worktree/bubblewrap）。\
-         凡需要读改代码、跑命令、操作文件的任务（trace_code / quant_code / general_task）\
-         都必须在用户本机在线的 hank-cli 节点上通过 codex/claude/grok/kimi 执行，\
-         agent_backend 不可选 native（仅 conversation / quant_research 可选 native）。\
-         没有匹配在线节点时创建会话会明确失败，这是预期行为。"
-            .to_string()
+        "当前环境已开启 server_agent：所有会话都在 server 侧执行，没有用户本机执行通道。\
+         代码/文件任务会在 server 的工作区里读改文件、跑命令。"
     } else {
-        "当前环境未开启 server_agent，没有 server 侧代码工作区（worktree/bubblewrap）。\
-         凡需要读改代码、跑命令、操作文件的任务（trace_code / quant_code / general_task）\
-         都必须在用户本机在线的 hank-cli 节点上通过 codex/claude/grok/kimi 执行，\
-         agent_backend 不可选 native（仅 conversation 可选 native）。\
-         没有匹配在线节点时创建会话会明确失败，这是预期行为。"
-            .to_string()
+        "当前环境未开启 server_agent，没有 server 侧代码工作区。\
+         凡需要读改代码、跑命令、操作文件的任务都无法执行，这类消息一律归到 conversation，\
+         由对话 Agent 说明限制。"
     };
     // quant_research 只在 quant_a2a.enabled 时进入可选列表；关闭时保持与历史 prompt 一致（无回归）。
     let quant_research_line = if quant_enabled {
@@ -845,38 +742,23 @@ async fn try_decide_new_topic(
         // enabled=false 时显式禁止，防止模型凭常识乱猜该类型。
         "本环境没有 quant 研究工具，不得输出 quant_research。\n".to_string()
     };
-    let backend_native_note = if quant_enabled {
-        "conversation 与 quant_research 必须选 native"
-    } else {
-        "conversation 必须选 native"
-    };
-    let backend_forbid_note = if quant_enabled {
-        "不能选 conversation 或 quant_research"
-    } else {
-        "不能选 conversation"
-    };
     let system = format!("你是飞书任务的路由 Agent。只输出一个 JSON 对象，不要输出 markdown 或其他文字。\n\
         {env_note}\n\
         输出字段 agent_kind 可选值：\n\
         - trace_code：需要读取、修改、测试或部署 Trace/Hank monorepo 的 server、\
-          crates、admin、cli、docs、飞书/微信渠道或同步流程；不包括 client 和 quant。\n\
+          crates、admin、docs、飞书/微信渠道或同步流程；不包括 client 和 quant。\n\
         - quant_code：需要读取、修改或测试独立 quant 仓库（github.com/hankjs/quant）的代码、策略、看板或文档。\n\
         - general_task：具体任务与 Trace/quant 无关，但需要文件、代码、命令、下载、分析产物或持续迭代工作区。\n\
         {quant_research_line}\
         - conversation：用户在问候、讨论、咨询、分析问题，或者尚未给出需要文件和命令的事项。\
           后续对话 Agent 会负责正式回答；路由器不要回答用户问题。\n\
-        输出字段 agent_backend 可选值：native、codex、claude、grok、kimi。{backend_native_note}；\
-        其他任务默认选 {default_backend}；用户明确要求 Codex、Claude/Claude Code、Grok 或 Kimi/Kimi Code 时，分别选择对应后端，且 agent_kind 至少为 general_task，{backend_forbid_note}。\n\
-        示例：{{\"agent_kind\":\"trace_code\",\"agent_backend\":\"{default_backend}\"}}。\n\
+        只输出 agent_kind 一个字段。示例：{{\"agent_kind\":\"trace_code\"}}。\n\
         {quant_priority_note}\
         判断 Agent 必须看语义，不只看是否出现项目名。拿不准是否属于 Trace/quant 时选择 general_task；\
         拿不准是否需要文件或命令时选择 conversation。",
         env_note = env_note,
         quant_research_line = quant_research_line,
         quant_priority_note = quant_priority_note,
-        backend_native_note = backend_native_note,
-        backend_forbid_note = backend_forbid_note,
-        default_backend = default_backend.as_str()
     );
     let request = CompletionRequest {
         model: provider_registry::resolve_default_model(&record),
@@ -1094,25 +976,6 @@ async fn dispatch_task_content(
         return Ok(());
     }
 
-    // 普通远程工具会话离线后可解除绑定；本机 Agent（client-only）会话在
-    // resolve_existing_feishu_session 已强制失败，此处不再解绑或换节点。
-    if let Ok(Some(session)) = state.db.get_session(&session_id).await {
-        if let Some(ref cid) = session.exec_client_id {
-            let local_agent = session
-                .metadata
-                .as_deref()
-                .and_then(parse_session_metadata_json)
-                .is_some_and(|metadata| is_client_only_metadata(&metadata));
-            if !local_agent && !crate::remote_exec::is_client_online(state, user_id, cid).await {
-                tracing::info!(session_id = %session_id, client_id = %cid, "feishu: exec client offline, unbind");
-                let _ = state
-                    .db
-                    .set_session_exec_client(&session_id, None, None)
-                    .await;
-            }
-        }
-    }
-
     let username = state
         .db
         .get_user_by_id(user_id)
@@ -1219,44 +1082,6 @@ async fn resolve_existing_feishu_session(
         .unwrap_or(SessionReusePolicy::Recreate);
 
     match policy {
-        SessionReusePolicy::ReuseClientOnly { backend, client_id } => {
-            // 同一话题固定 backend/client_id；离线或能力不匹配时明确失败，绝不换节点。
-            if is_external_agent_backend(&backend) {
-                let bound_client_id = match client_id {
-                    Some(id) => id,
-                    None => state
-                        .db
-                        .get_session(&session_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .and_then(|session| session.exec_client_id)
-                        .ok_or_else(|| {
-                            anyhow!(
-                                "本机 CLI 会话缺少绑定节点（backend={backend}）。请 /new 后重试。"
-                            )
-                        })?,
-                };
-                if !crate::remote_exec::is_client_online(state, user_id, &bound_client_id).await {
-                    bail!(
-                        "绑定的 hank-cli 节点不在线（client={bound_client_id}, backend={backend}）。请在对应电脑启动 hank-cli 后重试；不会切换到其他节点或 server。"
-                    );
-                }
-                if !crate::remote_exec::client_reports_backend(
-                    state,
-                    user_id,
-                    &bound_client_id,
-                    &backend,
-                )
-                .await
-                {
-                    bail!(
-                        "绑定的 hank-cli 节点未上报 {backend} 能力（client={bound_client_id}）。请检查本机 agent_backends 后重试；不会回退 server 或其他节点。"
-                    );
-                }
-            }
-            Ok(Some(session_id))
-        }
         SessionReusePolicy::ReuseManaged => Ok(Some(session_id)),
         SessionReusePolicy::RequireNew { backend, .. } => {
             bail!("{}", legacy_server_agent_require_new_message(&backend))
@@ -1272,18 +1097,6 @@ async fn resolve_existing_feishu_session(
     }
 }
 
-async fn session_is_client_only(state: &Arc<AppState>, session_id: &str) -> Result<bool> {
-    let metadata = state
-        .db
-        .get_session(session_id)
-        .await?
-        .and_then(|session| session.metadata);
-    Ok(metadata
-        .as_deref()
-        .and_then(parse_session_metadata_json)
-        .is_some_and(|value| is_client_only_metadata(&value)))
-}
-
 async fn create_and_map_feishu_session(
     state: &Arc<AppState>,
     account: &FeishuAccount,
@@ -1292,14 +1105,11 @@ async fn create_and_map_feishu_session(
     user_id: &str,
     content: &[ContentBlock],
 ) -> Result<Option<String>> {
-    // client-only hank-cli 路由始终可用：不因 server_agent.enabled=false 短路成 Native。
-    // conversation → native 无工具；代码/文件任务 → 外部 CLI 后端，缺节点时明确失败。
-    let decision = decide_new_topic(state, user_id, &classification_text(content)).await;
+    let decision = decide_new_topic(state, &classification_text(content)).await;
     let session = create_feishu_session(
         state,
         user_id,
         decision.agent_kind(),
-        decision.agent_backend.as_str(),
         decision.workspace_kind(),
     )
     .await?;
@@ -1344,14 +1154,15 @@ fn reuse_policy_for_session_metadata(metadata: &str) -> SessionReusePolicy {
         return SessionReusePolicy::Recreate;
     };
     let backend = value["agent_backend"].as_str().unwrap_or("native");
-    if is_client_only_metadata(&value) {
-        return SessionReusePolicy::ReuseClientOnly {
+    // 历史 client-only 话题绑的是已下线的本机 hank-cli，不能静默复用。
+    if is_client_only_metadata(&value) && is_external_agent_backend(backend) {
+        return SessionReusePolicy::RequireNew {
             backend: backend.to_string(),
-            client_id: value["exec_client_id"]
-                .as_str()
-                .map(str::to_string)
-                .filter(|id| !id.is_empty()),
+            reason: "external_agent_retired",
         };
+    }
+    if is_client_only_metadata(&value) {
+        return SessionReusePolicy::ReuseManaged;
     }
     if is_legacy_server_agent_metadata(&value) && is_external_agent_backend(backend) {
         return SessionReusePolicy::RequireNew {
@@ -1368,14 +1179,9 @@ fn reuse_policy_for_session_metadata(metadata: &str) -> SessionReusePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SessionReusePolicy {
-    /// client-only：固定 backend/client_id/thread_id，节点离线时失败而不是换节点。
-    ReuseClientOnly {
-        backend: String,
-        client_id: Option<String>,
-    },
-    /// 非外部后端的 managed 会话（如 native conversation）。
+    /// 可直接复用的 managed 会话（native）。
     ReuseManaged,
-    /// 历史 server-agent + 外部后端：禁止静默复用，要求 /new。
+    /// 历史外部后端会话（server-agent 或 client-only）：禁止静默复用，要求 /new。
     RequireNew {
         backend: String,
         reason: &'static str,
@@ -1384,183 +1190,25 @@ enum SessionReusePolicy {
     Recreate,
 }
 
-fn client_only_command_unsupported_message(command: &str) -> String {
-    format!(
-        "本机 CLI 会话不支持 {command}；该命令面向 server worktree 部署流程。请在本机工作目录自行查看变更、跑测试或部署，或使用 /new 开启新话题。"
-    )
-}
-
 fn legacy_server_agent_require_new_message(backend: &str) -> String {
     format!(
-        "该话题仍绑定已废弃的 server Agent 工作区（backend={backend}），不会再在 wananyun 上执行或修改 Trace。请发送 /new 开启本机 hank-cli 会话，并确保对应电脑在线且已上报 {backend} 能力。"
+        "该话题绑定的外部代码 Agent（backend={backend}）已下线，无法继续执行。请发送 /new 开启新话题。"
     )
 }
 
-fn missing_agent_node_message(backend: &str) -> String {
-    format!(
-        "没有在线且支持 {backend} 的 hank-cli 节点。请在目标电脑启动 hank-cli，确认 work_dir 有效且 agent_backends 包含 {backend} 后重试；不会回退到 server bubblewrap 或其他节点。"
-    )
-}
-
-/// 节点展示名：hostname 优先，否则 client_id 前 8 位。
-fn node_display_name(node: &HankCliNodeInfo) -> String {
-    match node
-        .hostname
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        Some(name) => name.to_string(),
-        None => {
-            let id = node.client_id.as_str();
-            let short = if id.len() > 8 { &id[..8] } else { id };
-            short.to_string()
-        }
-    }
-}
-
-/// 渲染 /nodes 命令回复（纯函数，便于单测）。
-fn format_nodes_command_reply(nodes: &[HankCliNodeInfo]) -> String {
-    if nodes.is_empty() {
-        return "当前没有注册的 hank-cli 节点。\n\
-请在目标电脑安装并启动 hank-cli，在配置中设置 work_dir 与 agent_backends \
-（如 codex/claude/grok/kimi），启动后使用 /nodes 可再次查看。"
-            .to_string();
-    }
-    let mut lines = vec![format!("hank-cli 节点（共 {} 台）：", nodes.len())];
-    for node in nodes {
-        let status = if node.online { "在线" } else { "离线" };
-        let work_dir = node
-            .work_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("未设置");
-        let backends = if node.agent_backends.is_empty() {
-            "（未上报）".to_string()
-        } else {
-            node.agent_backends.join(", ")
-        };
-        lines.push(format!(
-            "· {} | {} | work_dir={} | backends=[{}]",
-            node_display_name(node),
-            status,
-            work_dir,
-            backends
-        ));
-    }
-    lines.join("\n")
-}
-
-/// 渲染 conversation 注入用的节点快照（纯函数；数据必须来自调用方真实查询）。
-fn render_hank_cli_nodes_snapshot(nodes: &[HankCliNodeInfo]) -> String {
-    let online_count = nodes.iter().filter(|n| n.online).count();
-    if nodes.is_empty() || online_count == 0 {
-        let mut text = "当前没有在线的 hank-cli 节点。".to_string();
-        if !nodes.is_empty() {
-            text.push_str(" 已注册但全部离线的节点：\n");
-            for node in nodes {
-                let work_dir = node
-                    .work_dir
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("未设置");
-                let backends = if node.agent_backends.is_empty() {
-                    "（未上报）".to_string()
-                } else {
-                    node.agent_backends.join(", ")
-                };
-                text.push_str(&format!(
-                    "· {} | 离线 | work_dir={} | backends=[{}]\n",
-                    node_display_name(node),
-                    work_dir,
-                    backends
-                ));
-            }
-        }
-        return text.trim_end().to_string();
-    }
-    let mut lines = vec![format!(
-        "当前用户 hank-cli 节点快照（共 {} 台，其中 {} 台在线）：",
-        nodes.len(),
-        online_count
-    )];
-    for node in nodes {
-        let status = if node.online { "在线" } else { "离线" };
-        let work_dir = node
-            .work_dir
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("未设置");
-        let backends = if node.agent_backends.is_empty() {
-            "（未上报）".to_string()
-        } else {
-            node.agent_backends.join(", ")
-        };
-        lines.push(format!(
-            "· {} | {} | work_dir={} | backends=[{}]",
-            node_display_name(node),
-            status,
-            work_dir,
-            backends
-        ));
-    }
-    lines.join("\n")
-}
-
-/// 飞书 conversation 会话的链路架构说明（不含节点快照）。
+/// 飞书 conversation 会话的链路架构说明。
 fn feishu_conversation_architecture_text() -> &'static str {
     "【飞书链路与执行架构】\n\
      - 用户通过飞书对话，消息经 Trace server 转发。\n\
-     - 代码/文件/命令类任务由 server 路由到用户本机在线的 hank-cli 节点，在节点上调用本机 \
-codex / claude（Claude Code）/ grok / kimi CLI 执行，凭据留在本机不上传 server。\n\
-     - 一个飞书话题 = 一个会话，话题固定首次选定的 backend 与节点；换后端或换节点需要 /new。\n\
-     - 可用命令：/new /stop /status /nodes /help（/diff /test /deploy /rollback 仅 server worktree 会话）。\n\
-     - 当前话题是纯对话模式，没有工作目录也没有本地执行工具；用户要跑命令或改代码时应提示用 /new 重新路由。\n\
-     以下节点信息来自 server 实时查询，请直接据此回答，不要猜测或编造节点状态。"
+     - 所有会话都在 Trace server 侧执行；外部代码 Agent（codex / claude / grok / kimi）与\
+用户本机执行节点已下线，server 不会在用户电脑上跑任何命令。\n\
+     - 一个飞书话题 = 一个会话；换话题需要 /new。\n\
+     - 可用命令：/new /stop /status /help。\n\
+     - 当前话题是纯对话模式，没有工作目录也没有执行工具；用户要跑命令或改代码时应说明当前不支持。"
 }
 
-/// 从 DB + client_hubs 收集用户的 hank-cli 节点快照。
-async fn collect_hank_cli_nodes(state: &AppState, user_id: &str) -> Vec<HankCliNodeInfo> {
-    let agents = match state.db.list_client_agents(user_id).await {
-        Ok(list) => list,
-        Err(e) => {
-            tracing::warn!(user_id = %user_id, "feishu: list_client_agents failed: {e:#}");
-            return Vec::new();
-        }
-    };
-    let mut nodes = Vec::with_capacity(agents.len());
-    for agent in agents {
-        let online = crate::remote_exec::is_client_online(state, user_id, &agent.id).await;
-        // agent_backends 仅在节点 poll/register 时存在于内存 hub；离线时可能为空。
-        let agent_backends = {
-            let hubs = state.client_hubs.read().await;
-            hubs.get(user_id)
-                .and_then(|hub| hub.agent_backends.get(&agent.id))
-                .cloned()
-                .unwrap_or_default()
-        };
-        nodes.push(HankCliNodeInfo {
-            client_id: agent.id,
-            hostname: agent.hostname,
-            online,
-            work_dir: agent.work_dir,
-            agent_backends,
-        });
-    }
-    nodes
-}
-
-async fn build_feishu_conversation_extra_prompts(state: &AppState, user_id: &str) -> Vec<String> {
-    let nodes = collect_hank_cli_nodes(state, user_id).await;
-    let snapshot = render_hank_cli_nodes_snapshot(&nodes);
-    vec![format!(
-        "{}\n\n【当前用户 hank-cli 节点快照】\n{}",
-        feishu_conversation_architecture_text(),
-        snapshot
-    )]
+async fn build_feishu_conversation_extra_prompts(_state: &AppState, _user_id: &str) -> Vec<String> {
+    vec![feishu_conversation_architecture_text().to_string()]
 }
 
 async fn session_is_conversation(state: &AppState, session_id: &str) -> bool {
@@ -1595,7 +1243,6 @@ async fn create_feishu_session(
     state: &Arc<AppState>,
     user_id: &str,
     agent_kind: &str,
-    agent_backend: &str,
     workspace_kind: WorkspaceKind,
 ) -> Result<hank_db::Session> {
     // quant 研究话题：server 侧 native 会话，只挂 quant_* 工具，无工作区、
@@ -1626,58 +1273,13 @@ async fn create_feishu_session(
         return Ok(session);
     }
 
-    // codex/claude/grok/kimi：必须绑定在线且能力匹配的 hank-cli；绝不回退 server bubblewrap。
-    if is_external_agent_backend(agent_backend) {
-        let Some(client) =
-            crate::remote_exec::pick_online_agent_client(state, user_id, agent_backend).await
-        else {
-            bail!("{}", missing_agent_node_message(agent_backend));
-        };
-        let metadata = serde_json::json!({
-            "source": "feishu",
-            "agent_backend": agent_backend,
-            "agent_kind": agent_kind,
-            "agent_location": "client",
-            "workspace_kind": "client",
-            "exec_client_id": client.id,
-        })
-        .to_string();
-        let mut session = state
-            .db
-            .create_session(
-                agent_backend,
-                "",
-                client.work_dir.as_deref(),
-                Some(user_id),
-                Some("remote"),
-                Some("chat"),
-                Some(&metadata),
-            )
-            .await
-            .map_err(|e| anyhow!("create local agent session: {e:#}"))?;
-        state
-            .db
-            .set_session_exec_client(&session.id, Some(&client.id), client.work_dir.as_deref())
-            .await?;
-        tracing::info!(
-            session_id = %session.id,
-            client_id = %client.id,
-            backend = agent_backend,
-            "feishu session bound to hank-cli agent"
-        );
-        session.exec_client_id = Some(client.id);
-        session.work_dir = client.work_dir;
-        return Ok(session);
-    }
-
-    // native 对话：server-agent 开启时仍可建无 worktree 的 server 会话（不含代码 Agent）。
-    // 飞书不再为外部后端创建 server-only / bubblewrap 会话。
-    if state.config.server_agent.enabled && agent_backend == "native" {
+    // server-agent 开启时建无 worktree 的 server 会话。
+    if state.config.server_agent.enabled {
         crate::server_workspace::ensure_server_agent_admin(state, user_id).await?;
         let metadata = serde_json::json!({
             "source": "feishu",
             "server_agent": true,
-            "agent_backend": agent_backend,
+            "agent_backend": "native",
             "agent_kind": agent_kind,
             "workspace_kind": workspace_kind.as_str(),
             "client_excluded": true,
@@ -1686,7 +1288,7 @@ async fn create_feishu_session(
         let session = state
             .db
             .create_session(
-                agent_backend,
+                "",
                 "",
                 None,
                 Some(user_id),
@@ -1698,7 +1300,7 @@ async fn create_feishu_session(
             .map_err(|e| anyhow!("create server session: {e:#}"))?;
         // conversation 的 workspace_kind 为 None，不创建目录。
         if workspace_kind != WorkspaceKind::None {
-            // 防御：native 非 conversation 理论上已被 normalize 掉；若落到此路径不建 worktree。
+            // 代码/文件任务的 server 工作区已下线；落到此路径不建 worktree。
             tracing::warn!(
                 session_id = %session.id,
                 ?workspace_kind,
@@ -1714,21 +1316,12 @@ async fn create_feishu_session(
         "agent_kind": agent_kind,
     })
     .to_string();
-    // conversation 是纯对话：无工具、无工作区，不得绑定 exec_client / work_dir，
-    // 否则 chat.rs 会注入「在本地桌面执行」说明，与「没有本地执行工具」自相矛盾。
-    // 非 conversation 的 native 会话仍可绑在线桌面 client 使用普通远程工具。
-    let client = if should_bind_remote_exec_client(agent_kind) {
-        crate::remote_exec::pick_online_client(state, user_id).await
-    } else {
-        None
-    };
-    let work_dir = client.as_ref().and_then(|c| c.work_dir.clone());
-    let mut session = state
+    let session = state
         .db
         .create_session(
             "",
             "",
-            work_dir.as_deref(),
+            None,
             Some(user_id),
             Some("remote"),
             Some("chat"),
@@ -1736,27 +1329,7 @@ async fn create_feishu_session(
         )
         .await
         .map_err(|e| anyhow!("create session: {e:#}"))?;
-    if let Some(c) = client {
-        if let Err(e) = state
-            .db
-            .set_session_exec_client(&session.id, Some(&c.id), c.work_dir.as_deref())
-            .await
-        {
-            tracing::warn!("feishu: bind exec client failed: {e:#}");
-        } else {
-            tracing::info!(session_id = %session.id, client_id = %c.id, "feishu session bound to desktop client");
-            session.exec_client_id = Some(c.id);
-            session.work_dir = c.work_dir;
-        }
-    }
     Ok(session)
-}
-
-/// native fallback 分支是否应绑定远程执行节点。
-/// conversation 与 quant_research 都无工作目录，不得绑定；绑了会让 chat.rs 注入
-/// 「工作目录在你本地桌面」的说明，与「只有 quant 工具 / 纯对话无工具」自相矛盾。
-fn should_bind_remote_exec_client(agent_kind: &str) -> bool {
-    !matches!(agent_kind, "conversation" | "quant_research")
 }
 
 #[cfg(test)]
@@ -1880,214 +1453,106 @@ mod tests {
     }
 
     #[test]
-    fn format_nodes_command_reply_empty() {
-        let text = format_nodes_command_reply(&[]);
-        assert!(text.contains("没有注册的 hank-cli 节点"), "{text}");
-        assert!(text.contains("安装并启动"), "{text}");
-        assert!(text.contains("work_dir"), "{text}");
-        assert!(text.contains("agent_backends"), "{text}");
-    }
-
-    #[test]
-    fn render_nodes_snapshot_covers_empty_partial_and_online() {
-        // 无节点
-        let empty = render_hank_cli_nodes_snapshot(&[]);
-        assert!(empty.contains("当前没有在线的 hank-cli 节点"), "{empty}");
-
-        // 全部离线
-        let offline_only = vec![HankCliNodeInfo {
-            client_id: "abcdef012345".into(),
-            hostname: Some("mbp".into()),
-            online: false,
-            work_dir: Some("/Users/me/proj".into()),
-            agent_backends: vec!["codex".into()],
-        }];
-        let offline_text = render_hank_cli_nodes_snapshot(&offline_only);
-        assert!(
-            offline_text.contains("当前没有在线的 hank-cli 节点"),
-            "{offline_text}"
-        );
-        assert!(offline_text.contains("mbp"), "{offline_text}");
-        assert!(offline_text.contains("离线"), "{offline_text}");
-        assert!(offline_text.contains("codex"), "{offline_text}");
-
-        // 部分在线
-        let mixed = vec![
-            HankCliNodeInfo {
-                client_id: "online-1".into(),
-                hostname: Some("desk".into()),
-                online: true,
-                work_dir: Some("/work".into()),
-                agent_backends: vec!["claude".into(), "grok".into()],
-            },
-            HankCliNodeInfo {
-                client_id: "offline-1".into(),
-                hostname: None,
-                online: false,
-                work_dir: None,
-                agent_backends: vec![],
-            },
-        ];
-        let mixed_text = render_hank_cli_nodes_snapshot(&mixed);
-        assert!(mixed_text.contains("desk"), "{mixed_text}");
-        assert!(mixed_text.contains("在线"), "{mixed_text}");
-        assert!(mixed_text.contains("离线"), "{mixed_text}");
-        assert!(mixed_text.contains("claude"), "{mixed_text}");
-        // hostname 缺失时用 client_id 前 8 位
-        assert!(mixed_text.contains("offline-"), "{mixed_text}");
-        assert!(!mixed_text.contains("当前没有在线"), "{mixed_text}");
-
-        let cmd_text = format_nodes_command_reply(&mixed);
-        assert!(cmd_text.contains("desk"), "{cmd_text}");
-        assert!(cmd_text.contains("在线"), "{cmd_text}");
-        assert!(cmd_text.contains("离线"), "{cmd_text}");
-    }
-
-    #[test]
-    fn architecture_text_mentions_nodes_command_and_cli_chain() {
+    fn architecture_text_states_server_side_only_execution() {
         let text = feishu_conversation_architecture_text();
-        assert!(text.contains("hank-cli"));
-        assert!(text.contains("/nodes"));
-        assert!(text.contains("codex"));
-        assert!(text.contains("/new"));
-        assert!(text.contains("纯对话"));
+        // 外部 CLI 已下线，文案必须明确"不在用户电脑上执行"，否则模型会承诺做不到的事
+        assert!(text.contains("Trace server 侧执行"), "{text}");
+        assert!(text.contains("已下线"), "{text}");
+        for cmd in ["/new", "/stop", "/status", "/help"] {
+            assert!(text.contains(cmd), "{cmd} missing: {text}");
+        }
+        assert!(text.contains("纯对话"), "{text}");
     }
 
     #[test]
-    fn conversation_does_not_bind_remote_exec_client() {
-        assert!(!should_bind_remote_exec_client("conversation"));
-        assert!(should_bind_remote_exec_client("general_task"));
-        assert!(should_bind_remote_exec_client("trace_code"));
-        assert!(should_bind_remote_exec_client("quant_code"));
-    }
-
-    #[test]
-    fn quant_research_decision_parsing_and_normalization() {
+    fn quant_research_decision_parsing() {
+        // 历史 prompt 会带 agent_backend，多余字段必须被忽略而不是解析失败
         assert_eq!(
             parse_new_topic_decision(r#"{"agent_kind":"quant_research","agent_backend":"native"}"#)
                 .unwrap(),
             NewTopicDecision {
                 agent_kind: AgentKind::QuantResearch,
-                agent_backend: AgentBackend::Native,
             }
-        );
-        // 模型误填外部 backend 时必须被拉回 native，否则会落到 cli_agent
-        assert_eq!(
-            NewTopicDecision {
-                agent_kind: AgentKind::QuantResearch,
-                agent_backend: AgentBackend::Codex,
-            }
-            .normalized(AgentBackend::Claude)
-            .agent_backend,
-            AgentBackend::Native
         );
         assert_eq!(
             AgentKind::QuantResearch.workspace_kind(),
             WorkspaceKind::None
         );
-        assert!(!should_bind_remote_exec_client("quant_research"));
     }
 
     #[test]
     fn parses_new_topic_workspace_decisions() {
         assert_eq!(
-            parse_new_topic_decision(r#"{"agent_kind":"trace_code","agent_backend":"codex"}"#)
-                .unwrap(),
+            parse_new_topic_decision(r#"{"agent_kind":"trace_code"}"#).unwrap(),
             NewTopicDecision {
                 agent_kind: AgentKind::TraceCode,
-                agent_backend: AgentBackend::Codex,
             }
         );
         assert_eq!(
-            parse_new_topic_decision(
-                "```json\n{\"agent_kind\":\"quant_code\",\"agent_backend\":\"claude\"}\n```"
-            )
-            .unwrap(),
+            parse_new_topic_decision("```json\n{\"agent_kind\":\"quant_code\"}\n```").unwrap(),
             NewTopicDecision {
                 agent_kind: AgentKind::QuantCode,
-                agent_backend: AgentBackend::Claude,
             }
         );
         assert_eq!(
-            parse_new_topic_decision(r#"{"agent_kind":"general_task","agent_backend":"grok"}"#)
+            parse_new_topic_decision(r#"{"agent_kind":"conversation"}"#)
                 .unwrap()
-                .agent_backend,
-            AgentBackend::Grok
+                .agent_kind(),
+            "conversation"
         );
         assert_eq!(
-            parse_new_topic_decision(r#"{"agent_kind":"general_task","agent_backend":"kimi"}"#)
-                .unwrap()
-                .agent_backend,
-            AgentBackend::Kimi
-        );
-        assert_eq!(
-            parse_new_topic_decision(r#"{"agent_kind":"conversation","agent_backend":"native"}"#)
-                .unwrap(),
-            NewTopicDecision {
-                agent_kind: AgentKind::Conversation,
-                agent_backend: AgentBackend::Native,
-            }
-        );
-        assert_eq!(
-            NewTopicDecision::fallback(AgentBackend::Codex).workspace_kind(),
+            NewTopicDecision::fallback().workspace_kind(),
             WorkspaceKind::General
         );
         assert_eq!(
             AgentKind::QuantCode.workspace_kind(),
             WorkspaceKind::Repository
         );
-        assert_eq!(
-            NewTopicDecision {
-                agent_kind: AgentKind::Conversation,
-                agent_backend: AgentBackend::Codex,
-            }
-            .normalized(AgentBackend::Claude)
-            .agent_backend,
-            AgentBackend::Native
-        );
-        assert_eq!(
-            NewTopicDecision {
-                agent_kind: AgentKind::TraceCode,
-                agent_backend: AgentBackend::Native,
-            }
-            .normalized(AgentBackend::Claude)
-            .agent_backend,
-            AgentBackend::Claude
-        );
     }
 
     #[test]
-    fn client_only_session_reuses_fixed_backend_and_client() {
-        let policy = reuse_policy_for_session_metadata(
-            r#"{"agent_location":"client","agent_backend":"codex","exec_client_id":"cli-1"}"#,
-        );
-        assert_eq!(
-            policy,
-            SessionReusePolicy::ReuseClientOnly {
-                backend: "codex".into(),
-                client_id: Some("cli-1".into()),
-            }
-        );
-    }
-
-    #[test]
-    fn legacy_server_agent_external_session_requires_new() {
+    fn legacy_external_backend_sessions_require_new() {
+        // server-agent 与 client-only 两条历史路径都不能静默复用，否则用户以为任务还在跑
         for backend in ["codex", "claude", "grok", "kimi"] {
-            let metadata = format!(
-                r#"{{"server_agent":true,"agent_backend":"{backend}","workspace_kind":"repository"}}"#
-            );
-            let policy = reuse_policy_for_session_metadata(&metadata);
-            assert_eq!(
-                policy,
-                SessionReusePolicy::RequireNew {
-                    backend: backend.into(),
-                    reason: "legacy_server_agent",
-                },
-                "backend={backend}"
-            );
-            assert!(legacy_server_agent_require_new_message(backend).contains("/new"));
-            assert!(legacy_server_agent_require_new_message(backend).contains(backend));
+            let cases = [
+                (
+                    format!(
+                        r#"{{"server_agent":true,"agent_backend":"{backend}","workspace_kind":"repository"}}"#
+                    ),
+                    "legacy_server_agent",
+                ),
+                (
+                    format!(
+                        r#"{{"agent_location":"client","agent_backend":"{backend}","exec_client_id":"cli-1"}}"#
+                    ),
+                    "external_agent_retired",
+                ),
+            ];
+            for (metadata, reason) in cases {
+                assert_eq!(
+                    reuse_policy_for_session_metadata(&metadata),
+                    SessionReusePolicy::RequireNew {
+                        backend: backend.into(),
+                        reason,
+                    },
+                    "backend={backend} reason={reason}"
+                );
+            }
+            let message = legacy_server_agent_require_new_message(backend);
+            assert!(message.contains("/new"), "{message}");
+            assert!(message.contains(backend), "{message}");
+            assert!(message.contains("已下线"), "{message}");
         }
+    }
+
+    #[test]
+    fn legacy_client_only_native_session_can_reuse() {
+        assert_eq!(
+            reuse_policy_for_session_metadata(
+                r#"{"agent_location":"client","agent_backend":"native"}"#
+            ),
+            SessionReusePolicy::ReuseManaged
+        );
     }
 
     #[test]
@@ -2098,25 +1563,6 @@ mod tests {
             ),
             SessionReusePolicy::ReuseManaged
         );
-    }
-
-    #[test]
-    fn missing_agent_node_message_never_mentions_server_fallback() {
-        let text = missing_agent_node_message("claude");
-        assert!(text.contains("hank-cli"));
-        assert!(text.contains("claude"));
-        assert!(text.contains("不会回退"));
-        assert!(!text.contains("bubblewrap 继续"));
-    }
-
-    #[test]
-    fn client_only_commands_are_explicitly_unsupported() {
-        for command in ["/diff", "/test", "/deploy", "/rollback"] {
-            let text = client_only_command_unsupported_message(command);
-            assert!(text.contains(command), "{text}");
-            assert!(text.contains("本机 CLI 会话不支持"), "{text}");
-            assert!(text.contains("请在本机"), "{text}");
-        }
     }
 
     #[test]

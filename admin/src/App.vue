@@ -27,13 +27,11 @@ const navGroups: { title?: string; items: { to: string; label: string; icon: str
       { to: '/feishu', label: '飞书机器人', icon: 'feishu' },
       { to: '/weixin', label: '微信机器人', icon: 'weixin' },
       { to: '/chat-records', label: '聊天记录', icon: 'records' },
-      { to: '/notifications', label: '通知', icon: 'notification' },
     ],
   },
   {
     title: '任务',
     items: [
-      { to: '/team-task', label: '团队任务', icon: 'teamTask' },
       { to: '/jobs', label: '定时任务', icon: 'jobs' },
       { to: '/interactions', label: '交互单', icon: 'interaction' },
     ],
@@ -43,14 +41,12 @@ const navGroups: { title?: string; items: { to: string; label: string; icon: str
     items: [
       { to: '/providers', label: '供应商', icon: 'provider' },
       { to: '/image-providers', label: '生图供应商', icon: 'image' },
-      { to: '/agent-cli', label: 'Agent CLI', icon: 'cli' },
       { to: '/prompts', label: '提示词', icon: 'prompt' },
     ],
   },
   {
     title: '系统',
     items: [
-      { to: '/terminals', label: '终端', icon: 'terminal' },
       { to: '/users', label: '用户', icon: 'users' },
     ],
   },

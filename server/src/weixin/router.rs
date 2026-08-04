@@ -85,21 +85,6 @@ pub async fn handle_message(
         return Ok(());
     }
 
-    // kimi <text>：转发给托管的 Kimi CLI 终端（含 kimi /yolo 这类 CLI 自身命令）
-    // 必须放在 /ai 与斜杠命令检查之前，避免内容以 / 开头时被命令分支拦截
-    if let Some(input) = text
-        .strip_prefix("kimi ")
-        .or_else(|| text.strip_prefix("Kimi "))
-    {
-        let input = input.trim();
-        if !input.is_empty() {
-            if let Some(msg) = crate::weixin::kimi::send_input(&state, &binding, input).await {
-                reply(&msg).await;
-            }
-            return Ok(());
-        }
-    }
-
     // /ai <text>：跳过渠道 agent，直接派发给 coding agent
     if let Some(task) = text.strip_prefix("/ai") {
         let task = task.trim();
@@ -237,7 +222,7 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
             }
         }
         "/status" => {
-            let mut msg = match &session_id {
+            let msg = match &session_id {
                 Some(sid) => {
                     let running = state.active_tasks.read().await.contains_key(sid);
                     let session = state.db.get_session(sid).await.ok().flatten();
@@ -250,29 +235,8 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
                     } else {
                         title.as_str()
                     };
-                    // 执行位置：绑定的桌面 client（含在线状态）或 server 本地
-                    let exec_at = match session.as_ref().and_then(|s| s.exec_client_id.clone()) {
-                        Some(cid) => {
-                            let hostname = state
-                                .db
-                                .get_client_agent(&binding.user_id, &cid)
-                                .await
-                                .ok()
-                                .flatten()
-                                .and_then(|c| c.hostname)
-                                .unwrap_or_else(|| cid.clone());
-                            let online =
-                                crate::remote_exec::is_client_online(state, &binding.user_id, &cid)
-                                    .await;
-                            format!(
-                                "client 端 {hostname}{}",
-                                if online { "" } else { "（当前离线）" }
-                            )
-                        }
-                        None => "server 端".to_string(),
-                    };
                     let mut text = format!(
-                        "会话：{title}\nID：{sid}\n状态：{}\n执行位置：{exec_at}",
+                        "会话：{title}\nID：{sid}\n状态：{}",
                         if running { "执行中" } else { "空闲" }
                     );
                     // 执行中就把实时进度一并带上，省得再问一次
@@ -290,110 +254,10 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
                 }
                 None => "当前没有会话，直接发送消息即可开始".to_string(),
             };
-            if let Some(line) = crate::weixin::kimi::status_line(state, binding).await {
-                msg.push_str("\n");
-                msg.push_str(&line);
-            }
-            reply(&msg).await;
-        }
-        "/terms" => {
-            let msg = terminal_list(state, binding).await;
-            reply(&msg).await;
-        }
-        "/term" => {
-            let msg = terminal_read(state, binding, text).await;
-            reply(&msg).await;
-        }
-        "/send" => {
-            let msg = terminal_write(state, binding, text).await;
-            reply(&msg).await;
-        }
-        "/shot" => {
-            let msg = terminal_shot(state, account, binding, from, context_token, text).await;
             reply(&msg).await;
         }
         "/snap" => {
             let msg = web_snap(state, account, from, context_token, text).await;
-            reply(&msg).await;
-        }
-        "/cd" => {
-            let dir = text.splitn(2, ' ').nth(1).map(str::trim).unwrap_or("");
-            if dir.is_empty() {
-                let current = state
-                    .db
-                    .get_weixin_kimi(&binding.id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .and_then(|m| m.work_dir);
-                match current {
-                    Some(d) => {
-                        reply(&format!(
-                            "当前工作目录：{d}\n/cd <路径> 修改，/ls [路径] 浏览目录"
-                        ))
-                        .await
-                    }
-                    None => reply("还没有设置工作目录，/ls [路径] 先看看有哪些目录").await,
-                }
-            } else {
-                // 在 client 上真实校验目录存在，并解析为绝对路径（支持 ~）
-                match client_shell(state, binding, &format!("cd {} && pwd", sh_quote(dir))).await {
-                    Ok(out) => {
-                        let resolved = out
-                            .lines()
-                            .last()
-                            .map(str::trim)
-                            .filter(|s| s.starts_with('/'))
-                            .unwrap_or(dir);
-                        match state
-                            .db
-                            .upsert_weixin_kimi_work_dir(&binding.id, resolved)
-                            .await
-                        {
-                            Ok(()) => {
-                                // 已有存活托管会话时提示不即时生效
-                                let note =
-                                    match crate::weixin::kimi::status_line(state, binding).await {
-                                        Some(line) if line.contains("运行中") => {
-                                            "\n（当前 kimi 会话不受影响，/kstop 后重开才会切换）"
-                                        }
-                                        _ => "",
-                                    };
-                                reply(&format!("已记录工作目录：{resolved}{note}")).await;
-                            }
-                            Err(e) => {
-                                tracing::warn!("weixin: set kimi work dir failed: {e:#}");
-                                reply("设置失败，请稍后重试").await;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        let msg = format!("{e:#}");
-                        if msg.contains("不在线") {
-                            reply(&msg).await;
-                        } else {
-                            reply(&format!(
-                                "目录不存在或不可进入：{dir}\n用 /ls [路径] 看看 client 上有哪些目录"
-                            ))
-                            .await;
-                        }
-                    }
-                }
-            }
-        }
-        "/ls" => {
-            let msg = kimi_list_dir(state, binding, text).await;
-            reply(&msg).await;
-        }
-        "/kimi" => match crate::weixin::kimi::start_session(state, binding).await {
-            Ok(msg) => reply(&msg).await,
-            Err(e) => {
-                tracing::warn!("weixin: start kimi session failed: {e:#}");
-                reply(&format!("开启失败：{e:#}")).await;
-            }
-        },
-        "/kstop" => {
-            let msg = crate::weixin::kimi::stop_session(state, binding).await;
             reply(&msg).await;
         }
         "/菜单" | "/menu" | "/help" | "/帮助" => reply(MENU_TEXT).await,
@@ -401,294 +265,6 @@ async fn handle_command<Fut: std::future::Future<Output = ()>>(
     }
 }
 
-// ─── 终端远程命令（/terms /term /send）─────────────────────────────────────
-
-const TERM_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// 微信单条消息长度上限（留余量）
-const WECHAT_MSG_MAX: usize = 1800;
-
-/// 向当前在线 client 派发一条 terminal_* 工具调用，返回文本结果或错误文案。
-async fn dispatch_terminal(
-    state: &Arc<AppState>,
-    binding: &WeixinBinding,
-    tool: &str,
-    input: serde_json::Value,
-) -> Result<String> {
-    let client = crate::remote_exec::pick_online_client(state, &binding.user_id)
-        .await
-        .ok_or_else(|| anyhow!("桌面 client 不在线或未开启远程执行"))?;
-    let result = crate::remote_exec::dispatch_tool_call(
-        state,
-        &binding.user_id,
-        &client.id,
-        tool,
-        input,
-        TERM_CMD_TIMEOUT,
-    )
-    .await?;
-    if result.is_error {
-        Err(anyhow!(result.content))
-    } else {
-        Ok(result.content)
-    }
-}
-
-/// shell 路径转义：单引号包裹，~ 前缀展开为 $HOME
-fn sh_quote(path: &str) -> String {
-    if path == "~" {
-        "$HOME".to_string()
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        format!("$HOME/'{}'", rest.replace('\'', "'\\''"))
-    } else {
-        format!("'{}'", path.replace('\'', "'\\''"))
-    }
-}
-
-/// 在在线 client 上执行一条 shell 命令（/ls、/cd 校验用）
-async fn client_shell(
-    state: &Arc<AppState>,
-    binding: &WeixinBinding,
-    command: &str,
-) -> Result<String> {
-    dispatch_terminal(
-        state,
-        binding,
-        "shell",
-        serde_json::json!({ "command": command, "timeout_ms": 10000 }),
-    )
-    .await
-}
-
-/// /ls [路径] — 列出 client 上的目录内容，方便挑选 /cd 目标。
-/// 默认路径：/cd 已记录的目录 → client 注册的工作目录 → home。
-async fn kimi_list_dir(state: &Arc<AppState>, binding: &WeixinBinding, text: &str) -> String {
-    let arg = text
-        .splitn(2, ' ')
-        .nth(1)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let path = match arg {
-        Some(p) => p.to_string(),
-        None => {
-            let recorded = state
-                .db
-                .get_weixin_kimi(&binding.id)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|m| m.work_dir);
-            match recorded {
-                Some(d) => d,
-                None => crate::remote_exec::pick_online_client(state, &binding.user_id)
-                    .await
-                    .and_then(|c| c.work_dir)
-                    .unwrap_or_else(|| "~".to_string()),
-            }
-        }
-    };
-    match client_shell(state, binding, &format!("ls -la {}", sh_quote(&path))).await {
-        Ok(out) => {
-            let out = out.trim_end();
-            if out.is_empty() {
-                return format!("{path}：空目录");
-            }
-            if out.chars().count() > WECHAT_MSG_MAX {
-                let head: String = out.chars().take(WECHAT_MSG_MAX - 40).collect();
-                format!("{path}：\n{head}\n…（过长已截断，/ls <子目录> 细化）")
-            } else {
-                format!("{path}：\n{out}")
-            }
-        }
-        Err(e) => format!("ls 失败：{e:#}"),
-    }
-}
-
-/// /terms — 列出 client 上全部终端会话
-async fn terminal_list(state: &Arc<AppState>, binding: &WeixinBinding) -> String {
-    match dispatch_terminal(state, binding, "terminal_list", serde_json::json!({})).await {
-        Ok(content) => {
-            let terms: Vec<serde_json::Value> = match serde_json::from_str(&content) {
-                Ok(v) => v,
-                Err(_) => return format!("解析终端列表失败：{content}"),
-            };
-            if terms.is_empty() {
-                return "当前没有终端会话，在 client 的「终端」页新建一个即可".to_string();
-            }
-            let mut lines =
-                vec!["终端会话（/term <id> 看输出，/send <id> <文本> 发输入）：".to_string()];
-            for t in terms {
-                let id = t["id"].as_str().unwrap_or("?");
-                let short = &id[..id.len().min(8)];
-                let fg = t["foreground_cmd"].as_str().unwrap_or("?");
-                let cwd = t["cwd"].as_str().unwrap_or("");
-                let alive = if t["alive"].as_bool().unwrap_or(false) {
-                    "运行中"
-                } else {
-                    "已退出"
-                };
-                lines.push(format!("[{short}] {fg} · {alive}\n    {cwd}"));
-            }
-            lines.join("\n")
-        }
-        Err(e) => format!("获取终端列表失败：{e:#}"),
-    }
-}
-
-/// 按 id 前缀解析完整 term_id（前缀需唯一）
-async fn resolve_term_id(
-    state: &Arc<AppState>,
-    binding: &WeixinBinding,
-    prefix: &str,
-) -> Result<String> {
-    let content = dispatch_terminal(state, binding, "terminal_list", serde_json::json!({})).await?;
-    let terms: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-    let matches: Vec<&str> = terms
-        .iter()
-        .filter_map(|t| t["id"].as_str())
-        .filter(|id| id.starts_with(prefix))
-        .collect();
-    match matches.len() {
-        0 => Err(anyhow!("没有找到 id 以 {prefix} 开头的终端会话")),
-        1 => Ok(matches[0].to_string()),
-        _ => Err(anyhow!("id 前缀 {prefix} 匹配到多个会话，请多输几位")),
-    }
-}
-
-/// 保留字符串尾部不超过 max 个字符（按 char 边界）
-fn tail_chars(s: &str, max: usize) -> &str {
-    if s.chars().count() <= max {
-        return s;
-    }
-    let start = s
-        .char_indices()
-        .nth(s.chars().count() - max)
-        .map(|(i, _)| i)
-        .unwrap_or(0);
-    &s[start..]
-}
-
-/// /term <id前缀> [行数] — 查看终端输出尾部
-async fn terminal_read(state: &Arc<AppState>, binding: &WeixinBinding, text: &str) -> String {
-    let mut parts = text.split_whitespace();
-    let _ = parts.next(); // "/term"
-    let Some(prefix) = parts.next() else {
-        return "用法：/term <id> [行数]，id 用 /terms 查看".to_string();
-    };
-    let lines: usize = parts.next().and_then(|s| s.parse().ok()).unwrap_or(80);
-    match resolve_term_id(state, binding, prefix).await {
-        Ok(id) => {
-            match dispatch_terminal(
-                state,
-                binding,
-                "terminal_read",
-                serde_json::json!({ "id": id, "lines": lines }),
-            )
-            .await
-            {
-                Ok(content) => {
-                    let tail = tail_chars(content.trim_end(), WECHAT_MSG_MAX);
-                    if tail.is_empty() {
-                        "（该终端暂无输出）".to_string()
-                    } else {
-                        tail.to_string()
-                    }
-                }
-                Err(e) => format!("读取终端输出失败：{e:#}"),
-            }
-        }
-        Err(e) => format!("{e:#}"),
-    }
-}
-
-/// /send <id前缀> <文本> — 向终端发送输入（末尾自动补回车）
-async fn terminal_write(state: &Arc<AppState>, binding: &WeixinBinding, text: &str) -> String {
-    let mut parts = text.splitn(3, ' ');
-    let _ = parts.next(); // "/send"
-    let Some(prefix) = parts.next().map(str::trim).filter(|s| !s.is_empty()) else {
-        return "用法：/send <id> <文本>，id 用 /terms 查看".to_string();
-    };
-    let Some(data) = parts.next() else {
-        return "用法：/send <id> <文本>，文本不能为空".to_string();
-    };
-    match resolve_term_id(state, binding, prefix).await {
-        Ok(id) => {
-            match dispatch_terminal(
-                state,
-                binding,
-                "terminal_write",
-                serde_json::json!({ "id": id, "data": format!("{data}\r") }),
-            )
-            .await
-            {
-                Ok(_) => format!("已发送到 [{prefix}]，稍后用 /term {prefix} 查看输出"),
-                Err(e) => format!("发送失败：{e:#}"),
-            }
-        }
-        Err(e) => format!("{e:#}"),
-    }
-}
-/// /shot <id前缀> — 终端屏幕截图：拉 SGR 快照渲染成 PNG 发图，失败降级为文本输出
-async fn terminal_shot(
-    state: &Arc<AppState>,
-    account: &WeixinAccount,
-    binding: &WeixinBinding,
-    from: &str,
-    context_token: &str,
-    text: &str,
-) -> String {
-    let mut parts = text.split_whitespace();
-    let _ = parts.next(); // "/shot"
-    let Some(prefix) = parts.next() else {
-        return "用法：/shot <id>，id 用 /terms 查看".to_string();
-    };
-    let id = match resolve_term_id(state, binding, prefix).await {
-        Ok(id) => id,
-        Err(e) => return format!("{e:#}"),
-    };
-    // raw=true：client 返回带 SGR 转义码的当前屏幕快照
-    let snap = match dispatch_terminal(
-        state,
-        binding,
-        "terminal_read",
-        serde_json::json!({ "id": id, "raw": true }),
-    )
-    .await
-    {
-        Ok(content) => content,
-        Err(e) => return format!("读取终端屏幕失败：{e:#}"),
-    };
-    let fallback = |reason: &str| {
-        // 渲染/发图失败时降级为纯文本输出（复用 /term 的截尾逻辑）
-        let plain = crate::termshot::strip_ansi(&snap);
-        let tail = tail_chars(plain.trim_end(), WECHAT_MSG_MAX);
-        if tail.is_empty() {
-            reason.to_string()
-        } else {
-            format!("{reason}，以下为终端文本：\n{tail}")
-        }
-    };
-    let png = match crate::termshot::render_png(&snap) {
-        Ok(png) => png,
-        Err(e) => {
-            tracing::warn!("weixin: render term shot failed: {e:#}");
-            return fallback(&format!("截图渲染失败：{e:#}"));
-        }
-    };
-    let client = IlinkClient::new();
-    match client
-        .send_media(account, from, context_token, "term.png", &png)
-        .await
-    {
-        Ok(()) => format!("终端 [{prefix}] 截图已发送"),
-        Err(e) => {
-            tracing::warn!("weixin: send term shot failed: {e:#}");
-            fallback(&format!("截图发送失败：{e:#}"))
-        }
-    }
-}
-
-/// /snap <url> — 网页截图：server 本机 headless Chrome 截全页 PNG 发图。
-/// 耗时可达 30s；monitor 对每条消息单独 spawn（monitor.rs），这里直接 await 不会阻塞轮询。
 async fn web_snap(
     state: &Arc<AppState>,
     account: &WeixinAccount,
@@ -746,25 +322,13 @@ const MENU_TEXT: &str = "\
 /ai <任务> — 跳过智能判断，直接派任务给 agent
 /菜单 — 显示本说明
 
-【终端（桌面 client 在线时可用）】
-/terms — 列出 client 上的终端会话
-/term <id> [行数] — 查看终端输出（如 /term a1b2 100）
-/send <id> <文本> — 向终端发送输入（如 /send a1b2 ls -la）
-/shot <id> — 终端屏幕截图（图片）
+【截图】
 /snap <url> — 网页截图（图片）
 
-【kimi 托管（桌面 client 在线时可用）】
-/ls [路径] — 浏览 client 上的目录（挑 /cd 目标）
-/cd <路径> — 设置托管终端的工作目录（会在 client 上校验）
-/kimi — 在 client 上开一个托管的 Kimi CLI 会话
-kimi <文本> — 与托管 kimi 交互（如 kimi /yolo、kimi y）
-· 运行期间不推送进度；需要决策或完成任务时才通知你
-/kstop — 结束托管会话
-
 【小贴士】
-· 桌面 client 在线时任务在你本地机器执行，离线时在服务器端执行、仅支持查询类对话
+· 任务在服务器端执行
 · 同一时间只能跑一个任务，执行中新消息会排队提醒
-· 也可以直接说「截图 xxx」（网页或终端），agent 会自动截好发你
+· 也可以直接说「截图 xxx 官网」，agent 会自动截好发你
 · 暂只支持文字输入，语音还在开发中";
 
 /// 普通文本：先由渠道 agent 决策，再按 action 分发。
@@ -876,19 +440,6 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
         return;
     }
 
-    // 会话绑定的桌面 client 已离线时解除绑定，退化为 server 本地执行
-    if let Ok(Some(session)) = state.db.get_session(&session_id).await {
-        if let Some(ref cid) = session.exec_client_id {
-            if !crate::remote_exec::is_client_online(state, &binding.user_id, cid).await {
-                tracing::info!(session_id = %session_id, client_id = %cid, "exec client offline, unbind session");
-                let _ = state
-                    .db
-                    .set_session_exec_client(&session_id, None, None)
-                    .await;
-            }
-        }
-    }
-
     let username = state
         .db
         .get_user_by_id(&binding.user_id)
@@ -928,7 +479,6 @@ async fn dispatch_task<'a, Fut: std::future::Future<Output = ()>>(
                 from.to_string(),
                 context_token.to_string(),
                 session_id.clone(),
-                binding.user_id.clone(),
                 handle.event_rx,
             );
         }
@@ -962,15 +512,12 @@ async fn create_weixin_session(
     binding: &WeixinBinding,
 ) -> Result<hank_db::Session> {
     let metadata = serde_json::json!({ "source": "weixin" }).to_string();
-    // 有在线且接受远程任务的桌面 client 时，会话绑定到该 client 本地执行
-    let client = crate::remote_exec::pick_online_client(state, &binding.user_id).await;
-    let work_dir = client.as_ref().and_then(|c| c.work_dir.clone());
-    let mut session = state
+    let session = state
         .db
         .create_session(
             "",
             "",
-            work_dir.as_deref(),
+            None,
             Some(&binding.user_id),
             Some("remote"),
             Some("chat"),
@@ -978,19 +525,6 @@ async fn create_weixin_session(
         )
         .await
         .map_err(|e| anyhow!("create session: {e:#}"))?;
-    if let Some(c) = client {
-        if let Err(e) = state
-            .db
-            .set_session_exec_client(&session.id, Some(&c.id), c.work_dir.as_deref())
-            .await
-        {
-            tracing::warn!("weixin: bind exec client failed: {e:#}");
-        } else {
-            tracing::info!(session_id = %session.id, client_id = %c.id, "weixin session bound to desktop client");
-            session.exec_client_id = Some(c.id);
-            session.work_dir = c.work_dir;
-        }
-    }
     Ok(session)
 }
 

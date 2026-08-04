@@ -1,11 +1,9 @@
 mod admin;
-mod admin_terminal;
 mod auth;
 mod changes;
 mod channel_records;
 mod chat;
 mod checkpoints;
-mod cli_agent;
 mod config;
 mod server_workspace;
 mod feishu;
@@ -14,8 +12,6 @@ mod interaction_flow;
 mod interactions;
 mod llm;
 pub mod provider_registry;
-pub mod remote_exec;
-pub mod remote_tools;
 mod requirement_docs;
 pub mod response;
 mod routes;
@@ -24,14 +20,12 @@ mod skills;
 mod snap_tools;
 mod specs;
 pub mod task_state;
-mod team_task;
-mod termshot;
 mod websnap;
 mod weixin;
 
 use anyhow::Result;
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::State,
     http::{HeaderMap, Request},
     middleware::{self, Next},
     response::Response,
@@ -69,8 +63,6 @@ pub struct AppState {
     /// 微信渠道 agent 的短期对话记忆（binding_id → 最近若干轮问答）
     pub weixin_channel_history:
         RwLock<HashMap<String, std::collections::VecDeque<weixin::channel::ChannelTurn>>>,
-    /// 桌面 client 远程执行通道（user_id → 长轮询/派发状态）
-    pub client_hubs: RwLock<HashMap<String, remote_exec::UserHub>>,
     /// quant 高成本 skill 会话级授权存储（进程内，重启失效）
     pub quant_grant_store: Arc<code_tools::quant_grant::QuantGrantStore>,
     /// 渠道任务闸门与实时进度快照（单任务串行 + 随时可查进度）
@@ -151,15 +143,8 @@ fn cors_layer(extra_origins: &[String]) -> CorsLayer {
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
-fn main() -> Result<()> {
-    if cli_agent::sandbox_launcher_requested() {
-        return cli_agent::run_sandbox_launcher();
-    }
-    run_server()
-}
-
 #[tokio::main]
-async fn run_server() -> Result<()> {
+async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("安装 Rustls ring CryptoProvider 失败"))?;
@@ -194,7 +179,6 @@ async fn run_server() -> Result<()> {
         feishu_monitors: RwLock::new(HashMap::new()),
         scheduler: scheduler::SchedulerState::new(),
         weixin_channel_history: RwLock::new(HashMap::new()),
-        client_hubs: RwLock::new(HashMap::new()),
         quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
         tasks: Arc::new(task_state::TaskRegistry::new()),
     });
@@ -264,27 +248,6 @@ async fn run_server() -> Result<()> {
     // 启动定时任务调度器（cron 驱动的系统主动工作入口）
     scheduler::start(state.clone());
 
-    // 团队任务：run 终态回调 worker（channel 解耦，避免 cli_agent ↔ orchestrator 类型环）
-    team_task::orchestrator::start_run_finished_worker();
-
-    // 进程重启后 CLI thread 已不可信，一律标失败而不是尝试续跑
-    // （与 scheduler 收尾遗留 running job_run 同一模式）。
-    {
-        let settings = team_task::settings::effective(&state).await;
-        if settings.enabled {
-            let s = state.clone();
-            tokio::spawn(async move {
-                match s.db.fail_stale_team_tasks().await {
-                    Ok(0) => {}
-                    Ok(n) => tracing::warn!("team_task: 收尾 {n} 条进程重启遗留的运行中任务"),
-                    Err(e) => tracing::warn!("team_task: 收尾僵尸任务失败: {e:#}"),
-                }
-            });
-        }
-    }
-
-    // 启动 kimi 托管通知消费循环（client 通知 → 微信推送）
-    tokio::spawn(weixin::kimi::run_notification_consumer(state.clone()));
 
     // Public routes (no auth required)
     let public = Router::new()
@@ -430,28 +393,6 @@ async fn run_server() -> Result<()> {
             "/api/feishu/binding",
             delete(feishu::routes::delete_binding),
         )
-        // Remote execution: desktop client long-poll channel
-        .route(
-            "/api/client/registration",
-            put(remote_exec::register_client),
-        )
-        .route("/api/client/notify", post(remote_exec::post_notification))
-        .route("/api/client/poll", get(remote_exec::poll_requests))
-        .route(
-            "/api/client/agent-event",
-            post(remote_exec::post_agent_event).route_layer(DefaultBodyLimit::max(4 * 1024 * 1024)),
-        )
-        // tool-result 可能携带媒体文件 base64 回传（20MB 文件约 27MB），放宽 body 上限
-        .route(
-            "/api/client/tool-result",
-            post(remote_exec::post_tool_result)
-                .route_layer(DefaultBodyLimit::max(40 * 1024 * 1024)),
-        )
-        .route("/api/client/online", get(remote_exec::list_online))
-        .route(
-            "/api/sessions/{id}/exec-client",
-            put(remote_exec::set_session_exec_client),
-        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -495,35 +436,6 @@ async fn run_server() -> Result<()> {
         .route("/api/admin/providers", post(admin::create_provider))
         .route("/api/admin/providers/{id}", put(admin::update_provider))
         .route("/api/admin/providers/{id}", delete(admin::delete_provider))
-        // 外部 Agent CLI（codex / claude）凭据：每后端多份配置，切换启用即时生效
-        .route(
-            "/api/admin/agent-cli-config",
-            get(admin::list_agent_cli_configs),
-        )
-        .route(
-            "/api/admin/agent-cli-config/{backend}",
-            post(admin::create_agent_cli_profile),
-        )
-        .route(
-            "/api/admin/agent-cli-config/{backend}/deactivate",
-            post(admin::deactivate_agent_cli_profiles),
-        )
-        .route(
-            "/api/admin/agent-cli-config/profiles/{id}",
-            put(admin::update_agent_cli_profile),
-        )
-        .route(
-            "/api/admin/agent-cli-config/profiles/{id}",
-            delete(admin::delete_agent_cli_profile),
-        )
-        .route(
-            "/api/admin/agent-cli-config/profiles/{id}/activate",
-            post(admin::activate_agent_cli_profile),
-        )
-        .route(
-            "/api/admin/agent-cli-config/profiles/{id}/test",
-            post(admin::test_agent_cli_profile),
-        )
         // Image providers admin
         .route(
             "/api/admin/image-providers",
@@ -628,29 +540,6 @@ async fn run_server() -> Result<()> {
             get(scheduler::routes::job_runs),
         )
         .route("/api/admin/jobs/{id}/run", post(scheduler::routes::run_job))
-        // 团队任务运行时配置（DB 优先，admin 可改、即时生效）
-        .route(
-            "/api/admin/team-task/config",
-            get(team_task::routes::get_config),
-        )
-        .route(
-            "/api/admin/team-task/config",
-            patch(team_task::routes::update_config),
-        )
-        // 团队任务看板数据（路径前缀 /api/team/* 与配置接口刻意不同，见 06 任务 B2.1）
-        .route("/api/team/tasks", get(team_task::routes::list_tasks))
-        .route(
-            "/api/team/tasks/{task_no}",
-            get(team_task::routes::get_task),
-        )
-        .route(
-            "/api/team/tasks/{task_no}/cancel",
-            post(team_task::routes::cancel_task),
-        )
-        .route(
-            "/api/team/tasks/{task_no}/retry",
-            post(team_task::routes::retry_task),
-        )
         // 交互单管理（列表/详情/手动应答/取消；应答会真派发 resume）
         .route(
             "/api/admin/interactions",
@@ -667,32 +556,6 @@ async fn run_server() -> Result<()> {
         .route(
             "/api/admin/interactions/{id}/cancel",
             post(interactions::cancel_interaction),
-        )
-        // Admin terminal proxy
-        .route("/api/admin/clients", get(admin_terminal::list_clients))
-        .route(
-            "/api/admin/clients/{cid}/enabled",
-            post(admin_terminal::set_client_enabled),
-        )
-        .route(
-            "/api/admin/clients/{cid}/terminals",
-            get(admin_terminal::list_terminals),
-        )
-        .route(
-            "/api/admin/clients/{cid}/terminals/{tid}/output",
-            get(admin_terminal::terminal_output),
-        )
-        .route(
-            "/api/admin/clients/{cid}/terminals/{tid}/input",
-            post(admin_terminal::terminal_input),
-        )
-        .route(
-            "/api/admin/clients/{cid}/terminals/{tid}/enabled",
-            post(admin_terminal::terminal_set_enabled),
-        )
-        .route(
-            "/api/admin/notifications",
-            get(admin_terminal::list_notifications),
         )
         .layer(middleware::from_fn(admin_required))
         .layer(middleware::from_fn_with_state(

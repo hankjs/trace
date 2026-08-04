@@ -121,59 +121,6 @@ export interface Provider {
   created_at: string
 }
 
-/**
- * 外部 Agent CLI（codex / claude）的一份命名凭据配置。
- * 后端从不回传 api_key 明文，只给 api_key_set。
- */
-export interface AgentCliProfile {
-  id: string
-  backend: string
-  name: string
-  /** 凭据注入用的环境变量名，如 ANTHROPIC_AUTH_TOKEN */
-  auth_kind: string
-  /** 库里是否已存有凭据；为 true 时提交空 api_key 表示保留原值 */
-  api_key_set: boolean
-  base_url: string
-  model: string
-  extra_env: Record<string, string>
-  /** 该后端当前启用的是不是这一份 */
-  is_active: boolean
-  updated_at: string
-  updated_by: string
-}
-
-/** 单个后端的配置集合。每个后端可存多份，同时只启用一份。 */
-export interface AgentCliBackend {
-  backend: string
-  profiles: AgentCliProfile[]
-  /** 当前真正生效的来源：db=库里启用的配置，env=服务器环境文件，provider=复用供应商记录 */
-  effective_source: 'db' | 'env' | 'provider' | null
-  auth_kind_options: string[]
-  extra_env_keys: string[]
-}
-
-export interface AgentCliProfileInput {
-  name: string
-  auth_kind?: string
-  /** 更新时留空表示保留库里已有的凭据；新建时必填 */
-  api_key?: string
-  base_url?: string
-  model?: string
-  extra_env?: Record<string, string>
-}
-
-export interface AgentCliTestResult {
-  ok: boolean
-  status?: number
-  message: string
-  detail?: string
-  /** 凭据与端点其实是通的，只是模型名不被支持 */
-  model_rejected?: boolean
-  /** 端点自报支持的模型（最多 40 个），用于提示可填什么 */
-  models?: string[]
-  models_total?: number
-}
-
 export interface WeixinLoginStart {
   login_id: string
   qrcode_url: string
@@ -435,50 +382,6 @@ export const api = {
     return request<void>(`/api/admin/providers/${id}`, { method: 'DELETE' })
   },
 
-  // 外部 Agent CLI（codex / claude）凭据：每后端多份配置，切换启用即时生效
-  listAgentCliConfigs() {
-    return request<AgentCliBackend[]>('/api/admin/agent-cli-config')
-  },
-
-  createAgentCliProfile(backend: string, data: AgentCliProfileInput & { activate?: boolean }) {
-    return request<{ id: string }>(`/api/admin/agent-cli-config/${backend}`, {
-      method: 'POST',
-      body: JSON.stringify(data),
-    })
-  },
-
-  updateAgentCliProfile(id: string, data: AgentCliProfileInput) {
-    return request<{ status: string }>(`/api/admin/agent-cli-config/profiles/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    })
-  },
-
-  /** 启用这份配置，同后端其余自动停用 */
-  activateAgentCliProfile(id: string) {
-    return request<{ status: string }>(`/api/admin/agent-cli-config/profiles/${id}/activate`, {
-      method: 'POST',
-    })
-  },
-
-  /** 停用该后端全部配置，回退到服务器上的 agent-cli.env */
-  deactivateAgentCliProfiles(backend: string) {
-    return request<{ status: string }>(`/api/admin/agent-cli-config/${backend}/deactivate`, {
-      method: 'POST',
-    })
-  },
-
-  testAgentCliProfile(id: string) {
-    return request<AgentCliTestResult>(`/api/admin/agent-cli-config/profiles/${id}/test`, {
-      method: 'POST',
-    })
-  },
-
-  /** 删除这份配置，彻底清掉其中的凭据（停用只是不再使用，凭据仍在库里） */
-  deleteAgentCliProfile(id: string) {
-    return request<void>(`/api/admin/agent-cli-config/profiles/${id}`, { method: 'DELETE' })
-  },
-
   // Image provider management
   listImageProviders() {
     return request<Provider[]>('/api/admin/image-providers')
@@ -529,54 +432,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ binding_id: bindingId, text }),
     })
-  },
-
-  // ---- 终端代理 ----
-
-  listClients() {
-    return request<ClientAgentInfo[]>('/api/admin/clients')
-  },
-
-  clientSetEnabled(clientId: string, enabled: boolean) {
-    return request<{ id: string; enabled: boolean }>(
-      `/api/admin/clients/${clientId}/enabled`,
-      { method: 'POST', body: JSON.stringify({ enabled }) }
-    )
-  },
-
-  listClientTerminals(clientId: string) {
-    return request<TermInfo[]>(`/api/admin/clients/${clientId}/terminals`)
-  },
-
-  terminalOutput(clientId: string, termId: string, lines = 200) {
-    return request<{ output: string }>(
-      `/api/admin/clients/${clientId}/terminals/${termId}/output?lines=${lines}`
-    )
-  },
-
-  /** 保留 ANSI 的原始输出，供 xterm 回放渲染 */
-  terminalOutputRaw(clientId: string, termId: string) {
-    return request<{ output: string }>(
-      `/api/admin/clients/${clientId}/terminals/${termId}/output?raw=true`
-    )
-  },
-
-  terminalInput(clientId: string, termId: string, data: string) {
-    return request<{ sent: boolean }>(
-      `/api/admin/clients/${clientId}/terminals/${termId}/input`,
-      { method: 'POST', body: JSON.stringify({ data }) }
-    )
-  },
-
-  terminalSetEnabled(clientId: string, termId: string, enabled: boolean) {
-    return request<TermInfo>(
-      `/api/admin/clients/${clientId}/terminals/${termId}/enabled`,
-      { method: 'POST', body: JSON.stringify({ enabled }) }
-    )
-  },
-
-  listNotifications(limit = 100) {
-    return request<ClientNotification[]>(`/api/admin/notifications?limit=${limit}`)
   },
 
   deleteWeixinBinding(id: string) {
@@ -715,18 +570,6 @@ export const api = {
     })
   },
 
-  // 团队任务运行时配置（DB 优先，改完即时生效）
-  getTeamTaskConfig() {
-    return request<TeamTaskConfigResponse>('/api/admin/team-task/config')
-  },
-
-  updateTeamTaskConfig(data: Partial<TeamTaskConfig>) {
-    return request<TeamTaskConfigResponse>('/api/admin/team-task/config', {
-      method: 'PATCH',
-      body: JSON.stringify(data),
-    })
-  },
-
   chatGenerate(prompt: string, context?: string) {
     return fetch('/api/admin/chat/generate', {
       method: 'POST',
@@ -739,63 +582,3 @@ export const api = {
   },
 }
 
-/** 团队任务运行时配置（与后端 TeamTaskSettings 对齐） */
-export interface TeamTaskConfig {
-  task_gate_enabled: boolean
-  enabled: boolean
-  roles: string[]
-  gates: string[]
-  max_dev_rounds: number
-  dashboard_base_url: string | null
-  updated_by: string | null
-}
-
-export interface TeamTaskOption {
-  id: string
-  label: string
-}
-
-export interface TeamTaskConfigResponse {
-  config: TeamTaskConfig
-  /** db = 已在 admin 改过；config_file = 还在用 config.toml 默认值 */
-  source: 'db' | 'config_file'
-  role_options: TeamTaskOption[]
-  gate_options: TeamTaskOption[]
-}
-
-export interface ClientAgentInfo {
-  id: string
-  user_id: string
-  hostname: string | null
-  work_dir: string | null
-  accept_remote: boolean
-  enabled: boolean
-  last_active_at: string | null
-  last_seen_at: string | null
-  online: boolean
-}
-
-export interface TermInfo {
-  id: string
-  shell: string
-  cwd: string
-  foreground_cmd: string
-  alive: boolean
-  created_at: string
-  cols: number
-  rows: number
-  enabled: boolean
-  last_active_at: string
-  last_seen_at: string
-}
-
-export interface ClientNotification {
-  id: string
-  user_id: string
-  client_id: string
-  term_id: string | null
-  kind: string
-  title: string
-  body: string | null
-  created_at: string
-}

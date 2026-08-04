@@ -8,18 +8,13 @@
 //! 若先应答再抢名额，会留下「answered 但未派发」的不可恢复僵尸。
 
 use crate::chat::{run_chat_turn, ChatTurnOpts};
-use crate::cli_agent;
 use crate::feishu::api::FeishuApi;
-use crate::feishu::card::{
-    build_confirm_card, build_confirm_done_card, build_task_gate_card, ConfirmCardOptions,
-    TaskGateCardOptions,
-};
+use crate::feishu::card::{build_confirm_card, build_confirm_done_card, ConfirmCardOptions};
 use crate::feishu::pusher;
 use crate::task_state::DispatchGuard;
 use crate::AppState;
 use anyhow::{anyhow, Result};
 use hank_db::{AgentInteraction, FeishuAccount};
-use hank_provider::ContentBlock;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -213,8 +208,7 @@ pub async fn answer_and_resume(
         tracing::warn!(interaction_id, "feishu: patch confirm card failed: {e:#}");
     }
 
-    // ⑤ 派发。task_gate 在开关打开且有 team_task_id 时交给编排器，
-    // 否则走原来的单角色 resume；team_gate 一律交给编排器。
+    // ⑤ 派发：task_gate 走单角色 resume。
     // 分流放在这里而不是各调用方：飞书按钮与 admin 手动应答必须走同一条派发逻辑。
     let (api_for_resume, restore_card) =
         resolve_resume_api(state, &answered_row, channel_ctx.as_ref()).await;
@@ -232,150 +226,20 @@ pub async fn answer_and_resume(
     let chat_id2 = chat_id;
     let topic_id2 = topic_id;
 
-    let team_task_id = answered_row
-        .resume_ref
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-        .and_then(|v| v["team_task_id"].as_str().map(str::to_string))
-        .filter(|s| !s.is_empty());
-
-    // match guard 不能 await：先取运行时配置
-    let team_settings = crate::team_task::settings::effective(state).await;
-
     match answered_row.kind.as_str() {
-        "task_gate" | "team_gate" if team_settings.enabled && team_task_id.is_some() => {
-            let task_id = team_task_id.expect("is_some guard");
-            // 编排器的 dispatch_role 内部会自己抢名额。
-            // 进编排器之前必须先释放 answer_and_resume 持有的 guard，
-            // 否则 try_acquire 拿不到名额，任务会被静默跳过。
-            dispatch_guard.release().await;
-
-            let interaction_id_for_trigger = interaction_id2.clone();
-            let answer_for_trigger = answer2.clone();
-            let api_fail = api_for_resume.clone();
-            let msg_id_fail = message_id.clone();
-            let card_mid_fail = card_message_id.clone();
-            let chat_id_fail = chat_id2.clone();
-            let topic_id_fail = topic_id2.clone();
-            let restore = restore_card;
-            tokio::spawn(async move {
-                let result = crate::team_task::orchestrator::advance(
-                    &state2,
-                    &task_id,
-                    crate::team_task::orchestrator::Trigger::GateAnswered {
-                        interaction_id: interaction_id_for_trigger.clone(),
-                        answer: answer_for_trigger,
-                    },
-                )
-                .await;
-                if let Err(e) = result {
-                    tracing::warn!(
-                        interaction_id = %interaction_id_for_trigger,
-                        task_id = %task_id,
-                        session_id = %session_for_dispatch,
-                        "team_task advance 失败，回滚交互单: {e:#}"
-                    );
-                    let _ = force_interaction_pending(&state2, &interaction_id_for_trigger).await;
-                    if restore {
-                        if let Some(ref api) = api_fail {
-                            // team_gate 与 task_gate 共用恢复逻辑：把卡片刷回可点状态。
-                            if let Err(ce) = restore_task_gate_card(
-                                &state2,
-                                api,
-                                &interaction_id_for_trigger,
-                                card_mid_fail.as_deref(),
-                                &chat_id_fail,
-                                &topic_id_fail,
-                            )
-                            .await
-                            {
-                                tracing::warn!(
-                                    interaction_id = %interaction_id_for_trigger,
-                                    "restore gate card failed: {ce:#}"
-                                );
-                            }
-                            let _ = api
-                                .reply_text(
-                                    &msg_id_fail,
-                                    &format!("派发失败，已恢复待确认，可重新点击按钮。原因：{e:#}"),
-                                    topic_id_fail != "main",
-                                )
-                                .await;
-                        }
-                    }
-                }
-            });
-            Ok(())
-        }
+        // 外部代码 Agent 已下线，task_gate 不再有生产者；只可能是历史遗留卡片。
+        // 明确标 cancelled 并回话，别让用户以为任务真的接着跑了。
         "task_gate" => {
-            // 旧路径：开关关闭或没有 team_task_id 时与今天完全一致。
-            if answer == "跳过" {
-                handle_task_gate_skip(
-                    state,
-                    &answered_row,
-                    api_for_resume.as_ref(),
-                    &message_id,
-                    in_thread,
-                    dispatch_guard,
-                )
-                .await;
-                return Ok(());
-            }
-            tokio::spawn(async move {
-                if let Err(e) = resume_task_gate(ResumeInteraction {
-                    state: state2,
-                    api: api_for_resume,
-                    user_id: user_id2,
-                    session_id: session_for_dispatch.clone(),
-                    interaction_id: interaction_id2.clone(),
-                    text: answer2,
-                    message_id,
-                    chat_id: chat_id2,
-                    topic_id: topic_id2,
-                    in_thread,
-                    card_message_id,
-                    restore_card_on_fail: restore_card,
-                    dispatch_guard,
-                })
-                .await
-                {
-                    tracing::warn!(
-                        interaction_id = %interaction_id2,
-                        session_id = %session_for_dispatch,
-                        "resume task_gate failed: {e:#}"
-                    );
-                }
-            });
+            handle_task_gate_retired(
+                state,
+                &answered_row,
+                api_for_resume.as_ref(),
+                &message_id,
+                in_thread,
+                dispatch_guard,
+            )
+            .await;
             Ok(())
-        }
-        "team_gate" => {
-            // 有 team_gate 但拿不到 task_id：异常路径。
-            dispatch_guard.release().await;
-            tracing::warn!(
-                interaction_id = %interaction_id,
-                "team_gate 应答缺少 resume_ref.team_task_id，标 failed"
-            );
-            let _ = state
-                .db
-                .update_interaction_status(
-                    interaction_id,
-                    "failed",
-                    None,
-                    Some("缺少 team_task_id，无法推进流水线"),
-                )
-                .await;
-            if let Some(ref api) = api_for_resume {
-                let _ = api
-                    .reply_text(
-                        &message_id,
-                        "团队任务数据异常（缺少任务 id），请在看板查看或联系管理员。",
-                        in_thread,
-                    )
-                    .await;
-            }
-            Err(AnswerResumeError::new(
-                "team_gate 缺少 team_task_id，无法派发",
-            ))
         }
         _ => {
             tokio::spawn(async move {
@@ -408,8 +272,8 @@ pub async fn answer_and_resume(
     }
 }
 
-/// 跳过 = 不继续执行（不保证第一轮无副作用：CLI bypass-approvals，可能已改文件）。
-async fn handle_task_gate_skip(
+/// 历史 task_gate 卡片：外部代码 Agent 已下线，任何选项都无法继续执行，直接作废。
+async fn handle_task_gate_retired(
     state: &Arc<AppState>,
     row: &AgentInteraction,
     api: Option<&FeishuApi>,
@@ -426,14 +290,14 @@ async fn handle_task_gate_skip(
 
     if let Err(e) = state
         .db
-        .update_interaction_status(&row.id, "cancelled", Some("用户选择跳过"), None)
+        .update_interaction_status(&row.id, "cancelled", Some("外部代码 Agent 已下线"), None)
         .await
     {
         tracing::warn!(interaction_id = %row.id, "task_gate 标 cancelled 失败: {e:#}");
     }
     dispatch_guard.release().await;
 
-    let mut msg = "已跳过，不会继续执行。".to_string();
+    let mut msg = "外部代码 Agent 已下线，这张历史任务卡无法继续执行，已作废。".to_string();
     if let Some(n) = dirty_files.filter(|n| *n > 0) {
         msg.push_str(&format!(
             "\n第一轮产生的 {n} 个文件改动仍在你本机工作目录，需要的话请自行 git 处理。"
@@ -444,332 +308,6 @@ async fn handle_task_gate_skip(
     }
 }
 
-/// task_gate「开始修」：校验节点 → resume 同一 CLI thread 跑第二轮。
-async fn resume_task_gate(args: ResumeInteraction) -> Result<()> {
-    let ResumeInteraction {
-        state,
-        api,
-        user_id,
-        session_id,
-        interaction_id,
-        text: _,
-        message_id,
-        chat_id,
-        topic_id,
-        in_thread,
-        card_message_id,
-        restore_card_on_fail,
-        dispatch_guard,
-    } = args;
-
-    let row = state
-        .db
-        .get_interaction(&interaction_id)
-        .await?
-        .ok_or_else(|| anyhow!("交互单不存在"))?;
-    let resume: Value =
-        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
-    let backend = resume["backend"].as_str().unwrap_or("").to_string();
-    let exec_client_id = resume["exec_client_id"].as_str().unwrap_or("").to_string();
-    let gate_thread_id = resume["thread_id"].as_str().unwrap_or("").to_string();
-    let goal = row.goal.as_deref().unwrap_or("").to_string();
-    let analysis = row.analysis.as_deref().unwrap_or("").to_string();
-
-    if backend.is_empty() || exec_client_id.is_empty() {
-        dispatch_guard.release().await;
-        bail_task_gate_dispatch(
-            &state,
-            api.as_ref(),
-            &interaction_id,
-            card_message_id.as_deref(),
-            &chat_id,
-            &topic_id,
-            &message_id,
-            in_thread,
-            restore_card_on_fail,
-            "交互单缺少 backend / exec_client_id，无法 resume",
-        )
-        .await;
-        return Ok(());
-    }
-
-    // session 所有者用于在线判定；operator 可能是 admin。
-    let session_user_id = state
-        .db
-        .get_session(&session_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|s| s.user_id)
-        .unwrap_or_else(|| user_id.clone());
-
-    if !crate::remote_exec::is_client_online(&state, &session_user_id, &exec_client_id).await {
-        dispatch_guard.release().await;
-        bail_task_gate_dispatch(
-            &state,
-            api.as_ref(),
-            &interaction_id,
-            card_message_id.as_deref(),
-            &chat_id,
-            &topic_id,
-            &message_id,
-            in_thread,
-            restore_card_on_fail,
-            "节点离线，已恢复待确认；请在对应电脑启动 hank-cli 后重新点击「开始修」",
-        )
-        .await;
-        return Ok(());
-    }
-    if !crate::remote_exec::client_reports_backend(
-        &state,
-        &session_user_id,
-        &exec_client_id,
-        &backend,
-    )
-    .await
-    {
-        dispatch_guard.release().await;
-        bail_task_gate_dispatch(
-            &state,
-            api.as_ref(),
-            &interaction_id,
-            card_message_id.as_deref(),
-            &chat_id,
-            &topic_id,
-            &message_id,
-            in_thread,
-            restore_card_on_fail,
-            &format!("节点未上报 {backend} 能力，已恢复待确认"),
-        )
-        .await;
-        return Ok(());
-    }
-
-    // 第二轮 prompt：正常情况下不重复注入分析全文（thread resume 已带上下文）。
-    // 但 thread 对不上时 resume 接不到第一轮，必须把分析补回 prompt，
-    // 否则模型收到的是一句没有上下文的「按你上一轮的分析执行」。
-    let thread_state = if gate_thread_id.is_empty() {
-        // 老数据没存 thread_id：保持既有行为（靠 metadata 自然续接）。
-        tracing::warn!(
-            interaction_id = %interaction_id,
-            "task_gate 交互单未记录 thread_id，按 session metadata 续接"
-        );
-        cli_agent::GateThread::Match
-    } else {
-        match cli_agent::reconcile_gate_thread(&state, &session_id, &gate_thread_id).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(
-                    interaction_id = %interaction_id,
-                    "校正 task_gate thread 失败，按分叉处理: {e:#}"
-                );
-                cli_agent::GateThread::Diverged
-            }
-        }
-    };
-    if thread_state != cli_agent::GateThread::Match {
-        tracing::info!(
-            interaction_id = %interaction_id,
-            session_id = %session_id,
-            ?thread_state,
-            "task_gate 第二轮 thread 与第一轮不一致"
-        );
-    }
-    let prompt_text = match thread_state {
-        cli_agent::GateThread::Diverged if !analysis.is_empty() => format!(
-            "用户已确认开始修复，按下面这份你先前产出的分析执行。\n\n原始目标：\n{goal}\n\n先前的分析：\n{analysis}"
-        ),
-        _ => format!("用户已确认开始修复，按你上一轮的分析执行。\n\n原始目标：\n{goal}"),
-    };
-    let content = vec![ContentBlock::Text { text: prompt_text }];
-
-    if let Err(e) = cli_agent::attach_active_task_gate(&state, &session_id, &interaction_id).await {
-        tracing::warn!(
-            interaction_id = %interaction_id,
-            "挂 active_task_gate_id 失败: {e:#}"
-        );
-    }
-    let _ = state
-        .db
-        .update_interaction_status(&interaction_id, "executing", None, None)
-        .await;
-
-    let session = state.db.get_session(&session_id).await.ok().flatten();
-    let turn = cli_agent::run_cli_turn(&state, &session_id, session, content, &backend).await;
-    dispatch_guard.release().await;
-
-    // 卡片标题用闸门 goal，空则回落交互单 title
-    let task_title = if !goal.is_empty() {
-        goal.clone()
-    } else {
-        row.title.clone()
-    };
-    match turn {
-        Ok(handle) => {
-            if let Some(api) = api {
-                pusher::spawn(
-                    state.clone(),
-                    api,
-                    message_id,
-                    chat_id,
-                    topic_id,
-                    session_id,
-                    task_title,
-                    None, // resume 不经路由 LLM，无首响卡
-                    in_thread,
-                    handle.event_rx,
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                interaction_id = %interaction_id,
-                "task_gate 第二轮派发失败，回滚: {e:#}"
-            );
-            state.tasks.clear_progress(&session_id).await;
-            // 清掉 active_task_gate_id，避免后续正常轮次误 finalize
-            let _ = cli_agent::clear_active_task_gate(&state, &session_id).await;
-            // executing 不在 revert 的 WHERE status='answered' 里，统一强制回 pending。
-            let _ = force_interaction_pending(&state, &interaction_id).await;
-
-            if restore_card_on_fail {
-                if let Some(ref api) = api {
-                    if let Err(ce) = restore_task_gate_card(
-                        &state,
-                        api,
-                        &interaction_id,
-                        card_message_id.as_deref(),
-                        &chat_id,
-                        &topic_id,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            interaction_id = %interaction_id,
-                            "restore task_gate card failed: {ce:#}"
-                        );
-                    }
-                    let _ = api
-                        .reply_text(
-                            &message_id,
-                            &format!("派发失败，已恢复待确认，可重新点击按钮。原因：{e:#}"),
-                            in_thread,
-                        )
-                        .await;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 节点离线等派发前失败：回滚交互单 + 可选恢复卡片 + 提示。
-#[allow(clippy::too_many_arguments)]
-async fn bail_task_gate_dispatch(
-    state: &Arc<AppState>,
-    api: Option<&FeishuApi>,
-    interaction_id: &str,
-    card_message_id: Option<&str>,
-    chat_id: &str,
-    topic_id: &str,
-    message_id: &str,
-    in_thread: bool,
-    restore_card: bool,
-    user_message: &str,
-) {
-    // answer_and_resume 已把状态写成 answered，这里退回 pending 让用户可重试。
-    if let Err(e) = state.db.revert_interaction_to_pending(interaction_id).await {
-        tracing::warn!(interaction_id, "task_gate bail revert failed: {e:#}");
-        let _ = force_interaction_pending(state, interaction_id).await;
-    }
-    if restore_card {
-        if let Some(api) = api {
-            if let Err(e) = restore_task_gate_card(
-                state,
-                api,
-                interaction_id,
-                card_message_id,
-                chat_id,
-                topic_id,
-            )
-            .await
-            {
-                tracing::warn!(interaction_id, "restore task_gate card failed: {e:#}");
-            }
-            let _ = api.reply_text(message_id, user_message, in_thread).await;
-        }
-    }
-}
-
-async fn force_interaction_pending(state: &Arc<AppState>, interaction_id: &str) -> Result<()> {
-    // revert 只覆盖 answered；executing 失败路径先退到 answered 再 revert，以清空 answer。
-    let _ = state
-        .db
-        .update_interaction_status(interaction_id, "answered", None, None)
-        .await;
-    if !state
-        .db
-        .revert_interaction_to_pending(interaction_id)
-        .await?
-    {
-        // 极端情况：状态不是 answered 时再硬标 pending
-        state
-            .db
-            .update_interaction_status(interaction_id, "pending", None, None)
-            .await?;
-    }
-    Ok(())
-}
-
-async fn restore_task_gate_card(
-    state: &Arc<AppState>,
-    api: &FeishuApi,
-    interaction_id: &str,
-    card_message_id: Option<&str>,
-    chat_id: &str,
-    topic_id: &str,
-) -> Result<()> {
-    let Some(row) = state.db.get_interaction(interaction_id).await? else {
-        return Ok(());
-    };
-    let card_mid = card_message_id
-        .map(str::to_string)
-        .or(row.card_message_id.clone());
-    let Some(card_mid) = card_mid else {
-        return Ok(());
-    };
-    let card = task_gate_card_from_interaction(state, &row, chat_id, topic_id);
-    api.update_card(&card_mid, &card).await?;
-    Ok(())
-}
-
-fn task_gate_card_from_interaction(
-    state: &AppState,
-    row: &AgentInteraction,
-    chat_id: &str,
-    topic_id: &str,
-) -> Value {
-    let resume: Value =
-        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
-    let dirty_files = resume["dirty_files"].as_u64().map(|n| n as usize);
-    let backend = resume["backend"].as_str().unwrap_or("cli").to_string();
-    let admin_url = admin_interaction_url(state, &row.id);
-    let chat = row.chat_id.as_deref().unwrap_or(chat_id);
-    let topic = row.topic_id.as_deref().unwrap_or(topic_id);
-    build_task_gate_card(&TaskGateCardOptions {
-        interaction_id: row.id.clone(),
-        session_id: row.session_id.clone(),
-        chat_id: chat.to_string(),
-        topic_id: topic.to_string(),
-        goal: row.goal.clone().unwrap_or_default(),
-        analysis: row.analysis.clone().unwrap_or_default(),
-        backend,
-        source_label: "飞书派单".to_string(),
-        dirty_files,
-        admin_url,
-    })
-}
 
 /// 飞书 claim：防重复投递。claim 已存在但交互单仍 pending 时允许重试。
 #[allow(clippy::too_many_arguments)]
@@ -1273,25 +811,6 @@ async fn patch_card_to_done(
         Some(&row.id),
     );
     api.update_card(card_mid, &card).await
-}
-
-/// 闸门单被同会话新一轮取代时的卡片改写。
-///
-/// 标题统一走 interaction_card_title，取代语义体现在正文的「已作废」上，
-/// 避免同一张卡片在不同阶段标题跳变。
-pub(crate) async fn close_superseded_gate_card(
-    state: &Arc<AppState>,
-    interaction_id: &str,
-    card_message_id: &str,
-) -> Result<()> {
-    close_interaction_card(
-        state,
-        interaction_id,
-        Some(card_message_id),
-        "已作废",
-        "系统",
-    )
-    .await
 }
 
 fn card_action_claim_id(
