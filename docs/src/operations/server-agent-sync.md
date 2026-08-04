@@ -11,7 +11,7 @@
 - wananyun 不依赖 GitHub 网络，不执行 GitHub `clone`、`fetch` 或 `push`。
 - 本机通过 SSH 拉回 wananyun 的 Git 提交，人工检查后合并并手动 push GitHub。
 - server 与本机共享同一段 Git 历史，不通过 rsync 覆盖开发工作区。
-- 可迭代 `server/`、`crates/`、`admin/`、`cli/`、`quant/`、`docs/`；始终排除 `client/`。
+- 可迭代 `server/`、`crates/`、`admin/`、`cli/`、`docs/`；始终排除 `client/`。`quant` 已独立为 https://github.com/hankjs/quant，不在本 monorepo 迭代/部署。
 
 ## 唯一事实来源
 
@@ -68,7 +68,7 @@ wananyun Git 对象库 ──→ trace-production ──→ 新建 feishu/*
 ## 飞书侧标准流程
 
 1. 在新话题描述需求，server 先固定 Agent 后端与任务类型，再按工作区路由规则创建 Git worktree、普通隔离目录或不创建目录。
-2. Agent 开始工作前读取 `AGENTS.md` 和本协议；修改 quant 时还必须读取 `quant/AGENTS.md`。
+2. Agent 开始工作前读取 `AGENTS.md` 和本协议。quant 代码改动请到独立 quant 仓库进行，不要在 Trace monorepo 中创建 quant/。
 3. Agent 只修改允许的项目目录，不修改 `client/`、生产配置或部署基础设施。
 4. 在同一话题迭代，用 `/diff` 检查范围，用 `/test` 运行固定测试矩阵。
 5. 用 `/deploy` 生成审批卡，由发起任务的管理员确认。
@@ -190,7 +190,7 @@ make sync-agent-cli-config
 
 - `client/`：不得由飞书 Agent 读取、修改、测试或部署；同步发现相关变更必须失败。
 - `config.toml`：不得提交；线上配置只通过 SSH 维护。
-- `quant/alembic/`：常规部署拒绝执行 migration。维护窗口中通过 SSH 备份、迁移、验证。
+- quant 数据库 migration：在独立 quant 仓库维护；本 monorepo 部署不再包含 quant 目标。
 - GitHub：wananyun 正常流程不访问；只有本机人工 push。
 - 历史：同步只创建或更新本机远端跟踪引用，不自动改写任何本地分支。
 - 部署：只有审批 commit 与当前 `trace-production` 基线一致时才能执行。
@@ -213,5 +213,5 @@ make sync-agent-cli-config
 - [ ] 已检查尚未部署的 `wananyun/feishu/*` 分支。
 - [ ] 只在可快进且审阅通过时使用 `git merge --ff-only`。
 - [ ] GitHub push 由本机人工执行。
-- [ ] 部署后 server/CLI/quant/静态站按实际目标完成健康检查。
+- [ ] 部署后 server/CLI/docs 按实际目标完成健康检查；quant 在独立仓库单独部署与检查。
 - [ ] 再次运行同步，确认 `trace-production` 与预期 commit 一致。

@@ -64,7 +64,7 @@ fn quant_research_prompt_inputs(
 }
 
 /// quant_research 话题的 project segment 文案。
-/// 产品口径：只提供研究信息与模拟结果，不得写成交易建议（见 quant/PRODUCT.md）。
+/// 产品口径：只提供研究信息与模拟结果，不得写成交易建议（见 quant 独立仓库 PRODUCT.md）。
 fn quant_research_session_prompt() -> &'static str {
     "路由 Agent 已将当前话题标记为 quant 研究话题。你没有工作目录，也没有\
      shell、文件或 Git 工具，只能通过 quant_* 工具读取数据与执行研究操作。\
@@ -1126,6 +1126,7 @@ fn load_server_agent_instructions(
         ),
     ];
     if include_quant {
+        // quant 已迁出 monorepo；仅在 worktree 仍残留该文件时注入（兼容旧 worktree）。
         instruction_files.insert(1, ("quant/AGENTS.md", root.join("quant/AGENTS.md")));
     }
     for (name, path) in instruction_files {

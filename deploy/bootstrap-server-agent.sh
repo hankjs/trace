@@ -246,9 +246,8 @@ visudo -cf /etc/sudoers.d/hank-agent-cli
 
 install -o root -g root -m 644 "$STAGE/hank-server.service" /etc/systemd/system/hank-server.service
 install -o root -g root -m 644 "$STAGE/hank-cli.service" /etc/systemd/system/hank-cli.service
-install -o root -g root -m 644 "$STAGE/hank-quant.service" /etc/systemd/system/hank-quant.service
-install -o root -g root -m 644 "$STAGE/quant-slidev.nginx" /etc/nginx/sites-enabled/quant-slidev
 install -o root -g root -m 644 "$STAGE/hank-docs.nginx" /etc/nginx/sites-enabled/hank-docs
+# /opt/hank-quant* 目录仍创建，供独立 quant 仓库部署复用；unit/nginx 由 quant 仓库安装
 
 if [[ ! -f /opt/hank/config.toml && -f "$STAGE/config.toml" ]]; then
   install -o root -g hank -m 640 "$STAGE/config.toml" /opt/hank/config.toml
@@ -352,4 +351,4 @@ if [[ -x /opt/hank-cli/current/hank-cli && -f /opt/hank-cli/hank-cli.toml ]]; th
 fi
 REMOTE
 
-log "bootstrap 完成。下一步运行 make deploy / deploy-cli / deploy-quant 建立正式 release。"
+log "bootstrap 完成。下一步运行 make deploy / deploy-cli 建立正式 release；quant 请在独立仓库 make deploy。"

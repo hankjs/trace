@@ -2388,7 +2388,8 @@ fn agent_prompt(user_text: &str, agent_kind: &str) -> String {
     prompt.push_str("\n\n运行约束：只操作当前 /workspace；client/ 只读且不属于任务范围；不要读取或修改 config.toml。完成后用中文给出结果和验证情况。");
     if agent_kind == "quant_code" {
         prompt.push_str(
-            "修改 quant 前必须读取 /workspace/quant/AGENTS.md，并遵守禁止交易能力的产品边界。",
+            "quant 已是独立仓库（https://github.com/hankjs/quant）。修改前必须读取该仓库 AGENTS.md，\
+             并遵守禁止交易能力的产品边界；不要在 Trace monorepo 中新建 quant/ 目录。",
         );
     }
     prompt
@@ -2398,7 +2399,10 @@ fn local_agent_prompt(user_text: &str, agent_kind: &str) -> String {
     let mut prompt = user_text.to_string();
     prompt.push_str("\n\n运行约束：只操作 hank-cli 提供的当前工作目录及其子目录；遵循目录中的 AGENTS.md/CLAUDE.md 等项目规则；不要读取或修改凭据、密钥或本机 Agent 认证配置。完成后用中文给出结果和验证情况。");
     if agent_kind == "quant_code" {
-        prompt.push_str("修改 quant 前必须读取 quant/AGENTS.md，并遵守禁止交易能力的产品边界。");
+        prompt.push_str(
+            "quant 已是独立仓库（https://github.com/hankjs/quant）。修改前必须读取当前工作区 AGENTS.md，\
+             并遵守禁止交易能力的产品边界。",
+        );
     }
     prompt
 }
@@ -2464,7 +2468,8 @@ fn local_agent_analysis_prompt(user_text: &str, agent_kind: &str) -> String {
     );
     if agent_kind == "quant_code" {
         prompt.push_str(
-            "\n- 分析 quant 相关改动前必须读取 quant/AGENTS.md，并遵守禁止交易能力的产品边界。",
+            "\n- quant 是独立仓库（https://github.com/hankjs/quant）；分析前必须读取其 AGENTS.md，\
+             并遵守禁止交易能力的产品边界。",
         );
     }
     prompt

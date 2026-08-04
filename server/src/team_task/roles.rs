@@ -53,7 +53,10 @@ fn workspace_constraints(agent_kind: &str) -> String {
          - 不要读取或修改凭据、密钥或本机 Agent 认证配置。\n",
     );
     if agent_kind == "quant_code" {
-        s.push_str("- 修改 quant 前必须读取 quant/AGENTS.md，并遵守禁止交易能力的产品边界。\n");
+        s.push_str(
+            "- quant 是独立仓库（https://github.com/hankjs/quant）；修改前必须读取其 AGENTS.md，\
+             并遵守禁止交易能力的产品边界。\n",
+        );
     }
     s
 }
@@ -489,11 +492,12 @@ blocking: auth_test 失败
         let mut input = base_input("改 quant 指标");
         input.agent_kind = "quant_code";
         let p = developer_prompt(&input);
-        assert!(p.contains("quant/AGENTS.md"));
+        assert!(p.contains("github.com/hankjs/quant"));
+        assert!(p.contains("AGENTS.md"));
 
         input.agent_kind = "trace_code";
         let p = developer_prompt(&input);
-        assert!(!p.contains("quant/AGENTS.md"));
+        assert!(!p.contains("github.com/hankjs/quant"));
     }
 
     // ----- 5.8 评审只读约束 -----

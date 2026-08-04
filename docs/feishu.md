@@ -206,7 +206,7 @@ hank-cli
 /opt/hank/deploy-jobs                 审批后的结构化 manifest 与结果
 ```
 
-可迭代范围是 `server/`、`crates/`、`admin/`、`cli/`、`quant/`、`docs/`；`client/` 在文件工具、shell 规则和部署前检查三处拒绝。`deploy/`、systemd、sudoers、`Makefile` 和配置模板属于部署基础设施，不能自部署，需走 SSH 应急入口。
+可迭代范围是 `server/`、`crates/`、`admin/`、`cli/`、`docs/`；`client/` 在文件工具、shell 规则和部署前检查三处拒绝。quant 已独立仓库（https://github.com/hankjs/quant）。`deploy/`、systemd、sudoers、`Makefile` 和配置模板属于部署基础设施，不能自部署，需走 SSH 应急入口。
 
 ### 首次初始化
 
@@ -216,8 +216,7 @@ hank-cli
 make bootstrap-server-agent
 make deploy
 make deploy-cli       # 线上需要 hank-cli 时
-make deploy-quant     # 线上需要 quant 时
-make deploy-quant-slidev
+# quant 部署：cd ~/projects/hank/quant && make deploy / make deploy-slidev
 ```
 
 `bootstrap-server-agent` 会创建两个账号：`hank` 运行 server 并持有审批权限，`hank-build` 只执行工作区 shell、测试和构建，不具备 root 部署权限。构建用户只信任生产基线和 server 为话题注册的具体 worktree。bootstrap 还会安装 root-owned `/usr/local/libexec/hank-deploy`；helper 只接受 UUID，从 `/opt/hank/deploy-jobs` 读取 manifest，并把任务转交给独立 systemd transient unit，因此更新 `hank-server` 本身不会中断部署。

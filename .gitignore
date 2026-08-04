@@ -39,3 +39,6 @@ coverage/
 
 # quant baostock 原始落盘(大文件)
 quant/data/baostock_raw/
+
+# agent shell placeholder after quant extraction (do not re-add quant source here)
+quant/.agent-workspace-placeholder

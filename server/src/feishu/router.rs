@@ -1130,7 +1130,7 @@ async fn try_decide_new_topic(
         输出字段 agent_kind 可选值：\n\
         - trace_code：需要读取、修改、测试或部署 Trace/Hank monorepo 的 server、\
           crates、admin、cli、docs、飞书/微信渠道或同步流程；不包括 client 和 quant。\n\
-        - quant_code：需要读取、修改或测试 monorepo 的 quant 项目代码、策略、看板或文档。\n\
+        - quant_code：需要读取、修改或测试独立 quant 仓库（github.com/hankjs/quant）的代码、策略、看板或文档。\n\
         - general_task：具体任务与 Trace/quant 无关，但需要文件、代码、命令、下载、分析产物或持续迭代工作区。\n\
         {quant_research_line}\
         - conversation：用户在问候、讨论、咨询、分析问题，或者尚未给出需要文件和命令的事项。\

@@ -10,7 +10,7 @@ Agent 运行在服务器上执行 shell 命令和文件操作，客户端通过 
 核心能力：多 LLM 提供商、消息树（对话分支/回溯）、Checkpoint 快照、变更管理
 （Explore → Generate → Confirm → Archive 工作流）、版本化 Spec 系统、远程终端节点、微信通道。
 
-这是一个 **monorepo**，包含五个相对独立的子系统：
+这是一个 **monorepo**，包含四个相对独立的子系统：
 
 | 目录 | 说明 |
 |------|------|
@@ -18,7 +18,10 @@ Agent 运行在服务器上执行 shell 命令和文件操作，客户端通过 
 | `client/` | Tauri 2 + Vue 3 桌面客户端（包名 `hank-client`） |
 | `admin/` | Vue 3 + Vite 管理后台 Web（包名 `hank-admin`） |
 | `cli/` | `hank-cli`：headless 远程终端节点（独立 Cargo 项目，不进 workspace） |
-| `quant/` | A股日频量化信息系统（独立 Python 项目，**有自己的 `quant/AGENTS.md`，改 quant 前先读它**） |
+
+**quant 已迁出本 monorepo**：独立仓库 https://github.com/hankjs/quant（本地 `~/projects/hank/quant`）。
+Trace 仅通过 HTTP A2A（`[quant_a2a]` + `quant_*` 工具 + `server/skills/quant-research`）调用 quant；
+可共用同一 MySQL（`quant_*` 表前缀）与 JWT。改 quant 请到 quant 仓库并先读其 `AGENTS.md`。
 
 ## 技术栈
 
@@ -26,7 +29,7 @@ Agent 运行在服务器上执行 shell 命令和文件操作，客户端通过 
 - **客户端**: Vue 3.5 (`<script setup lang="ts">`), Vue Router 4, Tailwind CSS 4, TypeScript, Vite 6, Tauri 2, xterm.js, Vitest 4
 - **管理后台**: Vue 3 + Vite + Tailwind 4（无 Tauri）
 - **CLI**: Rust 独立项目 (clap, portable-pty, reqwest/rustls)
-- **数据库**: MySQL（`config.toml` 的 `database_url`）；quant 与服务端共用同一个 MySQL，表带 `quant_` 前缀
+- **数据库**: MySQL（`config.toml` 的 `database_url`）；独立 quant 服务可共用同一 MySQL，其表带 `quant_` 前缀
 - **配置**: 根目录 `config.toml`（gitignored，从 `config.example.toml` 复制）
 
 注意：`README.md`/`CLAUDE.md` 中的部分描述已过时（如 SQLite、hank-agent/hank-web-tools 名称），以本文件和实际代码为准。
@@ -63,7 +66,7 @@ client/src/              Tauri + Vue 3 客户端
   └── terminal/          终端布局与标签状态
 admin/src/               管理后台 (views/, components/, composables/)
 cli/src/                 hank-cli: main, config(clap), api, worker(长轮询执行), terminal(PTY), notify
-deploy/                  部署脚本 + systemd unit (hank-server / hank-cli / hank-quant)
+deploy/                  部署脚本 + systemd unit (hank-server / hank-cli)
 docs/                    mdBook 文档 (src/ 源码, book/ 已构建产物勿改), feature/, review/
 Makefile                 所有常用任务的统一入口
 ```
@@ -92,17 +95,15 @@ cd admin && pnpm build            # vue-tsc + 构建, 产物 admin/dist 由服�
 make cli-dev                      # 前台开发运行 (可用 SERVER=/USERNAME=/PASSWORD= 覆盖)
 make cli                          # release 构建并装到 /opt/homebrew/bin
 
-# quant 量化系统 (独立 Python 项目, 详见 quant/AGENTS.md)
-make quant                        # FastAPI, 0.0.0.0:8100
-make quant-web                    # 前端看板
-make quant-slidev                 # 系统介绍 Slidev 本地预览 (localhost:3030)
+# quant 量化系统（独立仓库，不在本 monorepo）
+# cd ~/projects/hank/quant && make dev / make web / make deploy
 
 # Makefile 汇总
 make server-dev / client-dev / admin-dev
 make app                          # 构建 Trace.app 并安装到 /Applications
 ```
 
-包管理器统一用 **pnpm**；Python 侧统一用 **uv**。
+包管理器统一用 **pnpm**。
 
 ## 运行时架构
 
@@ -146,10 +147,9 @@ make app                          # 构建 Trace.app 并安装到 /Applications
 ```bash
 make deploy               # server + admin: 服务器装依赖 -> 本地构建 admin -> rsync 源码 -> 服务器 cargo build -> /opt/hank -> systemctl 重启
 make deploy-cli           # hank-cli (需先跑过 make deploy)
-make deploy-quant         # quant 量化系统 (同机, 端口 8100)
-make deploy-quant-slidev  # quant 系统介绍 Slidev (同机 nginx 静态, 端口 3030)
 make sync-server-agent    # 拉回 wananyun Git 分支，不 merge、不 push
 # 跳过依赖安装: make deploy SKIP_DEPS=--skip-deps
+# quant 部署: cd ~/projects/hank/quant && make deploy / make deploy-slidev
 ```
 
 服务器上的 `config.toml` 只在缺失时上传一次，之后不会被覆盖。国内服务器默认走 rsproxy.cn 镜像
@@ -161,7 +161,7 @@ make sync-server-agent    # 拉回 wananyun Git 分支，不 merge、不 push
 - 密码用 bcrypt 哈希；管理端存储的 Provider key 有加密处理。
 - `/snap` 网页截图需要服务器安装 Chromium 并配置 `chrome_path`；`/shot` 终端截图需要等宽 CJK 字体。
 - Agent 会在服务器上执行真实 shell 命令与文件写操作，工具权限控制在 `code-tools/permission.rs`，改动需谨慎。
-- quant 是纯信息/回测系统：**永远不添加券商连接、下单或任何自动/半自动交易能力**（见 `quant/AGENTS.md` 的产品边界）。
+- quant（独立仓库）是纯信息/回测系统：**永远不添加券商连接、下单或任何自动/半自动交易能力**（见 quant 仓库 `AGENTS.md` 的产品边界）。
 
 ## 其他
 

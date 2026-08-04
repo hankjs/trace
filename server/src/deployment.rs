@@ -23,8 +23,6 @@ const RESULT_POLL_LIMIT: usize = 30 * 60;
 pub enum DeployTarget {
     Core,
     Cli,
-    Quant,
-    QuantSlidev,
     Docs,
 }
 
@@ -33,8 +31,6 @@ impl DeployTarget {
         match self {
             Self::Core => "server + admin",
             Self::Cli => "hank-cli",
-            Self::Quant => "quant + quant web",
-            Self::QuantSlidev => "quant Slidev",
             Self::Docs => "mdBook 文档",
         }
     }
@@ -668,76 +664,6 @@ pub async fn test_workspace(
                 )
                 .await?;
             }
-            DeployTarget::Quant => {
-                let quant = format!("{worktree}/quant");
-                let quant_web = format!("{quant}/web");
-                run_checked(
-                    &quant_web,
-                    "quant web pnpm install",
-                    "pnpm",
-                    &["install", "--frozen-lockfile"],
-                    cancel,
-                    &execution_user,
-                )
-                .await?;
-                run_checked(
-                    &quant_web,
-                    "quant web test",
-                    "pnpm",
-                    &["test"],
-                    cancel,
-                    &execution_user,
-                )
-                .await?;
-                run_checked(
-                    &quant_web,
-                    "quant web build",
-                    "pnpm",
-                    &["build"],
-                    cancel,
-                    &execution_user,
-                )
-                .await?;
-                run_checked(
-                    &quant,
-                    "quant uv sync",
-                    "uv",
-                    &["sync", "--frozen"],
-                    cancel,
-                    &execution_user,
-                )
-                .await?;
-                run_checked(
-                    &quant,
-                    "quant pytest",
-                    "uv",
-                    &["run", "pytest", "tests/"],
-                    cancel,
-                    &execution_user,
-                )
-                .await?;
-            }
-            DeployTarget::QuantSlidev => {
-                let slidev = format!("{worktree}/quant/slidev");
-                run_checked(
-                    &slidev,
-                    "Slidev pnpm install",
-                    "pnpm",
-                    &["install", "--frozen-lockfile"],
-                    cancel,
-                    &execution_user,
-                )
-                .await?;
-                run_checked(
-                    &slidev,
-                    "Slidev build",
-                    "pnpm",
-                    &["build"],
-                    cancel,
-                    &execution_user,
-                )
-                .await?;
-            }
             DeployTarget::Docs => {
                 let destination = format!("/tmp/hank-docs-test-{session_id}");
                 let result = run_checked(
@@ -979,7 +905,8 @@ pub async fn ensure_server_agent_admin(state: &Arc<AppState>, user_id: &str) -> 
 
 fn classify_targets(paths: &[String]) -> (Vec<DeployTarget>, bool, bool) {
     let mut targets = Vec::new();
-    let mut migration_required = false;
+    // migration_required 历史字段：quant 已迁出 monorepo，始终为 false。
+    let migration_required = false;
     let mut infra_changed = false;
     for path in paths {
         let target = if path.starts_with("server/")
@@ -990,17 +917,14 @@ fn classify_targets(paths: &[String]) -> (Vec<DeployTarget>, bool, bool) {
             Some(DeployTarget::Core)
         } else if path.starts_with("cli/") {
             Some(DeployTarget::Cli)
-        } else if path.starts_with("quant/slidev/") {
-            Some(DeployTarget::QuantSlidev)
-        } else if path.starts_with("quant/") {
-            if path.starts_with("quant/alembic/") {
-                migration_required = true;
-            }
-            Some(DeployTarget::Quant)
         } else if path.starts_with("docs/") || matches!(path.as_str(), "README.md" | "AGENTS.md") {
             Some(DeployTarget::Docs)
         } else if path.starts_with("deploy/") || path == "Makefile" || path == "config.example.toml"
         {
+            infra_changed = true;
+            None
+        } else if path == "quant" || path.starts_with("quant/") {
+            // quant 已独立仓库，monorepo 内不应再出现该路径改动。
             infra_changed = true;
             None
         } else {
@@ -1021,6 +945,12 @@ fn reject_forbidden_changes<'a>(paths: impl Iterator<Item = &'a str>) -> Result<
         let path = path.trim_matches('"');
         if path == "client" || path.starts_with("client/") || path.contains(" -> client/") {
             bail!("client/ 已从飞书迭代范围排除，请撤销该目录的修改");
+        }
+        if path == "quant" || path.starts_with("quant/") || path.contains(" -> quant/") {
+            bail!(
+                "quant 已独立为仓库 https://github.com/hankjs/quant（本地 ~/projects/hank/quant），\
+                 请在 quant 仓库中修改，不要在 Trace monorepo 中改 quant/"
+            );
         }
         if path == "config.toml" || path.ends_with("/config.toml") {
             bail!("生产配置文件不允许进入 Agent 部署提交: {path}");
@@ -1208,8 +1138,6 @@ mod tests {
             "server/src/main.rs".to_string(),
             "admin/src/App.vue".to_string(),
             "cli/src/main.rs".to_string(),
-            "quant/app/main.py".to_string(),
-            "quant/slidev/slides.md".to_string(),
             "docs/src/overview.md".to_string(),
         ];
         let (targets, migration, infra) = classify_targets(&paths);
@@ -1218,8 +1146,6 @@ mod tests {
             vec![
                 DeployTarget::Core,
                 DeployTarget::Cli,
-                DeployTarget::Quant,
-                DeployTarget::QuantSlidev,
                 DeployTarget::Docs,
             ]
         );
@@ -1228,20 +1154,22 @@ mod tests {
     }
 
     #[test]
-    fn detects_migrations_and_infrastructure() {
+    fn detects_infrastructure_and_legacy_quant_paths() {
         let paths = vec![
-            "quant/alembic/versions/0023_x.py".to_string(),
+            "quant/app/main.py".to_string(),
             "deploy/hank-server.service".to_string(),
         ];
-        let (_, migration, infra) = classify_targets(&paths);
-        assert!(migration);
+        let (targets, migration, infra) = classify_targets(&paths);
+        assert!(targets.is_empty());
+        assert!(!migration);
         assert!(infra);
     }
 
     #[test]
-    fn rejects_client_and_config() {
+    fn rejects_client_quant_and_config() {
         assert!(reject_forbidden_changes(["client/src/App.vue"].into_iter()).is_err());
-        assert!(reject_forbidden_changes(["quant/config.toml"].into_iter()).is_err());
+        assert!(reject_forbidden_changes(["quant/app/main.py"].into_iter()).is_err());
+        assert!(reject_forbidden_changes(["config.toml"].into_iter()).is_err());
     }
 
     #[test]

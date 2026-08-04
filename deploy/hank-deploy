@@ -129,8 +129,8 @@ print(sha)
 print("1" if data.get("migration_required") else "0")
 print(action)
 for target in data.get("targets", []):
-    if target not in {"core", "cli", "quant", "quant_slidev", "docs"}:
-        raise SystemExit(f"unsupported target: {target}")
+    if target not in {"core", "cli", "docs"}:
+        raise SystemExit(f"unsupported target: {target} (quant 已独立仓库，请在 hankjs/quant 部署)")
     print(target)
 PY
 )
@@ -141,7 +141,7 @@ MIGRATION_REQUIRED="${META[3]}"
 ACTION="${META[4]}"
 TARGETS=("${META[@]:5}")
 ORDERED_TARGETS=()
-for wanted in quant cli quant_slidev docs core; do
+for wanted in cli docs core; do
   for target in "${TARGETS[@]}"; do
     [[ "$target" == "$wanted" ]] && ORDERED_TARGETS+=("$target")
   done
@@ -154,7 +154,7 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
 fi
 
 if [[ "$MIGRATION_REQUIRED" == "1" ]]; then
-  write_result failed "" "检测到 quant Alembic 迁移；必须在维护窗口单独执行迁移"
+  write_result failed "" "检测到 migration_required=true；必须在维护窗口单独执行迁移"
   exit 1
 fi
 
