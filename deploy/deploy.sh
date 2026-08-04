@@ -26,6 +26,9 @@
 set -euo pipefail
 
 SSH_HOST="${SSH_HOST:-wananyun}"
+# 保留的历史发布数量。每个发布约 66MB，线上 /opt 只有个位数 GB 余量，
+# 不清理会慢性写满磁盘——磁盘满会同时搞掉部署和正在跑的服务。
+KEEP_RELEASES="${KEEP_RELEASES:-5}"
 REMOTE_APP="/opt/hank"
 SERVICE_NAME="hank-server"
 TARGET="x86_64-unknown-linux-gnu"
@@ -115,6 +118,31 @@ for _ in $(seq 1 10); do
 done
 echo "ERROR: 健康检查失败，查看 journalctl -u hank-server" >&2
 exit 1
+REMOTE
+
+# ---------- 6. 清理历史发布 ----------
+# 放在健康检查之后：新版本没起来时不动任何旧发布，回退路径必须保持完整。
+log "清理历史发布（保留最近 $KEEP_RELEASES 个）..."
+ssh "$SSH_HOST" bash -s -- "$REMOTE_APP" "$KEEP_RELEASES" <<'REMOTE'
+set -euo pipefail
+app="$1"; keep="$2"
+cd "$app/releases"
+# current / previous 指向的目录永不删除，无论排在第几位
+cur="$(readlink -f "$app/current" 2>/dev/null || true)"
+prev="$(readlink -f "$app/previous" 2>/dev/null || true)"
+# 按发布 ID 末尾的时间戳倒序，不用 mtime：rsync 与软链操作都会改 mtime，
+# 排序会漂。同时只认 deploy.sh 生成的 ID 格式，手工建的目录一律不碰。
+candidates="$(ls -1 | grep -E '^[a-z]+-[0-9a-f]+-[0-9]{14}$' || true)"
+echo "$candidates" | sed '/^$/d' | sort -t- -k3,3r | tail -n "+$((keep + 1))" | while read -r dir; do
+  full="$(readlink -f "$dir")"
+  if [ "$full" = "$cur" ] || [ "$full" = "$prev" ]; then
+    echo "keep (linked) $dir"
+    continue
+  fi
+  rm -rf -- "$dir"
+  echo "removed $dir"
+done
+df -h "$app" | tail -1
 REMOTE
 
 log "部署完成 ✔  回退: ssh $SSH_HOST 'ln -sfn \$(readlink -f $REMOTE_APP/previous) $REMOTE_APP/current && systemctl restart $SERVICE_NAME'"
