@@ -442,18 +442,6 @@ pub fn build_confirm_done_card(
     })
 }
 
-pub struct DeploymentCardOptions {
-    pub deployment_id: String,
-    pub session_id: String,
-    pub chat_id: String,
-    pub topic_id: String,
-    pub summary: String,
-    pub targets: Vec<String>,
-    pub diff_stat: String,
-    pub expires_at: String,
-    pub approve_label: String,
-}
-
 /// 两阶段任务闸门大卡片入参（字段多，避免 too_many_arguments）。
 pub struct TaskGateCardOptions {
     pub interaction_id: String,
@@ -581,60 +569,6 @@ pub fn build_task_gate_card(opts: &TaskGateCardOptions) -> Value {
                 {
                     "tag": "action",
                     "actions": buttons
-                }
-            ]
-        }
-    })
-}
-
-/// 部署审批使用独立 action，回调直接进入部署状态机，不再把“确认”交给 LLM。
-pub fn build_deployment_card(opts: &DeploymentCardOptions) -> Value {
-    let target_text = opts.targets.join("、");
-    let diff: String = opts.diff_stat.chars().take(1800).collect();
-    let button = |label: &str, decision: &str, primary: bool| {
-        json!({
-            "tag": "button",
-            "text": { "tag": "plain_text", "content": label },
-            "type": if primary { "primary" } else { "default" },
-            "behaviors": [{
-                "type": "callback",
-                "value": {
-                    "action": "deploy_approval",
-                    "deployment_id": opts.deployment_id,
-                    "session_id": opts.session_id,
-                    "chat_id": opts.chat_id,
-                    "topic_id": opts.topic_id,
-                    "decision": decision,
-                }
-            }]
-        })
-    };
-    json!({
-        "schema": "2.0",
-        "config": {
-            "update_multi": true,
-            "summary": { "content": format!("Trace {}：待审批", opts.approve_label) }
-        },
-        "header": {
-            "template": "orange",
-            "title": { "tag": "plain_text", "content": format!("Trace {}审批", opts.approve_label) }
-        },
-        "body": {
-            "direction": "vertical",
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": format!(
-                        "**摘要：** {}\n\n**目标：** {}\n\n**变更：**\n```\n{}\n```\n\n**审批有效期：** {}",
-                        opts.summary, target_text, diff, opts.expires_at
-                    )
-                },
-                {
-                    "tag": "action",
-                    "actions": [
-                        button(&opts.approve_label, "approve", true),
-                        button("取消", "cancel", false)
-                    ]
                 }
             ]
         }

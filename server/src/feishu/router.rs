@@ -7,10 +7,7 @@
 
 use crate::chat::{run_chat_turn, ChatTurnOpts};
 use crate::feishu::api::FeishuApi;
-use crate::feishu::card::{
-    build_deployment_card, build_task_card, build_task_title, DeploymentCardOptions,
-    TaskCardOptions, TaskStatus,
-};
+use crate::feishu::card::{build_task_card, build_task_title, TaskCardOptions, TaskStatus};
 use crate::feishu::pusher;
 use crate::provider_registry;
 use crate::AppState;
@@ -183,11 +180,6 @@ pub enum SlashCommand {
     New,
     Stop,
     Status,
-    Nodes,
-    Diff,
-    Test,
-    Deploy,
-    Rollback,
     Help,
 }
 
@@ -332,15 +324,10 @@ impl NewTopicDecision {
 pub fn parse_command(text: &str) -> Option<SlashCommand> {
     let normalized = text.trim().to_ascii_lowercase();
     let t = normalized.as_str();
-    const COMMANDS: [(&str, SlashCommand); 9] = [
+    const COMMANDS: [(&str, SlashCommand); 4] = [
         ("/new", SlashCommand::New),
         ("/stop", SlashCommand::Stop),
         ("/status", SlashCommand::Status),
-        ("/nodes", SlashCommand::Nodes),
-        ("/diff", SlashCommand::Diff),
-        ("/test", SlashCommand::Test),
-        ("/deploy", SlashCommand::Deploy),
-        ("/rollback", SlashCommand::Rollback),
         ("/help", SlashCommand::Help),
     ];
     for (pat, cmd) in COMMANDS {
@@ -666,16 +653,10 @@ async fn handle_command(
         SlashCommand::Help => {
             api.reply_text(
                 &msg.message_id,
-                "直接问行情、信号、回测即可（quant 研究话题）\n/new 开启新话题\n/stop 停止当前任务\n/status 查看当前会话\n/nodes 列出本机 hank-cli 节点（在线状态与 backends）\n/diff 查看 server worktree 变更（本机 CLI 会话不支持）\n/test 运行 server worktree 测试（本机 CLI 会话不支持）\n/deploy 创建 server 部署审批（本机 CLI 会话不支持）\n/rollback 创建 server 回滚审批（本机 CLI 会话不支持）\n/help 查看命令",
+                "直接问行情、信号、回测即可（quant 研究话题）\n/new 开启新话题\n/stop 停止当前任务\n/status 查看当前会话\n/help 查看命令",
                 msg.in_thread(),
             )
             .await?;
-        }
-        SlashCommand::Nodes => {
-            let nodes = collect_hank_cli_nodes(state, user_id).await;
-            let text = format_nodes_command_reply(&nodes);
-            api.reply_text(&msg.message_id, &text, msg.in_thread())
-                .await?;
         }
         SlashCommand::Status => {
             let chat = state
@@ -762,257 +743,6 @@ async fn handle_command(
                 "当前没有正在执行的任务"
             };
             api.reply_text(&msg.message_id, text, msg.in_thread())
-                .await?;
-        }
-        SlashCommand::Diff => {
-            let Some(chat) = state
-                .db
-                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
-                .await?
-            else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
-                    .await?;
-                return Ok(());
-            };
-            if session_is_client_only(state, &chat.session_id).await? {
-                api.reply_text(
-                    &msg.message_id,
-                    &client_only_command_unsupported_message("/diff"),
-                    msg.in_thread(),
-                )
-                .await?;
-                return Ok(());
-            }
-            let diff =
-                match crate::deployment::workspace_diff(state, &chat.session_id, &chat.user_id)
-                    .await
-                {
-                    Ok(diff) => diff,
-                    Err(e) => format!("读取变更失败：{e:#}"),
-                };
-            api.reply_text(&msg.message_id, &diff, msg.in_thread())
-                .await?;
-        }
-        SlashCommand::Test => {
-            let Some(chat) = state
-                .db
-                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
-                .await?
-            else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
-                    .await?;
-                return Ok(());
-            };
-            if session_is_client_only(state, &chat.session_id).await? {
-                api.reply_text(
-                    &msg.message_id,
-                    &client_only_command_unsupported_message("/test"),
-                    msg.in_thread(),
-                )
-                .await?;
-                return Ok(());
-            }
-            if state
-                .active_tasks
-                .read()
-                .await
-                .contains_key(&chat.session_id)
-            {
-                api.reply_text(
-                    &msg.message_id,
-                    "当前 Agent 仍在执行，请完成或 /stop 后再测试",
-                    msg.in_thread(),
-                )
-                .await?;
-                return Ok(());
-            }
-            api.reply_text(
-                &msg.message_id,
-                "已开始运行受影响项目的测试",
-                msg.in_thread(),
-            )
-            .await?;
-            let state = state.clone();
-            let api = api.clone();
-            let message_id = msg.message_id.clone();
-            let in_thread = msg.in_thread();
-            let session_id = chat.session_id.clone();
-            let cancel = tokio_util::sync::CancellationToken::new();
-            state
-                .active_tasks
-                .write()
-                .await
-                .insert(session_id.clone(), cancel.clone());
-            tokio::spawn(async move {
-                let text = match crate::deployment::test_workspace(
-                    &state,
-                    &session_id,
-                    &chat.user_id,
-                    &cancel,
-                )
-                .await
-                {
-                    Ok(summary) => format!("测试通过\n{summary}"),
-                    Err(e) => format!("测试失败\n{e:#}"),
-                };
-                state.active_tasks.write().await.remove(&session_id);
-                if let Err(e) = api.reply_text(&message_id, &text, in_thread).await {
-                    tracing::warn!("feishu: reply test result failed: {e:#}");
-                }
-            });
-        }
-        SlashCommand::Deploy => {
-            let Some(chat) = state
-                .db
-                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
-                .await?
-            else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
-                    .await?;
-                return Ok(());
-            };
-            if session_is_client_only(state, &chat.session_id).await? {
-                api.reply_text(
-                    &msg.message_id,
-                    &client_only_command_unsupported_message("/deploy"),
-                    msg.in_thread(),
-                )
-                .await?;
-                return Ok(());
-            }
-            if state
-                .active_tasks
-                .read()
-                .await
-                .contains_key(&chat.session_id)
-            {
-                api.reply_text(
-                    &msg.message_id,
-                    "当前 Agent 仍在执行，请完成或 /stop 后再部署",
-                    msg.in_thread(),
-                )
-                .await?;
-                return Ok(());
-            }
-            let prepared = match crate::deployment::prepare_deployment(
-                state,
-                &chat.session_id,
-                &chat.user_id,
-                &account.id,
-                &msg.chat_id,
-                &topic,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    api.reply_text(
-                        &msg.message_id,
-                        &format!("无法创建部署：{e:#}"),
-                        msg.in_thread(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-            let card = build_deployment_card(&DeploymentCardOptions {
-                deployment_id: prepared.record.id.clone(),
-                session_id: prepared.record.session_id.clone(),
-                chat_id: msg.chat_id.clone(),
-                topic_id: topic.clone(),
-                summary: prepared.record.summary.clone(),
-                targets: prepared
-                    .targets
-                    .iter()
-                    .map(|target| target.label().to_string())
-                    .collect(),
-                diff_stat: prepared.diff_stat,
-                expires_at: prepared.record.approval_expires_at.to_rfc3339(),
-                approve_label: prepared.approval_label.to_string(),
-            });
-            let card_message_id = api
-                .reply_card(&msg.message_id, &card, msg.in_thread())
-                .await?;
-            state
-                .db
-                .set_deployment_card(&prepared.record.id, &card_message_id)
-                .await?;
-        }
-        SlashCommand::Rollback => {
-            let Some(chat) = state
-                .db
-                .get_feishu_chat(&account.id, &msg.chat_id, &topic)
-                .await?
-            else {
-                api.reply_text(&msg.message_id, "当前话题还没有代码工作区", msg.in_thread())
-                    .await?;
-                return Ok(());
-            };
-            if session_is_client_only(state, &chat.session_id).await? {
-                api.reply_text(
-                    &msg.message_id,
-                    &client_only_command_unsupported_message("/rollback"),
-                    msg.in_thread(),
-                )
-                .await?;
-                return Ok(());
-            }
-            if state
-                .active_tasks
-                .read()
-                .await
-                .contains_key(&chat.session_id)
-            {
-                api.reply_text(
-                    &msg.message_id,
-                    "当前 Agent 仍在执行，请完成或 /stop 后再回滚",
-                    msg.in_thread(),
-                )
-                .await?;
-                return Ok(());
-            }
-            let prepared = match crate::deployment::prepare_rollback(
-                state,
-                &chat.session_id,
-                &chat.user_id,
-                &account.id,
-                &msg.chat_id,
-                &topic,
-            )
-            .await
-            {
-                Ok(prepared) => prepared,
-                Err(e) => {
-                    api.reply_text(
-                        &msg.message_id,
-                        &format!("无法创建回滚：{e:#}"),
-                        msg.in_thread(),
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            };
-            let card = build_deployment_card(&DeploymentCardOptions {
-                deployment_id: prepared.record.id.clone(),
-                session_id: prepared.record.session_id.clone(),
-                chat_id: msg.chat_id.clone(),
-                topic_id: topic.clone(),
-                summary: prepared.record.summary.clone(),
-                targets: prepared
-                    .targets
-                    .iter()
-                    .map(|target| target.label().to_string())
-                    .collect(),
-                diff_stat: prepared.diff_stat,
-                expires_at: prepared.record.approval_expires_at.to_rfc3339(),
-                approve_label: prepared.approval_label.to_string(),
-            });
-            let card_message_id = api
-                .reply_card(&msg.message_id, &card, msg.in_thread())
-                .await?;
-            state
-                .db
-                .set_deployment_card(&prepared.record.id, &card_message_id)
                 .await?;
         }
     }
@@ -1943,7 +1673,7 @@ async fn create_feishu_session(
     // native 对话：server-agent 开启时仍可建无 worktree 的 server 会话（不含代码 Agent）。
     // 飞书不再为外部后端创建 server-only / bubblewrap 会话。
     if state.config.server_agent.enabled && agent_backend == "native" {
-        crate::deployment::ensure_server_agent_admin(state, user_id).await?;
+        crate::server_workspace::ensure_server_agent_admin(state, user_id).await?;
         let metadata = serde_json::json!({
             "source": "feishu",
             "server_agent": true,
@@ -2128,11 +1858,6 @@ mod tests {
         assert_eq!(parse_command("/new"), Some(SlashCommand::New));
         assert_eq!(parse_command("/stop"), Some(SlashCommand::Stop));
         assert_eq!(parse_command("/status"), Some(SlashCommand::Status));
-        assert_eq!(parse_command("/nodes"), Some(SlashCommand::Nodes));
-        assert_eq!(parse_command("/diff"), Some(SlashCommand::Diff));
-        assert_eq!(parse_command("/test"), Some(SlashCommand::Test));
-        assert_eq!(parse_command("/deploy"), Some(SlashCommand::Deploy));
-        assert_eq!(parse_command("/rollback"), Some(SlashCommand::Rollback));
         assert_eq!(parse_command("/help"), Some(SlashCommand::Help));
         assert_eq!(parse_command("help"), Some(SlashCommand::Help));
         assert_eq!(parse_command("?help"), Some(SlashCommand::Help));
@@ -2145,9 +1870,10 @@ mod tests {
             parse_command("@Agent OS /status"),
             Some(SlashCommand::Status)
         );
-        assert_eq!(parse_command("@MyBot /nodes"), Some(SlashCommand::Nodes));
-        assert_eq!(parse_command("@Agent OS /nodes"), Some(SlashCommand::Nodes));
         assert_eq!(parse_command("帮我运行 /status"), None);
+        // 已移除的命令不再被识别（曾经是 /nodes /diff /test /deploy /rollback）
+        assert_eq!(parse_command("/nodes"), None);
+        assert_eq!(parse_command("/deploy"), None);
         assert_eq!(parse_command("怎么使用 help"), None);
         assert_eq!(parse_command("/unknown"), None);
         assert_eq!(parse_command("@MyBot"), None);

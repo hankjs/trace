@@ -7,7 +7,7 @@ mod chat;
 mod checkpoints;
 mod cli_agent;
 mod config;
-mod deployment;
+mod server_workspace;
 mod feishu;
 mod image_gen;
 mod interaction_flow;
@@ -260,7 +260,6 @@ async fn run_server() -> Result<()> {
     feishu::monitor::start_monitors(state.clone());
 
     // 恢复跨越 server 自身重启的独立部署任务监听。
-    deployment::recover_deployments(state.clone());
 
     // 启动定时任务调度器（cron 驱动的系统主动工作入口）
     scheduler::start(state.clone());

@@ -10,9 +10,7 @@
 
 use crate::chat::{flatten_question_options, format_multi_answer_token_string};
 use crate::feishu::api::FeishuApi;
-use crate::feishu::card::{
-    build_confirm_done_card, build_multi_question_card, MultiQuestionCardOptions,
-};
+use crate::feishu::card::{build_multi_question_card, MultiQuestionCardOptions};
 use crate::feishu::router::{self, IncomingMessage};
 use crate::interaction_flow::{self, ChannelCardContext};
 use crate::AppState;
@@ -74,17 +72,6 @@ pub async fn handle_card_action(
         .clone()
         .and_then(|a| a.value)
         .ok_or_else(|| anyhow!("卡片回调缺少 action.value"))?;
-
-    if value["action"].as_str() == Some("deploy_approval") {
-        return handle_deploy_approval(
-            state,
-            account,
-            operator_open_id,
-            value,
-            card_message_id_from_event(&ev),
-        )
-        .await;
-    }
 
     // 终态卡按钮：查看详情 / 建议动作（payload 存 feishu_card_actions，不进 value）
     if value["action"].as_str() == Some("task_detail") {
@@ -444,110 +431,6 @@ async fn handle_answer_multi(
             "toast": { "type": "warning", "content": e.message }
         })),
     }
-}
-
-async fn handle_deploy_approval(
-    state: Arc<AppState>,
-    account: FeishuAccount,
-    operator_open_id: String,
-    value: Value,
-    card_message_id: Option<String>,
-) -> Result<Value> {
-    let deployment_id = value["deployment_id"].as_str().unwrap_or_default();
-    let decision = value["decision"].as_str().unwrap_or_default();
-    if deployment_id.is_empty() || !matches!(decision, "approve" | "cancel") {
-        return Ok(json!({
-            "toast": { "type": "warning", "content": "无效的部署审批" }
-        }));
-    }
-    let binding = state
-        .db
-        .get_feishu_binding(&account.id, &operator_open_id)
-        .await
-        .unwrap_or(None);
-    let Some(binding) = binding else {
-        return Ok(json!({
-            "toast": { "type": "warning", "content": "你还没有绑定 Trace 用户" }
-        }));
-    };
-    if let Err(e) = crate::deployment::ensure_server_agent_admin(&state, &binding.user_id).await {
-        return Ok(json!({
-            "toast": { "type": "warning", "content": e.to_string() }
-        }));
-    }
-    let Some(mut deployment) = state.db.get_deployment(deployment_id).await? else {
-        return Ok(json!({
-            "toast": { "type": "warning", "content": "部署任务不存在或已清理" }
-        }));
-    };
-    if deployment.account_id != account.id {
-        return Ok(json!({
-            "toast": { "type": "warning", "content": "审批卡片不属于当前飞书应用" }
-        }));
-    }
-    if deployment.user_id != binding.user_id {
-        return Ok(json!({
-            "toast": { "type": "warning", "content": "只有发起人可以审批此部署" }
-        }));
-    }
-    if let (Some(expected), Some(actual)) = (
-        deployment.card_message_id.as_deref(),
-        card_message_id.as_deref(),
-    ) {
-        if expected != actual {
-            return Ok(json!({
-                "toast": { "type": "warning", "content": "审批卡片与部署任务不匹配" }
-            }));
-        }
-    }
-    if let Some(card_id) = card_message_id.as_deref() {
-        let _ = state.db.set_deployment_card(deployment_id, card_id).await;
-        deployment.card_message_id = Some(card_id.to_string());
-    }
-    let api = FeishuApi::new_archived(&account, state.db.clone());
-    if decision == "cancel" {
-        if !state
-            .db
-            .cancel_deployment(deployment_id, &binding.user_id)
-            .await?
-        {
-            return Ok(json!({
-                "toast": { "type": "warning", "content": "部署已处理、已过期或已被其他操作占用" }
-            }));
-        }
-        if let Some(card_id) = card_message_id.as_deref() {
-            let card =
-                build_confirm_done_card("Trace 发布", &deployment.summary, "已取消", "你", None);
-            let _ = api.update_card(card_id, &card).await;
-        }
-        return Ok(json!({
-            "toast": { "type": "success", "content": "部署已取消" }
-        }));
-    }
-
-    let Some(approved) = state
-        .db
-        .approve_deployment(deployment_id, &binding.user_id)
-        .await?
-    else {
-        return Ok(json!({
-            "toast": { "type": "warning", "content": "部署已处理、已过期或已被其他操作占用" }
-        }));
-    };
-    if let Some(card_id) = card_message_id.as_deref() {
-        let card = build_confirm_done_card(
-            "Trace 发布",
-            &approved.summary,
-            "已批准，正在执行",
-            "你",
-            None,
-        );
-        let _ = api.update_card(card_id, &card).await;
-    }
-    tokio::spawn(crate::deployment::start_deployment(state, approved));
-    Ok(json!({
-        "toast": { "type": "success", "content": "部署已批准，正在执行" }
-    }))
 }
 
 /// 终态卡「查看详情」：话题内另发完整总结（可分段）。

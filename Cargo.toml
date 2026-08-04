@@ -25,7 +25,17 @@ async-trait = "0.1"
 futures = "0.3"
 shlex = "1"
 base64 = "0.22"
-reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+# TLS 统一走 rustls：去掉 native-tls/openssl-sys，本地 zigbuild 交叉编译才能通。
+# default 里的 charset/http2/system-proxy 需显式保留（关 default-features 会一并丢掉）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "multipart",
+    "rustls-tls",
+    "charset",
+    "http2",
+    "system-proxy",
+] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql", "chrono", "uuid"] }
 axum = { version = "0.8", features = ["multipart"] }
 axum-extra = { version = "0.10", features = ["typed-header"] }

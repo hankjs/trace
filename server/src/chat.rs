@@ -285,7 +285,7 @@ pub async fn run_chat_turn(
         .and_then(|metadata| metadata["server_agent"].as_bool())
         .unwrap_or(false);
     let repository_workspace =
-        crate::deployment::is_repository_workspace_metadata(session_metadata);
+        crate::server_workspace::is_repository_workspace_metadata(session_metadata);
     let routed_agent_kind = session_metadata_value
         .as_ref()
         .and_then(|metadata| metadata["agent_kind"].as_str());
