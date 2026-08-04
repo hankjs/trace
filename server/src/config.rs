@@ -15,129 +15,15 @@ pub struct Config {
     pub quant_a2a: Option<QuantA2aConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// server 侧原生会话开关。
+///
+/// 只剩 `enabled` 一个字段：worktree / 沙箱 / 降权用户 / 部署 helper / 任务闸门
+/// 相关配置已随代码 Agent 执行链路下线。开启后 feishu 新话题会建 server 会话
+/// （仅限管理员），会话仍然只有对话与 server 本地工具，不再创建任何工作区目录。
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ServerAgentConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_repository_root")]
-    pub repository_root: String,
-    #[serde(default = "default_worktrees_root")]
-    pub worktrees_root: String,
-    /// 与 Trace/quant 无关的任务使用普通隔离目录，不创建 Git worktree。
-    #[serde(default = "default_general_workspaces_root")]
-    pub general_workspaces_root: String,
-    #[serde(default = "default_base_ref")]
-    pub base_ref: String,
-    #[serde(default = "default_deploy_jobs_dir")]
-    pub deploy_jobs_dir: String,
-    #[serde(default = "default_deploy_helper")]
-    pub deploy_helper: String,
-    /// 执行仓库 shell、测试和构建的低权限用户，不具备部署 sudoers。
-    #[serde(default = "default_execution_user")]
-    pub execution_user: String,
-    /// Claude Code / Codex 的离线安装目录。
-    #[serde(default = "default_agent_cli_root")]
-    pub agent_cli_root: String,
-    /// 每个飞书话题独占的 CLI HOME 与上下文目录。
-    #[serde(default = "default_agent_state_root")]
-    pub agent_state_root: String,
-    /// 外部 Agent 单轮最长运行时间。
-    #[serde(default = "default_agent_timeout_secs")]
-    pub agent_timeout_secs: u64,
-    /// 外部 Agent stdout/stderr 各自允许保留的最大字节数。
-    #[serde(default = "default_agent_output_limit_bytes")]
-    pub agent_output_limit_bytes: usize,
-    /// 外部 Agent 必须通过该程序进入文件系统沙箱；缺失时拒绝启动。
-    #[serde(default = "default_agent_sandbox_bin")]
-    pub agent_sandbox_bin: String,
-    /// 生产环境以非 root 用户运行 server 时，通过 sudo 调用唯一允许的部署 helper。
-    #[serde(default)]
-    pub deploy_use_sudo: bool,
-    #[serde(default = "default_deploy_approval_ttl_secs")]
-    pub approval_ttl_secs: u64,
-    /// 两阶段任务闸门开关。
-    ///
-    /// 与 `enabled` 解耦：client-only 链路在 `server_agent.enabled = false` 时
-    /// 同样要能用闸门。调用方不得写成 `enabled && task_gate_enabled`。
-    #[serde(default)]
-    pub task_gate_enabled: bool,
-}
-
-impl Default for ServerAgentConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            repository_root: default_repository_root(),
-            worktrees_root: default_worktrees_root(),
-            general_workspaces_root: default_general_workspaces_root(),
-            base_ref: default_base_ref(),
-            deploy_jobs_dir: default_deploy_jobs_dir(),
-            deploy_helper: default_deploy_helper(),
-            execution_user: default_execution_user(),
-            agent_cli_root: default_agent_cli_root(),
-            agent_state_root: default_agent_state_root(),
-            agent_timeout_secs: default_agent_timeout_secs(),
-            agent_output_limit_bytes: default_agent_output_limit_bytes(),
-            agent_sandbox_bin: default_agent_sandbox_bin(),
-            deploy_use_sudo: false,
-            approval_ttl_secs: default_deploy_approval_ttl_secs(),
-            task_gate_enabled: false,
-        }
-    }
-}
-
-fn default_repository_root() -> String {
-    "/opt/hank-src".to_string()
-}
-
-fn default_worktrees_root() -> String {
-    "/opt/hank-worktrees".to_string()
-}
-
-fn default_general_workspaces_root() -> String {
-    "/opt/hank-workspaces".to_string()
-}
-
-fn default_base_ref() -> String {
-    "trace-production".to_string()
-}
-
-fn default_deploy_jobs_dir() -> String {
-    "/opt/hank/deploy-jobs".to_string()
-}
-
-fn default_deploy_helper() -> String {
-    "/usr/local/libexec/hank-deploy".to_string()
-}
-
-fn default_execution_user() -> String {
-    "hank-build".to_string()
-}
-
-fn default_agent_cli_root() -> String {
-    "/opt/hank-agent-cli".to_string()
-}
-
-fn default_agent_state_root() -> String {
-    "/opt/hank-agent-state".to_string()
-}
-
-fn default_agent_timeout_secs() -> u64 {
-    30 * 60
-}
-
-/// 外部 Agent stdout 上限（runaway 保护）。JSONL 是逐行转发即弃的，不占内存，
-/// 所以这里只需要防跑飞；stream-json 下探索型任务几 MiB 起步，2 MiB 会误杀。
-fn default_agent_output_limit_bytes() -> usize {
-    64 * 1024 * 1024
-}
-
-fn default_agent_sandbox_bin() -> String {
-    "/usr/bin/bwrap".to_string()
-}
-
-fn default_deploy_approval_ttl_secs() -> u64 {
-    10 * 60
 }
 
 #[derive(Debug, Clone, Deserialize)]

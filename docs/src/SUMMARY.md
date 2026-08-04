@@ -1,7 +1,6 @@
 # Summary
 
 - [概览](./overview.md)
-- [Server Agent 双向 Git 同步](./operations/server-agent-sync.md)
 - [Agent 开发基础](./agent-fundamentals/01_我为什么要做这门课，以及我是谁.md)
   - [搞定 Agent 六大支柱](./agent-fundamentals/02_搞定%20Agent%20六大支柱：今天出个%20Manus%20明天出个%20OpenClaw，你到底应该学什么？.md)
   - [从 ChatBot 到 Agent](./agent-fundamentals/03_从%20ChatBot%20到%20Agent：一个%20while%20循环，凭什么让%20AI%20从_能聊天_变成_能干活_？.md)

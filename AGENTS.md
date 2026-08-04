@@ -17,7 +17,6 @@ Agent 运行在服务器上执行 shell 命令和文件操作，客户端通过 
 | `server/` + `crates/` | Rust workspace：Axum 服务端及 Agent 核心 crates |
 | `client/` | Tauri 2 + Vue 3 桌面客户端（包名 `hank-client`） |
 | `admin/` | Vue 3 + Vite 管理后台 Web（包名 `hank-admin`） |
-| `cli/` | `hank-cli`：headless 远程终端节点（独立 Cargo 项目，不进 workspace） |
 
 **quant 已迁出本 monorepo**：独立仓库 https://github.com/hankjs/quant（本地 `~/projects/hank/quant`）。
 Trace 仅通过 HTTP A2A（`[quant_a2a]` + `quant_*` 工具 + `server/skills/quant-research`）调用 quant；
@@ -44,10 +43,9 @@ server/src/              Axum HTTP/SSE 服务 (hank-server, 0.0.0.0:3000)
   ├── changes.rs         变更管理 (Artifacts, Tasks, Explore/Generate)
   ├── specs.rs           Spec 版本化管理
   ├── checkpoints.rs     Checkpoint 回溯系统
-  ├── admin.rs / admin_terminal.rs  管理后台 API
+  ├── admin.rs           管理后台 API
   ├── auth.rs            JWT 认证
   ├── llm.rs             通用 LLM completion / tool-exec 端点
-  ├── remote_exec.rs / remote_tools.rs  远程终端节点 (hank-cli) 调度
   ├── image_gen.rs / skills.rs / requirement_docs.rs / snap_tools.rs / termshot.rs / websnap.rs
   └── weixin/            微信通道 (登录、消息路由、推送、监控)
 crates/
@@ -65,8 +63,7 @@ client/src/              Tauri + Vue 3 客户端
   ├── api/               API 客户端层
   └── terminal/          终端布局与标签状态
 admin/src/               管理后台 (views/, components/, composables/)
-cli/src/                 hank-cli: main, config(clap), api, worker(长轮询执行), terminal(PTY), notify
-deploy/                  部署脚本 + systemd unit (hank-server / hank-cli)
+deploy/                  部署脚本 + systemd unit (hank-server)
 docs/                    mdBook 文档 (src/ 源码, book/ 已构建产物勿改), feature/, review/
 Makefile                 所有常用任务的统一入口
 ```
@@ -91,10 +88,6 @@ pnpm test:run                     # Vitest (happy-dom + msw, tests/ 与 src/**/*
 cd admin && pnpm dev              # Vite 开发
 cd admin && pnpm build            # vue-tsc + 构建, 产物 admin/dist 由服务端托管
 
-# hank-cli (cli/, 独立 Cargo 项目)
-make cli-dev                      # 前台开发运行 (可用 SERVER=/USERNAME=/PASSWORD= 覆盖)
-make cli                          # release 构建并装到 /opt/homebrew/bin
-
 # quant 量化系统（独立仓库，不在本 monorepo）
 # cd ~/projects/hank/quant && make dev / make web / make deploy
 
@@ -112,8 +105,8 @@ make app                          # 构建 Trace.app 并安装到 /Applications
 - 所有 `/api/*`（除 `/api/health` 和 `/api/auth/login`）需要 `Authorization: Bearer <JWT>`。
 - Agent loop 在 `code-agent` crate：orchestrator 编排 worker/verifier，工具由 `code-tools` 实现，
   LLM 调用走 `hank-provider`（Anthropic 原生协议 + OpenAI 兼容协议，可配多个 Provider 运行时切换）。
-- `hank-cli` 是部署在任意机器上的 headless 节点：登录 → 注册 → 长轮询拉取工具调用 → 本机 PTY 执行 → 回传结果，
-  服务端通过 `remote_exec.rs` 调度。
+- Agent 工具一律在 server 进程内本地执行：远程执行节点（`hank-cli`）、沙箱降权与 server 侧
+  代码工作区都已下线，server 不在任何用户机器上跑命令。
 - 微信通道 (`server/src/weixin/`) 提供扫码登录、消息收发、`/snap` 网页截图 (headless Chromium)、
   `/shot` 终端截图 (SGR→SVG→PNG) 等能力。
 
@@ -136,24 +129,21 @@ make app                          # 构建 Trace.app 并安装到 /Applications
 
 ## 部署
 
-### Server Agent 双向 Git 同步（必读）
-
-涉及飞书 server-only 开发、`/deploy`、`make sync-server-agent`、本机部署或分支协调前，
-必须先阅读 `docs/src/operations/server-agent-sync.md`。该文件是本机与 wananyun 共同维护的唯一同步协议；
-其他文档不得复制另一套流程。wananyun 不访问 GitHub，服务器提交只由本机拉回、人工合并并手动 push。
-
-通过 `deploy/` 下的脚本 SSH 到线上服务器（`SSH_HOST`，默认 `wananyun`），systemd 管理服务：
+通过 `deploy/` 下的脚本 SSH 到线上服务器（`SSH_HOST`，默认 `wananyun`），systemd 管理服务。
+构建全部在本地完成，服务器只接收产物：
 
 ```bash
-make deploy               # server + admin: 服务器装依赖 -> 本地构建 admin -> rsync 源码 -> 服务器 cargo build -> /opt/hank -> systemctl 重启
-make deploy-cli           # hank-cli (需先跑过 make deploy)
-make sync-server-agent    # 拉回 wananyun Git 分支，不 merge、不 push
-# 跳过依赖安装: make deploy SKIP_DEPS=--skip-deps
-# quant 部署: cd ~/projects/hank/quant && make deploy / make deploy-slidev
+make deploy               # 本地 zigbuild 交叉编译 server + 本地构建 admin -> 推产物到 /opt/hank -> systemctl 重启
+./deploy/bootstrap-server.sh   # 仅全新服务器一次性初始化（建 hank 用户与目录、装 unit）
+# quant 部署: cd ~/projects/hank/quant && make deploy
 ```
 
-服务器上的 `config.toml` 只在缺失时上传一次，之后不会被覆盖。国内服务器默认走 rsproxy.cn 镜像
-（`CARGO_MIRROR=none` 关闭）。systemd unit 文件在 `deploy/*.service`。
+服务器是 Ubuntu 18.04（glibc 2.27），因此用 zig 做链接器交叉编译；本机需要
+`brew install zig && cargo install cargo-zigbuild` 与 `rustup target add x86_64-unknown-linux-gnu`。
+服务器上不装 rustup/node，也不再有 Git 基线仓库或沙箱。
+
+`/opt/hank/current` 是指向 `releases/<id>` 的软链，`previous` 保留上一版可回退。
+服务器上的 `config.toml` 只在缺失时上传一次，之后不会被覆盖。systemd unit 在 `deploy/hank-server.service`。
 
 ## 安全注意事项
 

@@ -347,21 +347,12 @@ pub async fn run_chat_turn(
     } else {
         let base_url = format!("http://127.0.0.1:{}", state.config.server.port);
         let checksum_store = new_checksum_store();
-        let execution_user =
-            server_agent_session.then(|| state.config.server_agent.execution_user.clone());
-        // fs/shell 类工具：远程执行通道已移除，一律 server 本地执行
-        let shell = match &execution_user {
-            Some(user) => ShellTool::new_as_user(work_dir.clone(), user.clone()),
-            None => ShellTool::new(work_dir.clone()),
-        };
-        let git = match &execution_user {
-            Some(user) => GitTool::new_as_user(work_dir.clone(), user.clone()),
-            None => GitTool::new(work_dir.clone()),
-        };
-        let test_runner = match &execution_user {
-            Some(user) => TestRunnerTool::new_as_user(work_dir.clone(), user.clone()),
-            None => TestRunnerTool::new(work_dir.clone()),
-        };
+        // fs/shell 类工具一律以 server 进程自身身份在本地执行。
+        // 曾经 server_agent 会话会降权到 hank-build 用户跑 `sudo -u`，
+        // 但那条链路依赖的沙箱与 sudoers 已随代码 Agent 一起下线，留着只会静默失败。
+        let shell = ShellTool::new(work_dir.clone());
+        let git = GitTool::new(work_dir.clone());
+        let test_runner = TestRunnerTool::new(work_dir.clone());
         let mut t: Vec<Arc<dyn Tool>> = vec![
             Arc::new(shell),
             Arc::new(ReadFileTool::with_checksum_store(
@@ -986,9 +977,9 @@ pub async fn run_chat_turn(
                     ));
                 } else if server_agent_session {
                     project_segments.push(code_agent::PromptSegment::Dynamic(
-                        "你正在 wananyun 的普通隔离工作区中工作。这个话题与 Trace/quant 仓库无关，\
-                        不要访问 /opt/hank-src 或任何 Trace worktree，也不能使用 /diff、/test、/deploy、\
-                        /rollback。该目录会在同一飞书话题中持续复用。"
+                        "你运行在 wananyun 的 Trace server 进程内，没有专属代码工作区。\
+                        代码任务工作区、Git worktree 与 /diff、/test、/deploy、/rollback 均已下线，\
+                        不要声称能改仓库或部署。只做对话与分析；需要落地改动时，让用户在自己电脑上执行。"
                             .to_string(),
                     ));
                 }
@@ -1078,13 +1069,8 @@ fn load_server_agent_instructions(
     };
     let root = std::path::Path::new(work_dir);
     let mut segments = Vec::new();
-    let mut instruction_files = vec![
-        ("AGENTS.md", root.join("AGENTS.md")),
-        (
-            "Server Agent 双向 Git 同步协议",
-            root.join("docs/src/operations/server-agent-sync.md"),
-        ),
-    ];
+    // 双向 Git 同步协议已随 server 侧工作区下线，只保留仓库自身的 AGENTS.md。
+    let mut instruction_files = vec![("AGENTS.md", root.join("AGENTS.md"))];
     if include_quant {
         // quant 已迁出 monorepo；仅在 worktree 仍残留该文件时注入（兼容旧 worktree）。
         instruction_files.insert(1, ("quant/AGENTS.md", root.join("quant/AGENTS.md")));
@@ -1731,7 +1717,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_server_agent_loads_shared_sync_protocol() {
+    fn test_server_agent_loads_repo_agents_md() {
         let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("server crate should be inside project root")
@@ -1740,10 +1726,9 @@ mod tests {
         let segments = load_server_agent_instructions(&Some(project_root), true);
         let prompt = code_agent::build_system_prompt(&segments);
 
-        assert!(prompt.contains("Server Agent 双向 Git 同步协议"));
-        assert!(prompt.contains("协议版本："));
-        assert!(prompt.contains("wananyun 不依赖 GitHub 网络"));
-        assert!(prompt.contains("始终排除 `client/`"));
+        assert!(prompt.contains("AGENTS.md"), "{prompt}");
+        // 双向同步协议已删档，注入里不能再出现，否则模型会照着不存在的流程走
+        assert!(!prompt.contains("双向 Git 同步协议"), "{prompt}");
     }
 
     #[test]

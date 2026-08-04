@@ -7,22 +7,20 @@ Wants=network-online.target
 Type=simple
 User=hank
 Group=hank
-SupplementaryGroups=hank-workspace
 WorkingDirectory=/opt/hank/current
 Environment=HOME=/home/hank
 Environment=CONFIG_PATH=/opt/hank/config.toml
-EnvironmentFile=-/opt/hank/agent-cli.env
 ExecStart=/opt/hank/current/hank-server
 Restart=always
 RestartSec=3
 # 日志由应用自身写入 logs/ 目录，stdout 同时进 journal
 StandardOutput=journal
 StandardError=journal
-# server 需要通过受限 sudoers 调用唯一部署 helper，因此不能开启 NoNewPrivileges。
-# Agent 与 server 都以 hank 用户运行；root helper 只接受 UUID，不接受 shell 参数。
+# server 不再执行任何代码 Agent，也不调用 root helper，可以彻底禁止提权
+NoNewPrivileges=true
 ProtectSystem=strict
 PrivateTmp=true
-ReadWritePaths=/home/hank /home/hank-build /opt/hank/logs /opt/hank/deploy-jobs /opt/hank-src /opt/hank-worktrees /opt/hank-workspaces /opt/hank-agent-state
+ReadWritePaths=/home/hank /opt/hank/logs
 UMask=0007
 
 [Install]
