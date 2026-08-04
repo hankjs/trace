@@ -505,31 +505,6 @@ async fn run(
                                     );
                                 }
                             }
-                            // 闸门卡 message_id 回填到 team_tasks.origin_message_id，
-                            // 供后续主卡 reply 使用（建任务行时还没有卡片）。
-                            // 失败只 warn，不影响卡片本身。
-                            if let Some(team_task_id) = interaction
-                                .as_ref()
-                                .and_then(|r| r.resume_ref.as_deref())
-                                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                                .and_then(|v| {
-                                    v.get("team_task_id")
-                                        .and_then(|x| x.as_str())
-                                        .filter(|s| !s.is_empty())
-                                        .map(str::to_string)
-                                })
-                            {
-                                if let Err(e) = state
-                                    .db
-                                    .set_team_task_origin_message(&team_task_id, &card_mid)
-                                    .await
-                                {
-                                    tracing::warn!(
-                                        %team_task_id,
-                                        "feishu: set_team_task_origin_message failed: {e:#}"
-                                    );
-                                }
-                            }
                         }
                         Err(e) => {
                             tracing::warn!("feishu: send confirm card failed: {e:#}");

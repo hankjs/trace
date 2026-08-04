@@ -1131,8 +1131,12 @@ fn archive_account_name(account: &FeishuAccount) -> &str {
     }
 }
 
+/// 历史外部 CLI 后端名单。这四个 backend 已随外部代码 Agent 一起下线，
+/// 只在识别老会话 metadata 时还需要——不能再当作可执行后端。
+const RETIRED_EXTERNAL_BACKENDS: [&str; 4] = ["codex", "claude", "grok", "kimi"];
+
 fn is_external_agent_backend(backend: &str) -> bool {
-    hank_db::AgentBackend::parse(backend).is_some()
+    RETIRED_EXTERNAL_BACKENDS.contains(&backend)
 }
 
 fn parse_session_metadata_json(metadata: &str) -> Option<serde_json::Value> {
