@@ -46,6 +46,7 @@ rustls = { workspace = true }
 prost = { workspace = true }
 cron = { workspace = true }
 chrono-tz = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

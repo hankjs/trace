@@ -343,6 +343,21 @@ pub struct User {
     pub created_at: DateTime<Utc>,
 }
 
+/// 外部系统（桥接服务等）调 client API 的凭证。库只存 sha256 哈希，
+/// 明文只在创建时返回一次；`skip_serializing` 保证列表接口不泄露哈希。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ApiKey {
+    pub id: String,
+    /// 归属用户：key 的权限 = 该用户的 client scope（永远无 admin）
+    pub user_id: String,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub key_hash: String,
+    pub revoked: bool,
+    pub created_at: DateTime<Utc>,
+    pub last_used_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ProviderRecord {
     pub id: String,
@@ -750,6 +765,24 @@ impl Database {
                 "seeded default admin user, initial password: {initial_password} (change it after first login)"
             );
         }
+
+        // API keys：外部系统（桥接服务等）调 client API 的凭证。
+        // 只存 sha256 哈希（对齐「不明文落库」惯例），key_hash 唯一即防重复创建。
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS api_keys (
+                id VARCHAR(36) PRIMARY KEY,
+                user_id VARCHAR(36) NOT NULL,
+                name VARCHAR(128) NOT NULL,
+                key_hash VARCHAR(64) NOT NULL,
+                revoked BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                last_used_at DATETIME DEFAULT NULL,
+                UNIQUE INDEX idx_api_keys_key_hash (key_hash),
+                INDEX idx_api_keys_user_id (user_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
 
         // Providers table
         sqlx::query(
@@ -1959,6 +1992,71 @@ impl Database {
 
     pub async fn delete_user(&self, id: &str) -> Result<()> {
         db_retry!(sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
+        Ok(())
+    }
+
+    // ─── API keys（外部系统调 client API 的凭证，只存 sha256 哈希）───────────
+
+    pub async fn create_api_key(&self, user_id: &str, name: &str, key_hash: &str) -> Result<ApiKey> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(sqlx::query(
+            "INSERT INTO api_keys (id, user_id, name, key_hash, revoked, created_at) VALUES (?, ?, ?, ?, FALSE, ?)"
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(name)
+        .bind(key_hash)
+        .bind(now)
+        .execute(&self.pool))?;
+        Ok(ApiKey {
+            id,
+            user_id: user_id.to_string(),
+            name: name.to_string(),
+            key_hash: key_hash.to_string(),
+            revoked: false,
+            created_at: now,
+            last_used_at: None,
+        })
+    }
+
+    pub async fn get_api_key_by_hash(&self, key_hash: &str) -> Result<Option<ApiKey>> {
+        let row = db_retry!(sqlx::query_as::<_, ApiKey>(
+            "SELECT id, user_id, name, key_hash, revoked, created_at, last_used_at
+                 FROM api_keys WHERE key_hash = ?"
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
+        let rows = db_retry!(sqlx::query_as::<_, ApiKey>(
+            "SELECT id, user_id, name, key_hash, revoked, created_at, last_used_at
+                 FROM api_keys ORDER BY created_at DESC"
+        )
+        .fetch_all(&self.pool))?;
+        Ok(rows)
+    }
+
+    /// 吊销 key。幂等：重复吊销同一个 id 仍返回 Ok(true)；id 不存在返回 Ok(false)。
+    pub async fn revoke_api_key(&self, id: &str) -> Result<bool> {
+        db_retry!(sqlx::query("UPDATE api_keys SET revoked = TRUE WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool))?;
+        let exists: Option<(String,)> = db_retry!(
+            sqlx::query_as("SELECT id FROM api_keys WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+        )?;
+        Ok(exists.is_some())
+    }
+
+    /// 更新 last_used_at。调用方应 spawn 异步执行，不阻塞请求路径。
+    pub async fn touch_api_key_last_used(&self, id: &str) -> Result<()> {
+        db_retry!(sqlx::query("UPDATE api_keys SET last_used_at = NOW() WHERE id = ?")
             .bind(id)
             .execute(&self.pool))?;
         Ok(())

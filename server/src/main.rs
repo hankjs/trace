@@ -1,4 +1,5 @@
 mod admin;
+mod api_keys;
 mod auth;
 mod changes;
 mod channel_records;
@@ -81,6 +82,19 @@ async fn auth_middleware(
         .and_then(|v| v.strip_prefix("Bearer "));
 
     match token {
+        // API key 路径：trk_ 前缀分流，合成 client scope claims（can_admin 恒 false）
+        Some(t) if t.starts_with(api_keys::KEY_PREFIX) => {
+            match api_keys::authenticate_api_key(&state, t).await {
+                Ok(claims) => {
+                    request.extensions_mut().insert(claims);
+                    next.run(request).await
+                }
+                Err(msg) => {
+                    tracing::warn!("auth failed: {msg}");
+                    response::unauthorized(msg)
+                }
+            }
+        }
         Some(t) => match auth::verify_token(t, &state.jwt_secret) {
             Ok(claims) => {
                 request.extensions_mut().insert(claims);
@@ -148,6 +162,17 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("安装 Rustls ring CryptoProvider 失败"))?;
+
+    // 运维 provision 子命令：直连 DB 后即退出，不初始化日志与 HTTP 服务。
+    // 例：hank-server create-api-key --username <名> --name <key名>
+    if let Some(cmd) = std::env::args().nth(1) {
+        if api_keys::is_provision_command(&cmd) {
+            let config = Config::load()?;
+            let db = Database::new(&config.server.database_url).await?;
+            return api_keys::run_provision(&db, &cmd, &std::env::args().skip(2).collect::<Vec<_>>())
+                .await;
+        }
+    }
 
     // 日志：同时输出到终端和文件（按天滚动，实时写入）
     let file_appender = tracing_appender::rolling::daily("logs", "hank.log");
@@ -553,8 +578,7 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/interactions",
             get(interactions::list_interactions),
-        )
-        .route(
+        )        .route(
             "/api/admin/interactions/{id}",
             get(interactions::get_interaction),
         )
@@ -565,6 +589,13 @@ async fn main() -> Result<()> {
         .route(
             "/api/admin/interactions/{id}/cancel",
             post(interactions::cancel_interaction),
+        )
+        // API key 管理（创建/列表/吊销；明文只在创建响应出现一次）
+        .route("/api/admin/api-keys", post(api_keys::create_api_key))
+        .route("/api/admin/api-keys", get(api_keys::list_api_keys))
+        .route(
+            "/api/admin/api-keys/{id}/revoke",
+            post(api_keys::revoke_api_key),
         )
         .layer(middleware::from_fn(admin_required))
         .layer(middleware::from_fn_with_state(

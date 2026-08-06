@@ -95,7 +95,12 @@ pnpm tauri build
 
 ### 认证
 
-所有 `/api/*` 路由（除 health 和 login）需要 JWT token，通过 `Authorization: Bearer <token>` 传递。
+所有 `/api/*` 路由（除 health 和 login）需要认证，通过 `Authorization: Bearer <token>` 传递：
+
+- **JWT**：`POST /api/auth/login` 用用户名密码换取（30 天有效）。
+- **API key**：外部系统（桥接服务等）用 `trk_` 前缀的 key，永远是 client scope
+  （拿不到 admin 权限）；由 admin REST `/api/admin/api-keys` 或运维子命令
+  `hank-server create-api-key` 签发，详见 `AGENTS.md` 的「API key 认证」一节。
 
 ### REST 端点
 

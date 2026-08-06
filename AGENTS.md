@@ -130,8 +130,27 @@ make app                          # 构建 Trace.app 并安装到 /Applications
 
 管理侧对应端点在 `/api/admin/interactions*`（server/src/interactions.rs 前半）。
 
-handy 等外部系统经独立桥接服务接入（桥接服务持有 trace 用户 JWT，调上述通用端点 +
-SSE/chat 接口驱动 trace）；trace 体内没有任何 handy 专用代码。
+handy 等外部系统经独立桥接服务接入（桥接服务持有 trace 用户 JWT 或 API key，
+调上述通用端点 + SSE/chat 接口驱动 trace）；trace 体内没有任何 handy 专用代码。
+
+## API key 认证
+
+外部系统（桥接服务等）可以不走用户名密码登录，直接用 API key 调 client API
+（server/src/api_keys.rs）：
+
+- **格式**：`trk_` + 32 字节随机的 urlsafe base64（共 47 字符）。明文只在创建时
+  返回一次；`api_keys` 表只存 sha256 哈希（`key_hash` 唯一），另有
+  revoked / created_at / last_used_at。
+- **认证**：`Authorization: Bearer trk_...` 在 auth_middleware 走 API key 路径
+  （sha256 查表 → 未吊销 → 归属用户存在 → 合成与 JWT 等价的 Claims，
+  last_used_at 后台异步更新）；其余 Bearer 照旧走 JWT，两条路径互不影响。
+- **权限口径**：API key 永远是 client scope（can_admin 恒 false，即使归属用户是
+  admin），admin 路由天然拒绝；会话归属校验等 client 端点逻辑与 JWT 完全一致。
+- **管理路径**：admin REST（`POST/GET /api/admin/api-keys`、
+  `POST /api/admin/api-keys/{id}/revoke`，吊销幂等）+ 运维 provision 子命令
+  （直连 DB，不启动 HTTP，cwd 需能读到 config.toml）：
+  `hank-server create-api-key --username <名> --name <key名>`（明文只打印一次）/
+  `list-api-keys` / `revoke-api-key --id <id>`。
 
 ## 编码约定
 
