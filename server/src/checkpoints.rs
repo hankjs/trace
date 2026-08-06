@@ -292,7 +292,7 @@ pub async fn rewind_handler(
 
     // 5. 恢复 spec 快照
     if let Some(ref snapshot) = checkpoint.spec_snapshot {
-        if let Err(e) = restore_spec_snapshot(&state.db, snapshot).await {
+        if let Err(e) = restore_spec_snapshot(&state.db, &snapshot.to_string()).await {
             tracing::warn!(session_id = %session_id, "Failed to restore spec snapshot: {e:#}");
         }
     }

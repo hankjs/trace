@@ -416,8 +416,7 @@ async fn run(
                     let card = if is_task_gate {
                         let resume: Value = interaction
                             .as_ref()
-                            .and_then(|r| r.resume_ref.as_deref())
-                            .and_then(|raw| serde_json::from_str(raw).ok())
+                            .and_then(|r| r.resume_ref.clone())
                             .unwrap_or_default();
                         // 缺字段 / null 表示查不到，保持 None（卡片不渲染改动提示）
                         let dirty_files = resume["dirty_files"].as_u64().map(|n| n as usize);

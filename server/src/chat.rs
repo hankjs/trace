@@ -1345,10 +1345,8 @@ async fn resolve_pending_ask_user(state: &Arc<AppState>, session_id: &str) -> Op
             return None;
         }
     };
-    let resume: serde_json::Value =
-        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
-    let options: serde_json::Value =
-        serde_json::from_str(&row.options).unwrap_or_else(|_| serde_json::json!([]));
+    let resume: serde_json::Value = row.resume_ref.clone().unwrap_or_default();
+    let options: serde_json::Value = row.options.clone();
     let source = resume["source"].as_str().unwrap_or("");
     let kind = if row.kind == "quant_confirm" {
         format!("quant_confirm:{source}")

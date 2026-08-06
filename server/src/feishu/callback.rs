@@ -276,8 +276,7 @@ async fn handle_answer_multi(
         }));
     }
 
-    let resume: Value =
-        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
+    let resume: Value = row.resume_ref.clone().unwrap_or_default();
     let questions: Vec<AskUserQuestion> = resume
         .get("questions")
         .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -346,8 +345,7 @@ async fn handle_answer_multi(
         .ok()
         .flatten()
         .unwrap_or(row);
-    let resume: Value =
-        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
+    let resume: Value = row.resume_ref.clone().unwrap_or_default();
     let mut answered: HashMap<String, String> = HashMap::new();
     if let Some(obj) = resume.get("partial_answers").and_then(|v| v.as_object()) {
         for (k, v) in obj {

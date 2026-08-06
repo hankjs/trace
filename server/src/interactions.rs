@@ -107,12 +107,11 @@ pub async fn list_interactions(
 /// 时跳过白名单校验，交给 answer_and_resume / 下游 parse。
 pub fn validate_answer(
     options: &[String],
-    resume_ref: Option<&str>,
+    resume_ref: Option<&serde_json::Value>,
     answer: &str,
 ) -> Result<(), String> {
     let is_multi = resume_ref
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|v| v.get("questions").cloned())
+        .and_then(|v| v.get("questions"))
         .and_then(|q| q.as_array().map(|a| !a.is_empty()))
         .unwrap_or(false);
     if !is_multi && !options.iter().any(|o| o == answer) {
@@ -145,22 +144,17 @@ pub struct SessionInteraction {
 }
 
 fn to_session_interaction(row: &AgentInteraction) -> SessionInteraction {
-    let resume = row
-        .resume_ref
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    let resume = row.resume_ref.as_ref();
     let question = resume
-        .as_ref()
         .and_then(|v| v.get("question"))
         .and_then(|q| q.as_str())
         .unwrap_or(&row.title)
         .to_string();
     let questions = resume
-        .as_ref()
         .and_then(|v| v.get("questions"))
         .and_then(|q| q.as_array().cloned())
         .unwrap_or_default();
-    let options = serde_json::from_str(&row.options).unwrap_or_default();
+    let options = serde_json::from_value(row.options.clone()).unwrap_or_default();
     SessionInteraction {
         id: row.id.clone(),
         kind: row.kind.clone(),
@@ -237,11 +231,11 @@ pub async fn answer_session_interaction(
             row.status
         ));
     }
-    let options: Vec<String> = match serde_json::from_str(&row.options) {
+    let options: Vec<String> = match serde_json::from_value(row.options.clone()) {
         Ok(v) => v,
         Err(e) => return R::internal_error(format!("options 解析失败: {e}")),
     };
-    if let Err(msg) = validate_answer(&options, row.resume_ref.as_deref(), answer) {
+    if let Err(msg) = validate_answer(&options, row.resume_ref.as_ref(), answer) {
         return R::bad_request(msg);
     }
     match interaction_flow::answer_and_resume(&state, &interaction_id, answer, &claims.sub, None)
@@ -292,11 +286,11 @@ pub async fn answer_interaction(
             row.status
         ));
     }
-    let options: Vec<String> = match serde_json::from_str(&row.options) {
+    let options: Vec<String> = match serde_json::from_value(row.options.clone()) {
         Ok(v) => v,
         Err(e) => return R::internal_error(format!("options 解析失败: {e}")),
     };
-    if let Err(msg) = validate_answer(&options, row.resume_ref.as_deref(), answer) {
+    if let Err(msg) = validate_answer(&options, row.resume_ref.as_ref(), answer) {
         return R::bad_request(msg);
     }
     match interaction_flow::answer_and_resume(&state, &id, answer, &claims.sub, None).await {
@@ -407,11 +401,12 @@ mod tests {
     fn validate_answer_multi_question_skips_whitelist() {
         // 多问题单：options 是扁平 token 全集，合法答案是组合串，跳过白名单
         let options = strs(&["1A", "1B", "2A", "2B"]);
-        let resume_ref = r#"{"tool_use_id":"t1","questions":[{"id":"1"},{"id":"2"}]}"#;
-        assert!(validate_answer(&options, Some(resume_ref), "1A 2B").is_ok());
+        let resume_ref =
+            serde_json::json!({"tool_use_id":"t1","questions":[{"id":"1"},{"id":"2"}]});
+        assert!(validate_answer(&options, Some(&resume_ref), "1A 2B").is_ok());
         // questions 为空数组不算多问题，仍走白名单
-        let resume_ref = r#"{"tool_use_id":"t1","questions":[]}"#;
-        assert!(validate_answer(&options, Some(resume_ref), "1A 2B").is_err());
+        let resume_ref = serde_json::json!({"tool_use_id":"t1","questions":[]});
+        assert!(validate_answer(&options, Some(&resume_ref), "1A 2B").is_err());
     }
 
     #[test]

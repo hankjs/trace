@@ -243,13 +243,14 @@ pub async fn archive_change(
             Ok(Some(s)) => s,
             Ok(None) => {
                 // Create new spec from artifact
+                let metadata_str = artifact.metadata.as_ref().map(|m| m.to_string());
                 match state
                     .db
                     .create_spec(
                         capability,
                         capability,
                         &artifact.content,
-                        artifact.metadata.as_deref(),
+                        metadata_str.as_deref(),
                     )
                     .await
                 {
@@ -262,13 +263,14 @@ pub async fn archive_change(
         };
 
         // Store snapshot of current spec
+        let metadata_str = spec.metadata.as_ref().map(|m| m.to_string());
         if let Err(e) = state
             .db
             .create_spec_version(
                 &spec.id,
                 spec.version,
                 &spec.content,
-                spec.metadata.as_deref(),
+                metadata_str.as_deref(),
                 Some(&change.id),
             )
             .await

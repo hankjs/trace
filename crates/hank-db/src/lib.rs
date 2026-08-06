@@ -67,7 +67,10 @@ pub struct Session {
     pub environment: String,
     pub session_type: String,
     pub change_id: Option<String>,
-    pub pending_ask_user: Option<String>,
+    /// legacy 死列（状态已迁到 agent_interactions，读写方法已删）。建表 SQL 里
+    /// 类型是 JSON，sqlx 的 String 与 JSON 不兼容（NULL 也炸），故用 Value 承接。
+    /// 勿用于新逻辑。
+    pub pending_ask_user: Option<serde_json::Value>,
     pub active_leaf_id: Option<String>,
     pub metadata: Option<String>,
     /// 远程执行会话的桌面 client id，NULL 表示 server 本地执行
@@ -136,8 +139,9 @@ pub struct AgentInteraction {
     pub title: String,
     pub goal: Option<String>,
     pub analysis: Option<String>,
-    /// 按钮文案数组 JSON，如 `["确认","否"]`（`options` 在部分 MySQL 版本敏感，查询时加反引号）
-    pub options: String,
+    /// 按钮文案数组 JSON，如 `["确认","否"]`（`options` 在部分 MySQL 版本敏感，查询时加反引号）。
+    /// 列类型是 JSON，sqlx 的 String 与 JSON 不兼容，用 Value 承接；序列化即数组本身。
+    pub options: serde_json::Value,
     /// pending / answered / executing / done / failed / expired / cancelled
     pub status: String,
     pub answer: Option<String>,
@@ -145,7 +149,8 @@ pub struct AgentInteraction {
     pub answered_at: Option<DateTime<Utc>>,
     /// 恢复执行所需上下文 JSON。quant_confirm / ask_user 存
     /// `{"tool_use_id":"…","source":"…","question":"…"}`，不从 session metadata 现读。
-    pub resume_ref: Option<String>,
+    /// 列类型是 JSON，同 options 用 Value 承接。
+    pub resume_ref: Option<serde_json::Value>,
     pub card_message_id: Option<String>,
     /// NULL = 不过期。微信写 now+5min；飞书与网页写 NULL（5 分钟 TTL 是微信渠道特性）
     pub expires_at: Option<DateTime<Utc>>,
@@ -153,6 +158,13 @@ pub struct AgentInteraction {
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// 写入路径的 JSON 文本 → struct 的 Value 字段（JSON 列用 Value 承接，见
+/// `AgentInteraction::options` 注释）。写入前调用方已序列化过，正常不会失败；
+/// 失败兜底 Null，与库里可能出现的非 JSON 文本行为一致。
+fn json_text_to_value(s: &str) -> serde_json::Value {
+    serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
 }
 
 /// 飞书卡片按钮的服务端 payload。
@@ -400,7 +412,8 @@ pub struct Checkpoint {
     pub message_id: String,
     pub git_commit_sha: String,
     pub git_branch: String,
-    pub spec_snapshot: Option<String>,
+    /// 列类型是 JSON，sqlx 的 String 与 JSON 不兼容（NULL 也炸），用 Value 承接。
+    pub spec_snapshot: Option<serde_json::Value>,
     pub label: String,
     pub created_at: DateTime<Utc>,
 }
@@ -411,7 +424,8 @@ pub struct Spec {
     pub capability: String,
     pub title: String,
     pub content: String,
-    pub metadata: Option<String>,
+    /// 列类型是 JSON，sqlx 的 String 与 JSON 不兼容（NULL 也炸），用 Value 承接。
+    pub metadata: Option<serde_json::Value>,
     pub version: i32,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -423,7 +437,8 @@ pub struct SpecVersion {
     pub spec_id: String,
     pub version: i32,
     pub content: String,
-    pub metadata: Option<String>,
+    /// 列类型是 JSON，同 Spec.metadata 用 Value 承接。
+    pub metadata: Option<serde_json::Value>,
     pub change_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
@@ -451,7 +466,8 @@ pub struct ChangeArtifact {
     pub artifact_type: String,
     pub capability: Option<String>,
     pub content: String,
-    pub metadata: Option<String>,
+    /// 列类型是 JSON，同 Spec.metadata 用 Value 承接。
+    pub metadata: Option<serde_json::Value>,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -2447,7 +2463,7 @@ impl Database {
             capability: capability.to_string(),
             title: title.to_string(),
             content: content.to_string(),
-            metadata: metadata.map(|s| s.to_string()),
+            metadata: metadata.map(json_text_to_value),
             version: 1,
             created_at: now,
             updated_at: now,
@@ -2768,7 +2784,7 @@ impl Database {
             artifact_type: artifact_type.to_string(),
             capability: capability.map(|s| s.to_string()),
             content: content.to_string(),
-            metadata: metadata.map(|s| s.to_string()),
+            metadata: metadata.map(json_text_to_value),
             status: st.to_string(),
             created_at: now,
             updated_at: now,
@@ -3013,7 +3029,7 @@ impl Database {
             message_id: message_id.to_string(),
             git_commit_sha: git_commit_sha.to_string(),
             git_branch: git_branch.to_string(),
-            spec_snapshot: spec_snapshot.map(|s| s.to_string()),
+            spec_snapshot: spec_snapshot.map(json_text_to_value),
             label: label.to_string(),
             created_at: now,
         })

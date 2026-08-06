@@ -95,13 +95,14 @@ pub async fn update_spec(
     };
 
     // Store current version as snapshot
+    let metadata_str = spec.metadata.as_ref().map(|m| m.to_string());
     if let Err(e) = state
         .db
         .create_spec_version(
             &spec.id,
             spec.version,
             &spec.content,
-            spec.metadata.as_deref(),
+            metadata_str.as_deref(),
             None,
         )
         .await

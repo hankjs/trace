@@ -283,8 +283,7 @@ async fn handle_task_gate_retired(
 ) {
     let dirty_files = row
         .resume_ref
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .as_ref()
         .and_then(|v| v["dirty_files"].as_u64())
         .map(|n| n as usize);
 
@@ -607,14 +606,13 @@ fn confirm_card_from_interaction(
     chat_id: &str,
     topic_id: &str,
 ) -> Value {
-    let resume: Value =
-        serde_json::from_str(row.resume_ref.as_deref().unwrap_or("{}")).unwrap_or_default();
+    let resume: Value = row.resume_ref.clone().unwrap_or_default();
     let question = resume["question"]
         .as_str()
         .unwrap_or(row.title.as_str())
         .to_string();
-    let choices: Vec<String> =
-        serde_json::from_str(&row.options).unwrap_or_else(|_| vec!["确认".into(), "否".into()]);
+    let choices: Vec<String> = serde_json::from_value(row.options.clone())
+        .unwrap_or_else(|_| vec!["确认".into(), "否".into()]);
     let is_quant = row.kind == "quant_confirm";
     let title = if is_quant {
         "高成本操作确认"
@@ -694,7 +692,7 @@ pub(crate) fn interaction_card_question(row: &AgentInteraction) -> String {
     interaction_card_question_parts(
         &row.kind,
         row.goal.as_deref(),
-        row.resume_ref.as_deref(),
+        row.resume_ref.as_ref(),
         &row.title,
     )
 }
@@ -703,7 +701,7 @@ pub(crate) fn interaction_card_question(row: &AgentInteraction) -> String {
 fn interaction_card_question_parts(
     kind: &str,
     goal: Option<&str>,
-    resume_ref: Option<&str>,
+    resume_ref: Option<&Value>,
     title: &str,
 ) -> String {
     if kind == "task_gate" || kind == "team_gate" {
@@ -713,7 +711,6 @@ fn interaction_card_question_parts(
             .unwrap_or_else(|| title.to_string());
     }
     resume_ref
-        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .and_then(|v| v["question"].as_str().map(str::to_string))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| title.to_string())
@@ -897,11 +894,12 @@ mod tests {
 
     #[test]
     fn card_question_prefers_goal_for_gates() {
+        let resume = serde_json::json!({"question":"应被忽略"});
         assert_eq!(
             interaction_card_question_parts(
                 "task_gate",
                 Some("修登录超时"),
-                Some(r#"{"question":"应被忽略"}"#),
+                Some(&resume),
                 "fallback-title",
             ),
             "修登录超时"
@@ -914,20 +912,22 @@ mod tests {
 
     #[test]
     fn card_question_reads_resume_ref_for_confirm() {
+        let resume = serde_json::json!({"question":"是否继续回测？"});
         assert_eq!(
             interaction_card_question_parts(
                 "quant_confirm",
                 Some("应被忽略"),
-                Some(r#"{"question":"是否继续回测？"}"#),
+                Some(&resume),
                 "fallback-title",
             ),
             "是否继续回测？"
         );
+        let resume = serde_json::json!({"question":"用哪个分支？"});
         assert_eq!(
             interaction_card_question_parts(
                 "ask_user",
                 None,
-                Some(r#"{"question":"用哪个分支？"}"#),
+                Some(&resume),
                 "fallback-title",
             ),
             "用哪个分支？"
@@ -948,13 +948,18 @@ mod tests {
             interaction_card_question_parts(
                 "quant_confirm",
                 None,
-                Some(r#"{"other":1}"#),
+                Some(&serde_json::json!({"other":1})),
                 "标题回落",
             ),
             "标题回落"
         );
         assert_eq!(
-            interaction_card_question_parts("ask_user", None, Some("not-json"), "标题回落"),
+            interaction_card_question_parts(
+                "ask_user",
+                None,
+                Some(&serde_json::json!("not-json")),
+                "标题回落"
+            ),
             "标题回落"
         );
     }
