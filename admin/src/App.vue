@@ -48,6 +48,7 @@ const navGroups: { title?: string; items: { to: string; label: string; icon: str
     title: '系统',
     items: [
       { to: '/users', label: '用户', icon: 'users' },
+      { to: '/api-keys', label: 'API Keys', icon: 'key' },
     ],
   },
 ]

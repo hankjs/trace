@@ -146,7 +146,8 @@ handy 等外部系统经独立桥接服务接入（桥接服务持有 trace 用�
   last_used_at 后台异步更新）；其余 Bearer 照旧走 JWT，两条路径互不影响。
 - **权限口径**：API key 永远是 client scope（can_admin 恒 false，即使归属用户是
   admin），admin 路由天然拒绝；会话归属校验等 client 端点逻辑与 JWT 完全一致。
-- **管理路径**：admin REST（`POST/GET /api/admin/api-keys`、
+- **管理路径**：admin 页面 `/admin/api-keys`（history 路由，admin/src/views/ApiKeys.vue）、
+  admin REST（`POST/GET /api/admin/api-keys`、
   `POST /api/admin/api-keys/{id}/revoke`，吊销幂等）+ 运维 provision 子命令
   （直连 DB，不启动 HTTP，cwd 需能读到 config.toml）：
   `hank-server create-api-key --username <名> --name <key名>`（明文只打印一次）/

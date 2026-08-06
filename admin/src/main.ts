@@ -25,6 +25,7 @@ const router = createRouter({
     { path: '/explore/:id', component: () => import('./views/SessionExplore.vue'), meta: { width: 'wide' } },
     { path: '/prompts', component: () => import('./views/PromptLab.vue') },
     { path: '/users', component: () => import('./views/Users.vue') },
+    { path: '/api-keys', component: () => import('./views/ApiKeys.vue') },
     { path: '/providers', component: () => import('./views/Providers.vue') },
     { path: '/image-providers', component: () => import('./views/ImageProviders.vue') },
     { path: '/weixin', component: () => import('./views/WeixinBot.vue') },

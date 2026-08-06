@@ -108,6 +108,15 @@ export interface User {
   created_at: string
 }
 
+export interface ApiKey {
+  id: string
+  user_id: string
+  name: string
+  revoked: boolean
+  created_at: string
+  last_used_at: string | null
+}
+
 export interface Provider {
   id: string
   name: string
@@ -357,6 +366,22 @@ export const api = {
 
   deleteUser(id: string) {
     return request<void>(`/api/admin/users/${id}`, { method: 'DELETE' })
+  },
+
+  // API key management
+  listApiKeys() {
+    return request<ApiKey[]>('/api/admin/api-keys')
+  },
+
+  createApiKey(username: string, name: string) {
+    return request<{ id: string; key: string; name: string; user_id: string }>('/api/admin/api-keys', {
+      method: 'POST',
+      body: JSON.stringify({ username, name }),
+    })
+  },
+
+  revokeApiKey(id: string) {
+    return request<{ id: string; revoked: boolean }>(`/api/admin/api-keys/${id}/revoke`, { method: 'POST' })
   },
 
   // Provider management
