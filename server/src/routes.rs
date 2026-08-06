@@ -7,6 +7,7 @@ use axum::{
 use serde::Deserialize;
 use std::sync::Arc;
 
+use crate::api_keys::ApiKeyIdentity;
 use crate::auth::{self, Claims};
 use crate::config::DEFAULT_MODEL;
 use crate::provider_registry;
@@ -59,6 +60,45 @@ pub async fn login(
             serde_json::json!({"token": token, "username": user.username, "can_admin": user.can_login_admin, "can_client": user.can_login_client}),
         ),
         Err(e) => R::internal_error(e),
+    }
+}
+
+/// GET /api/auth/whoami —— 凭证自检端点：JWT 与 API key 均可（过 auth_middleware 即可，
+/// 不需要 admin）。username 以 users 表为准（claims.sub 是 user_id，用户名可能在
+/// token 签发后变更）；API key 路径额外回显 key_id/key_name。
+pub async fn whoami(
+    State(state): State<Arc<AppState>>,
+    Extension(claims): Extension<Claims>,
+    key: Option<Extension<ApiKeyIdentity>>,
+) -> impl IntoResponse {
+    let username = match state.db.get_user_by_id(&claims.sub).await {
+        Ok(Some(u)) => u.username,
+        Ok(None) => return R::unauthorized("user not found"),
+        Err(e) => return R::internal_error(e),
+    };
+    R::ok(whoami_data(
+        &claims,
+        &username,
+        key.as_ref().map(|Extension(k)| k),
+    ))
+}
+
+/// whoami 响应 data：两条认证路径形状不同，第三方据此确认凭证类型与归属。
+fn whoami_data(claims: &Claims, username: &str, key: Option<&ApiKeyIdentity>) -> serde_json::Value {
+    match key {
+        Some(k) => serde_json::json!({
+            "auth": "api_key",
+            "user_id": claims.sub,
+            "username": username,
+            "key_id": k.key_id,
+            "key_name": k.key_name,
+        }),
+        None => serde_json::json!({
+            "auth": "jwt",
+            "user_id": claims.sub,
+            "username": username,
+            "can_admin": claims.can_admin,
+        }),
     }
 }
 
@@ -603,5 +643,58 @@ pub async fn list_templates(
     match result {
         Ok(templates) => R::ok(templates),
         Err(e) => R::internal_error(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn jwt_claims() -> Claims {
+        Claims {
+            sub: "u1".to_string(),
+            username: "old-name".to_string(), // claims 里的用户名可能过期，以 join 结果为准
+            can_admin: true,
+            can_client: true,
+            exp: 0,
+        }
+    }
+
+    #[test]
+    fn whoami_data_jwt_shape() {
+        let data = whoami_data(&jwt_claims(), "alice", None);
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "auth": "jwt",
+                "user_id": "u1",
+                "username": "alice",
+                "can_admin": true,
+            })
+        );
+        // JWT 路径不带 key 信息
+        assert!(data.get("key_id").is_none());
+        assert!(data.get("key_name").is_none());
+    }
+
+    #[test]
+    fn whoami_data_api_key_shape() {
+        let key = ApiKeyIdentity {
+            key_id: "k1".to_string(),
+            key_name: "bridge".to_string(),
+        };
+        let data = whoami_data(&jwt_claims(), "bridge-bot", Some(&key));
+        assert_eq!(
+            data,
+            serde_json::json!({
+                "auth": "api_key",
+                "user_id": "u1",
+                "username": "bridge-bot",
+                "key_id": "k1",
+                "key_name": "bridge",
+            })
+        );
+        // API key 路径不回显 can_admin（恒 false，避免误读为可用权限）
+        assert!(data.get("can_admin").is_none());
     }
 }

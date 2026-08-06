@@ -146,6 +146,12 @@ handy 等外部系统经独立桥接服务接入（桥接服务持有 trace 用�
   last_used_at 后台异步更新）；其余 Bearer 照旧走 JWT，两条路径互不影响。
 - **权限口径**：API key 永远是 client scope（can_admin 恒 false，即使归属用户是
   admin），admin 路由天然拒绝；会话归属校验等 client 端点逻辑与 JWT 完全一致。
+- **验证凭证**：`GET /api/auth/whoami`（protected 组，JWT 与 API key 均可，不需
+  admin）回显当前凭证身份，供第三方验证 key 是否有效：200 + 身份回显
+  （API key 路径 `{"auth":"api_key", user_id, username, key_id, key_name}`；
+  JWT 路径 `{"auth":"jwt", user_id, username, can_admin}`；username 实时 join
+  users 表），401 = key 已吊销/无效。key_id/key_name 不进 Claims（JWT 线格式
+  不动），由 auth_middleware 以独立 extension（`ApiKeyIdentity`）传给 handler。
 - **管理路径**：admin 页面 `/admin/api-keys`（history 路由，admin/src/views/ApiKeys.vue）、
   admin REST（`POST/GET /api/admin/api-keys`、
   `POST /api/admin/api-keys/{id}/revoke`，吊销幂等）+ 运维 provision 子命令

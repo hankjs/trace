@@ -50,6 +50,14 @@ fn ensure_usable(key: Option<ApiKey>) -> Result<ApiKey, String> {
     }
 }
 
+/// API key 路径的身份回显信息：不进 Claims（那是 JWT 的线格式，不动），
+/// 由 auth_middleware 作为独立 extension 传给 handler（如 whoami）。
+#[derive(Debug, Clone)]
+pub struct ApiKeyIdentity {
+    pub key_id: String,
+    pub key_name: String,
+}
+
 /// 合成与 JWT 等价的 Claims。**can_admin 恒 false**：API key 永远拿不到
 /// admin 权限，admin_required 中间件天然拒绝。exp 非 JWT 路径无意义，置 0。
 pub fn claims_for_api_key(user: &User) -> Claims {
@@ -63,8 +71,12 @@ pub fn claims_for_api_key(user: &User) -> Claims {
 }
 
 /// API key 认证：sha256 查表 → 未吊销 → 归属用户存在 → 合成 claims。
+/// 返回 claims 与 key 身份信息（供 whoami 等端点回显）。
 /// last_used_at 挪到后台 task 更新，不阻塞请求路径。
-pub async fn authenticate_api_key(state: &Arc<AppState>, token: &str) -> Result<Claims, String> {
+pub async fn authenticate_api_key(
+    state: &Arc<AppState>,
+    token: &str,
+) -> Result<(Claims, ApiKeyIdentity), String> {
     let key = state
         .db
         .get_api_key_by_hash(&hash_key(token))
@@ -84,6 +96,10 @@ pub async fn authenticate_api_key(state: &Arc<AppState>, token: &str) -> Result<
         })?
         .ok_or_else(|| "api key 归属用户不存在".to_string())?;
 
+    let identity = ApiKeyIdentity {
+        key_id: key.id.clone(),
+        key_name: key.name.clone(),
+    };
     let db = state.db.clone();
     let key_id = key.id.clone();
     tokio::spawn(async move {
@@ -92,7 +108,7 @@ pub async fn authenticate_api_key(state: &Arc<AppState>, token: &str) -> Result<
         }
     });
 
-    Ok(claims_for_api_key(&user))
+    Ok((claims_for_api_key(&user), identity))
 }
 
 // ─── admin REST 管理端点 ─────────────────────────────────────────────────

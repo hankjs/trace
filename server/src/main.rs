@@ -85,8 +85,9 @@ async fn auth_middleware(
         // API key 路径：trk_ 前缀分流，合成 client scope claims（can_admin 恒 false）
         Some(t) if t.starts_with(api_keys::KEY_PREFIX) => {
             match api_keys::authenticate_api_key(&state, t).await {
-                Ok(claims) => {
+                Ok((claims, identity)) => {
                     request.extensions_mut().insert(claims);
+                    request.extensions_mut().insert(identity);
                     next.run(request).await
                 }
                 Err(msg) => {
@@ -281,6 +282,7 @@ async fn main() -> Result<()> {
 
     // Protected routes (auth required)
     let protected = Router::new()
+        .route("/api/auth/whoami", get(routes::whoami))
         .route("/api/sessions", post(routes::create_session))
         .route("/api/sessions", get(routes::list_sessions))
         .route("/api/sessions/{id}", get(routes::get_session))

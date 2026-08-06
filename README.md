@@ -108,6 +108,7 @@ pnpm tauri build
 |------|------|------|
 | GET | /api/health | 健康检查 |
 | POST | /api/auth/login | 获取 JWT token |
+| GET | /api/auth/whoami | 凭证自检：回显身份（JWT 与 API key 均可，401 = 无效/已吊销） |
 | GET | /api/providers | 可用 Provider 和模型列表 |
 | POST | /api/sessions | 创建会话 |
 | GET | /api/sessions | 会话列表 |
