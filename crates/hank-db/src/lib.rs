@@ -113,18 +113,6 @@ pub struct FeishuChat {
     pub updated_at: DateTime<Utc>,
 }
 
-/// handy 话题=会话映射（handy_chats 表）。
-/// handy 是单一对端（无账号维度），topic_id 即 handy 侧话题主键。
-/// 入站是 handy 主动 webhook 推送（message.created），不再需要轮询游标。
-#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
-pub struct HandyChat {
-    pub id: String,
-    pub topic_id: String,
-    pub session_id: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
 /// Agent 交互单：确认闸门 / ask_user / 任务闸门的统一载体。
 ///
 /// 为什么不能寄生在 session 上：此前 quant_confirm 存进程内 map、ask_user 存
@@ -1113,22 +1101,6 @@ impl Database {
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (account_id) REFERENCES feishu_accounts(id) ON DELETE CASCADE,
                 UNIQUE KEY uk_feishu_chat_topic (account_id, chat_id, topic_id)
-            ) DEFAULT CHARSET=utf8mb4",
-        )
-        .execute(&pool)
-        .await?;
-
-        // handy 话题=会话映射（handy 是单一对端，无账号维度；
-        // 入站走 webhook 推送，无需轮询游标。已部署库可能还带着旧的
-        // last_seen_message_id 列，项目无迁移机制，留着不管）
-        sqlx::query(
-            "CREATE TABLE IF NOT EXISTS handy_chats (
-                id VARCHAR(36) PRIMARY KEY,
-                topic_id VARCHAR(36) NOT NULL,
-                session_id VARCHAR(36) NOT NULL,
-                created_at DATETIME NOT NULL DEFAULT NOW(),
-                updated_at DATETIME NOT NULL DEFAULT NOW(),
-                UNIQUE KEY uk_handy_chat_topic (topic_id)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -3809,35 +3781,8 @@ impl Database {
         Ok(())
     }
 
-    // Handy chats（话题=会话映射，单一对端无账号维度；入站走 webhook 推送）
-    pub async fn get_handy_chat(&self, topic_id: &str) -> Result<Option<HandyChat>> {
-        let row = db_retry!(sqlx::query_as::<_, HandyChat>(
-            "SELECT id, topic_id, session_id, created_at, updated_at
-                 FROM handy_chats WHERE topic_id = ?"
-        )
-        .bind(topic_id)
-        .fetch_optional(&self.pool))?;
-        Ok(row)
-    }
-
-    /// 建/更新话题映射。
-    pub async fn set_handy_chat(&self, topic_id: &str, session_id: &str) -> Result<()> {
-        let id = Uuid::new_v4().to_string();
-        let now = Utc::now();
-        db_retry!(
-            sqlx::query(
-                "INSERT INTO handy_chats (id, topic_id, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
-                 ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), updated_at = VALUES(updated_at)"
-            )
-            .bind(&id)
-            .bind(topic_id)
-            .bind(session_id)
-            .bind(now)
-            .bind(now)
-            .execute(&self.pool)
-        )?;
-        Ok(())
-    }
+    // Handy chats 已随 handy 渠道拆除（桥接服务架构后 trace 不再认识 handy；
+    // 已部署库里的 handy_chats 残留表无迁移机制，留着不管）
 
     // ─── Agent 交互单 ────────────────────────────────────────────────────
 
@@ -4151,6 +4096,30 @@ impl Database {
         .bind(offset)
         .fetch_all(&self.pool))?;
         Ok((rows, count))
+    }
+
+    /// 按会话查交互单（client 级端点）。status 传 None 表示不限。
+    /// 单会话交互单数量小，不分页；归属校验由调用方（路由层）负责。
+    pub async fn list_interactions_by_session(
+        &self,
+        session_id: &str,
+        status: Option<&str>,
+    ) -> Result<Vec<AgentInteraction>> {
+        let rows = db_retry!(sqlx::query_as::<_, AgentInteraction>(
+            "SELECT id, session_id, user_id, channel, account_id,
+                        chat_id, topic_id, kind, title, goal, analysis, `options` AS `options`, status,
+                        answer, answered_by, answered_at, resume_ref, card_message_id, expires_at,
+                        result, error, created_at, updated_at
+                 FROM agent_interactions
+                 WHERE session_id = ?
+                   AND (? IS NULL OR status = ?)
+                 ORDER BY created_at DESC"
+        )
+        .bind(session_id)
+        .bind(status)
+        .bind(status)
+        .fetch_all(&self.pool))?;
+        Ok(rows)
     }
 
     /// 取消待确认交互单。只动 pending，不覆盖终态。

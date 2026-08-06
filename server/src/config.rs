@@ -13,27 +13,6 @@ pub struct Config {
     pub server_agent: ServerAgentConfig,
     #[serde(default)]
     pub quant_a2a: Option<QuantA2aConfig>,
-    #[serde(default)]
-    pub handy: Option<HandyConfig>,
-}
-
-/// handy 渠道配置。handy 是单一固定对端（一套 base_url + token），
-/// 不走 feishu/weixin 的「accounts 表 + admin REST」那套。
-#[derive(Debug, Clone, Deserialize)]
-pub struct HandyConfig {
-    /// 是否启用 handy 渠道（进度卡片下行 + 人工闸门 webhook 回收应答）。
-    #[serde(default)]
-    pub enabled: bool,
-    /// handy 服务根地址，如 `https://handy.example.com`（不要带尾部斜杠）。
-    pub base_url: String,
-    /// handy「凭证」页创建的 API token，Bearer 认证。
-    pub token: String,
-    /// 创建 token 时 handy 返回的 webhook 签名密钥（HMAC-SHA256）。
-    pub webhook_secret: String,
-    /// handy 会话归属的 trace 用户 id（建会话 / 签内部 JWT 用）。
-    /// 留空则会话 user_id 为空、spec 类工具回调不可用，建议配置。
-    #[serde(default)]
-    pub user_id: Option<String>,
 }
 
 /// server 侧原生会话开关。

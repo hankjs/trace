@@ -48,7 +48,6 @@ server/src/              Axum HTTP/SSE 服务 (hank-server, 0.0.0.0:3000)
   ├── llm.rs             通用 LLM completion / tool-exec 端点
   ├── image_gen.rs / skills.rs / requirement_docs.rs / snap_tools.rs / termshot.rs / websnap.rs
   └── weixin/            微信通道 (登录、消息路由、推送、监控)
-  └── handy/             handy 通道 (REST client、进度卡片推送、webhook、入站轮询)
 crates/
   ├── hank-provider/     LLM 多厂商抽象 (anthropic.rs, openai.rs, types.rs)
   ├── code-agent/        Agent 核心：agent/ (orchestrator, worker, verifier, loop_detector),
@@ -110,45 +109,29 @@ make app                          # 构建 Trace.app 并安装到 /Applications
   代码工作区都已下线，server 不在任何用户机器上跑命令。
 - 微信通道 (`server/src/weixin/`) 提供扫码登录、消息收发、`/snap` 网页截图 (headless Chromium)、
   `/shot` 终端截图 (SGR→SVG→PNG) 等能力。
-- handy 通道 (`server/src/handy/`) 是第四个交互渠道（feishu / weixin / trace_chat 之外），
-  纯 HTTP 形态：下行把 agent 进度卡片与 ask_user/task_gate 闸门推到 handy（用户在 handy
-  网页点按钮，应答经 webhook 回推，HMAC-SHA256 验签，另有 30s 轮询兜底）；
-  入站是 handy 主动 webhook 推送留言（`message.created`，与应答同一端点、同一验签）。
-  配置走 `config.toml` 的 `[handy]` 段（单一对端，无 accounts 表），详见下文「handy 渠道」。
+- handy 等外部系统不经 trace 体内渠道代码接入，而是走独立桥接服务；
+  trace 只暴露通用 client API（见下文「通用 client 交互单 API」）。
 
-## handy 渠道
+## 通用 client 交互单 API
 
-配置（`config.toml`，模板见 `config.example.toml`）：
+任何第三方系统都可以通过 client API 驱动 trace 的 ask_user 交互（不需要 admin 权限，
+只需普通 JWT；handler 内校验会话属于当前用户，不属于一律 404）：
 
-```toml
-[handy]
-enabled = true
-base_url = "https://<handy-host>"
-token = "..."            # handy「凭证」页创建；name 即话题 source，须唯一
-webhook_secret = "..."   # 创建 token 时 handy 返回
-user_id = "..."          # handy 会话归属的 trace 用户 id，建议配置
-```
+- **SSE `interaction_created` 事件**：交互单落库成功后，服务端向同一事件流（broadcast，
+  SSE 与 `/events/resume` 共用）紧随 ask_user 补发 `{"type":"interaction_created",
+  interaction_id, session_id, kind, question, options, questions?, expires_at?}`。
+  纯追加，ask_user 原事件不变；该事件由 server 侧生成，不进 agent_events 表。
+- `GET /api/sessions/{id}/interactions?status=pending`：该会话交互单列表
+  （默认只返回 pending，status 白名单与 admin 一致；字段 id/kind/status/question/
+  options/questions/expires_at/created_at）。
+- `POST /api/sessions/{id}/interactions/{iid}/answer` body `{"answer":"..."}`：
+  options 白名单校验（多问题单跳过，与 admin 同一 `validate_answer`）后走
+  `interaction_flow::answer_and_resume` 真派发，operator 为当前 JWT user_id。
 
-handy 侧建 token 时 webhook_url 填 `https://<trace-host>/api/channels/handy/webhook`。
+管理侧对应端点在 `/api/admin/interactions*`（server/src/interactions.rs 前半）。
 
-- **下行**：`metadata.source=="handy"` 的会话在 `run_chat_turn` 启动时自动挂 pusher
-  （chat.rs 薄 hook）→ handy 话题（external_id=session_id）出进度卡片；AskUser 事件开
-  handy 交互单（`resume_ref={"trace_interaction_id":...}`，禁用键名 `final_answer`/
-  `partial_answers`），点按钮后 webhook / 兜底轮询调 `answer_and_resume(..., "handy", None)`。
-- **入站**：用户在外部话题的留言由 handy 推送 `message.created` webhook。
-  **handy 收到 2xx 即标已读、不再重推**，所以 handler 只做验签/解析/按 message_id
-  幂等去重（进程内 10 分钟 TTL 窗口，handy 重试都在几秒内到达）就快速返回，
-  实际派发（查/建会话 → run_chat_turn）挪到异步 task，失败只记日志。
-  未知 topic 自动建会话（metadata 写 source=handy，标题取留言首行截断）并登记
-  `handy_chats` 映射——用户在 handy 网页徒手开新话题也能发起任务。
-  pending ask_user 的文字作答由 chat.rs 的 `resolve_pending_ask_user` 零改动接管。
-- **丢消息风险**：2xx 即已读意味着「异步 task 处理失败」或「trace 不可达导致 handy
-  重试 3 次后放弃」时该条留言会丢。handy 侧仍保留
-  `GET /api/v1/topics/{id}/messages?since=<message_id>` 拉取接口，可作人工兜底
-  （注意：拉走即标已读，是有意语义）。trace 进程重启会清空去重窗口，
-  重启瞬间到达的重试可能重复派发一次。
-- 定时任务的盘后 quant 简报在 `[handy]` 启用时会同步推到 handy 固定话题
-  `quant-daily-brief`（需配 `user_id`）。
+handy 等外部系统经独立桥接服务接入（桥接服务持有 trace 用户 JWT，调上述通用端点 +
+SSE/chat 接口驱动 trace）；trace 体内没有任何 handy 专用代码。
 
 ## 编码约定
 

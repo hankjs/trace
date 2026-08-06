@@ -454,32 +454,6 @@ pub async fn run_chat_turn(
     let sid = session_id.clone();
     let content_text = text_from_blocks(&content);
 
-    // handy 渠道 Phase 1 没有入站 router：任何 metadata.source=="handy" 的会话
-    // 在 run 启动时自动挂 handy pusher（进度卡片 + 人工闸门下行到 handy）。
-    // 与上方 SSE 的 rx 并列订阅同一个 EventBuffer broadcast，互不影响；
-    // 其他渠道（feishu/weixin/trace_chat）路径完全不走这里。
-    if metadata_source == "handy" {
-        if let Some(api) = state.handy.clone() {
-            let handy_rx = {
-                let buffers = state.event_buffers.read().await;
-                buffers.get(&session_id).map(|buf| buf.tx.subscribe())
-            };
-            if let Some(handy_rx) = handy_rx {
-                let task_title = session_record
-                    .as_ref()
-                    .map(|s| s.title.trim().to_string())
-                    .filter(|t| !t.is_empty())
-                    .unwrap_or_else(|| content_text.chars().take(60).collect());
-                crate::handy::pusher::spawn(
-                    state.clone(),
-                    api,
-                    session_id.clone(),
-                    task_title,
-                    handy_rx,
-                );
-            }
-        }
-    }
     let apply_change_id = opts.apply_change_id.clone();
     let extra_prompt_segments = opts.extra_prompt_segments;
 
@@ -727,6 +701,8 @@ pub async fn run_chat_turn(
                 }
 
                 // Keep existing metric/tool persistence for backward compatibility
+                // AskUser 落库成功后在此暂存服务端生成的 interaction_created 补发事件
+                let mut interaction_created_event: Option<AgentEvent> = None;
                 match &event {
                     AgentEvent::Metrics {
                         input_tokens,
@@ -813,7 +789,6 @@ pub async fn run_chat_turn(
                         let channel = match source.as_str() {
                             "weixin" => "weixin",
                             "feishu" => "feishu",
-                            "handy" => "handy",
                             _ => "trace_chat",
                         };
                         match db_fwd
@@ -845,6 +820,17 @@ pub async fn run_chat_turn(
                                     kind = interaction_kind,
                                     "交互单已落表"
                                 );
+                                // 纯追加补发：ask_user 不带 interaction_id，client 靠本事件
+                                // 拿交互单 id 后走 client 级端点应答。字段口径与落库行一致。
+                                interaction_created_event = Some(AgentEvent::InteractionCreated {
+                                    interaction_id: row.id.clone(),
+                                    session_id: sid_fwd2.clone(),
+                                    kind: interaction_kind.to_string(),
+                                    question: question.clone(),
+                                    options: options_for_db.clone(),
+                                    questions: questions.clone(),
+                                    expires_at,
+                                });
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -859,6 +845,11 @@ pub async fn run_chat_turn(
                 let mut buffers = state_fwd.event_buffers.write().await;
                 if let Some(buf) = buffers.get_mut(&sid_fwd) {
                     push_chat_stream_event(buf, event_for_stream(&event));
+                    // interaction_created 紧随 ask_user 补发，走同一条 broadcast 流；
+                    // 服务端生成，不进 agent_events 表（表内已有交互单本体）。
+                    if let Some(evt) = interaction_created_event {
+                        push_chat_stream_event(buf, evt);
+                    }
                 }
             }
 
@@ -1617,9 +1608,8 @@ fn parse_quant_confirmation(text: &str, source: &str) -> (u32, String) {
         return (1, "用户已确认，本次高成本量化操作已授权".to_string());
     }
 
-    // 微信 / handy 入口无批量授权：handy 应答是交互卡按钮的文本原文回传，
-    // 没有批量授权 UI，用户无法表达「确认N次」，与微信同口径处理。
-    if source != "weixin" && source != "handy" {
+    // 微信入口无批量授权：用户无法表达「确认N次」，按单次确认处理。
+    if source != "weixin" {
         // 飞书卡片按钮的文案，等价于「确认50次」。
         // 与打字路径共用同一个 grant 上限，不引入第二套配额语义。
         // 用 trim 后的原文判断（normalize 会去空白/小写，中文不受影响）。
@@ -1686,6 +1676,7 @@ fn extract_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::TaskUpdated { .. } => "task_updated",
         AgentEvent::ArtifactUpdated { .. } => "artifact_updated",
         AgentEvent::AskUser { .. } => "ask_user",
+        AgentEvent::InteractionCreated { .. } => "interaction_created",
         AgentEvent::SuggestedActions { .. } => "suggested_actions",
         AgentEvent::ExploreComplete { .. } => "explore_complete",
         AgentEvent::GenerateComplete { .. } => "generate_complete",
@@ -1965,8 +1956,55 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_turn_complete_waits_for_message_persistence() {
-        let mut buffer = EventBuffer::new();
+    fn test_interaction_created_event_serialization() {
+        // 单问题：questions / expires_at 省略；type tag 与字段名 snake_case
+        let event = AgentEvent::InteractionCreated {
+            interaction_id: "ia_1".to_string(),
+            session_id: "s1".to_string(),
+            kind: "ask_user".to_string(),
+            question: "确认部署？".to_string(),
+            options: vec!["确认".to_string(), "否".to_string()],
+            questions: vec![],
+            expires_at: None,
+        };
+        assert_eq!(extract_event_type(&event), "interaction_created");
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["type"], "interaction_created");
+        assert_eq!(v["interaction_id"], "ia_1");
+        assert_eq!(v["session_id"], "s1");
+        assert_eq!(v["kind"], "ask_user");
+        assert_eq!(v["question"], "确认部署？");
+        assert_eq!(v["options"], serde_json::json!(["确认", "否"]));
+        assert!(v.get("questions").is_none(), "{v}");
+        assert!(v.get("expires_at").is_none(), "{v}");
+    }
+
+    #[test]
+    fn test_interaction_created_event_with_expiry_and_questions() {
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-08-06T02:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let event = AgentEvent::InteractionCreated {
+            interaction_id: "ia_2".to_string(),
+            session_id: "s1".to_string(),
+            kind: "quant_confirm".to_string(),
+            question: "高成本操作".to_string(),
+            options: vec!["1A".to_string(), "1B".to_string()],
+            questions: vec![code_agent::AskUserQuestion {
+                id: "1".to_string(),
+                question: "选哪个？".to_string(),
+                options: vec!["A".to_string(), "B".to_string()],
+            }],
+            expires_at: Some(expires_at),
+        };
+        let v = serde_json::to_value(&event).unwrap();
+        assert_eq!(v["expires_at"], "2026-08-06T02:00:00Z");
+        assert_eq!(v["questions"][0]["id"], "1");
+        assert_eq!(v["questions"][0]["options"], serde_json::json!(["A", "B"]));
+    }
+
+    #[test]
+    fn test_chat_turn_complete_waits_for_message_persistence() {        let mut buffer = EventBuffer::new();
         push_chat_stream_event(
             &mut buffer,
             AgentEvent::TextDelta {

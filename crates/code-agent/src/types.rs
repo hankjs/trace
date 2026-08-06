@@ -1,4 +1,5 @@
 use crate::agent::{TaskStatus, Verdict};
+use chrono::{DateTime, Utc};
 use hank_provider::{ContentBlock, Message, StopReason, ToolDefinition};
 use serde::{Deserialize, Serialize};
 
@@ -173,6 +174,22 @@ pub enum AgentEvent {
         /// 多问题作答。为空表示单问题（走 question / options）。
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         questions: Vec<AskUserQuestion>,
+    },
+    /// 服务端生成：交互单落库后补发到同一事件流（纯追加，ask_user 原事件不变）。
+    /// ask_user 本身不带交互单 id；第三方 client 靠本事件拿到 interaction_id 后
+    /// 走 client 级交互单端点查询 / 应答。字段口径与 agent_interactions 表一致。
+    InteractionCreated {
+        interaction_id: String,
+        session_id: String,
+        kind: String,
+        question: String,
+        options: Vec<String>,
+        /// 多问题作答结构。为空表示单问题（走 question / options）。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        questions: Vec<AskUserQuestion>,
+        /// NULL = 不过期（与 agent_interactions.expires_at 口径一致）
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<DateTime<Utc>>,
     },
     /// Agent 提议的后续动作（不中断循环，由渠道渲染成按钮）
     SuggestedActions {

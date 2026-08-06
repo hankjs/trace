@@ -114,9 +114,11 @@ pnpm tauri build
 | POST | /api/sessions/:id/messages/truncate | 截断消息 |
 | GET | /api/sessions/:id/tree | 消息树结构 |
 | PUT | /api/sessions/:id/active-leaf | 切换活跃分支 |
-| POST | /api/sessions/:id/chat | SSE 聊天 |
+| POST | /api/sessions/:id/chat | SSE 聊天（交互单落库后补发 interaction_created 事件） |
 | POST | /api/sessions/:id/stop | 停止生成 |
 | GET | /api/sessions/:id/events/resume | 恢复事件流 |
+| GET | /api/sessions/:id/interactions | 会话交互单列表（?status=，默认 pending，仅限本人会话） |
+| POST | /api/sessions/:id/interactions/:iid/answer | 应答交互单（{"answer":"..."}，options 白名单校验后真派发） |
 | POST | /api/sessions/:id/local-events | 上传本地执行事件 |
 | GET | /api/sessions/:id/events | 获取会话事件 (remote + local) |
 | GET | /api/sessions/:id/checkpoints | Checkpoint 列表 |
@@ -200,23 +202,12 @@ reasoner = "deepseek-reasoner"
 
 `type = "openai"` 兼容所有 OpenAI 格式的 API（DeepSeek、Groq 等）。
 
-## handy 渠道
+## 外部系统接入
 
-handy 是除飞书 / 微信 / trace_chat 外的第四个交互渠道：agent 进度卡片与人工闸门下行到
-handy 网页，用户在 handy 里看进度、点按钮、留言驱动 agent。
-
-```toml
-[handy]
-enabled = true
-base_url = "https://<handy-host>"
-token = "..."            # handy「凭证」页创建
-webhook_secret = "..."   # 创建 token 时 handy 返回
-user_id = "..."          # handy 会话归属的 trace 用户 id
-```
-
-handy 侧建 token 时 webhook_url 填 `https://<trace-host>/api/channels/handy/webhook`。
-渠道形态与已知限制（入站是 handy 主动 webhook 推送、2xx 即已读、按 message_id 幂等等）
-见 `AGENTS.md` 的「handy 渠道」一节。
+handy 等外部系统经独立桥接服务接入，trace 体内没有 handy 专用代码。trace 只暴露
+通用 client API：SSE 聊天流（交互单落库后补发 `interaction_created` 事件）+
+`GET /api/sessions/:id/interactions` / `POST /api/sessions/:id/interactions/:iid/answer`
+交互单查询与应答端点，详见 `AGENTS.md` 的「通用 client 交互单 API」一节。
 
 ## 核心功能
 

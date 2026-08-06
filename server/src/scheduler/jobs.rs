@@ -44,9 +44,7 @@ pub async fn quant_signal_brief(state: Arc<AppState>) -> Result<Value> {
         .date_naive();
 
     let bindings = state.db.list_feishu_bindings().await?;
-    // handy 渠道独立推送一份（配置了 handy.user_id 时），与飞书绑定列表无关
-    let handy_cfg = state.config.handy.as_ref().filter(|c| c.enabled);
-    if bindings.is_empty() && handy_cfg.is_none() {
+    if bindings.is_empty() {
         return Ok(
             json!({ "date": today.to_string(), "skipped": true, "reason": "无飞书绑定用户" }),
         );
@@ -68,17 +66,6 @@ pub async fn quant_signal_brief(state: Arc<AppState>) -> Result<Value> {
             Err(e) => {
                 tracing::warn!(user = %binding.username, "scheduler: 信号简报推送失败: {e:#}");
                 errors.push(format!("{}: {e:#}", binding.username));
-            }
-        }
-    }
-
-    if let Some(cfg) = handy_cfg {
-        match push_handy_brief(&state, &http, base, cfg, today).await {
-            Ok(true) => pushed.push("handy".to_string()),
-            Ok(false) => quiet.push("handy".to_string()),
-            Err(e) => {
-                tracing::warn!("scheduler: handy 信号简报推送失败: {e:#}");
-                errors.push(format!("handy: {e:#}"));
             }
         }
     }
@@ -132,59 +119,6 @@ async fn push_user_brief(
         &format_brief(today, &signals.items),
     )
     .await?;
-    Ok(true)
-}
-
-/// 同一份简报推 handy 固定话题（external_id="quant-daily-brief"）。
-/// 用 handy.user_id 配置的 trace 用户拉信号（策略可见性同飞书按用户过滤）。
-/// 顺手建映射会话：用户在 handy 话题里回复可被入站轮询接管（追问信号）。
-async fn push_handy_brief(
-    state: &Arc<AppState>,
-    http: &reqwest::Client,
-    base: &str,
-    cfg: &crate::config::HandyConfig,
-    today: chrono::NaiveDate,
-) -> Result<bool> {
-    let api = state
-        .handy
-        .clone()
-        .ok_or_else(|| anyhow!("handy client 未构建"))?;
-    let Some(user_id) = cfg.user_id.clone() else {
-        // 没有用户就拉不了 signals（per-user 可见性），安静跳过
-        tracing::warn!("scheduler: handy.user_id 未配置，跳过 handy 信号简报");
-        return Ok(false);
-    };
-    let username = state
-        .db
-        .get_user_by_id(&user_id)
-        .await?
-        .map(|u| u.username)
-        .unwrap_or_default();
-    let jwt = crate::auth::sign_internal_jwt(&state.jwt_secret, &user_id, &username)
-        .context("签内部 JWT 失败")?;
-
-    let resp = http
-        .get(format!("{base}/api/signals?date={today}&limit=100"))
-        .bearer_auth(&jwt)
-        .send()
-        .await
-        .context("调 quant /api/signals 失败")?;
-    if !resp.status().is_success() {
-        bail!("quant /api/signals 返回 {}", resp.status());
-    }
-    let signals = resp.json::<SignalsResp>().await?;
-    if signals.items.is_empty() {
-        return Ok(false);
-    }
-
-    let topic = api.upsert_topic("quant-daily-brief", "盘后信号简报").await?;
-    // 映射会话只建一次；已有映射说明话题已绑定会话，留言会继续派给它
-    if state.db.get_handy_chat(&topic.topic_id).await?.is_none() {
-        let session = crate::handy::router::create_handy_session(state).await?;
-        state.db.set_handy_chat(&topic.topic_id, &session.id).await?;
-    }
-    api.post_message(&topic.topic_id, &format_brief(today, &signals.items))
-        .await?;
     Ok(true)
 }
 
