@@ -37,6 +37,19 @@ enabled = false
 # quant A2A Server 根地址（也可直接填 .../a2a）；省略时默认 http://127.0.0.1:8100
 base_url = "http://127.0.0.1:8100"
 
+# handy 渠道：agent 进度卡片与人工闸门下行到 handy，用户在 handy 网页点按钮 / 留言，
+# 都经 webhook 回推 trace（POST /api/channels/handy/webhook，HMAC-SHA256 验签）。
+# token 在 handy「凭证」页创建；webhook_url 填 https://<trace-host>/api/channels/handy/webhook；
+# webhook_secret 是创建 token 时 handy 返回的签名密钥。
+# user_id 是 handy 会话归属的 trace 用户 id（admin 用户列表里查）；留空则
+# spec 类工具回调不可用，建议配置。
+# [handy]
+# enabled = false
+# base_url = "https://handy.example.com"
+# token = ""
+# webhook_secret = ""
+# user_id = ""
+
 # 飞书渠道：应用凭证不走配置文件，由 admin REST 管理（见 docs/feishu.md）：
 #   POST /api/admin/feishu/accounts  {name, app_id, app_secret}
 # 多实例共库时只能一个实例开 WS 长连接（在 [server] 里设 feishu_monitor = false 可关）

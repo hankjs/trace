@@ -26,7 +26,7 @@ const STATUSES: &[&str] = &[
     "cancelled",
 ];
 const KINDS: &[&str] = &["quant_confirm", "ask_user", "task_gate", "team_gate"];
-const CHANNELS: &[&str] = &["feishu", "weixin", "trace_chat"];
+const CHANNELS: &[&str] = &["feishu", "weixin", "trace_chat", "handy"];
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -224,6 +224,10 @@ mod tests {
         assert_eq!(
             parse_filter_param(Some("feishu"), CHANNELS, "channel").unwrap(),
             Some("feishu")
+        );
+        assert_eq!(
+            parse_filter_param(Some("handy"), CHANNELS, "channel").unwrap(),
+            Some("handy")
         );
     }
 

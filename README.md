@@ -200,6 +200,24 @@ reasoner = "deepseek-reasoner"
 
 `type = "openai"` 兼容所有 OpenAI 格式的 API（DeepSeek、Groq 等）。
 
+## handy 渠道
+
+handy 是除飞书 / 微信 / trace_chat 外的第四个交互渠道：agent 进度卡片与人工闸门下行到
+handy 网页，用户在 handy 里看进度、点按钮、留言驱动 agent。
+
+```toml
+[handy]
+enabled = true
+base_url = "https://<handy-host>"
+token = "..."            # handy「凭证」页创建
+webhook_secret = "..."   # 创建 token 时 handy 返回
+user_id = "..."          # handy 会话归属的 trace 用户 id
+```
+
+handy 侧建 token 时 webhook_url 填 `https://<trace-host>/api/channels/handy/webhook`。
+渠道形态与已知限制（入站是 handy 主动 webhook 推送、2xx 即已读、按 message_id 幂等等）
+见 `AGENTS.md` 的「handy 渠道」一节。
+
 ## 核心功能
 
 - **多 LLM 提供商**: 同时配置 Anthropic、OpenAI 兼容服务，运行时切换

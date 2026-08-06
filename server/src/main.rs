@@ -7,6 +7,7 @@ mod checkpoints;
 mod config;
 mod server_workspace;
 mod feishu;
+mod handy;
 mod image_gen;
 mod interaction_flow;
 mod interactions;
@@ -67,6 +68,8 @@ pub struct AppState {
     pub quant_grant_store: Arc<code_tools::quant_grant::QuantGrantStore>,
     /// 渠道任务闸门与实时进度快照（单任务串行 + 随时可查进度）
     pub tasks: Arc<task_state::TaskRegistry>,
+    /// handy 渠道 client（config.handy.enabled 时构建；webhook 验签直接读 config）
+    pub handy: Option<handy::client::HandyApi>,
 }
 
 async fn auth_middleware(
@@ -168,6 +171,16 @@ async fn main() -> Result<()> {
     let config = Config::load()?;
     let db = Database::new(&config.server.database_url).await?;
 
+    // handy 渠道：单一对端，config 存在且 enabled 时构建 client
+    let handy_api = config
+        .handy
+        .as_ref()
+        .filter(|c| c.enabled)
+        .map(handy::client::HandyApi::new);
+    if handy_api.is_some() {
+        tracing::info!("handy 渠道已启用");
+    }
+
     let state = Arc::new(AppState {
         db,
         jwt_secret: config.server.jwt_secret.clone(),
@@ -181,6 +194,7 @@ async fn main() -> Result<()> {
         weixin_channel_history: RwLock::new(HashMap::new()),
         quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
         tasks: Arc::new(task_state::TaskRegistry::new()),
+        handy: handy_api,
     });
 
     // 一次性收尾：过期 pending → expired；卡住的 answered 僵尸 → pending；
@@ -252,7 +266,12 @@ async fn main() -> Result<()> {
     // Public routes (no auth required)
     let public = Router::new()
         .route("/api/health", get(routes::health))
-        .route("/api/auth/login", post(routes::login));
+        .route("/api/auth/login", post(routes::login))
+        // handy webhook：无 JWT，handler 内自行 HMAC-SHA256 验签
+        .route(
+            "/api/channels/handy/webhook",
+            post(handy::webhook::webhook_handler),
+        );
 
     // Protected routes (auth required)
     let protected = Router::new()

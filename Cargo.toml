@@ -60,3 +60,7 @@ prost = "0.13"
 # 定时任务调度(cron 解析 + 上海时区)
 cron = "0.15"
 chrono-tz = "0.10"
+# handy 渠道 webhook 验签(HMAC-SHA256 + hex)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
