@@ -66,10 +66,31 @@ export async function authFetch(path: string, options: RequestInit = {}): Promis
   return res;
 }
 
+/** 把 fetch 网络层失败（WebKit 常报 "Load failed"）转成可读中文 */
+function networkErrorMsg(e: unknown): string {
+  const raw = e instanceof Error ? e.message : String(e);
+  if (/load failed|failed to fetch|networkerror|network request failed|fetch/i.test(raw)) {
+    return `无法连接 server（${API_BASE}）。请确认服务已启动且本机网络可达。原始错误：${raw}`;
+  }
+  return raw || "请求失败";
+}
+
 export async function apiRequest<T = any>(path: string, options: RequestInit = {}): Promise<{ ok: boolean; data?: T; msg?: string }> {
-  const res = await authFetch(path, options);
+  let res: Response;
+  try {
+    res = await authFetch(path, options);
+  } catch (e) {
+    return { ok: false, msg: networkErrorMsg(e) };
+  }
   const json = await res.json().catch(() => null);
-  if (!json) return { ok: false, msg: "Invalid response" };
+  if (!json) {
+    return {
+      ok: false,
+      msg: res.ok
+        ? "Invalid response"
+        : `HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ""}（${API_BASE}${path}）`,
+    };
+  }
   if (json.code === 0) return { ok: true, data: json.data as T };
   return { ok: false, msg: json.msg || "Request failed" };
 }

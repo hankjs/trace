@@ -7,6 +7,7 @@ import { createBindCode, getBinding, unbind, type WeixinBinding } from "../api/w
 import { createFeishuBindCode, getFeishuBinding, unbindFeishu, type FeishuBinding } from "../api/feishu";
 import { getHandyAccount, putHandyAccount, testHandyAccount, type HandyAccount } from "../api/handy";
 import { useRemoteTerm } from "../composables/useRemoteTerm";
+import { API_BASE } from "../config";
 
 interface AgentConfig {
   name: string;
@@ -451,6 +452,10 @@ onUnmounted(() => {
           {{ remoteToggling ? "处理中…" : "允许远程终端控制" }}
         </label>
         <div class="weixin-bound-info" style="margin-top: 8px">
+          <span class="weixin-label">Server</span>
+          <span class="weixin-value" style="font-family: monospace; font-size: 12px">{{ API_BASE }}</span>
+        </div>
+        <div class="weixin-bound-info">
           <span class="weixin-label">Client ID</span>
           <span class="weixin-value" style="font-family: monospace; font-size: 12px">{{ remoteClientId }}</span>
         </div>

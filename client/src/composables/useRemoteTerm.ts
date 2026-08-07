@@ -233,19 +233,27 @@ function stopPolling() {
 }
 
 async function syncRegistration(): Promise<{ ok: boolean; msg?: string }> {
-  const result = await registerClient({
-    client_id: clientId,
-    hostname: await hostname(),
-    work_dir: workDir.value || undefined,
-    accept_remote: acceptRemote.value,
-  });
-  if (!result.ok) {
-    const msg = result.msg || "注册失败";
-    console.warn("[RemoteTerm] registration failed:", msg);
+  try {
+    const result = await registerClient({
+      client_id: clientId,
+      hostname: await hostname(),
+      work_dir: workDir.value || undefined,
+      accept_remote: acceptRemote.value,
+    });
+    if (!result.ok) {
+      const msg = result.msg || "注册失败";
+      console.warn("[RemoteTerm] registration failed:", msg);
+      lastError.value = msg;
+      return { ok: false, msg };
+    }
+    return { ok: true };
+  } catch (e: any) {
+    // apiRequest 已吞网络错误；此处兜底未预期抛错
+    const msg = e?.message || String(e) || "注册异常";
+    console.warn("[RemoteTerm] registration threw:", msg);
     lastError.value = msg;
     return { ok: false, msg };
   }
-  return { ok: true };
 }
 
 /** 登录后调用：若 accept_remote 开启则注册并启动轮询 */
