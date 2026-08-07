@@ -18,9 +18,6 @@ help:
 	@echo ""
 	@echo "  部署:"
 	@echo "    make deploy              本地交叉编译 server + 构建 admin/app，推产物到线上"
-	@echo ""
-	@echo "  说明: quant 已独立为仓库 https://github.com/hankjs/quant"
-	@echo "        本地路径 ~/projects/hank/quant；开发/部署请到该仓库执行 make dev / make deploy"
 
 # 后端开发服务 (0.0.0.0:3000)
 server-dev:
