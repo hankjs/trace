@@ -125,14 +125,16 @@ const avgLatency = () => {
 
 <template>
   <div>
-    <RouterLink to="/sessions" class="text-[12px] text-text-tertiary hover:text-text-secondary transition-colors">← Sessions</RouterLink>
-    <div class="flex items-center gap-3 mt-2 mb-6">
+    <RouterLink to="/sessions" class="text-[12px] text-text-tertiary transition-colors hover:text-text-secondary">← Sessions</RouterLink>
+    <div class="mb-6 mt-2 flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
       <h1 class="text-lg font-semibold text-text-primary">{{ sessionId.slice(0, 8) }}</h1>
-      <RouterLink :to="`/sessions/${sessionId}/timeline`" class="text-[12px] text-accent hover:text-accent-hover transition-colors">Timeline →</RouterLink>
-      <RouterLink :to="`/sessions/${sessionId}/explore`" class="text-[12px] text-accent hover:text-accent-hover transition-colors">Explore →</RouterLink>
+      <div class="flex flex-wrap gap-3">
+        <RouterLink :to="`/sessions/${sessionId}/timeline`" class="min-h-9 text-[12px] text-accent transition-colors hover:text-accent-hover sm:min-h-0">Timeline →</RouterLink>
+        <RouterLink :to="`/sessions/${sessionId}/explore`" class="min-h-9 text-[12px] text-accent transition-colors hover:text-accent-hover sm:min-h-0">Explore →</RouterLink>
+      </div>
     </div>
 
-    <div v-if="metrics.length" class="flex gap-8 mb-8 text-[12px]">
+    <div v-if="metrics.length" class="mb-8 flex flex-wrap gap-x-6 gap-y-2 text-[12px] sm:gap-8">
       <div><span class="text-text-tertiary">Tokens</span> <span class="ml-1.5 tabular-nums">{{ totalTokens().toLocaleString() }}</span></div>
       <div><span class="text-text-tertiary">Avg latency</span> <span class="ml-1.5 tabular-nums">{{ avgLatency() }}ms</span></div>
       <div><span class="text-text-tertiary">Tools</span> <span class="ml-1.5 tabular-nums">{{ toolExecs.length }}</span></div>

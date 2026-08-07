@@ -161,22 +161,25 @@ onMounted(async () => {
 
 <template>
   <div>
-    <RouterLink to="/sessions" class="text-[12px] text-text-tertiary hover:text-text-secondary transition-colors">← Sessions</RouterLink>
-    <div class="flex items-center gap-3 mt-2 mb-6">
-      <h1 class="text-lg font-semibold text-text-primary">Timeline</h1>
-      <span class="text-[12px] text-text-tertiary font-mono">{{ sessionId.slice(0, 8) }}</span>
-      <RouterLink :to="`/sessions/${sessionId}`" class="text-[12px] text-accent hover:text-accent-hover transition-colors ml-auto">Detail →</RouterLink>
+    <RouterLink to="/sessions" class="text-[12px] text-text-tertiary transition-colors hover:text-text-secondary">← Sessions</RouterLink>
+    <div class="mb-6 mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
+      <div class="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
+        <h1 class="text-lg font-semibold text-text-primary">Timeline</h1>
+        <span class="font-mono text-[12px] text-text-tertiary">{{ sessionId.slice(0, 8) }}</span>
+      </div>
+      <RouterLink :to="`/sessions/${sessionId}`" class="min-h-9 text-[12px] text-accent transition-colors hover:text-accent-hover sm:ml-auto sm:min-h-0">Detail →</RouterLink>
     </div>
 
     <!-- Filters -->
-    <div class="flex flex-wrap gap-1.5 mb-6">
+    <div class="mb-6 flex flex-wrap gap-1.5">
       <button
         v-for="type in eventTypes"
         :key="type"
+        type="button"
         @click="toggleFilter(type)"
-        class="px-2 py-0.5 text-[11px] rounded-full border transition-all"
+        class="min-h-8 rounded-full border px-2.5 py-1 text-[11px] transition-all"
         :class="activeFilters.size === 0 || activeFilters.has(type)
-          ? 'border-accent text-accent bg-accent/5'
+          ? 'border-accent bg-accent/5 text-accent'
           : 'border-border text-text-tertiary hover:border-border-subtle'"
       >{{ EVENT_LABELS[type] || type }}</button>
     </div>

@@ -106,88 +106,90 @@ onMounted(load)
 
 <template>
   <div>
-    <div class="flex items-center justify-between mb-6">
+    <div class="mb-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
       <h1 class="text-lg font-semibold text-text-primary">供应商管理</h1>
-      <button @click="showForm = true; editingId = null" class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90">添加供应商</button>
+      <button type="button" @click="showForm = true; editingId = null" class="min-h-10 self-start rounded-md bg-accent px-3 py-2 text-xs text-white hover:opacity-90 sm:min-h-0 sm:py-1.5">添加供应商</button>
     </div>
 
-    <div v-if="showForm" class="mb-6 p-4 border border-border-subtle rounded-lg space-y-3">
-      <div class="grid grid-cols-2 gap-3">
+    <div v-if="showForm" class="mb-6 space-y-3 rounded-lg border border-border-subtle p-4">
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div>
-          <label class="block text-xs text-text-secondary mb-1">名称</label>
-          <input v-model="form.name" class="w-full px-2 py-1.5 text-sm border border-border-subtle rounded bg-transparent text-text-primary" />
+          <label class="mb-1 block text-xs text-text-secondary">名称</label>
+          <input v-model="form.name" class="w-full rounded border border-border-subtle bg-transparent px-2 py-2 text-sm text-text-primary sm:py-1.5" />
         </div>
         <div>
-          <label class="block text-xs text-text-secondary mb-1">类型</label>
-          <select v-model="form.provider_type" class="w-full px-2 py-1.5 text-sm border border-border-subtle rounded bg-transparent text-text-primary">
+          <label class="mb-1 block text-xs text-text-secondary">类型</label>
+          <select v-model="form.provider_type" class="w-full rounded border border-border-subtle bg-transparent px-2 py-2 text-sm text-text-primary sm:py-1.5">
             <option value="anthropic">Anthropic</option>
             <option value="openai">OpenAI</option>
           </select>
         </div>
         <div>
-          <label class="block text-xs text-text-secondary mb-1">API 密钥</label>
-          <input v-model="form.api_key" type="password" class="w-full px-2 py-1.5 text-sm border border-border-subtle rounded bg-transparent text-text-primary" />
+          <label class="mb-1 block text-xs text-text-secondary">API 密钥</label>
+          <input v-model="form.api_key" type="password" class="w-full rounded border border-border-subtle bg-transparent px-2 py-2 text-sm text-text-primary sm:py-1.5" />
         </div>
         <div>
-          <label class="block text-xs text-text-secondary mb-1">接口地址</label>
-          <input v-model="form.base_url" class="w-full px-2 py-1.5 text-sm border border-border-subtle rounded bg-transparent text-text-primary" placeholder="https://api.openai.com/v1" />
+          <label class="mb-1 block text-xs text-text-secondary">接口地址</label>
+          <input v-model="form.base_url" class="w-full rounded border border-border-subtle bg-transparent px-2 py-2 text-sm text-text-primary sm:py-1.5" placeholder="https://api.openai.com/v1" />
         </div>
         <div>
-          <label class="block text-xs text-text-secondary mb-1">默认模型</label>
-          <input v-model="form.default_model" class="w-full px-2 py-1.5 text-sm border border-border-subtle rounded bg-transparent text-text-primary" />
+          <label class="mb-1 block text-xs text-text-secondary">默认模型</label>
+          <input v-model="form.default_model" class="w-full rounded border border-border-subtle bg-transparent px-2 py-2 text-sm text-text-primary sm:py-1.5" />
         </div>
         <div>
-          <label class="block text-xs text-text-secondary mb-1">优先级</label>
-          <input v-model.number="form.priority" type="number" class="w-full px-2 py-1.5 text-sm border border-border-subtle rounded bg-transparent text-text-primary" />
+          <label class="mb-1 block text-xs text-text-secondary">优先级</label>
+          <input v-model.number="form.priority" type="number" class="w-full rounded border border-border-subtle bg-transparent px-2 py-2 text-sm text-text-primary sm:py-1.5" />
         </div>
-        <div class="col-span-2">
-          <label class="block text-xs text-text-secondary mb-1">模型映射 (JSON)</label>
-          <input v-model="form.models_json" class="w-full px-2 py-1.5 text-sm border border-border-subtle rounded bg-transparent text-text-primary font-mono" placeholder='{"别名": "实际模型ID"}' />
+        <div class="sm:col-span-2">
+          <label class="mb-1 block text-xs text-text-secondary">模型映射 (JSON)</label>
+          <input v-model="form.models_json" class="w-full rounded border border-border-subtle bg-transparent px-2 py-2 font-mono text-sm text-text-primary sm:py-1.5" placeholder='{"别名": "实际模型ID"}' />
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex min-h-10 items-center gap-2 sm:min-h-0">
           <input v-model="form.enabled" type="checkbox" id="enabled" />
           <label for="enabled" class="text-xs text-text-secondary">启用</label>
         </div>
       </div>
-      <div class="flex gap-2">
-        <button @click="save" class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90">{{ editingId ? '更新' : '创建' }}</button>
-        <button @click="resetForm" class="px-3 py-1.5 text-xs border border-border-subtle rounded-md text-text-secondary hover:bg-hover">取消</button>
+      <div class="flex flex-wrap gap-2">
+        <button type="button" @click="save" class="min-h-10 rounded-md bg-accent px-3 py-2 text-xs text-white hover:opacity-90 sm:min-h-0 sm:py-1.5">{{ editingId ? '更新' : '创建' }}</button>
+        <button type="button" @click="resetForm" class="min-h-10 rounded-md border border-border-subtle px-3 py-2 text-xs text-text-secondary hover:bg-hover sm:min-h-0 sm:py-1.5">取消</button>
       </div>
     </div>
 
     <div v-if="loading" class="text-sm text-text-tertiary">加载中...</div>
-    <table v-else class="w-full text-sm">
-      <thead>
-        <tr class="text-left text-xs text-text-tertiary border-b border-border-subtle">
-          <th class="py-2 pr-3">优先级</th>
-          <th class="py-2 pr-3">名称</th>
-          <th class="py-2 pr-3">类型</th>
-          <th class="py-2 pr-3">模型</th>
-          <th class="py-2 pr-3">状态</th>
-          <th class="py-2">操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="(p, idx) in providers" :key="p.id" class="border-b border-border-subtle">
-          <td class="py-2 pr-3 text-text-secondary">
-            <span class="inline-flex gap-1">
-              <button @click="moveUp(idx)" :disabled="idx === 0" class="text-xs disabled:opacity-30">▲</button>
-              <button @click="moveDown(idx)" :disabled="idx === providers.length - 1" class="text-xs disabled:opacity-30">▼</button>
-              <span class="ml-1">{{ p.priority }}</span>
-            </span>
-          </td>
-          <td class="py-2 pr-3 text-text-primary font-medium">{{ p.name }}</td>
-          <td class="py-2 pr-3 text-text-secondary">{{ p.provider_type }}</td>
-          <td class="py-2 pr-3 text-text-secondary font-mono text-xs">{{ p.default_model || '—' }}</td>
-          <td class="py-2 pr-3">
-            <span :class="p.enabled ? 'text-green-500' : 'text-text-tertiary'">{{ p.enabled ? '已启用' : '已禁用' }}</span>
-          </td>
-          <td class="py-2">
-            <button @click="startEdit(p)" class="text-xs text-accent hover:underline mr-2">编辑</button>
-            <button @click="remove(p.id)" class="text-xs text-red-400 hover:underline">删除</button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else class="table-scroll">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-border-subtle text-left text-xs text-text-tertiary">
+            <th class="py-2 pr-3">优先级</th>
+            <th class="py-2 pr-3">名称</th>
+            <th class="py-2 pr-3">类型</th>
+            <th class="py-2 pr-3">模型</th>
+            <th class="py-2 pr-3">状态</th>
+            <th class="py-2">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="(p, idx) in providers" :key="p.id" class="border-b border-border-subtle">
+            <td class="py-2 pr-3 text-text-secondary">
+              <span class="inline-flex gap-1">
+                <button type="button" @click="moveUp(idx)" :disabled="idx === 0" class="min-h-8 min-w-8 text-xs disabled:opacity-30">▲</button>
+                <button type="button" @click="moveDown(idx)" :disabled="idx === providers.length - 1" class="min-h-8 min-w-8 text-xs disabled:opacity-30">▼</button>
+                <span class="ml-1">{{ p.priority }}</span>
+              </span>
+            </td>
+            <td class="py-2 pr-3 font-medium text-text-primary">{{ p.name }}</td>
+            <td class="py-2 pr-3 text-text-secondary">{{ p.provider_type }}</td>
+            <td class="py-2 pr-3 font-mono text-xs text-text-secondary">{{ p.default_model || '—' }}</td>
+            <td class="py-2 pr-3">
+              <span :class="p.enabled ? 'text-green-500' : 'text-text-tertiary'">{{ p.enabled ? '已启用' : '已禁用' }}</span>
+            </td>
+            <td class="py-2">
+              <button type="button" @click="startEdit(p)" class="mr-2 min-h-8 text-xs text-accent hover:underline">编辑</button>
+              <button type="button" @click="remove(p.id)" class="min-h-8 text-xs text-red-400 hover:underline">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </template>

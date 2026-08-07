@@ -41,45 +41,48 @@ onMounted(load)
 
 <template>
   <div>
-    <div class="flex items-center justify-between mb-6">
+    <div class="mb-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
       <h1 class="text-lg font-semibold text-text-primary">用户管理</h1>
       <button
+        type="button"
+        class="min-h-10 self-start text-[13px] text-accent transition-colors hover:text-accent-hover sm:min-h-0"
         @click="showForm = !showForm"
-        class="text-[13px] text-accent hover:text-accent-hover transition-colors"
       >{{ showForm ? '取消' : '+ 新建用户' }}</button>
     </div>
 
     <div v-if="showForm" class="mb-8 space-y-3">
-      <div class="grid grid-cols-2 gap-3">
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <input
           v-model="newUsername"
           placeholder="用户名"
-          class="bg-transparent border border-border rounded-md px-3 py-2 text-[13px] placeholder:text-text-tertiary focus:outline-none focus:border-accent transition-colors"
+          class="rounded-md border border-border bg-transparent px-3 py-2 text-[13px] placeholder:text-text-tertiary transition-colors focus:border-accent focus:outline-none"
         />
         <input
           v-model="newPassword"
           type="password"
           placeholder="密码"
-          class="bg-transparent border border-border rounded-md px-3 py-2 text-[13px] placeholder:text-text-tertiary focus:outline-none focus:border-accent transition-colors"
+          class="rounded-md border border-border bg-transparent px-3 py-2 text-[13px] placeholder:text-text-tertiary transition-colors focus:border-accent focus:outline-none"
         />
       </div>
-      <div class="flex items-center gap-5 text-[13px] text-text-secondary">
-        <label class="flex items-center gap-1.5 cursor-pointer">
+      <div class="flex flex-wrap items-center gap-5 text-[13px] text-text-secondary">
+        <label class="flex min-h-10 items-center gap-1.5 cursor-pointer sm:min-h-0">
           <input v-model="newCanAdmin" type="checkbox" class="rounded" />
           管理后台
         </label>
-        <label class="flex items-center gap-1.5 cursor-pointer">
+        <label class="flex min-h-10 items-center gap-1.5 cursor-pointer sm:min-h-0">
           <input v-model="newCanClient" type="checkbox" class="rounded" />
           客户端
         </label>
       </div>
       <button
+        type="button"
+        class="min-h-10 rounded-md bg-text-primary px-3.5 py-2 text-[13px] text-surface-raised transition-opacity hover:opacity-80 sm:min-h-0 sm:py-1.5"
         @click="createUser"
-        class="px-3.5 py-1.5 bg-text-primary text-surface-raised text-[13px] rounded-md hover:opacity-80 transition-opacity"
       >创建</button>
     </div>
 
-    <div class="text-[12px] text-text-tertiary grid grid-cols-[1fr_80px_80px_60px] gap-2 px-2 pb-2 border-b border-border-subtle font-medium">
+    <!-- 桌面表头 -->
+    <div class="hidden text-[12px] font-medium text-text-tertiary md:grid md:grid-cols-[1fr_80px_80px_60px] md:gap-2 md:border-b md:border-border-subtle md:px-2 md:pb-2">
       <span>用户名</span>
       <span class="text-center">管理后台</span>
       <span class="text-center">客户端</span>
@@ -90,29 +93,36 @@ onMounted(load)
       <div
         v-for="user in users"
         :key="user.id"
-        class="grid grid-cols-[1fr_80px_80px_60px] gap-2 items-center px-2 py-2.5"
+        class="flex flex-col gap-2 px-0 py-3 md:grid md:grid-cols-[1fr_80px_80px_60px] md:items-center md:gap-2 md:px-2 md:py-2.5"
       >
         <span class="text-[13px] text-text-primary">{{ user.username }}</span>
-        <span class="text-center">
-          <button
-            @click="togglePermission(user, 'can_login_admin')"
-            class="text-[12px] px-2 py-0.5 rounded transition-colors"
-            :class="user.can_login_admin ? 'bg-active text-text-primary' : 'text-text-tertiary hover:bg-hover'"
-          >{{ user.can_login_admin ? '是' : '否' }}</button>
-        </span>
-        <span class="text-center">
-          <button
-            @click="togglePermission(user, 'can_login_client')"
-            class="text-[12px] px-2 py-0.5 rounded transition-colors"
-            :class="user.can_login_client ? 'bg-active text-text-primary' : 'text-text-tertiary hover:bg-hover'"
-          >{{ user.can_login_client ? '是' : '否' }}</button>
-        </span>
-        <span class="text-right">
-          <button
-            @click="deleteUser(user)"
-            class="text-[12px] text-text-tertiary hover:text-red-500 transition-colors"
-          >删除</button>
-        </span>
+        <div class="flex flex-wrap items-center gap-2 md:contents">
+          <span class="flex items-center gap-1.5 md:justify-center">
+            <span class="text-[11px] text-text-tertiary md:hidden">管理后台</span>
+            <button
+              type="button"
+              class="min-h-9 rounded px-2.5 py-1 text-[12px] transition-colors md:min-h-0 md:py-0.5"
+              :class="user.can_login_admin ? 'bg-active text-text-primary' : 'text-text-tertiary hover:bg-hover'"
+              @click="togglePermission(user, 'can_login_admin')"
+            >{{ user.can_login_admin ? '是' : '否' }}</button>
+          </span>
+          <span class="flex items-center gap-1.5 md:justify-center">
+            <span class="text-[11px] text-text-tertiary md:hidden">客户端</span>
+            <button
+              type="button"
+              class="min-h-9 rounded px-2.5 py-1 text-[12px] transition-colors md:min-h-0 md:py-0.5"
+              :class="user.can_login_client ? 'bg-active text-text-primary' : 'text-text-tertiary hover:bg-hover'"
+              @click="togglePermission(user, 'can_login_client')"
+            >{{ user.can_login_client ? '是' : '否' }}</button>
+          </span>
+          <span class="md:text-right">
+            <button
+              type="button"
+              class="min-h-9 text-[12px] text-text-tertiary transition-colors hover:text-red-500 md:min-h-0"
+              @click="deleteUser(user)"
+            >删除</button>
+          </span>
+        </div>
       </div>
     </div>
 

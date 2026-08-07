@@ -183,16 +183,16 @@ onUnmounted(() => {
 
 <template>
   <div>
-    <div class="flex items-center justify-between mb-6">
+    <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <h1 class="text-lg font-semibold text-text-primary">飞书机器人</h1>
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-3">
         <a
           href="https://open.feishu.cn/document/home/index"
           target="_blank"
           rel="noopener noreferrer"
           class="text-xs text-text-secondary hover:text-text-primary hover:underline"
         >飞书开放平台文档 ↗</a>
-        <button @click="showAdd = !showAdd" class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90">添加应用</button>
+        <button type="button" @click="showAdd = !showAdd" class="min-h-10 rounded-md bg-accent px-3 py-2 text-xs text-white hover:opacity-90 sm:min-h-0 sm:py-1.5">添加应用</button>
       </div>
     </div>
 
@@ -218,94 +218,100 @@ onUnmounted(() => {
 
     <!-- 账号列表 -->
     <div v-if="loading" class="text-sm text-text-tertiary">加载中...</div>
-    <div v-else-if="accounts.length === 0" class="text-sm text-text-tertiary mb-10">暂无飞书应用，点击右上角"添加应用"。</div>
-    <table v-else class="w-full text-sm mb-10">
-      <thead>
-        <tr class="text-left text-xs text-text-tertiary border-b border-border-subtle">
-          <th class="py-2 pr-3">备注</th>
-          <th class="py-2 pr-3">App ID</th>
-          <th class="py-2 pr-3">状态（即长连接开关）</th>
-          <th class="py-2 pr-3">创建时间</th>
-          <th class="py-2">操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="a in accounts" :key="a.id" class="border-b border-border-subtle">
-          <td class="py-2 pr-3 text-text-primary">{{ a.name || '—' }}</td>
-          <td class="py-2 pr-3 text-text-secondary font-mono text-xs">{{ a.app_id }}</td>
-          <td class="py-2 pr-3">
-            <button @click="toggleEnabled(a)" class="flex items-center gap-2">
-              <span class="relative inline-flex h-4 w-7 items-center rounded-full transition-colors" :class="a.enabled ? 'bg-green-500' : 'bg-border-subtle'">
-                <span class="inline-block h-3 w-3 rounded-full bg-white transition-transform" :class="a.enabled ? 'translate-x-3.5' : 'translate-x-0.5'"></span>
-              </span>
-              <span :class="a.enabled ? 'text-green-500' : 'text-text-tertiary'">{{ a.enabled ? '已启用' : '已禁用' }}</span>
-            </button>
-          </td>
-          <td class="py-2 pr-3 text-text-tertiary text-xs">{{ a.created_at }}</td>
-          <td class="py-2">
-            <button @click="remove(a.id)" class="text-xs text-red-400 hover:underline">删除</button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else-if="accounts.length === 0" class="mb-10 text-sm text-text-tertiary">暂无飞书应用，点击「添加应用」。</div>
+    <div v-else class="table-scroll mb-10">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-border-subtle text-left text-xs text-text-tertiary">
+            <th class="py-2 pr-3">备注</th>
+            <th class="py-2 pr-3">App ID</th>
+            <th class="py-2 pr-3">状态（即长连接开关）</th>
+            <th class="py-2 pr-3">创建时间</th>
+            <th class="py-2">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="a in accounts" :key="a.id" class="border-b border-border-subtle">
+            <td class="py-2 pr-3 text-text-primary">{{ a.name || '—' }}</td>
+            <td class="py-2 pr-3 font-mono text-xs text-text-secondary">{{ a.app_id }}</td>
+            <td class="py-2 pr-3">
+              <button type="button" @click="toggleEnabled(a)" class="flex min-h-9 items-center gap-2">
+                <span class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors" :class="a.enabled ? 'bg-green-500' : 'bg-border-subtle'">
+                  <span class="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform" :class="a.enabled ? 'translate-x-4' : 'translate-x-0.5'"></span>
+                </span>
+                <span :class="a.enabled ? 'text-green-500' : 'text-text-tertiary'">{{ a.enabled ? '已启用' : '已禁用' }}</span>
+              </button>
+            </td>
+            <td class="py-2 pr-3 text-xs text-text-tertiary">{{ a.created_at }}</td>
+            <td class="py-2">
+              <button type="button" @click="remove(a.id)" class="min-h-8 text-xs text-red-400 hover:underline">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
     <!-- 用户绑定 -->
-    <h2 class="text-sm font-semibold text-text-primary mb-2">用户绑定</h2>
-    <p class="text-xs text-text-tertiary mb-3">选择 Trace 用户生成绑定码，然后在飞书里向机器人发送绑定命令。</p>
-    <div class="flex items-end gap-3 max-w-xl mb-3">
+    <h2 class="mb-2 text-sm font-semibold text-text-primary">用户绑定</h2>
+    <p class="mb-3 text-xs text-text-tertiary">选择 Trace 用户生成绑定码，然后在飞书里向机器人发送绑定命令。</p>
+    <div class="mb-3 flex max-w-xl flex-col gap-3 sm:flex-row sm:items-end">
       <label class="flex-1 text-xs text-text-secondary">
         Trace 用户
         <select
           v-model="bindUserId"
           :disabled="usersLoading || users.length === 0"
-          class="mt-1 w-full px-3 py-1.5 text-sm bg-transparent border border-border-subtle rounded-md text-text-primary disabled:opacity-40"
+          class="mt-1 w-full rounded-md border border-border-subtle bg-transparent px-3 py-2 text-sm text-text-primary disabled:opacity-40 sm:py-1.5"
         >
           <option value="" disabled>{{ usersLoading ? '加载用户中...' : '选择用户' }}</option>
           <option v-for="user in users" :key="user.id" :value="user.id">{{ user.username }}</option>
         </select>
       </label>
       <button
+        type="button"
         @click="generateBindCode"
         :disabled="!bindUserId || bindCodeGenerating"
-        class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
+        class="min-h-10 rounded-md bg-accent px-3 py-2 text-xs text-white hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40 sm:min-h-0 sm:py-1.5"
       >{{ bindCodeGenerating ? '生成中...' : bindCode ? '重新生成' : '生成绑定码' }}</button>
     </div>
-    <div v-if="bindCode" class="flex flex-wrap items-center gap-3 max-w-xl mb-4 px-3 py-2.5 border border-border-subtle rounded-md">
+    <div v-if="bindCode" class="mb-4 flex max-w-xl flex-wrap items-center gap-3 rounded-md border border-border-subtle px-3 py-2.5">
       <span class="text-xs text-text-tertiary">发送给机器人</span>
-      <code class="px-2 py-1 rounded bg-active text-sm text-text-primary">bind {{ bindCode }}</code>
+      <code class="rounded bg-active px-2 py-1 text-sm text-text-primary">bind {{ bindCode }}</code>
       <button
+        type="button"
         @click="copyBindCommand"
         :disabled="bindCodeExpired"
-        class="text-xs text-accent hover:text-accent-hover disabled:text-text-tertiary disabled:cursor-not-allowed"
+        class="min-h-8 text-xs text-accent hover:text-accent-hover disabled:cursor-not-allowed disabled:text-text-tertiary"
       >{{ bindCodeCopied ? '已复制' : '复制命令' }}</button>
-      <span class="ml-auto text-xs" :class="bindCodeExpired ? 'text-red-400' : 'text-text-tertiary'">
+      <span class="text-xs sm:ml-auto" :class="bindCodeExpired ? 'text-red-400' : 'text-text-tertiary'">
         {{ bindCodeUsername }} · {{ bindCodeExpired ? '已过期' : `${bindCodeCountdown} 后过期` }}
       </span>
     </div>
-    <p v-if="bindCodeError" class="text-xs text-red-400 mb-3">{{ bindCodeError }}</p>
-    <p v-else-if="!usersLoading && users.length === 0" class="text-xs text-text-tertiary mb-3">暂无 Trace 用户，请先在“用户”页面创建。</p>
+    <p v-if="bindCodeError" class="mb-3 text-xs text-red-400">{{ bindCodeError }}</p>
+    <p v-else-if="!usersLoading && users.length === 0" class="mb-3 text-xs text-text-tertiary">暂无 Trace 用户，请先在“用户”页面创建。</p>
     <div v-if="bindingsLoading" class="text-sm text-text-tertiary">加载中...</div>
     <div v-else-if="bindings.length === 0" class="text-sm text-text-tertiary">暂无绑定。</div>
-    <table v-else class="w-full text-sm">
-      <thead>
-        <tr class="text-left text-xs text-text-tertiary border-b border-border-subtle">
-          <th class="py-2 pr-3">用户名</th>
-          <th class="py-2 pr-3">open_id</th>
-          <th class="py-2 pr-3">绑定时间</th>
-          <th class="py-2">操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="b in bindings" :key="b.id" class="border-b border-border-subtle">
-          <td class="py-2 pr-3 text-text-primary font-medium">{{ b.username }}</td>
-          <td class="py-2 pr-3 text-text-secondary font-mono text-xs">{{ b.open_id }}</td>
-          <td class="py-2 pr-3 text-text-tertiary text-xs">{{ b.created_at }}</td>
-          <td class="py-2">
-            <button @click="unbind(b.id)" class="text-xs text-red-400 hover:underline">解绑</button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else class="table-scroll">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-border-subtle text-left text-xs text-text-tertiary">
+            <th class="py-2 pr-3">用户名</th>
+            <th class="py-2 pr-3">open_id</th>
+            <th class="py-2 pr-3">绑定时间</th>
+            <th class="py-2">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="b in bindings" :key="b.id" class="border-b border-border-subtle">
+            <td class="py-2 pr-3 font-medium text-text-primary">{{ b.username }}</td>
+            <td class="py-2 pr-3 font-mono text-xs text-text-secondary">{{ b.open_id }}</td>
+            <td class="py-2 pr-3 text-xs text-text-tertiary">{{ b.created_at }}</td>
+            <td class="py-2">
+              <button type="button" @click="unbind(b.id)" class="min-h-8 text-xs text-red-400 hover:underline">解绑</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
     <!-- 主动发送 -->
     <template v-if="!bindingsLoading && bindings.length > 0">

@@ -233,7 +233,7 @@ function controlPreview(event: ParsedAgentEvent) {
         <h3 class="mb-2 text-[11px] font-semibold text-text-secondary">运行控制事件 · {{ trace.controlEvents.length }}</h3>
         <div class="divide-y divide-border-subtle border-y border-border-subtle">
           <details v-for="event in trace.controlEvents" :key="event.record.id" class="py-2">
-            <summary class="grid cursor-pointer select-none grid-cols-[74px_88px_minmax(0,1fr)] gap-2 text-[10px]">
+            <summary class="grid cursor-pointer select-none grid-cols-1 gap-1 text-[10px] sm:grid-cols-[74px_88px_minmax(0,1fr)] sm:gap-2">
               <span class="font-mono tabular-nums text-text-tertiary">{{ formatTime(event.record.created_at) }}</span>
               <span class="font-medium text-text-secondary">{{ controlLabel(event.record.event_type) }}</span>
               <span class="truncate text-text-tertiary">{{ controlPreview(event) }}</span>

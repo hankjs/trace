@@ -37,13 +37,15 @@ onMounted(load)
           v-for="s in sessions"
           :key="s.id"
           :to="`/explore/${s.id}`"
-          class="flex items-center gap-3 px-3 py-2.5 rounded-lg border border-transparent hover:border-border-subtle hover:bg-surface-raised/50 transition-all group"
+          class="group flex min-h-12 flex-col gap-1 rounded-lg border border-transparent px-3 py-2.5 transition-all hover:border-border-subtle hover:bg-surface-raised/50 sm:flex-row sm:items-center sm:gap-3"
         >
-          <span class="text-[12px] font-mono text-text-tertiary w-16 shrink-0">{{ s.id.slice(0, 8) }}</span>
-          <span class="text-[13px] text-text-primary truncate flex-1">{{ s.title || '(untitled)' }}</span>
-          <span class="text-[11px] text-text-tertiary">{{ s.model }}</span>
-          <span class="text-[11px] text-text-tertiary tabular-nums">{{ new Date(s.created_at).toLocaleDateString() }}</span>
-          <span class="text-[11px] text-accent opacity-0 group-hover:opacity-100 transition-opacity">Explore →</span>
+          <span class="w-auto shrink-0 font-mono text-[12px] text-text-tertiary sm:w-16">{{ s.id.slice(0, 8) }}</span>
+          <span class="min-w-0 flex-1 truncate text-[13px] text-text-primary">{{ s.title || '(untitled)' }}</span>
+          <div class="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-text-tertiary">
+            <span>{{ s.model }}</span>
+            <span class="tabular-nums">{{ new Date(s.created_at).toLocaleDateString() }}</span>
+            <span class="text-accent sm:opacity-0 sm:transition-opacity sm:group-hover:opacity-100">Explore →</span>
+          </div>
         </RouterLink>
       </div>
 

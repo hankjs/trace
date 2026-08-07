@@ -33,9 +33,9 @@ async function handleLogin() {
 </script>
 
 <template>
-  <div class="min-h-screen flex items-center justify-center bg-surface">
-    <div class="w-72">
-      <div class="flex items-center gap-2.5 mb-8">
+  <div class="flex min-h-dvh items-center justify-center bg-surface px-4 safe-pt safe-pb">
+    <div class="w-full max-w-72">
+      <div class="mb-8 flex items-center gap-2.5">
         <img :src="faviconUrl" alt="" width="28" height="28" class="rounded-[7px] shrink-0" />
         <span class="text-sm font-medium text-text-secondary tracking-tight">Trace Admin</span>
       </div>

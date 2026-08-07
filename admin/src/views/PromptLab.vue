@@ -257,18 +257,18 @@ onMounted(loadTemplates)
 
         <!-- A/B mode -->
         <div v-else>
-          <div class="grid grid-cols-2 gap-4 mb-3">
+          <div class="mb-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
             <textarea
               v-model="promptA"
               placeholder="Prompt A (system prompt)"
               rows="4"
-              class="w-full bg-transparent border border-border rounded-md px-3 py-2 text-[12px] font-mono leading-relaxed placeholder:text-text-tertiary focus:outline-none focus:border-accent transition-colors resize-y"
+              class="w-full resize-y rounded-md border border-border bg-transparent px-3 py-2 font-mono text-[12px] leading-relaxed placeholder:text-text-tertiary transition-colors focus:border-accent focus:outline-none"
             ></textarea>
             <textarea
               v-model="promptB"
               placeholder="Prompt B (system prompt)"
               rows="4"
-              class="w-full bg-transparent border border-border rounded-md px-3 py-2 text-[12px] font-mono leading-relaxed placeholder:text-text-tertiary focus:outline-none focus:border-accent transition-colors resize-y"
+              class="w-full resize-y rounded-md border border-border bg-transparent px-3 py-2 font-mono text-[12px] leading-relaxed placeholder:text-text-tertiary transition-colors focus:border-accent focus:outline-none"
             ></textarea>
           </div>
           <button
@@ -278,7 +278,7 @@ onMounted(loadTemplates)
           >{{ (resultA.running || resultB.running) ? 'Running...' : 'Run A/B' }}</button>
 
           <!-- A/B Results side by side -->
-          <div v-if="resultA.events.length || resultB.events.length" class="grid grid-cols-2 gap-4 mt-5">
+          <div v-if="resultA.events.length || resultB.events.length" class="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <div class="text-[11px] text-text-tertiary font-medium mb-2">Prompt A</div>
               <div class="flex flex-wrap gap-1 mb-2">

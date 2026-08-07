@@ -208,38 +208,39 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <div class="flex flex-col h-full min-h-0">
-    <div class="flex items-center justify-between mb-6 shrink-0">
-      <div class="flex items-center gap-3">
+  <div class="flex h-full min-h-0 flex-col">
+    <div class="mb-4 flex shrink-0 flex-col gap-2 sm:mb-6 sm:flex-row sm:items-center sm:justify-between">
+      <div class="flex flex-wrap items-center gap-2 sm:gap-3">
         <h1 class="text-lg font-semibold text-text-primary">终端</h1>
         <span
           v-if="channelMode"
-          class="text-[11px] px-2 py-0.5 rounded-full border"
+          class="rounded-full border px-2 py-0.5 text-[11px]"
           :class="
             channelMode === 'rtc'
-              ? 'border-green-500/40 text-green-400 bg-green-500/10'
+              ? 'border-green-500/40 bg-green-500/10 text-green-400'
               : 'border-border-subtle text-text-tertiary'
           "
         >
           {{ channelMode === 'rtc' ? 'P2P 直连' : '中转' }}
         </span>
       </div>
-      <label class="flex items-center gap-1.5 text-[13px] text-text-secondary cursor-pointer">
+      <label class="flex min-h-10 cursor-pointer items-center gap-1.5 text-[13px] text-text-secondary sm:min-h-0">
         <input v-model="autoRefresh" type="checkbox" class="rounded" />
         自动刷新列表
       </label>
     </div>
 
-    <p v-if="error" class="mb-4 text-[13px] text-red-400 shrink-0">{{ error }}</p>
+    <p v-if="error" class="mb-4 shrink-0 text-[13px] text-red-400">{{ error }}</p>
 
-    <div class="grid grid-cols-[260px_1fr] gap-6 flex-1 min-h-0">
-      <div class="space-y-6 overflow-y-auto min-h-0">
+    <div class="flex min-h-0 flex-1 flex-col gap-4 lg:grid lg:grid-cols-[minmax(200px,260px)_1fr] lg:gap-6">
+      <!-- 列表区：移动端限高可滚；大屏占左栏 -->
+      <div class="max-h-[40vh] min-h-0 shrink-0 space-y-4 overflow-y-auto thin-scrollbar lg:max-h-none lg:space-y-6">
         <div>
-          <div class="text-[12px] text-text-tertiary font-medium mb-2 px-1">桌面 CLIENT</div>
+          <div class="mb-2 px-1 text-[12px] font-medium text-text-tertiary">桌面 CLIENT</div>
           <div
             v-for="c in clients"
             :key="c.id"
-            class="px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors"
+            class="cursor-pointer rounded-md px-2 py-2 text-[13px] transition-colors lg:py-1.5"
             :class="[
               c.id === selectedClientId
                 ? 'bg-surface-raised text-text-primary'
@@ -250,45 +251,46 @@ onUnmounted(() => {
           >
             <div class="flex items-center gap-2">
               <span
-                class="w-1.5 h-1.5 rounded-full shrink-0"
+                class="h-1.5 w-1.5 shrink-0 rounded-full"
                 :class="c.online ? 'bg-green-400' : 'bg-text-tertiary'"
               ></span>
               <span class="truncate">{{ c.hostname || shortId(c.id) }}</span>
               <span
                 v-if="c.enabled === false"
-                class="text-[10px] text-text-tertiary shrink-0 px-1 rounded bg-surface-raised"
+                class="shrink-0 rounded bg-surface-raised px-1 text-[10px] text-text-tertiary"
               >已停用</span>
               <button
-                class="flex items-center shrink-0 ml-auto"
+                type="button"
+                class="ml-auto flex min-h-9 shrink-0 items-center lg:min-h-0"
                 title="停用/启用节点"
                 @click.stop="toggleClientEnabled(c)"
               >
                 <span
-                  class="relative inline-flex h-4 w-7 items-center rounded-full transition-colors"
+                  class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors"
                   :class="c.enabled !== false ? 'bg-green-500' : 'bg-border-subtle'"
                 >
                   <span
-                    class="inline-block h-3 w-3 rounded-full bg-white transition-transform"
-                    :class="c.enabled !== false ? 'translate-x-3.5' : 'translate-x-0.5'"
+                    class="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform"
+                    :class="c.enabled !== false ? 'translate-x-4' : 'translate-x-0.5'"
                   ></span>
                 </span>
               </button>
             </div>
-            <div class="text-[11px] text-text-tertiary truncate pl-3.5">
+            <div class="truncate pl-3.5 text-[11px] text-text-tertiary">
               最后运行 {{ relTime(c.last_active_at) }} · 最后在线 {{ relTime(c.last_seen_at) }}
             </div>
           </div>
-          <div v-if="clients.length === 0" class="text-[12px] text-text-tertiary px-1">
+          <div v-if="clients.length === 0" class="px-1 text-[12px] text-text-tertiary">
             暂无 client 注册（桌面端设置里开启「允许远程终端」）
           </div>
         </div>
 
         <div v-if="selectedClientId">
-          <div class="text-[12px] text-text-tertiary font-medium mb-2 px-1">终端会话</div>
+          <div class="mb-2 px-1 text-[12px] font-medium text-text-tertiary">终端会话</div>
           <div
             v-for="t in terminals"
             :key="t.id"
-            class="px-2 py-1.5 rounded-md cursor-pointer text-[13px] transition-colors"
+            class="cursor-pointer rounded-md px-2 py-2 text-[13px] transition-colors lg:py-1.5"
             :class="
               t.id === selectedTermId
                 ? 'bg-surface-raised text-text-primary'
@@ -298,35 +300,36 @@ onUnmounted(() => {
           >
             <div class="flex items-center gap-2">
               <span
-                class="w-1.5 h-1.5 rounded-full shrink-0"
+                class="h-1.5 w-1.5 shrink-0 rounded-full"
                 :class="t.alive ? 'bg-green-400' : 'bg-text-tertiary'"
               ></span>
               <span class="truncate">{{ t.foreground_cmd || t.shell }}</span>
-              <span class="text-[11px] text-text-tertiary shrink-0 ml-auto">{{ shortId(t.id) }}</span>
+              <span class="ml-auto shrink-0 text-[11px] text-text-tertiary">{{ shortId(t.id) }}</span>
             </div>
-            <div class="text-[11px] text-text-tertiary truncate pl-3.5">{{ homeCwd(t.cwd) }}</div>
+            <div class="truncate pl-3.5 text-[11px] text-text-tertiary">{{ homeCwd(t.cwd) }}</div>
           </div>
-          <div v-if="terminals.length === 0" class="text-[12px] text-text-tertiary px-1">
+          <div v-if="terminals.length === 0" class="px-1 text-[12px] text-text-tertiary">
             该 client 没有终端会话
           </div>
         </div>
       </div>
 
-      <div v-if="selectedTermId" class="flex flex-col min-h-0">
+      <div v-if="selectedTermId" class="flex min-h-[50vh] min-w-0 flex-1 flex-col lg:min-h-0">
         <div
           ref="termEl"
-          class="flex-1 min-h-0 bg-[#0d1117] border border-border-subtle rounded-md overflow-hidden p-1"
+          class="min-h-[240px] flex-1 overflow-hidden rounded-md border border-border-subtle bg-[#0d1117] p-1"
         ></div>
-        <div class="flex gap-2 mt-3">
+        <div class="mt-3 flex flex-col gap-2 sm:flex-row">
           <input
             v-model="input"
             type="text"
             placeholder="输入命令，回车发送（也可直接在上方终端打字）"
-            class="flex-1 bg-transparent border border-border rounded-md px-3 py-2 text-[13px] font-mono placeholder:text-text-tertiary focus:outline-none focus:border-accent transition-colors"
+            class="min-w-0 flex-1 rounded-md border border-border bg-transparent px-3 py-2 font-mono text-[13px] placeholder:text-text-tertiary transition-colors focus:border-accent focus:outline-none"
             @keydown.enter="send"
           />
           <button
-            class="px-3.5 py-1.5 bg-text-primary text-surface-raised text-[13px] rounded-md hover:opacity-80 transition-opacity"
+            type="button"
+            class="min-h-10 shrink-0 rounded-md bg-text-primary px-3.5 py-2 text-[13px] text-surface-raised transition-opacity hover:opacity-80 sm:min-h-0 sm:py-1.5"
             @click="send"
           >
             发送
@@ -335,7 +338,7 @@ onUnmounted(() => {
       </div>
       <div
         v-else
-        class="flex items-center justify-center min-h-0 h-full text-[13px] text-text-tertiary border border-dashed border-border-subtle rounded-md"
+        class="flex min-h-[200px] flex-1 items-center justify-center rounded-md border border-dashed border-border-subtle px-4 text-center text-[13px] text-text-tertiary lg:min-h-0 lg:h-full"
       >
         选择一个终端会话查看输出
       </div>

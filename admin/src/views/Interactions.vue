@@ -165,10 +165,11 @@ onMounted(() => { void load() })
 
 <template>
   <div>
-    <div class="flex items-center justify-between mb-6">
+    <div class="mb-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
       <h1 class="text-lg font-semibold text-text-primary">交互单</h1>
       <button
-        class="text-xs text-accent hover:underline disabled:opacity-40"
+        type="button"
+        class="min-h-10 self-start text-xs text-accent hover:underline disabled:opacity-40 sm:min-h-0"
         :disabled="loading"
         @click="load"
       >刷新</button>
@@ -177,46 +178,46 @@ onMounted(() => { void load() })
     <p v-if="actionError" class="mb-4 text-xs text-red-400">{{ actionError }}</p>
     <p v-else-if="notice" class="mb-4 text-xs text-green-500">{{ notice }}</p>
 
-    <div class="mb-6 p-4 border border-border-subtle rounded-lg text-xs leading-5 text-text-secondary">
+    <div class="mb-6 rounded-lg border border-border-subtle p-3 text-xs leading-5 text-text-secondary sm:p-4">
       <p>
         交互单是 Agent 向用户索取确认或输入的待办记录（量化高成本确认、ask_user 等）。
         状态会从「待确认」经「已应答」到「已完成 / 失败 / 取消」。
       </p>
       <p class="mt-1 text-text-tertiary">
-        手动应答会代替用户做出选择并<strong class="text-text-secondary font-medium">真的推进任务执行</strong>；
+        手动应答会代替用户做出选择并<strong class="font-medium text-text-secondary">真的推进任务执行</strong>；
         高成本量化操作（回测 / trial / 因子评估）会真实消耗配额，确认前请核对标题与目标。
         取消只把状态标为已取消，不改飞书卡片外观，但再点卡片会被拒绝。
       </p>
     </div>
 
-    <div class="flex flex-wrap items-center gap-3 mb-4 text-xs">
-      <label class="flex items-center gap-1.5 text-text-secondary">
+    <div class="mb-4 flex flex-col gap-3 text-xs sm:flex-row sm:flex-wrap sm:items-center">
+      <label class="flex min-h-10 items-center gap-1.5 text-text-secondary sm:min-h-0">
         状态
         <select
           v-model="filterStatus"
-          class="bg-transparent border border-border rounded px-2 py-1 text-text-primary"
+          class="min-w-0 flex-1 rounded border border-border bg-transparent px-2 py-2 text-text-primary sm:flex-none sm:py-1"
           @change="onFilterChange"
         >
           <option value="">全部</option>
           <option v-for="(label, key) in STATUS_LABELS" :key="key" :value="key">{{ label }}</option>
         </select>
       </label>
-      <label class="flex items-center gap-1.5 text-text-secondary">
+      <label class="flex min-h-10 items-center gap-1.5 text-text-secondary sm:min-h-0">
         类型
         <select
           v-model="filterKind"
-          class="bg-transparent border border-border rounded px-2 py-1 text-text-primary"
+          class="min-w-0 flex-1 rounded border border-border bg-transparent px-2 py-2 text-text-primary sm:flex-none sm:py-1"
           @change="onFilterChange"
         >
           <option value="">全部</option>
           <option v-for="(label, key) in KIND_LABELS" :key="key" :value="key">{{ label }}</option>
         </select>
       </label>
-      <label class="flex items-center gap-1.5 text-text-secondary">
+      <label class="flex min-h-10 items-center gap-1.5 text-text-secondary sm:min-h-0">
         渠道
         <select
           v-model="filterChannel"
-          class="bg-transparent border border-border rounded px-2 py-1 text-text-primary"
+          class="min-w-0 flex-1 rounded border border-border bg-transparent px-2 py-2 text-text-primary sm:flex-none sm:py-1"
           @change="onFilterChange"
         >
           <option value="">全部</option>
@@ -227,90 +228,151 @@ onMounted(() => { void load() })
 
     <div v-if="loading" class="text-sm text-text-tertiary">加载中...</div>
     <div v-else-if="displayRows.length === 0" class="text-sm text-text-tertiary">暂无交互单。</div>
-    <table v-else class="w-full text-sm">
-      <thead>
-        <tr class="text-left text-xs text-text-tertiary border-b border-border-subtle">
-          <th class="py-2 pr-3">任务编号</th>
-          <th class="py-2 pr-3">类型</th>
-          <th class="py-2 pr-3">状态</th>
-          <th class="py-2 pr-3">标题</th>
-          <th class="py-2 pr-3">渠道</th>
-          <th class="py-2 pr-3">创建时间</th>
-          <th class="py-2 pr-3">应答时间</th>
-          <th class="py-2">操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <template v-for="row in displayRows" :key="row.id">
-          <tr class="border-b border-border-subtle">
-            <td class="py-2 pr-3 align-top">
-              <button
-                class="font-mono text-xs text-accent hover:underline"
-                :title="row.id"
-                @click="toggleExpand(row.id)"
-              >{{ shortId(row.id) }}</button>
-            </td>
-            <td class="py-2 pr-3 align-top text-xs text-text-secondary whitespace-nowrap">
-              {{ kindLabel(row.kind) }}
-            </td>
-            <td class="py-2 pr-3 align-top text-xs whitespace-nowrap" :class="statusClass(row.status)">
-              {{ statusLabel(row.status) }}
-            </td>
-            <td class="py-2 pr-3 align-top text-text-primary max-w-48 truncate" :title="row.title">
-              {{ row.title || '—' }}
-            </td>
-            <td class="py-2 pr-3 align-top text-xs text-text-secondary whitespace-nowrap">
-              {{ channelLabel(row.channel) }}
-            </td>
-            <td class="py-2 pr-3 align-top text-xs text-text-tertiary whitespace-nowrap">
-              {{ formatTime(row.created_at) }}
-            </td>
-            <td class="py-2 pr-3 align-top text-xs text-text-tertiary whitespace-nowrap">
-              {{ formatTime(row.answered_at) }}
-            </td>
-            <td class="py-2 align-top whitespace-nowrap">
-              <button
-                class="text-xs text-text-secondary hover:underline mr-2"
-                @click="toggleExpand(row.id)"
-              >{{ expandedId === row.id ? '收起' : '详情' }}</button>
-              <template v-if="row.status === 'pending'">
-                <button
-                  v-for="opt in parseOptions(row.options)"
-                  :key="opt"
-                  class="text-xs text-accent hover:underline mr-2 disabled:opacity-40"
-                  :disabled="actionBusy"
-                  @click="answer(row, opt)"
-                >{{ opt }}</button>
-                <button
-                  class="text-xs text-red-400 hover:underline disabled:opacity-40"
-                  :disabled="actionBusy"
-                  @click="cancel(row)"
-                >取消</button>
-              </template>
-            </td>
+
+    <!-- 移动端卡片列表 -->
+    <div v-else class="space-y-3 md:hidden">
+      <div
+        v-for="row in displayRows"
+        :key="row.id"
+        class="rounded-md border border-border-subtle p-3"
+      >
+        <div class="flex items-start justify-between gap-2">
+          <button
+            type="button"
+            class="font-mono text-xs text-accent hover:underline"
+            :title="row.id"
+            @click="toggleExpand(row.id)"
+          >{{ shortId(row.id) }}</button>
+          <span class="shrink-0 text-xs" :class="statusClass(row.status)">{{ statusLabel(row.status) }}</span>
+        </div>
+        <p class="mt-1.5 text-[13px] text-text-primary">{{ row.title || '—' }}</p>
+        <div class="mt-1.5 flex flex-wrap gap-x-3 gap-y-1 text-[11px] text-text-tertiary">
+          <span>{{ kindLabel(row.kind) }}</span>
+          <span>{{ channelLabel(row.channel) }}</span>
+          <span>{{ formatTime(row.created_at) }}</span>
+        </div>
+        <div class="mt-2 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            class="min-h-9 text-xs text-text-secondary hover:underline"
+            @click="toggleExpand(row.id)"
+          >{{ expandedId === row.id ? '收起' : '详情' }}</button>
+          <template v-if="row.status === 'pending'">
+            <button
+              v-for="opt in parseOptions(row.options)"
+              :key="opt"
+              type="button"
+              class="min-h-9 rounded-md border border-border px-2.5 text-xs text-accent disabled:opacity-40"
+              :disabled="actionBusy"
+              @click="answer(row, opt)"
+            >{{ opt }}</button>
+            <button
+              type="button"
+              class="min-h-9 text-xs text-red-400 hover:underline disabled:opacity-40"
+              :disabled="actionBusy"
+              @click="cancel(row)"
+            >取消</button>
+          </template>
+        </div>
+        <div v-if="expandedId === row.id" class="mt-3 border-t border-border-subtle pt-3">
+          <InteractionDetail :row="row" />
+        </div>
+      </div>
+    </div>
+
+    <!-- 桌面表格 -->
+    <div v-if="!loading && displayRows.length > 0" class="hidden table-scroll md:block">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-border-subtle text-left text-xs text-text-tertiary">
+            <th class="py-2 pr-3">任务编号</th>
+            <th class="py-2 pr-3">类型</th>
+            <th class="py-2 pr-3">状态</th>
+            <th class="py-2 pr-3">标题</th>
+            <th class="py-2 pr-3">渠道</th>
+            <th class="py-2 pr-3">创建时间</th>
+            <th class="py-2 pr-3">应答时间</th>
+            <th class="py-2">操作</th>
           </tr>
-          <tr v-if="expandedId === row.id" class="border-b border-border-subtle bg-surface">
-            <td colspan="8">
-              <InteractionDetail :row="row" />
-            </td>
-          </tr>
-        </template>
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          <template v-for="row in displayRows" :key="row.id">
+            <tr class="border-b border-border-subtle">
+              <td class="py-2 pr-3 align-top">
+                <button
+                  type="button"
+                  class="font-mono text-xs text-accent hover:underline"
+                  :title="row.id"
+                  @click="toggleExpand(row.id)"
+                >{{ shortId(row.id) }}</button>
+              </td>
+              <td class="whitespace-nowrap py-2 pr-3 align-top text-xs text-text-secondary">
+                {{ kindLabel(row.kind) }}
+              </td>
+              <td class="whitespace-nowrap py-2 pr-3 align-top text-xs" :class="statusClass(row.status)">
+                {{ statusLabel(row.status) }}
+              </td>
+              <td class="max-w-48 truncate py-2 pr-3 align-top text-text-primary" :title="row.title">
+                {{ row.title || '—' }}
+              </td>
+              <td class="whitespace-nowrap py-2 pr-3 align-top text-xs text-text-secondary">
+                {{ channelLabel(row.channel) }}
+              </td>
+              <td class="whitespace-nowrap py-2 pr-3 align-top text-xs text-text-tertiary">
+                {{ formatTime(row.created_at) }}
+              </td>
+              <td class="whitespace-nowrap py-2 pr-3 align-top text-xs text-text-tertiary">
+                {{ formatTime(row.answered_at) }}
+              </td>
+              <td class="whitespace-nowrap py-2 align-top">
+                <button
+                  type="button"
+                  class="mr-2 text-xs text-text-secondary hover:underline"
+                  @click="toggleExpand(row.id)"
+                >{{ expandedId === row.id ? '收起' : '详情' }}</button>
+                <template v-if="row.status === 'pending'">
+                  <button
+                    v-for="opt in parseOptions(row.options)"
+                    :key="opt"
+                    type="button"
+                    class="mr-2 text-xs text-accent hover:underline disabled:opacity-40"
+                    :disabled="actionBusy"
+                    @click="answer(row, opt)"
+                  >{{ opt }}</button>
+                  <button
+                    type="button"
+                    class="text-xs text-red-400 hover:underline disabled:opacity-40"
+                    :disabled="actionBusy"
+                    @click="cancel(row)"
+                  >取消</button>
+                </template>
+              </td>
+            </tr>
+            <tr v-if="expandedId === row.id" class="border-b border-border-subtle bg-surface">
+              <td colspan="8">
+                <InteractionDetail :row="row" />
+              </td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </div>
 
     <div
       v-if="!loading && total > 0"
-      class="flex items-center justify-between mt-6 text-[12px] text-text-tertiary"
+      class="mt-6 flex flex-col gap-3 text-[12px] text-text-tertiary sm:flex-row sm:items-center sm:justify-between"
     >
       <span>{{ total }} 条 · 第 {{ page }} / {{ totalPages }} 页</span>
       <div class="flex items-center gap-1">
         <button
-          class="px-2.5 py-1 rounded hover:bg-hover disabled:opacity-30 transition-colors"
+          type="button"
+          class="min-h-9 rounded px-3 py-1.5 transition-colors hover:bg-hover disabled:opacity-30"
           :disabled="page <= 1"
           @click="page = Math.max(1, page - 1); load()"
         >← 上一页</button>
         <button
-          class="px-2.5 py-1 rounded hover:bg-hover disabled:opacity-30 transition-colors"
+          type="button"
+          class="min-h-9 rounded px-3 py-1.5 transition-colors hover:bg-hover disabled:opacity-30"
           :disabled="page >= totalPages"
           @click="page += 1; load()"
         >下一页 →</button>

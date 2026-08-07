@@ -23,15 +23,39 @@
   --color-active: oklch(0.93 0.008 80);
 }
 
+html {
+  /* 避免移动端横向溢出；dvh 由子元素按需使用 */
+  overflow-x: hidden;
+}
+
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   background: var(--color-surface);
   color: var(--color-text-primary);
   -webkit-font-smoothing: antialiased;
+  /* 触控滚动更顺滑 */
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* 表单控件在 iOS 上小于 16px 会强制缩放视口；小屏抬到 16px */
+@media (max-width: 767px) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]),
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
 }
 
 ::selection {
   background: oklch(0.85 0.08 250);
+}
+
+/* 刘海屏安全区：配合 App 顶栏 / 底栏 */
+.safe-pt {
+  padding-top: max(0.5rem, env(safe-area-inset-top, 0px));
+}
+.safe-pb {
+  padding-bottom: max(0.5rem, env(safe-area-inset-bottom, 0px));
 }
 
 /* 细滚动条：侧边栏与内容区独立滚动时不抢视觉重心 */
@@ -52,4 +76,13 @@ body {
 }
 .thin-scrollbar::-webkit-scrollbar-thumb:hover {
   background: var(--color-active);
+}
+
+/* 表格在窄屏可横向滑动，避免撑破布局 */
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+.table-scroll > table {
+  min-width: 36rem;
 }

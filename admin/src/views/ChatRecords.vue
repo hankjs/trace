@@ -155,40 +155,43 @@ onMounted(loadConversations)
 </script>
 
 <template>
-  <div class="flex h-full min-h-[620px] flex-col">
-    <div class="mb-5 flex flex-wrap items-start justify-between gap-3">
+  <div class="flex h-full min-h-0 flex-col sm:min-h-[480px] lg:min-h-[620px]">
+    <div class="mb-4 flex flex-col gap-3 sm:mb-5 sm:flex-row sm:flex-wrap sm:items-start sm:justify-between">
       <div>
         <h1 class="text-lg font-semibold text-text-primary">聊天记录</h1>
         <p class="mt-1 text-xs text-text-tertiary">飞书渠道 · {{ totalConversations }} 个会话</p>
       </div>
-      <div class="flex items-center gap-2">
+      <div class="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
         <select
           aria-label="聊天渠道"
           disabled
-          class="h-8 rounded-md border border-border bg-transparent px-2 text-xs text-text-secondary disabled:opacity-70"
+          class="h-10 w-full rounded-md border border-border bg-transparent px-2 text-xs text-text-secondary disabled:opacity-70 sm:h-8 sm:w-auto"
         >
           <option>飞书</option>
         </select>
-        <div class="flex h-8 items-center rounded-md border border-border bg-transparent">
+        <div class="flex h-10 min-w-0 flex-1 items-center rounded-md border border-border bg-transparent sm:h-8 sm:flex-none">
           <input
             v-model="searchInput"
             placeholder="搜索会话、用户或内容"
-            class="w-48 bg-transparent px-2.5 text-xs text-text-primary outline-none placeholder:text-text-tertiary"
+            class="min-w-0 flex-1 bg-transparent px-2.5 text-xs text-text-primary outline-none placeholder:text-text-tertiary sm:w-48 sm:flex-none"
             @keydown.enter="applySearch"
           />
           <button
             v-if="searchInput"
+            type="button"
             aria-label="清除搜索"
-            class="px-2 text-xs text-text-tertiary hover:text-text-secondary"
+            class="min-h-8 px-2 text-xs text-text-tertiary hover:text-text-secondary"
             @click="clearSearch"
           >×</button>
           <button
-            class="border-l border-border-subtle px-2.5 text-xs text-text-secondary hover:text-text-primary"
+            type="button"
+            class="min-h-8 border-l border-border-subtle px-2.5 text-xs text-text-secondary hover:text-text-primary"
             @click="applySearch"
           >搜索</button>
         </div>
         <button
-          class="h-8 rounded-md border border-border px-2.5 text-xs text-text-secondary transition-colors hover:bg-hover hover:text-text-primary"
+          type="button"
+          class="h-10 w-full rounded-md border border-border px-2.5 text-xs text-text-secondary transition-colors hover:bg-hover hover:text-text-primary sm:h-8 sm:w-auto"
           @click="loadConversations"
         >刷新</button>
       </div>
@@ -197,7 +200,11 @@ onMounted(loadConversations)
     <p v-if="error" class="mb-3 rounded-md border border-red-300/50 bg-red-50 px-3 py-2 text-xs text-red-600">{{ error }}</p>
 
     <div class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border border-border lg:flex-row">
-      <aside class="flex max-h-72 w-full shrink-0 flex-col border-b border-border lg:max-h-none lg:w-72 lg:border-b-0 lg:border-r">
+      <!-- 选中会话时移动端可隐藏列表，给消息区更大空间 -->
+      <aside
+        class="flex max-h-[40vh] w-full shrink-0 flex-col border-b border-border lg:max-h-none lg:w-72 lg:border-b-0 lg:border-r"
+        :class="selected ? 'hidden lg:flex' : 'flex'"
+      >
         <div class="flex h-10 items-center justify-between border-b border-border-subtle px-3">
           <span class="text-xs font-medium text-text-secondary">会话</span>
           <span class="font-mono text-[11px] text-text-tertiary">{{ totalConversations }}</span>
@@ -233,21 +240,36 @@ onMounted(loadConversations)
         </div>
       </aside>
 
-      <section class="flex min-h-0 min-w-0 flex-1 flex-col">
+      <section class="flex min-h-0 min-w-0 flex-1 flex-col" :class="!selected ? 'hidden lg:flex' : ''">
         <template v-if="selected">
-          <header class="border-b border-border-subtle px-4 py-3">
+          <header class="border-b border-border-subtle px-3 py-3 sm:px-4">
             <div class="flex flex-wrap items-center justify-between gap-2">
-              <div class="min-w-0">
-                <h2 class="truncate text-[13px] font-semibold text-text-primary">{{ conversationLabel(selected) }}</h2>
-                <p class="mt-1 truncate font-mono text-[11px] text-text-tertiary">{{ selected.conversation_id }} · {{ topicLabel(selected) }}</p>
-                <p v-if="selected.session_id" class="mt-1 truncate text-[11px]" :class="backendTone(selected.agent_provider)">
-                  执行后端：{{ backendSummary(selected.agent_provider, selected.agent_model) }}
-                </p>
-              </div>
-              <div class="flex shrink-0 items-center gap-2">
-                <div class="flex h-7 items-center rounded border border-border-subtle bg-surface" role="tablist" aria-label="记录视图">
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-2">
                   <button
-                    class="h-full px-2.5 text-[11px] transition-colors"
+                    type="button"
+                    class="flex size-9 shrink-0 items-center justify-center rounded-md text-text-secondary hover:bg-hover lg:hidden"
+                    aria-label="返回会话列表"
+                    @click="selected = null; messages = []; traceEvents = []"
+                  >
+                    <svg class="size-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" aria-hidden="true">
+                      <path d="M15 18 9 12l6-6" />
+                    </svg>
+                  </button>
+                  <div class="min-w-0">
+                    <h2 class="truncate text-[13px] font-semibold text-text-primary">{{ conversationLabel(selected) }}</h2>
+                    <p class="mt-1 truncate font-mono text-[11px] text-text-tertiary">{{ selected.conversation_id }} · {{ topicLabel(selected) }}</p>
+                    <p v-if="selected.session_id" class="mt-1 truncate text-[11px]" :class="backendTone(selected.agent_provider)">
+                      执行后端：{{ backendSummary(selected.agent_provider, selected.agent_model) }}
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <div class="flex w-full shrink-0 flex-wrap items-center gap-2 sm:w-auto">
+                <div class="flex h-9 flex-1 items-center rounded border border-border-subtle bg-surface sm:h-7 sm:flex-none" role="tablist" aria-label="记录视图">
+                  <button
+                    type="button"
+                    class="h-full flex-1 px-2.5 text-[11px] transition-colors sm:flex-none"
                     :class="detailMode === 'messages' ? 'bg-active font-medium text-text-primary' : 'text-text-tertiary hover:text-text-secondary'"
                     role="tab"
                     :aria-selected="detailMode === 'messages'"
@@ -255,7 +277,8 @@ onMounted(loadConversations)
                   >消息</button>
                   <button
                     v-if="selected.session_id"
-                    class="h-full border-l border-border-subtle px-2.5 text-[11px] transition-colors"
+                    type="button"
+                    class="h-full flex-1 border-l border-border-subtle px-2.5 text-[11px] transition-colors sm:flex-none"
                     :class="detailMode === 'trace' ? 'bg-active font-medium text-text-primary' : 'text-text-tertiary hover:text-text-secondary'"
                     role="tab"
                     :aria-selected="detailMode === 'trace'"
@@ -265,22 +288,26 @@ onMounted(loadConversations)
                 <RouterLink
                   v-if="selected.session_id"
                   :to="`/sessions/${selected.session_id}`"
-                  class="text-[11px] text-accent hover:text-accent-hover"
+                  class="min-h-9 text-[11px] text-accent hover:text-accent-hover sm:min-h-0"
                 >Session ↗</RouterLink>
               </div>
             </div>
           </header>
           <div v-if="detailMode === 'messages'" class="min-h-0 flex-1 overflow-y-auto" role="tabpanel">
             <div v-if="hasOlderMessages" class="border-b border-border-subtle px-4 py-2 text-center">
-              <button class="text-[11px] text-accent hover:text-accent-hover disabled:opacity-40" :disabled="messagesLoading" @click="loadMessages(messagePage + 1)">
+              <button type="button" class="min-h-9 text-[11px] text-accent hover:text-accent-hover disabled:opacity-40" :disabled="messagesLoading" @click="loadMessages(messagePage + 1)">
                 {{ messagesLoading ? '加载中...' : '加载更早记录' }}
               </button>
             </div>
             <div v-if="messagesLoading && !messages.length" class="px-4 py-10 text-xs text-text-tertiary">加载中...</div>
             <div v-else-if="!messages.length" class="px-4 py-10 text-xs text-text-tertiary">暂无消息</div>
             <div v-else class="divide-y divide-border-subtle">
-              <article v-for="message in messages" :key="message.id" class="grid grid-cols-[58px_minmax(0,1fr)] gap-3 px-4 py-3">
-                <div class="pt-0.5 text-[11px] text-text-tertiary">{{ formatTime(message.created_at) }}</div>
+              <article
+                v-for="message in messages"
+                :key="message.id"
+                class="grid grid-cols-1 gap-1 px-3 py-3 sm:grid-cols-[58px_minmax(0,1fr)] sm:gap-3 sm:px-4"
+              >
+                <div class="text-[11px] text-text-tertiary sm:pt-0.5">{{ formatTime(message.created_at) }}</div>
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-2">
                     <span class="text-xs font-medium" :class="message.direction === 'inbound' ? 'text-text-primary' : 'text-accent'">{{ directionLabel(message.direction) }}</span>
@@ -301,7 +328,7 @@ onMounted(loadConversations)
             <AgentTracePanel :events="traceEvents" :loading="traceLoading" :error="traceError" />
           </div>
         </template>
-        <div v-else class="flex flex-1 items-center justify-center px-6 text-xs text-text-tertiary">选择一个会话查看记录</div>
+        <div v-else class="hidden flex-1 items-center justify-center px-6 text-xs text-text-tertiary lg:flex">选择一个会话查看记录</div>
       </section>
     </div>
   </div>

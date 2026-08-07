@@ -269,15 +269,18 @@ onMounted(async () => {
 </script>
 
 <template>
-  <div class="max-w-5xl">
-    <RouterLink to="/explore" class="text-[12px] text-text-tertiary hover:text-text-secondary transition-colors">← 探索</RouterLink>
-    <div class="flex items-center gap-3 mt-2 mb-5">
-      <h1 class="text-lg font-semibold text-text-primary">Explore Timeline</h1>
-      <span class="text-[12px] text-text-tertiary font-mono">{{ sessionId.slice(0, 8) }}</span>
+  <div class="w-full max-w-5xl">
+    <RouterLink to="/explore" class="text-[12px] text-text-tertiary transition-colors hover:text-text-secondary">← 探索</RouterLink>
+    <div class="mb-5 mt-2 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
+      <div class="flex min-w-0 flex-wrap items-center gap-2 sm:gap-3">
+        <h1 class="text-lg font-semibold text-text-primary">Explore Timeline</h1>
+        <span class="font-mono text-[12px] text-text-tertiary">{{ sessionId.slice(0, 8) }}</span>
+      </div>
       <button
         v-if="!loading && timeline.length"
+        type="button"
         @click="exportContext"
-        class="ml-auto px-3 py-1 text-[12px] rounded bg-surface-secondary hover:bg-surface-tertiary text-text-secondary transition-colors"
+        class="min-h-10 self-start rounded bg-surface-secondary px-3 py-1.5 text-[12px] text-text-secondary transition-colors hover:bg-surface-tertiary sm:ml-auto sm:min-h-0 sm:py-1"
       >导出上下文</button>
     </div>
 

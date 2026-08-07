@@ -134,26 +134,26 @@ onUnmounted(stopPolling)
 
 <template>
   <div>
-    <div class="flex items-center justify-between mb-6">
+    <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
       <h1 class="text-lg font-semibold text-text-primary">微信机器人</h1>
-      <button @click="startLogin" class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90">扫码添加</button>
+      <button type="button" @click="startLogin" class="min-h-10 self-start rounded-md bg-accent px-3 py-2 text-xs text-white hover:opacity-90 sm:min-h-0 sm:py-1.5">扫码添加</button>
     </div>
 
     <!-- 扫码登录 -->
-    <div v-if="showLogin" class="mb-6 p-4 border border-border-subtle rounded-lg">
-      <div class="flex items-start gap-6">
-        <div class="w-[220px] h-[220px] flex items-center justify-center border border-border-subtle rounded bg-white">
-          <img v-if="qrcodeImage" :src="qrcodeImage" class="w-[220px] h-[220px]" alt="微信登录二维码" />
+    <div v-if="showLogin" class="mb-6 rounded-lg border border-border-subtle p-4">
+      <div class="flex flex-col items-center gap-4 sm:flex-row sm:items-start sm:gap-6">
+        <div class="flex h-[min(220px,70vw)] w-[min(220px,70vw)] items-center justify-center rounded border border-border-subtle bg-white">
+          <img v-if="qrcodeImage" :src="qrcodeImage" class="h-full w-full" alt="微信登录二维码" />
           <span v-else class="text-xs text-text-tertiary">{{ loginStatus === 'loading' ? '获取二维码中...' : '—' }}</span>
         </div>
-        <div class="pt-2 space-y-2">
+        <div class="w-full space-y-2 pt-0 text-center sm:pt-2 sm:text-left">
           <p v-if="loginStatus === 'waiting'" class="text-sm text-text-primary">请用微信扫码</p>
           <p v-else-if="loginStatus === 'scanned'" class="text-sm text-text-primary">已扫码，请在手机上确认</p>
           <p v-else-if="loginStatus === 'expired' || loginStatus === 'error'" class="text-sm text-red-400">{{ loginMsg }}</p>
           <p v-else-if="loginStatus === 'loading'" class="text-sm text-text-tertiary">正在初始化登录...</p>
-          <div class="flex gap-2 pt-1">
-            <button v-if="loginStatus === 'expired' || loginStatus === 'error'" @click="startLogin" class="px-3 py-1.5 text-xs bg-accent text-white rounded-md hover:opacity-90">重试</button>
-            <button @click="cancelLogin" class="px-3 py-1.5 text-xs border border-border-subtle rounded-md text-text-secondary hover:bg-hover">取消</button>
+          <div class="flex flex-wrap justify-center gap-2 pt-1 sm:justify-start">
+            <button v-if="loginStatus === 'expired' || loginStatus === 'error'" type="button" @click="startLogin" class="min-h-10 rounded-md bg-accent px-3 py-2 text-xs text-white hover:opacity-90 sm:min-h-0 sm:py-1.5">重试</button>
+            <button type="button" @click="cancelLogin" class="min-h-10 rounded-md border border-border-subtle px-3 py-2 text-xs text-text-secondary hover:bg-hover sm:min-h-0 sm:py-1.5">取消</button>
           </div>
         </div>
       </div>
@@ -161,64 +161,68 @@ onUnmounted(stopPolling)
 
     <!-- 账号列表 -->
     <div v-if="loading" class="text-sm text-text-tertiary">加载中...</div>
-    <div v-else-if="accounts.length === 0" class="text-sm text-text-tertiary mb-10">暂无机器人账号，点击右上角"扫码添加"。</div>
-    <table v-else class="w-full text-sm mb-10">
-      <thead>
-        <tr class="text-left text-xs text-text-tertiary border-b border-border-subtle">
-          <th class="py-2 pr-3">Bot ID</th>
-          <th class="py-2 pr-3">接口地址</th>
-          <th class="py-2 pr-3">用户 ID</th>
-          <th class="py-2 pr-3">状态</th>
-          <th class="py-2 pr-3">创建时间</th>
-          <th class="py-2">操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="a in accounts" :key="a.id" class="border-b border-border-subtle">
-          <td class="py-2 pr-3 text-text-primary font-mono text-xs">{{ a.ilink_bot_id }}</td>
-          <td class="py-2 pr-3 text-text-secondary font-mono text-xs">{{ a.base_url }}</td>
-          <td class="py-2 pr-3 text-text-secondary font-mono text-xs">{{ a.bot_user_id }}</td>
-          <td class="py-2 pr-3">
-            <button @click="toggleEnabled(a)" class="flex items-center gap-2">
-              <span class="relative inline-flex h-4 w-7 items-center rounded-full transition-colors" :class="a.enabled ? 'bg-green-500' : 'bg-border-subtle'">
-                <span class="inline-block h-3 w-3 rounded-full bg-white transition-transform" :class="a.enabled ? 'translate-x-3.5' : 'translate-x-0.5'"></span>
-              </span>
-              <span :class="a.enabled ? 'text-green-500' : 'text-text-tertiary'">{{ a.enabled ? '已启用' : '已禁用' }}</span>
-            </button>
-            <p v-if="!a.enabled" class="text-xs text-red-400 mt-1">已失效，请重新扫码</p>
-          </td>
-          <td class="py-2 pr-3 text-text-tertiary text-xs">{{ a.created_at }}</td>
-          <td class="py-2">
-            <button @click="remove(a.id)" class="text-xs text-red-400 hover:underline">删除</button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else-if="accounts.length === 0" class="mb-10 text-sm text-text-tertiary">暂无机器人账号，点击「扫码添加」。</div>
+    <div v-else class="table-scroll mb-10">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-border-subtle text-left text-xs text-text-tertiary">
+            <th class="py-2 pr-3">Bot ID</th>
+            <th class="py-2 pr-3">接口地址</th>
+            <th class="py-2 pr-3">用户 ID</th>
+            <th class="py-2 pr-3">状态</th>
+            <th class="py-2 pr-3">创建时间</th>
+            <th class="py-2">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="a in accounts" :key="a.id" class="border-b border-border-subtle">
+            <td class="py-2 pr-3 font-mono text-xs text-text-primary">{{ a.ilink_bot_id }}</td>
+            <td class="py-2 pr-3 font-mono text-xs text-text-secondary">{{ a.base_url }}</td>
+            <td class="py-2 pr-3 font-mono text-xs text-text-secondary">{{ a.bot_user_id }}</td>
+            <td class="py-2 pr-3">
+              <button type="button" @click="toggleEnabled(a)" class="flex min-h-9 items-center gap-2">
+                <span class="relative inline-flex h-5 w-9 items-center rounded-full transition-colors" :class="a.enabled ? 'bg-green-500' : 'bg-border-subtle'">
+                  <span class="inline-block h-3.5 w-3.5 rounded-full bg-white transition-transform" :class="a.enabled ? 'translate-x-4' : 'translate-x-0.5'"></span>
+                </span>
+                <span :class="a.enabled ? 'text-green-500' : 'text-text-tertiary'">{{ a.enabled ? '已启用' : '已禁用' }}</span>
+              </button>
+              <p v-if="!a.enabled" class="mt-1 text-xs text-red-400">已失效，请重新扫码</p>
+            </td>
+            <td class="py-2 pr-3 text-xs text-text-tertiary">{{ a.created_at }}</td>
+            <td class="py-2">
+              <button type="button" @click="remove(a.id)" class="min-h-8 text-xs text-red-400 hover:underline">删除</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
     <!-- 用户绑定 -->
-    <h2 class="text-sm font-semibold text-text-primary mb-3">用户绑定</h2>
+    <h2 class="mb-3 text-sm font-semibold text-text-primary">用户绑定</h2>
     <div v-if="bindingsLoading" class="text-sm text-text-tertiary">加载中...</div>
     <div v-else-if="bindings.length === 0" class="text-sm text-text-tertiary">暂无绑定。</div>
-    <table v-else class="w-full text-sm">
-      <thead>
-        <tr class="text-left text-xs text-text-tertiary border-b border-border-subtle">
-          <th class="py-2 pr-3">用户名</th>
-          <th class="py-2 pr-3">ilink 用户 ID</th>
-          <th class="py-2 pr-3">绑定时间</th>
-          <th class="py-2">操作</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="b in bindings" :key="b.id" class="border-b border-border-subtle">
-          <td class="py-2 pr-3 text-text-primary font-medium">{{ b.username }}</td>
-          <td class="py-2 pr-3 text-text-secondary font-mono text-xs">{{ b.ilink_user_id }}</td>
-          <td class="py-2 pr-3 text-text-tertiary text-xs">{{ b.created_at }}</td>
-          <td class="py-2">
-            <button @click="unbind(b.id)" class="text-xs text-red-400 hover:underline">解绑</button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else class="table-scroll">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="border-b border-border-subtle text-left text-xs text-text-tertiary">
+            <th class="py-2 pr-3">用户名</th>
+            <th class="py-2 pr-3">ilink 用户 ID</th>
+            <th class="py-2 pr-3">绑定时间</th>
+            <th class="py-2">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="b in bindings" :key="b.id" class="border-b border-border-subtle">
+            <td class="py-2 pr-3 font-medium text-text-primary">{{ b.username }}</td>
+            <td class="py-2 pr-3 font-mono text-xs text-text-secondary">{{ b.ilink_user_id }}</td>
+            <td class="py-2 pr-3 text-xs text-text-tertiary">{{ b.created_at }}</td>
+            <td class="py-2">
+              <button type="button" @click="unbind(b.id)" class="min-h-8 text-xs text-red-400 hover:underline">解绑</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
     <!-- 主动发送 -->
     <template v-if="!bindingsLoading && bindings.length > 0">
