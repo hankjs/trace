@@ -20,7 +20,8 @@ watch(isAuthenticated, (authed) => {
     return;
   }
   // 登录后（含带 token 冷启动）：若已开启远程终端则注册并启动长轮询
-  remoteTerm.startIfEnabled();
+  // 不 await：避免挡住路由；失败时设置页会显示 lastError
+  void remoteTerm.startIfEnabled();
 }, { immediate: true });
 </script>
 

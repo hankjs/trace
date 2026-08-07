@@ -21,16 +21,27 @@ const {
   clientId: remoteClientId,
   acceptRemote,
   isPolling: remoteIsPolling,
+  lastError: remoteLastError,
+  statusText: remoteStatusText,
   setAcceptRemote,
 } = useRemoteTerm();
 const acceptRemoteLocal = ref(acceptRemote.value);
 const remoteToggling = ref(false);
+const remoteFeedback = ref<{ ok: boolean; message: string } | null>(null);
 
 async function toggleAcceptRemote(v: boolean) {
   remoteToggling.value = true;
+  remoteFeedback.value = null;
   try {
-    await setAcceptRemote(v);
+    const result = await setAcceptRemote(v);
     acceptRemoteLocal.value = acceptRemote.value;
+    remoteFeedback.value = { ok: result.ok, message: result.message };
+  } catch (e: any) {
+    acceptRemoteLocal.value = acceptRemote.value;
+    remoteFeedback.value = {
+      ok: false,
+      message: e?.message || String(e) || "操作失败",
+    };
   } finally {
     remoteToggling.value = false;
   }
@@ -428,15 +439,16 @@ onUnmounted(() => {
       <div class="weixin-section">
         <p class="weixin-desc">
           开启后本机会向 server 注册并长轮询；admin 网页可查看/操作本机终端，优先走 WebRTC 直连（失败回落中转）。
+          需与 admin 连同一 server。
         </p>
-        <label class="remote-toggle-row">
+        <label class="remote-toggle-row" :class="{ disabled: remoteToggling }">
           <input
             type="checkbox"
             :checked="acceptRemoteLocal"
             :disabled="remoteToggling"
             @change="toggleAcceptRemote(($event.target as HTMLInputElement).checked)"
           />
-          允许远程终端控制
+          {{ remoteToggling ? "处理中…" : "允许远程终端控制" }}
         </label>
         <div class="weixin-bound-info" style="margin-top: 8px">
           <span class="weixin-label">Client ID</span>
@@ -444,9 +456,22 @@ onUnmounted(() => {
         </div>
         <div class="weixin-bound-info">
           <span class="weixin-label">状态</span>
-          <span class="weixin-value">
-            {{ acceptRemoteLocal ? (remoteIsPolling ? "在线轮询中" : "已开启（轮询未运行）") : "已关闭" }}
+          <span class="weixin-value" :class="{ 'remote-status-live': remoteIsPolling }">
+            {{ remoteToggling ? "处理中…" : remoteStatusText }}
           </span>
+        </div>
+        <div
+          v-if="remoteFeedback"
+          class="test-result"
+          :class="{ ok: remoteFeedback.ok }"
+        >
+          {{ remoteFeedback.message }}
+        </div>
+        <div
+          v-else-if="remoteLastError && acceptRemoteLocal"
+          class="test-result"
+        >
+          {{ remoteLastError }}
         </div>
       </div>
 
@@ -632,6 +657,8 @@ onUnmounted(() => {
 .weixin-label { color: var(--color-text-secondary); min-width: 4rem; }
 .weixin-value { font-family: monospace; color: var(--color-text-primary); }
 .remote-toggle-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.875rem; color: var(--color-text-primary); cursor: pointer; margin-bottom: 0.5rem; }
+.remote-toggle-row.disabled { opacity: 0.6; cursor: wait; }
+.remote-status-live { color: var(--color-success, #4f4); }
 .remote-status { font-size: 0.8rem; color: var(--color-text-secondary); margin-bottom: 0.75rem; }
 .remote-status.on { color: var(--color-success, #4f4); }
 .remote-workdir-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }

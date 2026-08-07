@@ -48,6 +48,21 @@ command -v cargo-zigbuild >/dev/null || {
 }
 
 # ---------- 1. 本地交叉编译 ----------
+# rustc + zig 链接阶段会同时打开大量 rlib；macOS 默认 soft limit 常为 256/8192，
+# 依赖变多后会报 ProcessFdQuotaExceeded。尽量抬到硬上限（失败也不阻断）。
+if soft="$(ulimit -Sn 2>/dev/null || true)" && hard="$(ulimit -Hn 2>/dev/null || true)"; then
+  # hard 可能是 "unlimited" 或数字
+  if [[ "$hard" == "unlimited" ]]; then
+    target_fd=65536
+  else
+    target_fd="$hard"
+  fi
+  if [[ -n "$soft" && "$soft" != "unlimited" && "$target_fd" =~ ^[0-9]+$ && "$soft" -lt "$target_fd" ]]; then
+    ulimit -n "$target_fd" 2>/dev/null || ulimit -n 10240 2>/dev/null || true
+  fi
+  log "文件描述符 soft limit: $(ulimit -n 2>/dev/null || echo '?')"
+fi
+
 log "本地交叉编译 hank-server ($TARGET.$GLIBC) ..."
 cd "$PROJECT_ROOT"
 cargo zigbuild --release -p hank-server --target "$TARGET.$GLIBC"
