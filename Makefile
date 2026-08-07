@@ -14,7 +14,7 @@ help:
 	@echo "    make app-dev            远程终端 App 前端 (Vite :18791)"
 	@echo ""
 	@echo "  构建:"
-	@echo "    make app                 构建桌面客户端并安装到 /Applications"
+	@echo "    make client                 构建桌面客户端并安装到 /Applications"
 	@echo ""
 	@echo "  部署:"
 	@echo "    make deploy              本地交叉编译 server + 构建 admin/app，推产物到线上"
@@ -43,7 +43,7 @@ app-dev:
 	cd app && pnpm dev
 
 # 构建桌面客户端 (Tauri release) 并安装到 /Applications
-app:
+client:
 	cd client && pnpm tauri build
 	rm -rf /Applications/Trace.app
 	cp -R client/src-tauri/target/release/bundle/macos/Trace.app /Applications/
