@@ -37,6 +37,13 @@ enabled = false
 # quant A2A Server 根地址（也可直接填 .../a2a）；省略时默认 http://127.0.0.1:8100
 base_url = "http://127.0.0.1:8100"
 
+# WebRTC ICE/TURN（admin 远程终端 P2P）。不配 secret 时只回公网 STUN（同 LAN 仍可直连）。
+# 生产建议配 coturn use-auth-secret（可与 handy 共用同一 coturn，secret 可分开）。
+# [turn]
+# urls = ["turn:your-host:3478?transport=udp", "turn:your-host:3478?transport=tcp"]
+# secret = "coturn-shared-secret"
+# ttl_seconds = 86400
+
 # 飞书渠道：应用凭证不走配置文件，由 admin REST 管理（见 docs/feishu.md）：
 #   POST /api/admin/feishu/accounts  {name, app_id, app_secret}
 # 多实例共库时只能一个实例开 WS 长连接（在 [server] 里设 feishu_monitor = false 可关）

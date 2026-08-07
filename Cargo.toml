@@ -62,3 +62,8 @@ cron = "0.15"
 chrono-tz = "0.10"
 # API key 入库指纹(sha256,只存哈希不存明文)
 sha2 = "0.10"
+# handy 渠道 webhook 验签(HMAC-SHA256 + hex)
+hmac = "0.12"
+hex = "0.4"
+# coturn use-auth-secret 限时 ICE 凭据（HMAC-SHA1）
+sha1 = "0.10"

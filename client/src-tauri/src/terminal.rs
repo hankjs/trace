@@ -1,6 +1,6 @@
 //! 内置终端：基于 portable-pty 的 PTY 会话管理。
-//! 每个会话持有 shell 子进程、写入端、滚动缓冲（256KB 环形），
-//! 输出通过 `term-output/{id}` 事件实时推给前端。
+//! 每个会话持有 shell 子进程、写入端、滚动缓冲（256KB 环形）+ vt100 屏幕状态，
+//! 输出通过 `term-output/{id}` 事件实时推给前端；RTC/中转通道读 screen 缓冲。
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::screen::{Delta, ScreenBuffer};
 
 const SCROLLBACK_CAP: usize = 256 * 1024;
 
@@ -22,6 +24,8 @@ pub struct TermSession {
     pub cwd: String,
     pub created_at: String,
     pub scrollback: Arc<Mutex<VecDeque<u8>>>,
+    /// vt100 屏幕状态 + 有序增量（RTC / 中转的事实源）
+    pub screen: Arc<Mutex<ScreenBuffer>>,
     pub alive: Arc<AtomicBool>,
     /// PTY 当前尺寸，随 term_create/term_resize 更新
     pub cols: u16,
@@ -31,6 +35,88 @@ pub struct TermSession {
 #[derive(Default)]
 pub struct TermManager {
     pub sessions: Mutex<HashMap<String, TermSession>>,
+}
+
+impl TermManager {
+    /// 会话存活：None = 不存在，Some(false) = 子进程已退出
+    pub fn term_alive(&self, id: &str) -> Option<bool> {
+        let sessions = self.sessions.lock().unwrap();
+        sessions.get(id).map(|s| s.alive.load(Ordering::SeqCst))
+    }
+
+    /// 原始字节写入（RTC DataChannel / 远程工具共用）
+    pub fn term_write_bytes(&self, id: &str, data: &[u8]) -> Result<(), String> {
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(id).ok_or("terminal not found")?;
+        session
+            .writer
+            .write_all(data)
+            .and_then(|_| session.writer.flush())
+            .map_err(|e| format!("write failed: {e}"))
+    }
+
+    /// 调整尺寸：PTY ioctl 与 vt100 必须同步
+    pub fn term_resize_inner(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
+        if cols == 0 || rows == 0 {
+            return Err("终端尺寸必须为正数".into());
+        }
+        let mut sessions = self.sessions.lock().unwrap();
+        let session = sessions.get_mut(id).ok_or("terminal not found")?;
+        session
+            .master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| format!("resize failed: {e}"))?;
+        session.screen.lock().unwrap().resize(rows, cols);
+        session.cols = cols;
+        session.rows = rows;
+        Ok(())
+    }
+
+    pub fn term_close_inner(&self, id: &str) -> Result<(), String> {
+        let session = self.sessions.lock().unwrap().remove(id);
+        if let Some(session) = session {
+            session.alive.store(false, Ordering::SeqCst);
+            #[cfg(unix)]
+            if session.child_pid > 0 {
+                unsafe {
+                    libc::kill(session.child_pid as i32, libc::SIGHUP);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn screen_of(&self, id: &str) -> Result<Arc<Mutex<ScreenBuffer>>, String> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions.get(id).ok_or("terminal not found")?;
+        Ok(session.screen.clone())
+    }
+
+    /// 当前尺寸（cols, rows）
+    pub fn term_size(&self, id: &str) -> Result<(u16, u16), String> {
+        let sessions = self.sessions.lock().unwrap();
+        let session = sessions.get(id).ok_or("terminal not found")?;
+        Ok((session.cols, session.rows))
+    }
+
+    /// 带 ANSI 的整屏 + 当时 seq（xterm 首帧 / resync）
+    pub fn term_ansi_screen(&self, id: &str) -> Result<(Vec<u8>, u64), String> {
+        let screen = self.screen_of(id)?;
+        let screen = screen.lock().unwrap();
+        Ok((screen.ansi_snapshot(), screen.seq()))
+    }
+
+    /// after_seq 之后的原始增量；bool=false 表示有缺口需整屏重取
+    pub fn term_deltas(&self, id: &str, after_seq: u64) -> Result<(Vec<Delta>, bool), String> {
+        let screen = self.screen_of(id)?;
+        let result = screen.lock().unwrap().deltas_since(after_seq);
+        Ok(result)
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -354,13 +440,24 @@ fi
 [[ -f "$__TRACE_REAL_ZDOTDIR/.zprofile" ]] && source "$__TRACE_REAL_ZDOTDIR/.zprofile"
 "##;
     std::fs::write(dir.join(".zprofile"), profile).ok()?;
+    // .zshenv 是 zsh 最早读的启动文件（所有 shell 形态都会读），同样按当时的
+    // ZDOTDIR 查找；不包一层的话 volta/fnm 等装在 ~/.zshenv 里的 PATH 会整个丢掉
+    let zshenv = r##"# Trace terminal shell integration (auto-generated, 勿手改)
+if [[ -n "$TRACE_ORIG_ZDOTDIR" ]]; then
+  __TRACE_REAL_ZDOTDIR="$TRACE_ORIG_ZDOTDIR"
+else
+  __TRACE_REAL_ZDOTDIR="$HOME"
+fi
+[[ -f "$__TRACE_REAL_ZDOTDIR/.zshenv" ]] && source "$__TRACE_REAL_ZDOTDIR/.zshenv"
+"##;
+    std::fs::write(dir.join(".zshenv"), zshenv).ok()?;
     Some(dir.to_string_lossy().to_string())
 }
 
 #[tauri::command]
 pub fn term_create(
     app: AppHandle,
-    state: State<'_, TermManager>,
+    state: State<'_, Arc<TermManager>>,
     cols: u16,
     rows: u16,
     cwd: Option<String>,
@@ -417,15 +514,17 @@ pub fn term_create(
     let child_pid = child.process_id().unwrap_or(0);
     let id = uuid::Uuid::new_v4().to_string();
     let scrollback: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let screen: Arc<Mutex<ScreenBuffer>> = Arc::new(Mutex::new(ScreenBuffer::new(rows, cols)));
     let alive = Arc::new(AtomicBool::new(true));
 
-    // reader 线程：PTY 输出 → scrollback + 事件推送 + 通知捕获（OSC 9/777/133/BEL）
+    // reader 线程：PTY 输出 → scrollback + screen + 事件推送 + 通知捕获（OSC 9/777/133/BEL）
     let mut reader = pair
         .master
         .try_clone_reader()
         .map_err(|e| format!("clone reader failed: {e}"))?;
     {
         let scrollback = scrollback.clone();
+        let screen = screen.clone();
         let event = format!("term-output/{id}");
         let app = app.clone();
         let term_id = id.clone();
@@ -442,6 +541,8 @@ pub fn term_create(
                     Ok(n) => {
                         let chunk = &buf[..n];
                         append_scrollback(&scrollback, chunk);
+                        // 屏幕缓冲同步喂入：唯一写入方，顺序即字节到达顺序
+                        screen.lock().unwrap().feed(chunk);
                         for (kind, title, body) in scanner.feed(chunk) {
                             // 带上前台进程名（如 "kimi · 任务通知"），与原视图侧行为一致
                             let fg = foreground_cmd(child_pid, &shell_for_notify);
@@ -503,6 +604,7 @@ pub fn term_create(
         cwd,
         created_at: chrono::Utc::now().to_rfc3339(),
         scrollback,
+        screen,
         alive,
         cols,
         rows,
@@ -513,55 +615,28 @@ pub fn term_create(
 }
 
 #[tauri::command]
-pub fn term_write(state: State<'_, TermManager>, id: String, data: String) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions.get_mut(&id).ok_or("terminal not found")?;
-    session
-        .writer
-        .write_all(data.as_bytes())
-        .and_then(|_| session.writer.flush())
-        .map_err(|e| format!("write failed: {e}"))
+pub fn term_write(state: State<'_, Arc<TermManager>>, id: String, data: String) -> Result<(), String> {
+    state.term_write_bytes(&id, data.as_bytes())
 }
 
 #[tauri::command]
 pub fn term_resize(
-    state: State<'_, TermManager>,
+    state: State<'_, Arc<TermManager>>,
     id: String,
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    let session = sessions.get_mut(&id).ok_or("terminal not found")?;
-    session
-        .master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("resize failed: {e}"))?;
-    session.cols = cols;
-    session.rows = rows;
-    Ok(())
+    state.term_resize_inner(&id, cols, rows)
 }
 
 #[tauri::command]
-pub fn term_close(state: State<'_, TermManager>, id: String) -> Result<(), String> {
-    let session = state.sessions.lock().unwrap().remove(&id);
-    if let Some(session) = session {
-        session.alive.store(false, Ordering::SeqCst);
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(session.child_pid as i32, libc::SIGHUP);
-        }
-    }
-    Ok(())
+pub fn term_close(state: State<'_, Arc<TermManager>>, id: String) -> Result<(), String> {
+    state.term_close_inner(&id)
 }
 
 #[tauri::command]
 pub fn term_read(
-    state: State<'_, TermManager>,
+    state: State<'_, Arc<TermManager>>,
     id: String,
     max_bytes: Option<usize>,
     raw: Option<bool>,
@@ -590,14 +665,17 @@ fn foreground_cwd(s: &TermSession) -> String {
 }
 
 #[tauri::command]
-pub fn term_foreground_cwd(state: State<'_, TermManager>, id: String) -> Result<String, String> {
+pub fn term_foreground_cwd(
+    state: State<'_, Arc<TermManager>>,
+    id: String,
+) -> Result<String, String> {
     let sessions = state.sessions.lock().unwrap();
     let session = sessions.get(&id).ok_or("terminal not found")?;
     Ok(foreground_cwd(session))
 }
 
 #[tauri::command]
-pub fn term_list(state: State<'_, TermManager>) -> Vec<TermInfo> {
+pub fn term_list(state: State<'_, Arc<TermManager>>) -> Vec<TermInfo> {
     let sessions = state.sessions.lock().unwrap();
     sessions.values().map(session_info).collect()
 }

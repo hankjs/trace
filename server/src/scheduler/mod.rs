@@ -88,6 +88,9 @@ pub fn start(state: Arc<AppState>) {
         tracing::info!("scheduler disabled by config (scheduler_enabled=false), skip");
         return;
     }
+    // handy 闸门兜底轮询（30s）：与调度器同开关——多实例共库时只能一个实例
+    // 轮询，否则同一应答会被两个实例重复补答（虽有原子应答兜底，但白白双倍请求）。
+    jobs::start_handy_gate_poller(state.clone());
     tokio::spawn(async move {
         match state.db.fail_stale_running_job_runs().await {
             Ok(0) => {}

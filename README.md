@@ -210,8 +210,11 @@ reasoner = "deepseek-reasoner"
 
 ## 外部系统接入
 
-handy 等外部系统经独立桥接服务接入，trace 体内没有 handy 专用代码。trace 只暴露
-通用 client API：SSE 聊天流（交互单落库后补发 `interaction_created` 事件）+
+handy 走体内渠道接入（`server/src/handy/`）：每个用户在 client 设置页配自己的
+handy 连接（base_url + token + webhook_secret），进度卡片/人工闸门下行到 handy，
+用户操作经 webhook 回推，详见 `AGENTS.md` 的「运行时架构」一节。
+
+其他外部系统用通用 client API：SSE 聊天流（交互单落库后补发 `interaction_created` 事件）+
 `GET /api/sessions/:id/interactions` / `POST /api/sessions/:id/interactions/:iid/answer`
 交互单查询与应答端点，详见 `AGENTS.md` 的「通用 client 交互单 API」一节。
 

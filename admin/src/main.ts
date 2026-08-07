@@ -34,6 +34,7 @@ const router = createRouter({
     { path: '/jobs', component: () => import('./views/Jobs.vue') },
     { path: '/interactions', component: () => import('./views/Interactions.vue'), meta: { width: 'wide' } },
     { path: '/interactions/:id', component: () => import('./views/Interactions.vue'), meta: { width: 'wide' } },
+    { path: '/terminals', component: () => import('./views/Terminals.vue'), meta: { fill: true, width: 'full' } },
   ],
 })
 

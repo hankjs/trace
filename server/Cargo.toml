@@ -47,6 +47,9 @@ prost = { workspace = true }
 cron = { workspace = true }
 chrono-tz = { workspace = true }
 sha2 = { workspace = true }
+sha1 = { workspace = true }
+hmac = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

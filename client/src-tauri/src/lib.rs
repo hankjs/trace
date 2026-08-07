@@ -1,6 +1,8 @@
 mod acp;
 mod commands;
 mod llm_stream;
+mod rtc;
+mod screen;
 mod terminal;
 mod tools;
 
@@ -28,7 +30,8 @@ pub fn run() {
             });
 
             app.manage(state);
-            app.manage(terminal::TermManager::default());
+            // Arc 共享：Tauri 命令与 RTC 后台任务共用同一 TermManager
+            app.manage(Arc::new(terminal::TermManager::default()));
 
             // macOS 默认菜单的 Close Window (⌘W) 会抢走快捷键关闭整个窗口,
             // 移除它让 ⌘W 透传到前端用于关闭终端 pane
@@ -80,6 +83,7 @@ pub fn run() {
             terminal::term_read,
             terminal::term_list,
             terminal::term_foreground_cwd,
+            rtc::rtc_accept_offer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

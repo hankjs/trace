@@ -1,6 +1,7 @@
 //! 定时任务实现。
 
 use crate::feishu::api::FeishuApi;
+use crate::handy::client::HandyApi;
 use crate::scheduler::TZ;
 use crate::AppState;
 use anyhow::{anyhow, bail, Context, Result};
@@ -8,9 +9,105 @@ use chrono::TimeZone;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// 单用户简报的信号条数上限（防刷屏）
 const MAX_BRIEF_ITEMS: usize = 20;
+
+/// handy 闸门兜底轮询间隔（webhook 重试 3 次后放弃，丢的应答靠这里回收）
+const HANDY_GATE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+
+/// handy 侧交互单终态集：见到即摘掉映射停止跟踪
+/// （trace 单本身保持 pending，仍可由其他路径应答）。
+const HANDY_TERMINAL_INTERACTION_STATUS: &[&str] =
+    &["done", "failed", "cancelled", "expired", "superseded"];
+
+fn is_handy_terminal(status: &str) -> bool {
+    HANDY_TERMINAL_INTERACTION_STATUS.contains(&status)
+}
+
+/// 启动 handy 闸门兜底轮询（由 scheduler::start 在 scheduler_enabled 检查
+/// 通过后调用：多实例共库时只能一个实例轮询，避免重复补答）。
+/// 循环内任何错误只记日志，下一轮继续——这个循环绝不能死。
+pub fn start_handy_gate_poller(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(HANDY_GATE_POLL_INTERVAL);
+        loop {
+            tick.tick().await;
+            if let Err(e) = poll_handy_gates(&state).await {
+                tracing::warn!("handy 闸门兜底轮询失败（下轮继续）: {e:#}");
+            }
+        }
+    });
+}
+
+/// 全量扫 channel=handy 且已挂 handy 映射的 pending 交互单，逐条查 handy 侧状态。
+async fn poll_handy_gates(state: &Arc<AppState>) -> Result<()> {
+    let gates = state.db.list_pending_handy_gates().await?;
+    for gate in &gates {
+        if let Err(e) = poll_one_handy_gate(state, gate).await {
+            // 单条失败不影响其他单，留到下轮重试
+            tracing::warn!(
+                interaction_id = %gate.id,
+                "handy 闸门轮询单条失败（下轮重试）: {e:#}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn poll_one_handy_gate(state: &Arc<AppState>, gate: &hank_db::AgentInteraction) -> Result<()> {
+    let Some(handy_iid) = gate
+        .resume_ref
+        .as_ref()
+        .and_then(|r| r["handy_interaction_id"].as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(());
+    };
+    // 账号被删/停用：留到下轮（可能重新配置启用），不算错误
+    let account = match state.db.get_handy_account(&gate.user_id).await? {
+        Some(a) if a.enabled => a,
+        _ => return Ok(()),
+    };
+    let api = HandyApi::new(&account.base_url, &account.token);
+    let interaction = api.get_interaction(handy_iid).await?;
+    match interaction.status.as_str() {
+        "pending" => Ok(()),
+        "answered" => {
+            let answer = interaction.answer.unwrap_or_default();
+            if answer.is_empty() {
+                tracing::warn!(
+                    handy_interaction_id = handy_iid,
+                    "handy 交互单已应答但 answer 为空，停止跟踪"
+                );
+                state.db.clear_interaction_handy_ref(&gate.id).await?;
+            } else {
+                // 与 webhook 路径同一入口，原子应答天然幂等；
+                // 成功后 trace 单离开 pending，下轮自然不再跟踪。
+                crate::handy::webhook::answer_trace_interaction(
+                    state,
+                    &gate.id,
+                    &answer,
+                    &gate.user_id,
+                )
+                .await;
+            }
+            Ok(())
+        }
+        s if is_handy_terminal(s) => {
+            state.db.clear_interaction_handy_ref(&gate.id).await?;
+            tracing::info!(
+                interaction_id = %gate.id,
+                handy_status = s,
+                "handy 闸门已进终态，停止跟踪"
+            );
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 
 #[derive(Debug, Deserialize)]
 struct SignalsResp {
@@ -152,6 +249,16 @@ fn format_brief(today: chrono::NaiveDate, items: &[SignalItem]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handy_terminal_status_set() {
+        for s in ["done", "failed", "cancelled", "expired", "superseded"] {
+            assert!(is_handy_terminal(s), "{s} 应是 handy 交互单终态");
+        }
+        for s in ["pending", "answered", ""] {
+            assert!(!is_handy_terminal(s), "{s} 不应是终态");
+        }
+    }
 
     #[test]
     fn brief_formatting() {

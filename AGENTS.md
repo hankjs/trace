@@ -109,8 +109,16 @@ make app                          # 构建 Trace.app 并安装到 /Applications
   代码工作区都已下线，server 不在任何用户机器上跑命令。
 - 微信通道 (`server/src/weixin/`) 提供扫码登录、消息收发、`/snap` 网页截图 (headless Chromium)、
   `/shot` 终端截图 (SGR→SVG→PNG) 等能力。
-- handy 等外部系统不经 trace 体内渠道代码接入，而是走独立桥接服务；
-  trace 只暴露通用 client API（见下文「通用 client 交互单 API」）。
+- handy 渠道 (`server/src/handy/`) 是体内渠道：agent 进度卡片/人工闸门下行到 handy，
+  用户在 handy 网页点按钮/留言经 webhook 回推（`POST /api/channels/handy/{user_id}/webhook`，
+  HMAC-SHA256 验签）。凭证是**用户级**：每用户在 client 设置页配自己的
+  base_url + hnk_ token + webhook_secret（`handy_accounts` 表），不走 config.toml，
+  也不需要 `trk_` API key。其他外部系统仍可走下文「通用 client 交互单 API」。
+- **远程终端（admin 网页控桌面 client）**：桌面端设置开启「允许远程终端」后注册并长轮询
+  （`/api/client/*`，`server/src/remote_term/`）。Admin `/terminals` 经中转读写
+  （`terminal_*` 工具）或 WebRTC DataChannel 直连（`rtc_signal` 信令 + `client/src-tauri/src/rtc.rs`，
+  协议对齐 handy）。ICE/TURN 见 `config.toml` `[turn]`；失败静默回落中转。
+  **不**恢复 agent 远程执行（shell/写文件/exec_client_id）。
 
 ## 通用 client 交互单 API
 
@@ -130,8 +138,9 @@ make app                          # 构建 Trace.app 并安装到 /Applications
 
 管理侧对应端点在 `/api/admin/interactions*`（server/src/interactions.rs 前半）。
 
-handy 等外部系统经独立桥接服务接入（桥接服务持有 trace 用户 JWT 或 API key，
-调上述通用端点 + SSE/chat 接口驱动 trace）；trace 体内没有任何 handy 专用代码。
+handy 不走这套通用 API，它有体内渠道（`server/src/handy/`，见「运行时架构」）；
+其他外部系统（如已退役的独立桥接服务的后继者）仍经通用端点 + SSE/chat 接口驱动 trace，
+凭证用下文 API key。
 
 ## API key 认证
 

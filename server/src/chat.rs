@@ -454,6 +454,53 @@ pub async fn run_chat_turn(
     let sid = session_id.clone();
     let content_text = text_from_blocks(&content);
 
+    // handy 渠道：任何 metadata.source=="handy" 的会话在 run 启动时自动挂
+    // handy pusher（进度卡片 + 人工闸门下行到 handy）。router 派发的首轮与
+    // interaction_flow 应答后的 resume 轮都汇聚到 run_chat_turn，hook 一处
+    // 覆盖两条入口；与下方 SSE 的 rx 并列订阅同一个 EventBuffer broadcast，
+    // 互不影响。凭证按会话 user_id 从 handy_accounts 表取（用户级配置），
+    // 未配置 / 停用 / 无 user_id 只记日志不挂，会话本身照常跑。
+    if metadata_source == "handy" {
+        let handy_api = match session_user_id.as_deref() {
+            Some(uid) => match state.db.get_handy_account(uid).await {
+                Ok(Some(account)) if account.enabled => Some(
+                    crate::handy::client::HandyApi::new(&account.base_url, &account.token),
+                ),
+                Ok(_) => {
+                    tracing::warn!(session_id = %session_id, "handy 会话所属用户未配置/已停用 handy，跳过 pusher 挂接");
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(session_id = %session_id, "handy 读取账号失败，跳过 pusher 挂接: {e:#}");
+                    None
+                }
+            },
+            None => {
+                tracing::warn!(session_id = %session_id, "handy 会话缺 user_id，跳过 pusher 挂接");
+                None
+            }
+        };
+        if let Some(api) = handy_api {
+            let handy_rx = {
+                let buffers = state.event_buffers.read().await;
+                buffers.get(&session_id).map(|buf| buf.tx.subscribe())
+            };
+            if let Some(handy_rx) = handy_rx {
+                let task_title = session_record
+                    .as_ref()
+                    .map(|s| s.title.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or_else(|| content_text.chars().take(60).collect());
+                crate::handy::pusher::spawn(
+                    state.clone(),
+                    api,
+                    session_id.clone(),
+                    task_title,
+                    handy_rx,
+                );
+            }
+        }
+    }
     let apply_change_id = opts.apply_change_id.clone();
     let extra_prompt_segments = opts.extra_prompt_segments;
 
@@ -789,6 +836,7 @@ pub async fn run_chat_turn(
                         let channel = match source.as_str() {
                             "weixin" => "weixin",
                             "feishu" => "feishu",
+                            "handy" => "handy",
                             _ => "trace_chat",
                         };
                         match db_fwd
@@ -1606,8 +1654,9 @@ fn parse_quant_confirmation(text: &str, source: &str) -> (u32, String) {
         return (1, "用户已确认，本次高成本量化操作已授权".to_string());
     }
 
-    // 微信入口无批量授权：用户无法表达「确认N次」，按单次确认处理。
-    if source != "weixin" {
+    // 微信 / handy 入口无批量授权：handy 应答是交互卡按钮的文本原文回传，
+    // 没有批量授权 UI，用户无法表达「确认N次」，与微信同口径处理。
+    if source != "weixin" && source != "handy" {
         // 飞书卡片按钮的文案，等价于「确认50次」。
         // 与打字路径共用同一个 grant 上限，不引入第二套配额语义。
         // 用 trim 后的原文判断（normalize 会去空白/小写，中文不受影响）。

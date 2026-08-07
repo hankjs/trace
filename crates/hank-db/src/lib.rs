@@ -116,6 +116,35 @@ pub struct FeishuChat {
     pub updated_at: DateTime<Utc>,
 }
 
+/// handy 连接配置（handy_accounts 表）。用户级：每个 trace 用户一条，
+/// 在用户自己的设置页维护（base_url + hnk_ token + webhook_secret）。
+/// 凭证明文入库（与 feishu_accounts.app_secret 同口径）；出 API 由 server 层
+/// 掩码，这里 skip_serializing 兜底防 struct 直出。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct HandyAccount {
+    pub user_id: String,
+    pub base_url: String,
+    #[serde(skip_serializing)]
+    pub token: String,
+    #[serde(skip_serializing)]
+    pub webhook_secret: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// handy 话题=会话映射（handy_chats 表）。
+/// topic_id 全局唯一（每用户 handy 实例各自发 id，跨用户撞 id 的概率忽略，
+/// 因此不加 account 维度）。入站是 handy 主动 webhook 推送（message.created）。
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct HandyChat {
+    pub id: String,
+    pub topic_id: String,
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Agent 交互单：确认闸门 / ask_user / 任务闸门的统一载体。
 ///
 /// 为什么不能寄生在 session 上：此前 quant_confirm 存进程内 map、ask_user 存
@@ -1150,6 +1179,38 @@ impl Database {
                 updated_at DATETIME NOT NULL DEFAULT NOW(),
                 FOREIGN KEY (account_id) REFERENCES feishu_accounts(id) ON DELETE CASCADE,
                 UNIQUE KEY uk_feishu_chat_topic (account_id, chat_id, topic_id)
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // handy 连接配置（用户级：每 trace 用户一条；凭证管理走 client 级 REST，
+        // 与飞书/微信的 admin 级 accounts 表口径不同——handy 是用户自己的对端）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS handy_accounts (
+                user_id VARCHAR(36) PRIMARY KEY,
+                base_url VARCHAR(255) NOT NULL,
+                token VARCHAR(128) NOT NULL,
+                webhook_secret VARCHAR(128) NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            ) DEFAULT CHARSET=utf8mb4",
+        )
+        .execute(&pool)
+        .await?;
+
+        // handy 话题=会话映射（topic_id 全局唯一；入站走 webhook 推送，无需轮询游标。
+        // 已部署库可能还带着旧的 last_seen_message_id 列，项目无迁移机制，留着不管）
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS handy_chats (
+                id VARCHAR(36) PRIMARY KEY,
+                topic_id VARCHAR(36) NOT NULL,
+                session_id VARCHAR(36) NOT NULL,
+                created_at DATETIME NOT NULL DEFAULT NOW(),
+                updated_at DATETIME NOT NULL DEFAULT NOW(),
+                UNIQUE KEY uk_handy_chat_topic (topic_id)
             ) DEFAULT CHARSET=utf8mb4",
         )
         .execute(&pool)
@@ -3895,8 +3956,76 @@ impl Database {
         Ok(())
     }
 
-    // Handy chats 已随 handy 渠道拆除（桥接服务架构后 trace 不再认识 handy；
-    // 已部署库里的 handy_chats 残留表无迁移机制，留着不管）
+    // ─── Handy（用户级连接配置 + 话题=会话映射；入站走 webhook 推送）───────
+
+    pub async fn get_handy_account(&self, user_id: &str) -> Result<Option<HandyAccount>> {
+        let row = db_retry!(sqlx::query_as::<_, HandyAccount>(
+            "SELECT user_id, base_url, token, webhook_secret, enabled, created_at, updated_at
+                 FROM handy_accounts WHERE user_id = ?"
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 建/更新用户的 handy 连接配置（每用户一条，user_id 为主键）。
+    pub async fn upsert_handy_account(
+        &self,
+        user_id: &str,
+        base_url: &str,
+        token: &str,
+        webhook_secret: &str,
+        enabled: bool,
+    ) -> Result<()> {
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO handy_accounts (user_id, base_url, token, webhook_secret, enabled, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE base_url = VALUES(base_url), token = VALUES(token),
+                     webhook_secret = VALUES(webhook_secret), enabled = VALUES(enabled),
+                     updated_at = VALUES(updated_at)"
+            )
+            .bind(user_id)
+            .bind(base_url)
+            .bind(token)
+            .bind(webhook_secret)
+            .bind(enabled)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
+
+    pub async fn get_handy_chat(&self, topic_id: &str) -> Result<Option<HandyChat>> {
+        let row = db_retry!(sqlx::query_as::<_, HandyChat>(
+            "SELECT id, topic_id, session_id, created_at, updated_at
+                 FROM handy_chats WHERE topic_id = ?"
+        )
+        .bind(topic_id)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
+    }
+
+    /// 建/更新话题映射。
+    pub async fn set_handy_chat(&self, topic_id: &str, session_id: &str) -> Result<()> {
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db_retry!(
+            sqlx::query(
+                "INSERT INTO handy_chats (id, topic_id, session_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE session_id = VALUES(session_id), updated_at = VALUES(updated_at)"
+            )
+            .bind(&id)
+            .bind(topic_id)
+            .bind(session_id)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+        )?;
+        Ok(())
+    }
 
     // ─── Agent 交互单 ────────────────────────────────────────────────────
 
@@ -4008,6 +4137,74 @@ impl Database {
         .bind(id)
         .execute(&self.pool))?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// 把 handy 侧交互单 id 挂到 trace 交互单的 resume_ref.handy_interaction_id：
+    /// handy 闸门兜底轮询（scheduler）靠它找到要查的 handy 单，webhook 丢
+    /// resume_ref 时也靠它反查。复用 resume_ref 列，不新建映射表。仅 pending 可写。
+    pub async fn set_interaction_handy_ref(&self, id: &str, handy_interaction_id: &str) -> Result<bool> {
+        let result = db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                SET resume_ref = JSON_SET(COALESCE(resume_ref, '{}'), '$.handy_interaction_id', ?),
+                    updated_at = NOW()
+              WHERE id = ? AND status = 'pending'"
+        )
+        .bind(handy_interaction_id)
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// 摘掉 handy 闸门映射（handy 侧单进入终态，停止跟踪）。trace 单本身保持
+    /// pending，仍可由其他路径应答。
+    pub async fn clear_interaction_handy_ref(&self, id: &str) -> Result<()> {
+        db_retry!(sqlx::query(
+            "UPDATE agent_interactions
+                SET resume_ref = JSON_REMOVE(resume_ref, '$.handy_interaction_id'),
+                    updated_at = NOW()
+              WHERE id = ?
+                AND JSON_CONTAINS_PATH(resume_ref, 'one', '$.handy_interaction_id')"
+        )
+        .bind(id)
+        .execute(&self.pool))?;
+        Ok(())
+    }
+
+    /// handy 渠道待回收应答的闸门：channel=handy、pending、已挂 handy 交互单 id。
+    pub async fn list_pending_handy_gates(&self) -> Result<Vec<AgentInteraction>> {
+        let rows = db_retry!(sqlx::query_as::<_, AgentInteraction>(
+            "SELECT id, session_id, user_id, channel, account_id,
+                        chat_id, topic_id, kind, title, goal, analysis, `options` AS `options`, status,
+                        answer, answered_by, answered_at, resume_ref, card_message_id, expires_at,
+                        result, error, created_at, updated_at
+                 FROM agent_interactions
+                 WHERE channel = 'handy' AND status = 'pending'
+                   AND JSON_CONTAINS_PATH(resume_ref, 'one', '$.handy_interaction_id')
+                 ORDER BY created_at"
+        )
+        .fetch_all(&self.pool))?;
+        Ok(rows)
+    }
+
+    /// 按 handy 侧交互单 id 反查 trace 交互单（webhook 丢 resume_ref 时的退化路径）。
+    pub async fn find_handy_gate_by_ref(
+        &self,
+        handy_interaction_id: &str,
+    ) -> Result<Option<AgentInteraction>> {
+        let row = db_retry!(sqlx::query_as::<_, AgentInteraction>(
+            "SELECT id, session_id, user_id, channel, account_id,
+                        chat_id, topic_id, kind, title, goal, analysis, `options` AS `options`, status,
+                        answer, answered_by, answered_at, resume_ref, card_message_id, expires_at,
+                        result, error, created_at, updated_at
+                 FROM agent_interactions
+                 WHERE channel = 'handy'
+                   AND JSON_UNQUOTE(JSON_EXTRACT(resume_ref, '$.handy_interaction_id')) = ?
+                 ORDER BY created_at DESC
+                 LIMIT 1"
+        )
+        .bind(handy_interaction_id)
+        .fetch_optional(&self.pool))?;
+        Ok(row)
     }
 
     /// 原子应答：仅 pending 且未过期时成功，防重复点击。返回 None 表示已被抢答或过期。

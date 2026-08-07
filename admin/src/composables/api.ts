@@ -271,6 +271,34 @@ export interface AgentInteraction {
   updated_at: string
 }
 
+export interface ClientAgentInfo {
+  id: string
+  user_id: string
+  hostname: string | null
+  work_dir: string | null
+  accept_remote: boolean
+  enabled: boolean
+  last_active_at: string | null
+  last_seen_at: string | null
+  online: boolean
+}
+
+export interface TermInfo {
+  id: string
+  shell: string
+  cwd: string
+  foreground_cmd: string
+  alive: boolean
+  created_at: string
+  cols: number
+  rows: number
+}
+
+export interface RtcIceConfig {
+  iceServers: RTCIceServer[]
+  ttl: number
+}
+
 export interface AgentEventRecord {
   id: string
   session_id: string
@@ -604,6 +632,54 @@ export const api = {
       },
       body: JSON.stringify({ prompt, context }),
     })
+  },
+
+  // ---- 终端代理 + WebRTC 信令 ----
+
+  listClients() {
+    return request<ClientAgentInfo[]>('/api/admin/clients')
+  },
+
+  clientSetEnabled(clientId: string, enabled: boolean) {
+    return request<{ id: string; enabled: boolean }>(
+      `/api/admin/clients/${clientId}/enabled`,
+      { method: 'POST', body: JSON.stringify({ enabled }) },
+    )
+  },
+
+  listClientTerminals(clientId: string) {
+    return request<TermInfo[]>(`/api/admin/clients/${clientId}/terminals`)
+  },
+
+  terminalOutput(clientId: string, termId: string, lines = 200) {
+    return request<{ output: string }>(
+      `/api/admin/clients/${clientId}/terminals/${termId}/output?lines=${lines}`,
+    )
+  },
+
+  /** 保留 ANSI 的原始输出，供 xterm 回放渲染 */
+  terminalOutputRaw(clientId: string, termId: string) {
+    return request<{ output: string }>(
+      `/api/admin/clients/${clientId}/terminals/${termId}/output?raw=true`,
+    )
+  },
+
+  terminalInput(clientId: string, termId: string, data: string) {
+    return request<{ sent: boolean }>(
+      `/api/admin/clients/${clientId}/terminals/${termId}/input`,
+      { method: 'POST', body: JSON.stringify({ data }) },
+    )
+  },
+
+  rtcIce() {
+    return request<RtcIceConfig>('/api/admin/rtc/ice')
+  },
+
+  rtcOffer(clientId: string, sdp: string) {
+    return request<RTCSessionDescriptionInit>(
+      `/api/admin/clients/${clientId}/rtc/offer`,
+      { method: 'POST', body: JSON.stringify({ sdp }) },
+    )
   },
 }
 

@@ -5,7 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import { createBindCode, getBinding, unbind, type WeixinBinding } from "../api/weixin";
 import { createFeishuBindCode, getFeishuBinding, unbindFeishu, type FeishuBinding } from "../api/feishu";
-
+import { getHandyAccount, putHandyAccount, testHandyAccount, type HandyAccount } from "../api/handy";
+import { useRemoteTerm } from "../composables/useRemoteTerm";
 
 interface AgentConfig {
   name: string;
@@ -14,6 +15,26 @@ interface AgentConfig {
 }
 
 const router = useRouter();
+
+// 远程终端（admin 网页 / P2P 控本机终端）
+const {
+  clientId: remoteClientId,
+  acceptRemote,
+  isPolling: remoteIsPolling,
+  setAcceptRemote,
+} = useRemoteTerm();
+const acceptRemoteLocal = ref(acceptRemote.value);
+const remoteToggling = ref(false);
+
+async function toggleAcceptRemote(v: boolean) {
+  remoteToggling.value = true;
+  try {
+    await setAcceptRemote(v);
+    acceptRemoteLocal.value = acceptRemote.value;
+  } finally {
+    remoteToggling.value = false;
+  }
+}
 
 const agents = ref<AgentConfig[]>([]);
 const newName = ref("");
@@ -84,6 +105,7 @@ async function browsePath() {
 onMounted(() => {
   loadAgents();
   loadBinding();
+  loadHandy();
 });
 
 // ---------- 微信绑定 ----------
@@ -262,6 +284,91 @@ onMounted(() => {
   loadFsBinding();
 });
 
+// ---------- handy 渠道 ----------
+
+const handyAccount = ref<HandyAccount | null>(null);
+const handyBaseUrl = ref("");
+const handyToken = ref("");
+const handySecret = ref("");
+const handyEnabled = ref(true);
+const handySaving = ref(false);
+const handyTesting = ref(false);
+const handySaveOk = ref(false);
+const handySaveMsg = ref("");
+const handyTestResult = ref<{ ok: boolean; message: string } | null>(null);
+const handyCopied = ref(false);
+
+async function loadHandy() {
+  const result = await getHandyAccount();
+  if (result.ok && result.data) {
+    handyAccount.value = result.data;
+    handyBaseUrl.value = result.data.base_url;
+    handyEnabled.value = result.data.enabled;
+  }
+}
+
+async function saveHandy() {
+  handySaving.value = true;
+  handySaveMsg.value = "";
+  try {
+    const result = await putHandyAccount({
+      base_url: handyBaseUrl.value.trim(),
+      token: handyToken.value.trim(),
+      webhook_secret: handySecret.value.trim(),
+      enabled: handyEnabled.value,
+    });
+    if (result.ok && result.data) {
+      handyAccount.value = result.data;
+      handyBaseUrl.value = result.data.base_url;
+      handyEnabled.value = result.data.enabled;
+      // 清空输入框：掩码态下空串 = 保留旧值，避免误把掩码写回去
+      handyToken.value = "";
+      handySecret.value = "";
+      handySaveOk.value = true;
+      handySaveMsg.value = "已保存";
+    } else {
+      handySaveOk.value = false;
+      handySaveMsg.value = result.msg || "保存失败";
+    }
+  } finally {
+    handySaving.value = false;
+  }
+}
+
+async function testHandy() {
+  handyTesting.value = true;
+  handyTestResult.value = null;
+  try {
+    const result = await testHandyAccount({
+      base_url: handyBaseUrl.value.trim(),
+      token: handyToken.value.trim(),
+    });
+    if (!result.ok) {
+      handyTestResult.value = { ok: false, message: result.msg || "测试失败" };
+    } else if (result.data?.ok) {
+      const who = result.data.token_name || "handy";
+      const hook = result.data.webhook_configured ? "webhook 已配置" : "webhook 未配置";
+      handyTestResult.value = { ok: true, message: `连接成功：${who}（${hook}）` };
+    } else {
+      handyTestResult.value = { ok: false, message: result.data?.error || "连接失败" };
+    }
+  } finally {
+    handyTesting.value = false;
+  }
+}
+
+async function copyHandyWebhookUrl() {
+  const url = handyAccount.value?.webhook_url;
+  if (!url) return;
+  try {
+    await navigator.clipboard.writeText(url);
+    handyCopied.value = true;
+    setTimeout(() => (handyCopied.value = false), 1500);
+  } catch {
+    // 剪贴板不可用时静默失败，用户可手动选中复制
+  }
+}
+
 onUnmounted(() => {
   clearInterval(countdownTimer);
   stopPolling();
@@ -316,6 +423,32 @@ onUnmounted(() => {
         </div>
       </div>
       <button v-else class="btn-primary" @click="isAdding = true">+ Add Agent</button>
+
+      <h3 class="section-title weixin-title">远程终端</h3>
+      <div class="weixin-section">
+        <p class="weixin-desc">
+          开启后本机会向 server 注册并长轮询；admin 网页可查看/操作本机终端，优先走 WebRTC 直连（失败回落中转）。
+        </p>
+        <label class="remote-toggle-row">
+          <input
+            type="checkbox"
+            :checked="acceptRemoteLocal"
+            :disabled="remoteToggling"
+            @change="toggleAcceptRemote(($event.target as HTMLInputElement).checked)"
+          />
+          允许远程终端控制
+        </label>
+        <div class="weixin-bound-info" style="margin-top: 8px">
+          <span class="weixin-label">Client ID</span>
+          <span class="weixin-value" style="font-family: monospace; font-size: 12px">{{ remoteClientId }}</span>
+        </div>
+        <div class="weixin-bound-info">
+          <span class="weixin-label">状态</span>
+          <span class="weixin-value">
+            {{ acceptRemoteLocal ? (remoteIsPolling ? "在线轮询中" : "已开启（轮询未运行）") : "已关闭" }}
+          </span>
+        </div>
+      </div>
 
       <h3 class="section-title weixin-title">微信绑定</h3>
       <div class="weixin-section">
@@ -378,6 +511,54 @@ onUnmounted(() => {
           <button class="btn-primary" :disabled="fsGeneratingCode" @click="generateFsCode">
             {{ fsGeneratingCode ? "生成中..." : fsBindCode ? "重新生成绑定码" : "生成绑定码" }}
           </button>
+        </div>
+      </div>
+
+      <h3 class="section-title weixin-title">handy 渠道</h3>
+      <div class="weixin-section">
+        <p class="weixin-desc">配置 handy 连接后，agent 进度卡片和人工闸门会推送到你的 handy 网页，可在 handy 侧直接操作回推。</p>
+
+        <!-- 已保存：展示 webhook 回推地址 -->
+        <div v-if="handyAccount?.webhook_url" class="handy-webhook">
+          <p class="weixin-hint">
+            Webhook 地址：到 handy 的「接入凭证」页新建凭证时把这个地址填进 Webhook 地址，再把 handy 返回的 token 和 secret 填回下面保存。
+          </p>
+          <div class="handy-webhook-row">
+            <code class="handy-webhook-url">{{ handyAccount.webhook_url }}</code>
+            <button class="btn-sm" @click="copyHandyWebhookUrl">{{ handyCopied ? "已复制" : "复制" }}</button>
+          </div>
+        </div>
+
+        <div class="add-form handy-form">
+          <input v-model="handyBaseUrl" placeholder="handy 服务地址，如 https://handy.example.com" class="input" />
+          <input
+            v-model="handyToken"
+            type="password"
+            :placeholder="handyAccount?.token ? 'API token（已配置，留空不变）' : 'API token（hnk_ 开头）'"
+            class="input"
+          />
+          <input
+            v-model="handySecret"
+            type="password"
+            :placeholder="handyAccount?.webhook_secret ? 'webhook_secret（已配置，留空不变）' : 'webhook_secret'"
+            class="input"
+          />
+          <label class="remote-toggle-row handy-toggle">
+            <input v-model="handyEnabled" type="checkbox" />
+            启用 handy 推送
+          </label>
+          <div class="form-actions">
+            <button class="btn-primary" :disabled="handySaving || !handyBaseUrl.trim()" @click="saveHandy">
+              {{ handySaving ? "保存中..." : "保存" }}
+            </button>
+            <button class="btn-sm" :disabled="handyTesting" @click="testHandy">
+              {{ handyTesting ? "测试中..." : "测试连接" }}
+            </button>
+          </div>
+          <div v-if="handySaveMsg" class="test-result" :class="{ ok: handySaveOk }">{{ handySaveMsg }}</div>
+          <div v-if="handyTestResult" class="test-result" :class="{ ok: handyTestResult.ok }">
+            {{ handyTestResult.message }}
+          </div>
         </div>
       </div>
     </div>
@@ -454,4 +635,9 @@ onUnmounted(() => {
 .remote-status { font-size: 0.8rem; color: var(--color-text-secondary); margin-bottom: 0.75rem; }
 .remote-status.on { color: var(--color-success, #4f4); }
 .remote-workdir-row { display: flex; gap: 0.5rem; margin-bottom: 0.5rem; }
+.handy-webhook { margin-bottom: 0.75rem; }
+.handy-webhook-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.25rem; }
+.handy-webhook-url { flex: 1; font-family: monospace; font-size: 0.8rem; background: var(--color-surface-1, #1a1a1a); padding: 0.4rem 0.5rem; border-radius: 0.25rem; color: var(--color-text-primary); word-break: break-all; }
+.handy-form { margin-top: 0.25rem; }
+.handy-toggle { margin-bottom: 0; }
 </style>

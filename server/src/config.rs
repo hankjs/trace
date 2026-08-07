@@ -13,6 +13,24 @@ pub struct Config {
     pub server_agent: ServerAgentConfig,
     #[serde(default)]
     pub quant_a2a: Option<QuantA2aConfig>,
+    /// WebRTC ICE/TURN（admin 远程终端 P2P）。缺省只回公网 STUN。
+    #[serde(default)]
+    pub turn: TurnConfig,
+}
+
+/// coturn use-auth-secret 配置。urls 空时 ice 签发退回公网 STUN。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TurnConfig {
+    #[serde(default)]
+    pub urls: Vec<String>,
+    #[serde(default)]
+    pub secret: String,
+    #[serde(default = "default_turn_ttl")]
+    pub ttl_seconds: u64,
+}
+
+fn default_turn_ttl() -> u64 {
+    86400
 }
 
 /// server 侧原生会话开关。

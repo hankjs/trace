@@ -1,4 +1,5 @@
 mod admin;
+mod admin_terminal;
 mod api_keys;
 mod auth;
 mod changes;
@@ -8,11 +9,13 @@ mod checkpoints;
 mod config;
 mod server_workspace;
 mod feishu;
+mod handy;
 mod image_gen;
 mod interaction_flow;
 mod interactions;
 mod llm;
 pub mod provider_registry;
+mod remote_term;
 mod requirement_docs;
 pub mod response;
 mod routes;
@@ -21,6 +24,7 @@ mod skills;
 mod snap_tools;
 mod specs;
 pub mod task_state;
+mod turn;
 mod websnap;
 mod weixin;
 
@@ -68,6 +72,8 @@ pub struct AppState {
     pub quant_grant_store: Arc<code_tools::quant_grant::QuantGrantStore>,
     /// 渠道任务闸门与实时进度快照（单任务串行 + 随时可查进度）
     pub tasks: Arc<task_state::TaskRegistry>,
+    /// 桌面 client 远程终端通道（user_id → 长轮询/派发状态）
+    pub client_hubs: RwLock<HashMap<String, remote_term::UserHub>>,
 }
 
 async fn auth_middleware(
@@ -207,6 +213,7 @@ async fn main() -> Result<()> {
         weixin_channel_history: RwLock::new(HashMap::new()),
         quant_grant_store: Arc::new(code_tools::quant_grant::QuantGrantStore::new()),
         tasks: Arc::new(task_state::TaskRegistry::new()),
+        client_hubs: RwLock::new(HashMap::new()),
     });
 
     // 一次性收尾：过期 pending → expired；卡住的 answered 僵尸 → pending；
@@ -278,7 +285,12 @@ async fn main() -> Result<()> {
     // Public routes (no auth required)
     let public = Router::new()
         .route("/api/health", get(routes::health))
-        .route("/api/auth/login", post(routes::login));
+        .route("/api/auth/login", post(routes::login))
+        // handy webhook：无 JWT，handler 内按 user_id 解析账号后自行 HMAC-SHA256 验签
+        .route(
+            "/api/channels/handy/{user_id}/webhook",
+            post(handy::webhook::webhook_handler),
+        );
 
     // Protected routes (auth required)
     let protected = Router::new()
@@ -429,6 +441,24 @@ async fn main() -> Result<()> {
             "/api/feishu/binding",
             delete(feishu::routes::delete_binding),
         )
+        // Handy routes (client)：用户级 handy 连接配置管理
+        .route("/api/handy/account", get(handy::routes::get_account))
+        .route("/api/handy/account", put(handy::routes::put_account))
+        .route(
+            "/api/handy/account/test",
+            post(handy::routes::test_account),
+        )
+        // 桌面 client 远程终端通道（注册 + 长轮询 + 结果回传）
+        .route(
+            "/api/client/registration",
+            put(remote_term::register_client),
+        )
+        .route("/api/client/poll", get(remote_term::poll_requests))
+        .route(
+            "/api/client/tool-result",
+            post(remote_term::post_tool_result),
+        )
+        .route("/api/client/online", get(remote_term::list_online))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -576,6 +606,29 @@ async fn main() -> Result<()> {
             get(scheduler::routes::job_runs),
         )
         .route("/api/admin/jobs/{id}/run", post(scheduler::routes::run_job))
+        // Admin 终端代理 + WebRTC 信令
+        .route("/api/admin/clients", get(admin_terminal::list_clients))
+        .route(
+            "/api/admin/clients/{cid}/enabled",
+            post(admin_terminal::set_client_enabled),
+        )
+        .route(
+            "/api/admin/clients/{cid}/terminals",
+            get(admin_terminal::list_terminals),
+        )
+        .route(
+            "/api/admin/clients/{cid}/terminals/{tid}/output",
+            get(admin_terminal::terminal_output),
+        )
+        .route(
+            "/api/admin/clients/{cid}/terminals/{tid}/input",
+            post(admin_terminal::terminal_input),
+        )
+        .route(
+            "/api/admin/clients/{cid}/rtc/offer",
+            post(admin_terminal::rtc_offer),
+        )
+        .route("/api/admin/rtc/ice", get(admin_terminal::rtc_ice))
         // 交互单管理（列表/详情/手动应答/取消；应答会真派发 resume）
         .route(
             "/api/admin/interactions",
