@@ -5,7 +5,7 @@
 #
 # 流程:
 #   1. 本地 cargo zigbuild 交叉编译 hank-server → x86_64 glibc 2.27
-#   2. 本地 pnpm build 出 admin/dist
+#   2. 本地 pnpm build 出 admin/dist + app/dist
 #   3. scp/rsync 产物到 /opt/hank/releases/<release-id>
 #   4. 原子切换 current 软链（previous 保留上一版可回退）
 #   5. 重启 systemd 服务并做健康检查
@@ -74,19 +74,26 @@ if command -v objdump >/dev/null && objdump -p "$BINARY" 2>/dev/null | grep -q '
   exit 1
 fi
 
-# ---------- 2. 本地构建 admin ----------
+# ---------- 2. 本地构建 admin + app ----------
 log "本地构建 admin 前端 ..."
 cd "$PROJECT_ROOT/admin"
 pnpm install --frozen-lockfile
 pnpm build
 cd "$PROJECT_ROOT"
 
+log "本地构建 app 前端 ..."
+cd "$PROJECT_ROOT/app"
+pnpm install --frozen-lockfile
+pnpm build
+cd "$PROJECT_ROOT"
+
 # ---------- 3. 推送产物 ----------
 log "推送产物到 $REMOTE_RELEASE ..."
-ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE/admin' '$REMOTE_APP/logs' && chown -R hank:hank '$REMOTE_APP/logs'"
+ssh "$SSH_HOST" "mkdir -p '$REMOTE_RELEASE/admin' '$REMOTE_RELEASE/app' '$REMOTE_APP/logs' && chown -R hank:hank '$REMOTE_APP/logs'"
 scp -q "$BINARY" "$SSH_HOST:$REMOTE_RELEASE/hank-server.new"
 ssh "$SSH_HOST" "install -m 755 '$REMOTE_RELEASE/hank-server.new' '$REMOTE_RELEASE/hank-server' && rm -f '$REMOTE_RELEASE/hank-server.new'"
 rsync -az --delete -e ssh "$PROJECT_ROOT/admin/dist/" "$SSH_HOST:$REMOTE_RELEASE/admin/dist/"
+rsync -az --delete -e ssh "$PROJECT_ROOT/app/dist/" "$SSH_HOST:$REMOTE_RELEASE/app/dist/"
 ssh "$SSH_HOST" "ln -sfn '$REMOTE_APP/logs' '$REMOTE_RELEASE/logs'"
 
 # config.toml: 只在服务器缺失时上传，绝不覆盖（线上配置与本地长期不同步）

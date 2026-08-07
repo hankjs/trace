@@ -54,7 +54,6 @@ const navGroups: { title?: string; items: { to: string; label: string; icon: str
     items: [
       { to: '/jobs', label: '定时任务', icon: 'jobs' },
       { to: '/interactions', label: '交互单', icon: 'interaction' },
-      { to: '/terminals', label: '终端', icon: 'terminal' },
     ],
   },
   {

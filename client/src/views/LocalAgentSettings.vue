@@ -439,8 +439,8 @@ onUnmounted(() => {
       <h3 class="section-title weixin-title">远程终端</h3>
       <div class="weixin-section">
         <p class="weixin-desc">
-          开启后本机会向 server 注册并长轮询；admin 网页可查看/操作本机终端，优先走 WebRTC 直连（失败回落中转）。
-          需与 admin 连同一 server。
+          开启后本机会向 server 注册并长轮询；手机浏览器打开 App 网页即可操作本机终端（WebRTC 优先，失败回落中转）。
+          使用与桌面端相同的 Trace 账号登录。
         </p>
         <label class="remote-toggle-row" :class="{ disabled: remoteToggling }">
           <input
@@ -452,6 +452,16 @@ onUnmounted(() => {
           {{ remoteToggling ? "处理中…" : "允许远程终端控制" }}
         </label>
         <div class="weixin-bound-info" style="margin-top: 8px">
+          <span class="weixin-label">App 网页</span>
+          <a
+            class="weixin-value"
+            style="font-family: monospace; font-size: 12px; color: var(--color-accent, #4a9eff); word-break: break-all"
+            :href="`${API_BASE}/app/`"
+            target="_blank"
+            rel="noopener noreferrer"
+          >{{ API_BASE }}/app/</a>
+        </div>
+        <div class="weixin-bound-info">
           <span class="weixin-label">Server</span>
           <span class="weixin-value" style="font-family: monospace; font-size: 12px">{{ API_BASE }}</span>
         </div>

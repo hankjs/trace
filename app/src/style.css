@@ -1,0 +1,373 @@
+@import "tailwindcss";
+
+/*
+ * Handy 拟态（Neumorphism）设计 token。
+ * 纯单色：中性色 + 凹凸层次承载全部视觉，无装饰强调色；
+ * danger / ok / warn 只用于功能性状态（错误、在线、告警），不是装饰。
+ * 浅/深主题由 useTheme 驱动：<html data-theme="light|dark">，
+ * 「跟随系统」也在 JS 里解析成具体值后落到该属性上。
+ */
+
+:root {
+  color-scheme: light;
+  /* 页面底色必须是中调灰（非白），双向投影才看得见 */
+  --canvas: oklch(0.91 0.008 250);
+  /* 凸起面：比底色略亮 */
+  --raise: oklch(0.93 0.007 250);
+  /* 三级文字：正文 / 次要 / 弱提示（弱提示只用于图标、时间戳等非关键信息） */
+  --ink: oklch(0.32 0.02 250);
+  --ink-2: oklch(0.42 0.015 250);
+  --ink-3: oklch(0.45 0.012 250);
+  /* 拟态双向投影：左上高光 + 右下阴影 */
+  --shadow-hi: oklch(1 0 0 / 0.85);
+  --shadow-lo: oklch(0.74 0.03 250 / 0.5);
+  /* 功能性状态色（muted） */
+  --danger: oklch(0.55 0.19 25);
+  --ok: oklch(0.58 0.12 155);
+  --warn: oklch(0.6 0.12 70);
+
+  --neu-raised: -6px -6px 12px var(--shadow-hi), 6px 6px 12px var(--shadow-lo);
+  --neu-raised-sm: -3px -3px 6px var(--shadow-hi), 3px 3px 6px var(--shadow-lo);
+  --neu-inset: inset 3px 3px 6px var(--shadow-lo), inset -3px -3px 6px var(--shadow-hi);
+
+  /* z-index 阶梯：sticky 顶栏 < 遮罩 < 底部弹窗 < 全局提示 */
+  --z-sticky: 40;
+  --z-overlay: 50;
+  --z-sheet: 60;
+  --z-toast: 70;
+}
+
+html[data-theme='dark'] {
+  color-scheme: dark;
+    --canvas: oklch(0.27 0.012 250);
+    --raise: oklch(0.3 0.012 250);
+    --ink: oklch(0.9 0.008 250);
+    --ink-2: oklch(0.74 0.01 250);
+    --ink-3: oklch(0.62 0.01 250);
+    /* 暗色拟态：上方微高光 + 下方深影 */
+    --shadow-hi: oklch(0.4 0.015 250 / 0.55);
+    --shadow-lo: oklch(0.1 0.008 250 / 0.65);
+    --danger: oklch(0.68 0.17 25);
+    --ok: oklch(0.72 0.13 155);
+    --warn: oklch(0.75 0.12 75);
+}
+
+/* 把 token 接进 Tailwind：bg-canvas / text-ink / text-ink-2 / text-danger … */
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-raise: var(--raise);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+}
+
+html {
+  background: var(--canvas);
+}
+
+/* 内置 Nerd Font 符号字体（只含图标/PUA 字形）：终端 powerline/图标兜底，
+   系统未装 Nerd Font 时也能渲染 zsh 提示符里的特殊字符 */
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("/app/fonts/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+  font-display: block;
+}
+
+body {
+  color: var(--ink);
+}
+
+/* 终端/等宽场景的统一字体栈：正文等宽 + Nerd 符号兜底 */
+.font-term {
+  font-family: Menlo, "Symbols Nerd Font Mono", "MesloLGS NF", Monaco,
+    "Courier New", monospace;
+}
+
+/* 终端输出块：聊天里的 exec 回帖。两个主题统一深色 —— 终端即深色，
+   ANSI 配色也是在深色背景上设计的。
+   底色/前景与 terminalTheme.ts 的 TERM_BG/TERM_FG 保持同一值 */
+.term-block {
+  background: #0d1117;
+  border-radius: 12px;
+  box-shadow: var(--neu-inset);
+  color: #e6edf3;
+}
+
+@layer components {
+  /* 凸起面板（卡片、侧栏、弹窗） */
+  .neu-card {
+    background: var(--raise);
+    border-radius: 16px;
+    box-shadow: var(--neu-raised);
+  }
+
+  /* 凹陷槽（输入框、代码块、终端井） */
+  .neu-inset {
+    background: var(--canvas);
+    border-radius: 12px;
+    box-shadow: var(--neu-inset);
+  }
+
+  .neu-input {
+    background: var(--canvas);
+    border-radius: 12px;
+    box-shadow: var(--neu-inset);
+    color: var(--ink);
+    outline: none;
+  }
+
+  .neu-input::placeholder {
+    color: var(--ink-2);
+  }
+
+  .neu-input:focus-visible {
+    outline: 2px solid var(--ink-2);
+    outline-offset: 1px;
+  }
+
+  /* 凸起按钮；按下变凹陷。主按钮 = 墨色反底（单色体系里唯一的重色块） */
+  .neu-btn {
+    background: var(--raise);
+    border-radius: 12px;
+    box-shadow: var(--neu-raised-sm);
+    color: var(--ink);
+    transition:
+      box-shadow 160ms ease-out,
+      transform 160ms ease-out;
+  }
+
+  .neu-btn:hover {
+    color: var(--ink);
+  }
+
+  .neu-btn:active {
+    box-shadow: var(--neu-inset);
+  }
+
+  .neu-btn:disabled {
+    opacity: 0.5;
+    box-shadow: none;
+  }
+
+  .neu-btn:focus-visible,
+  .neu-btn-primary:focus-visible,
+  .neu-chip:focus-visible,
+  .neu-icon-btn:focus-visible {
+    outline: 2px solid var(--ink-2);
+    outline-offset: 2px;
+  }
+
+  .neu-btn-primary {
+    background: var(--ink);
+    border-radius: 12px;
+    box-shadow: var(--neu-raised-sm);
+    color: var(--canvas);
+    transition:
+      box-shadow 160ms ease-out,
+      opacity 160ms ease-out;
+  }
+
+  .neu-btn-primary:active {
+    box-shadow: none;
+    opacity: 0.85;
+  }
+
+  .neu-btn-primary:disabled {
+    opacity: 0.5;
+    box-shadow: none;
+  }
+
+  /* pill 触发器（节点/目录选择器的入口） */
+  .neu-chip {
+    align-items: center;
+    background: var(--raise);
+    border-radius: 999px;
+    box-shadow: var(--neu-raised-sm);
+    color: var(--ink);
+    display: inline-flex;
+    gap: 6px;
+    transition: box-shadow 160ms ease-out;
+  }
+
+  .neu-chip:active {
+    box-shadow: var(--neu-inset);
+  }
+
+  .neu-icon-btn {
+    align-items: center;
+    background: var(--raise);
+    border-radius: 12px;
+    box-shadow: var(--neu-raised-sm);
+    color: var(--ink-2);
+    display: inline-flex;
+    justify-content: center;
+    transition: box-shadow 160ms ease-out;
+  }
+
+  .neu-icon-btn:active {
+    box-shadow: var(--neu-inset);
+  }
+
+  /* 在线状态点：功能性状态色，不是装饰 */
+  .status-dot {
+    border-radius: 999px;
+    display: inline-block;
+    height: 8px;
+    width: 8px;
+  }
+
+  .status-dot.on {
+    background: var(--ok);
+  }
+
+  .status-dot.off {
+    background: var(--ink-3);
+  }
+
+  /* ---- 底部弹窗（BottomSheet） ---- */
+
+  .sheet-backdrop {
+    background: oklch(0.2 0.01 250 / 0.45);
+    inset: 0;
+    position: fixed;
+    z-index: var(--z-overlay);
+  }
+
+  .sheet-panel {
+    background: var(--raise);
+    border-radius: 16px 16px 0 0;
+    bottom: 0;
+    box-shadow: 0 -8px 24px var(--shadow-lo);
+    display: flex;
+    flex-direction: column;
+    left: 0;
+    margin: 0 auto;
+    max-height: 72dvh;
+    max-width: 28rem;
+    padding-bottom: env(safe-area-inset-bottom);
+    position: fixed;
+    right: 0;
+    z-index: var(--z-sheet);
+  }
+
+  .sheet-header {
+    align-items: center;
+    display: flex;
+    gap: 8px;
+    padding: 12px 16px;
+  }
+
+  .sheet-title {
+    color: var(--ink);
+    flex: 1;
+    font-size: 15px;
+    font-weight: 500;
+    overflow: hidden;
+    text-align: center;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .sheet-action {
+    background: none;
+    border-radius: 8px;
+    color: var(--ink-2);
+    flex-shrink: 0;
+    font-size: 15px;
+    padding: 4px 8px;
+  }
+
+  .sheet-action:active {
+    color: var(--ink);
+  }
+
+  .sheet-confirm {
+    color: var(--ink);
+    font-weight: 600;
+  }
+
+  .sheet-action:disabled {
+    opacity: 0.4;
+  }
+
+  .sheet-input {
+    padding: 0 16px 12px;
+  }
+
+  .sheet-options {
+    border-top: 1px solid var(--shadow-lo);
+    overflow-y: auto;
+    padding: 8px;
+  }
+
+  /* 选项行；选中态 = 凹陷槽 + 勾 */
+  .sheet-option {
+    align-items: center;
+    background: none;
+    border-radius: 12px;
+    color: var(--ink);
+    display: flex;
+    gap: 8px;
+    padding: 12px;
+    text-align: left;
+    width: 100%;
+  }
+
+  .sheet-option:active {
+    box-shadow: var(--neu-inset);
+  }
+
+  .sheet-option.selected {
+    background: var(--canvas);
+    box-shadow: var(--neu-inset);
+  }
+}
+
+/* 弹窗过渡：底部滑入 220ms ease-out；reduced-motion 退化为淡入淡出 */
+.sheet-fade-enter-active,
+.sheet-fade-leave-active {
+  transition: opacity 180ms ease-out;
+}
+
+.sheet-fade-enter-from,
+.sheet-fade-leave-to {
+  opacity: 0;
+}
+
+.sheet-slide-enter-active {
+  transition: transform 220ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.sheet-slide-leave-active {
+  transition: transform 160ms ease-in;
+}
+
+.sheet-slide-enter-from,
+.sheet-slide-leave-to {
+  transform: translateY(100%);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sheet-slide-enter-active,
+  .sheet-slide-leave-active {
+    transition: opacity 150ms ease-out;
+  }
+
+  .sheet-slide-enter-from,
+  .sheet-slide-leave-to {
+    opacity: 0;
+    transform: none;
+  }
+
+  .neu-btn,
+  .neu-btn-primary,
+  .neu-chip,
+  .neu-icon-btn {
+    transition: none;
+  }
+}

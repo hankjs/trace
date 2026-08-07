@@ -5027,6 +5027,17 @@ impl Database {
         Ok(())
     }
 
+    /// 删除用户自己的节点登记；rows_affected=0 表示不存在或不属于该用户
+    pub async fn delete_client_agent(&self, user_id: &str, client_id: &str) -> Result<bool> {
+        let res = db_retry!(
+            sqlx::query("DELETE FROM client_agents WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(client_id)
+                .execute(&self.pool)
+        )?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// 刷新最后运行时间（被派发任务时调用）
     pub async fn touch_client_agent_active(&self, client_id: &str) -> Result<()> {
         db_retry!(

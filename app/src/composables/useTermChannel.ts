@@ -1,9 +1,9 @@
 /**
  * 终端 IO 通道：RTC 优先（DataChannel 直连），失败/心跳判死 → 静默回落中转。
- * 协议对齐 handy/docs/p2p-terminal.md。
+ * 协议对齐 handy/docs/p2p-terminal.md；中转为 3s raw 整屏拉取。
  */
 import { ref, type Ref } from 'vue'
-import { api } from './api'
+import { api } from '../api'
 
 export type TermChannelMode = 'rtc' | 'relay'
 
@@ -50,7 +50,6 @@ interface TermLink {
   stop(): void
 }
 
-/** 中转：3s 拉 raw 整屏 + terminal_input 写 */
 function createRelayLink(
   clientId: string,
   termId: string,
@@ -67,7 +66,6 @@ function createRelayLink(
       if (stopped) return
       if (res.output !== lastSnapshot) {
         lastSnapshot = res.output
-        // 整屏回放：前缀清屏复位，避免叠字
         handlers.onData(
           new TextEncoder().encode('\x1b[H\x1b[2J\x1b[3J' + res.output),
         )
@@ -85,12 +83,11 @@ function createRelayLink(
       timer = setInterval(() => void pull(), 3000)
     },
     write(data) {
-      // 文本按 UTF-8 发；\r 由调用方保证
       const text = new TextDecoder().decode(data)
       void api.terminalInput(clientId, termId, text).catch(() => {})
     },
-    resize(_cols, _rows) {
-      // 中转暂不主动 resize 远端
+    resize(cols, rows) {
+      void api.terminalResize(clientId, termId, cols, rows).catch(() => {})
     },
     stop() {
       stopped = true
@@ -245,6 +242,22 @@ async function connectRtcLink(
   }
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('rtc timeout')), ms)
+    p.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err instanceof Error ? err : new Error(String(err)))
+      },
+    )
+  })
+}
+
 export function useTermChannel(
   clientId: string,
   termId: string,
@@ -294,6 +307,9 @@ export function useTermChannel(
           handlers,
           (reason) => {
             handlers.onClosed?.(reason)
+            // 心跳判死后先停旧 link 再开中转
+            link?.stop()
+            link = null
             startRelay()
           },
           ctl,
@@ -331,20 +347,4 @@ export function useTermChannel(
       pendingWrites.length = 0
     },
   }
-}
-
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('rtc timeout')), ms)
-    p.then(
-      (v) => {
-        clearTimeout(timer)
-        resolve(v)
-      },
-      (err) => {
-        clearTimeout(timer)
-        reject(err instanceof Error ? err : new Error(String(err)))
-      },
-    )
-  })
 }

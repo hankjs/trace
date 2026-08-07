@@ -1,5 +1,4 @@
 mod admin;
-mod admin_terminal;
 mod api_keys;
 mod auth;
 mod changes;
@@ -24,6 +23,7 @@ mod skills;
 mod snap_tools;
 mod specs;
 pub mod task_state;
+mod app_web;
 mod turn;
 mod websnap;
 mod weixin;
@@ -459,6 +459,41 @@ async fn main() -> Result<()> {
             post(remote_term::post_tool_result),
         )
         .route("/api/client/online", get(remote_term::list_online))
+        // App 产品：用户作用域远程终端代理 + WebRTC
+        .route("/api/app/clients", get(app_web::list_clients))
+        .route(
+            "/api/app/clients/{cid}",
+            delete(app_web::delete_client),
+        )
+        .route(
+            "/api/app/clients/{cid}/enabled",
+            post(app_web::set_client_enabled),
+        )
+        .route(
+            "/api/app/clients/{cid}/terminals",
+            get(app_web::list_terminals).post(app_web::create_terminal),
+        )
+        .route(
+            "/api/app/clients/{cid}/terminals/{tid}",
+            delete(app_web::close_terminal),
+        )
+        .route(
+            "/api/app/clients/{cid}/terminals/{tid}/output",
+            get(app_web::terminal_output),
+        )
+        .route(
+            "/api/app/clients/{cid}/terminals/{tid}/input",
+            post(app_web::terminal_input),
+        )
+        .route(
+            "/api/app/clients/{cid}/terminals/{tid}/resize",
+            post(app_web::terminal_resize),
+        )
+        .route(
+            "/api/app/clients/{cid}/rtc/offer",
+            post(app_web::rtc_offer),
+        )
+        .route("/api/app/rtc/ice", get(app_web::rtc_ice))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -606,29 +641,6 @@ async fn main() -> Result<()> {
             get(scheduler::routes::job_runs),
         )
         .route("/api/admin/jobs/{id}/run", post(scheduler::routes::run_job))
-        // Admin 终端代理 + WebRTC 信令
-        .route("/api/admin/clients", get(admin_terminal::list_clients))
-        .route(
-            "/api/admin/clients/{cid}/enabled",
-            post(admin_terminal::set_client_enabled),
-        )
-        .route(
-            "/api/admin/clients/{cid}/terminals",
-            get(admin_terminal::list_terminals),
-        )
-        .route(
-            "/api/admin/clients/{cid}/terminals/{tid}/output",
-            get(admin_terminal::terminal_output),
-        )
-        .route(
-            "/api/admin/clients/{cid}/terminals/{tid}/input",
-            post(admin_terminal::terminal_input),
-        )
-        .route(
-            "/api/admin/clients/{cid}/rtc/offer",
-            post(admin_terminal::rtc_offer),
-        )
-        .route("/api/admin/rtc/ice", get(admin_terminal::rtc_ice))
         // 交互单管理（列表/详情/手动应答/取消；应答会真派发 resume）
         .route(
             "/api/admin/interactions",
@@ -658,15 +670,18 @@ async fn main() -> Result<()> {
             auth_middleware,
         ));
 
-    // Static file serving for admin SPA
+    // Static file serving for admin / app SPA
     // 注意用 fallback（保留 200 状态），not_found_service 会把 SPA 路由也标成 404
     let admin_static =
         ServeDir::new("admin/dist").fallback(ServeFile::new("admin/dist/index.html"));
+    let app_static =
+        ServeDir::new("app/dist").fallback(ServeFile::new("app/dist/index.html"));
 
     let app = public
         .merge(protected)
         .merge(admin_api)
         .nest_service("/admin", admin_static)
+        .nest_service("/app", app_static)
         .layer(cors_layer(&config.server.cors_origins))
         .layer(
             TraceLayer::new_for_http()

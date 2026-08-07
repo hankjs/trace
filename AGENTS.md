@@ -17,6 +17,7 @@ Agent 运行在服务器上执行 shell 命令和文件操作，客户端通过 
 | `server/` + `crates/` | Rust workspace：Axum 服务端及 Agent 核心 crates |
 | `client/` | Tauri 2 + Vue 3 桌面客户端（包名 `hank-client`） |
 | `admin/` | Vue 3 + Vite 管理后台 Web（包名 `hank-admin`） |
+| `app/` | 远程终端产品 Web PWA（包名 `hank-app`，挂载 `/app`） |
 
 **quant 已迁出本 monorepo**：独立仓库 https://github.com/hankjs/quant（本地 `~/projects/hank/quant`）。
 Trace 仅通过 HTTP A2A（`[quant_a2a]` + `quant_*` 工具 + `server/skills/quant-research`）调用 quant；
@@ -44,6 +45,8 @@ server/src/              Axum HTTP/SSE 服务 (hank-server, 0.0.0.0:3000)
   ├── specs.rs           Spec 版本化管理
   ├── checkpoints.rs     Checkpoint 回溯系统
   ├── admin.rs           管理后台 API
+  ├── app_web.rs         App 产品用户作用域终端代理 + WebRTC
+  ├── remote_term/       桌面 client 注册/长轮询 hub
   ├── auth.rs            JWT 认证
   ├── llm.rs             通用 LLM completion / tool-exec 端点
   ├── image_gen.rs / skills.rs / requirement_docs.rs / snap_tools.rs / termshot.rs / websnap.rs
@@ -63,6 +66,7 @@ client/src/              Tauri + Vue 3 客户端
   ├── api/               API 客户端层
   └── terminal/          终端布局与标签状态
 admin/src/               管理后台 (views/, components/, composables/)
+app/src/                 远程终端 App PWA (handy 风格，挂载 /app)
 deploy/                  部署脚本 + systemd unit (hank-server)
 docs/                    mdBook 文档 (src/ 源码, book/ 已构建产物勿改), feature/, review/
 Makefile                 所有常用任务的统一入口
@@ -88,11 +92,15 @@ pnpm test:run                     # Vitest (happy-dom + msw, tests/ 与 src/**/*
 cd admin && pnpm dev              # Vite 开发
 cd admin && pnpm build            # vue-tsc + 构建, 产物 admin/dist 由服务端托管
 
+# 远程终端 App (app/)
+cd app && pnpm dev                # Vite :18791，base /app/
+cd app && pnpm build              # 产物 app/dist 由服务端托管于 /app
+
 # quant 量化系统（独立仓库，不在本 monorepo）
 # cd ~/projects/hank/quant && make dev / make web / make deploy
 
 # Makefile 汇总
-make server-dev / client-dev / admin-dev
+make server-dev / client-dev / admin-dev / app-dev
 make app                          # 构建 Trace.app 并安装到 /Applications
 ```
 
@@ -114,11 +122,12 @@ make app                          # 构建 Trace.app 并安装到 /Applications
   HMAC-SHA256 验签）。凭证是**用户级**：每用户在 client 设置页配自己的
   base_url + hnk_ token + webhook_secret（`handy_accounts` 表），不走 config.toml，
   也不需要 `trk_` API key。其他外部系统仍可走下文「通用 client 交互单 API」。
-- **远程终端（admin 网页控桌面 client）**：桌面端设置开启「允许远程终端」后注册并长轮询
-  （`/api/client/*`，`server/src/remote_term/`）。Admin `/terminals` 经中转读写
-  （`terminal_*` 工具）或 WebRTC DataChannel 直连（`rtc_signal` 信令 + `client/src-tauri/src/rtc.rs`，
-  协议对齐 handy）。ICE/TURN 见 `config.toml` `[turn]`；失败静默回落中转。
-  **不**恢复 agent 远程执行（shell/写文件/exec_client_id）。
+- **远程终端（App 产品，`/app`）**：桌面端设置开启「允许远程终端」后注册并长轮询
+  （`/api/client/*`，`server/src/remote_term/`）。手机/浏览器打开 `/app`（`app/` SPA）
+  用同一 Trace 账号登录，经用户作用域 `/api/app/*`（`server/src/app_web.rs`，归属校验）
+  中转读写（`terminal_*`）或 WebRTC DataChannel 直连（`rtc_signal` 信令 +
+  `client/src-tauri/src/rtc.rs`，协议对齐 handy）。ICE/TURN 见 `config.toml` `[turn]`；
+  失败静默回落中转。**不**恢复 agent 远程执行（shell/写文件/exec_client_id）。
 
 ## 通用 client 交互单 API
 
