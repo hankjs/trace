@@ -68,12 +68,23 @@ async function load() {
   }
 }
 
+/** 按当前视口估算终端网格，让 PTY 以 app 尺寸启动（避免 120×30 后再 resize 闪一下） */
+function estimateAppTermSize(): { cols: number; rows: number } {
+  // 与 TerminalView 字体 13px mono 大致对齐：~7.8×16 单元格
+  const cols = Math.max(40, Math.floor((window.innerWidth - 48) / 7.8))
+  const rows = Math.max(12, Math.floor((Math.min(window.innerHeight * 0.7, 32 * 16) - 24) / 16))
+  return { cols, rows }
+}
+
 async function createTerminal() {
   creating.value = true
   error.value = ''
   try {
+    const { cols, rows } = estimateAppTermSize()
     const { terminal } = await api.createTerminal(clientId.value, {
       cwd: cwd.value.trim() || undefined,
+      cols,
+      rows,
     })
     const t = normalizeTerm(terminal)
     if (t) {

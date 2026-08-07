@@ -79,6 +79,14 @@ onMounted(async () => {
   term.onData((data) => channel?.write(encoder.encode(data)))
   term.onResize(({ cols, rows }) => channel?.resize(cols, rows))
 
+  // 强制把当前 fit 尺寸推到真实 PTY（中转路径 onResize 有时不会二次触发）
+  const pushSize = () => {
+    if (!term || !channel) return
+    channel.resize(term.cols, term.rows)
+  }
+  requestAnimationFrame(pushSize)
+  setTimeout(pushSize, 100)
+
   window.addEventListener('resize', onWindowResize)
 })
 

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, onMounted, onUnmounted, nextTick, provide } from "vue";
+import { ref, reactive, onMounted, onUnmounted, nextTick, provide, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { Terminal } from "@xterm/xterm";
@@ -31,6 +31,12 @@ import {
   firstLeaf,
   allLeaves,
 } from "../terminal/layout";
+import {
+  useRemoteControl,
+  isRemoteControlled,
+  getRemoteSize,
+  clearRemoteControl,
+} from "../composables/useRemoteControl";
 
 // tab 状态提升到 ../terminal/termTabs（模块级），供全局 tab 栏共享；
 // 本组件只管理 xterm 前端实例（离开时销毁，PTY 保留，回来时回放重建）
@@ -57,8 +63,12 @@ const paneTitles = reactive<Record<string, string>>({});
 const paneRename = reactive<{ id: string | null }>({ id: null });
 provide("paneTitles", paneTitles);
 provide("paneRename", paneRename);
+/** 远程占用状态 → PaneNode 遮罩 */
+const { remoteTerms } = useRemoteControl();
+provide("remoteTerms", remoteTerms);
 let unlistenFocus: (() => void) | null = null;
 let unlistenDrag: (() => void) | null = null;
+let stopRemoteWatch: (() => void) | null = null;
 
 // 搜索框状态
 const searchOpen = ref(false);
@@ -77,6 +87,33 @@ provide("registerTermEl", (id: string, el: unknown) => {
   }
 });
 
+/**
+ * 同步本地 xterm 显示尺寸到 PTY。
+ * 远程占用时：禁止本地 fit 回写 PTY（尺寸以 app 为准），仅把远程 cols/rows 套到 xterm。
+ */
+function syncPaneSize(id: string) {
+  const inst = instances.get(id);
+  if (!inst) return;
+  if (isRemoteControlled(id)) {
+    const size = getRemoteSize(id);
+    if (size) {
+      try {
+        // 只改前端显示网格，不 invoke term_resize（PTY 已是 app 尺寸）
+        if (inst.term.cols !== size.cols || inst.term.rows !== size.rows) {
+          inst.term.resize(size.cols, size.rows);
+        }
+      } catch {
+        /* xterm 尚未 open 完成 */
+      }
+    }
+    return;
+  }
+  const el = containers.get(id);
+  if (el && (el.clientWidth === 0 || el.clientHeight === 0)) return;
+  inst.fit.fit();
+  invoke("term_resize", { id, cols: inst.term.cols, rows: inst.term.rows }).catch(() => {});
+}
+
 /** 实例已存在但容器 div 被重建时，把 xterm DOM 移入新容器并重新观察尺寸 */
 function reattachInstance(id: string, el: HTMLElement) {
   const inst = instances.get(id);
@@ -89,13 +126,11 @@ function reattachInstance(id: string, el: HTMLElement) {
       }
       inst.observer?.disconnect();
       const observer = new ResizeObserver(() => {
-        if (el.clientWidth === 0 || el.clientHeight === 0) return;
-        inst.fit.fit();
-        invoke("term_resize", { id, cols: inst.term.cols, rows: inst.term.rows }).catch(() => {});
+        syncPaneSize(id);
       });
       observer.observe(el);
       inst.observer = observer;
-      inst.fit.fit();
+      syncPaneSize(id);
     } catch (e) {
       // 搬家失败（如 canvas 状态损坏）：销毁重建 + 回放 scrollback 兜底
       console.warn("[Terminal] reattach failed, recreating:", e);
@@ -218,10 +253,13 @@ async function attachInstance(id: string, replay?: string, retries = 3) {
 
   // shell 退出（如输入 exit）：关闭对应 pane
   const unlistenExit = await listen(`term-exit/${id}`, () => {
+    clearRemoteControl(id);
     closePane(id);
   });
 
   term.onData((data) => {
+    // 远程占用时屏蔽本地键盘，避免与 app 双写
+    if (isRemoteControlled(id)) return;
     invoke("term_write", { id, data }).catch(() => {});
   });
 
@@ -235,17 +273,15 @@ async function attachInstance(id: string, replay?: string, retries = 3) {
 
   const inst: TermInstance = { term, fit, search, unlisten, unlistenExit, observer: null };
   const observer = new ResizeObserver(() => {
-    if (el.clientWidth === 0 || el.clientHeight === 0) return;
-    fit.fit();
-    invoke("term_resize", { id, cols: term.cols, rows: term.rows }).catch(() => {});
+    syncPaneSize(id);
   });
   observer.observe(el);
   inst.observer = observer;
   instances.set(id, inst);
   registerTerm(id, term);
 
-  // 初始同步一次真实尺寸
-  invoke("term_resize", { id, cols: term.cols, rows: term.rows }).catch(() => {});
+  // 初始同步一次真实尺寸（远程占用则套 app 尺寸）
+  syncPaneSize(id);
   term.focus();
 }
 
@@ -261,10 +297,7 @@ function disposeInstance(id: string) {
 }
 
 function fitPane(id: string) {
-  const inst = instances.get(id);
-  if (!inst) return;
-  inst.fit.fit();
-  invoke("term_resize", { id, cols: inst.term.cols, rows: inst.term.rows }).catch(() => {});
+  syncPaneSize(id);
 }
 
 function fitAndFocus(tab: Tab) {
@@ -360,6 +393,7 @@ async function closePane(paneId: string | undefined) {
   if (!paneId) return;
   const tab = tabs.value.find((t) => allLeaves(t.root).includes(paneId));
   if (!tab) return;
+  clearRemoteControl(paneId);
   invoke("term_close", { id: paneId }).catch(() => {});
   // dispose 失败不能阻断树更新，否则会留下空框
   try {
@@ -474,6 +508,8 @@ function onFileDrop(paths: string[], position: { x: number; y: number }) {
   const paneId = paneAtPosition(position);
   const inst = paneId ? instances.get(paneId) : undefined;
   if (!paneId || !inst) return;
+  // 远程占用时不接受本地拖入路径
+  if (isRemoteControlled(paneId)) return;
   let data = paths.map(shellQuote).join(" ");
   // 与 iTerm2 一致：应用开启 bracketed paste 时按"粘贴"投递，
   // CLI（kimi/claude code 等）靠这个标记把粘贴的图片路径识别为附件
@@ -638,6 +674,24 @@ onMounted(async () => {
       onFileDrop(event.payload.paths, event.payload.position);
     }
   });
+
+  // 远程占用 / 尺寸变化：刷新 xterm 网格；释放后重新 fit 回本地容器
+  stopRemoteWatch = watch(
+    remoteTerms,
+    (curr, prev) => {
+      const ids = new Set([...Object.keys(curr), ...Object.keys(prev || {})]);
+      for (const id of ids) {
+        if (!instances.has(id)) continue;
+        if (curr[id]) {
+          syncPaneSize(id);
+        } else if (prev?.[id]) {
+          // 远程释放：恢复本地 fit → PTY
+          syncPaneSize(id);
+        }
+      }
+    },
+    { deep: true },
+  );
 });
 
 onUnmounted(() => {
@@ -645,6 +699,8 @@ onUnmounted(() => {
   unlistenFocus = null;
   unlistenDrag?.();
   unlistenDrag = null;
+  stopRemoteWatch?.();
+  stopRemoteWatch = null;
   // 只销毁前端实例，PTY 会话保留，回到页面时可重连
   for (const id of [...instances.keys()]) disposeInstance(id);
 });

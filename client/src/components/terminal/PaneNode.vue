@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, inject } from "vue";
+import { ref, inject, computed } from "vue";
 import type { LayoutNode, PaneDragState } from "../../terminal/layout";
+import type { RemoteTermState } from "../../composables/useRemoteControl";
 
 interface PaneInfo {
   foreground_cmd: string;
@@ -29,6 +30,13 @@ const paneRename = inject<{ id: string | null }>("paneRename", { id: null });
 const paneDrag = inject<PaneDragState>("paneDrag", { dragId: null, targetId: null, zone: null });
 const paneDragMove = inject<(x: number, y: number) => void>("paneDragMove", () => {});
 const paneDragDrop = inject<(x: number, y: number) => void>("paneDragDrop", () => {});
+// 由 TerminalView provide：远程占用（app 连上时遮罩）
+const remoteTerms = inject<Record<string, RemoteTermState>>("remoteTerms", {});
+
+const isRemote = computed(() => {
+  if (props.node.kind !== "term") return false;
+  return !!remoteTerms[props.node.id];
+});
 
 const renameValue = ref("");
 
@@ -147,6 +155,7 @@ function openPaneMenu(e: MouseEvent) {
     class="pane"
     :class="{
       active: node.id === activePaneId,
+      remote: isRemote,
       'drag-source': paneDrag.dragId === node.id,
       'drag-target': paneDrag.targetId === node.id && paneDrag.zone,
     }"
@@ -159,7 +168,7 @@ function openPaneMenu(e: MouseEvent) {
       @dblclick.stop="startRename"
       @pointerdown="onTitlebarDown"
     >
-      <span class="pane-title-dot" :class="{ alive: paneInfos[node.id]?.alive !== false }"></span>
+      <span class="pane-title-dot" :class="{ alive: paneInfos[node.id]?.alive !== false, remote: isRemote }"></span>
       <input
         v-if="paneRename.id === node.id"
         v-model="renameValue"
@@ -172,6 +181,7 @@ function openPaneMenu(e: MouseEvent) {
       />
       <template v-else>
         <span class="pane-title-cmd">{{ paneTitles[node.id] || paneInfos[node.id]?.foreground_cmd || "shell" }}</span>
+        <span v-if="isRemote" class="pane-remote-badge">远程中</span>
         <span class="pane-title-cwd">{{ homeCwd(paneInfos[node.id]?.cwd || "") }}</span>
       </template>
       <!-- 设置按钮：点击效果等同 pane 右键菜单 -->
@@ -189,6 +199,14 @@ function openPaneMenu(e: MouseEvent) {
       </button>
     </div>
     <div class="term-container" :ref="(el) => registerTermEl?.(node.id, el)"></div>
+    <!-- app 远程控制遮罩：拦截本地输入，尺寸由 app 驱动 PTY -->
+    <div v-if="isRemote" class="remote-mask" aria-live="polite">
+      <div class="remote-mask-card">
+        <span class="remote-mask-dot" />
+        <span class="remote-mask-title">远程控制中</span>
+        <span class="remote-mask-sub">终端尺寸与输入由 App 接管</span>
+      </div>
+    </div>
     <!-- 拖拽落点高亮（iTerm2 风格：边缘 = split，中央 = 交换） -->
     <div
       v-if="paneDrag.targetId === node.id && paneDrag.zone"
@@ -263,11 +281,87 @@ function openPaneMenu(e: MouseEvent) {
   box-shadow: inset 0 0 0 1px var(--color-accent);
 }
 
+.pane.remote {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, #f59e0b 70%, transparent);
+}
+
 .term-container {
   position: absolute;
   inset: 0;
   top: 24px; /* 标题栏高度 */
   padding: var(--space-1);
+}
+
+/* 远程控制遮罩：盖住 xterm，拦截指针；标题栏仍可操作 */
+.remote-mask {
+  position: absolute;
+  inset: 0;
+  top: 24px;
+  z-index: 8;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: oklch(0.12 0.02 250 / 0.55);
+  backdrop-filter: blur(1px);
+  cursor: not-allowed;
+  user-select: none;
+}
+
+.remote-mask-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 18px;
+  border-radius: var(--radius-md, 8px);
+  background: oklch(0.18 0.02 250 / 0.88);
+  border: 1px solid color-mix(in srgb, #f59e0b 45%, transparent);
+  box-shadow: 0 8px 24px oklch(0 0 0 / 0.35);
+}
+
+.remote-mask-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f59e0b;
+  box-shadow: 0 0 0 0 color-mix(in srgb, #f59e0b 50%, transparent);
+  animation: remote-pulse 1.6s ease-out infinite;
+}
+
+.remote-mask-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #fbbf24;
+  letter-spacing: 0.02em;
+}
+
+.remote-mask-sub {
+  font-size: 11px;
+  color: var(--color-text-muted, #8b949e);
+}
+
+@keyframes remote-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, #f59e0b 55%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 10px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.pane-remote-badge {
+  flex-shrink: 0;
+  padding: 0 5px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  color: #0d1117;
+  background: #f59e0b;
+  border-radius: 3px;
+  letter-spacing: 0.02em;
 }
 
 .pane-titlebar {
@@ -325,6 +419,10 @@ function openPaneMenu(e: MouseEvent) {
 
 .pane-title-dot.alive {
   background: var(--color-accent);
+}
+
+.pane-title-dot.remote {
+  background: #f59e0b;
 }
 
 .pane-title-cmd {

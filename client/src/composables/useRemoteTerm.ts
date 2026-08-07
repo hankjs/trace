@@ -12,6 +12,11 @@ import {
   registerClient,
   type RemoteToolRequest,
 } from "../api/remoteTerm";
+import {
+  markRemoteControl,
+  clearRemoteControl,
+  startRemoteControlListeners,
+} from "./useRemoteControl";
 
 const CLIENT_ID_KEY = "hank_remote_client_id";
 const ACCEPT_KEY = "hank_accept_remote";
@@ -82,6 +87,9 @@ async function executeRemoteTool(
         return { content: JSON.stringify(list), is_error: false };
       }
       case "terminal_read": {
+        // app 打开终端视图时会 3s 轮询 raw 输出 → 心跳占用
+        const readId = String(input.id ?? "");
+        if (readId) markRemoteControl(readId);
         if (input.raw) {
           const { serializeScreen } = await import("../terminal/screenRegistry");
           const snap = serializeScreen(input.id);
@@ -102,6 +110,8 @@ async function executeRemoteTool(
         return { content: tail, is_error: false };
       }
       case "terminal_write": {
+        const writeId = String(input.id ?? "");
+        if (writeId) markRemoteControl(writeId);
         await invoke("term_write", {
           id: input.id,
           data: String(input.data ?? ""),
@@ -109,26 +119,38 @@ async function executeRemoteTool(
         return { content: "ok", is_error: false };
       }
       case "terminal_create": {
-        const info = await invoke("term_create", {
-          cols: Number(input.cols) || 120,
-          rows: Number(input.rows) || 30,
+        const cols = Number(input.cols) || 120;
+        const rows = Number(input.rows) || 30;
+        const info = await invoke<{ id: string }>("term_create", {
+          cols,
+          rows,
           cwd: input.cwd ?? null,
         });
+        // 新建即由 app 占用，尺寸以 app 传入为准
+        if (info?.id) markRemoteControl(info.id, { cols, rows });
         return { content: JSON.stringify(info), is_error: false };
       }
       case "terminal_close": {
-        await invoke("term_close", { id: String(input.id ?? "") });
+        const closeId = String(input.id ?? "");
+        clearRemoteControl(closeId);
+        await invoke("term_close", { id: closeId });
         return { content: "ok", is_error: false };
       }
       case "terminal_resize": {
+        // app 容器尺寸 → 真实 PTY 进程；本地 fit 在占用期间不再回写
+        const resizeId = String(input.id ?? "");
+        const cols = Number(input.cols) || 80;
+        const rows = Number(input.rows) || 24;
         await invoke("term_resize", {
-          id: String(input.id ?? ""),
-          cols: Number(input.cols) || 80,
-          rows: Number(input.rows) || 24,
+          id: resizeId,
+          cols,
+          rows,
         });
+        if (resizeId) markRemoteControl(resizeId, { cols, rows });
         return { content: "ok", is_error: false };
       }
       case "rtc_signal": {
+        // 实际附着 term 由 Rust RTC 驱动在 open 时 emit term-remote
         const answer = await invoke<string>("rtc_accept_offer", {
           offerSdp: String(input.sdp ?? ""),
         });
@@ -215,6 +237,7 @@ function startPolling() {
   const gen = loopGen;
   abort = null;
   isPolling.value = true;
+  void startRemoteControlListeners();
 
   pollLoop(gen).finally(() => {
     // 只有自己仍是当前 gen 时才清 isPolling

@@ -17,7 +17,7 @@ use str0m::change::SdpOffer;
 use str0m::channel::{ChannelData, ChannelId};
 use str0m::net::{Protocol, Receive};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 use tokio::net::UdpSocket;
 
 use crate::terminal::TermManager;
@@ -34,6 +34,35 @@ fn b64_decode(text: &str) -> Result<Vec<u8>, String> {
     base64::engine::general_purpose::STANDARD
         .decode(text)
         .map_err(|e| format!("不是合法 base64: {e}"))
+}
+
+/// 通知前端：某终端被 app 远程占用 / 释放 / 尺寸变化（遮罩 + 抑制本地 fit）
+#[derive(Clone, Serialize)]
+struct TermRemoteEvent {
+    id: String,
+    active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<u16>,
+}
+
+fn emit_term_remote(
+    app: &AppHandle,
+    id: &str,
+    active: bool,
+    cols: Option<u16>,
+    rows: Option<u16>,
+) {
+    let _ = app.emit(
+        "term-remote",
+        TermRemoteEvent {
+            id: id.to_string(),
+            active,
+            cols,
+            rows,
+        },
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,7 +99,11 @@ fn encode_server_msg(msg: &ServerMsg) -> Result<String, String> {
 }
 
 /// 收 offer SDP → 建 PeerConnection → 立即回 answer SDP；数据面后台跑。
-pub async fn accept_offer(term: Arc<TermManager>, offer_sdp: &str) -> Result<String, String> {
+pub async fn accept_offer(
+    app: AppHandle,
+    term: Arc<TermManager>,
+    offer_sdp: &str,
+) -> Result<String, String> {
     let offer =
         SdpOffer::from_sdp_string(offer_sdp).map_err(|e| format!("offer SDP 解析失败: {e}"))?;
 
@@ -95,17 +128,18 @@ pub async fn accept_offer(term: Arc<TermManager>, offer_sdp: &str) -> Result<Str
         .map_err(|e| format!("offer 不合法: {e}"))?;
     let answer_sdp = answer.to_sdp_string();
 
-    tokio::spawn(drive(rtc, socket, cand_addr, term));
+    tokio::spawn(drive(app, rtc, socket, cand_addr, term));
     Ok(answer_sdp)
 }
 
 /// Tauri command：长轮询收到 rtc_signal 时调用（offerSdp → answer SDP）
 #[tauri::command]
 pub async fn rtc_accept_offer(
+    app: AppHandle,
     term: State<'_, Arc<TermManager>>,
     offer_sdp: String,
 ) -> Result<String, String> {
-    accept_offer(term.inner().clone(), &offer_sdp).await
+    accept_offer(app, term.inner().clone(), &offer_sdp).await
 }
 
 fn select_host_address() -> Ipv4Addr {
@@ -199,6 +233,7 @@ fn send_snapshot(rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge) {
 }
 
 fn handle_open(
+    app: &AppHandle,
     rtc: &mut Rtc,
     term: &TermManager,
     bridge: &mut TermBridge,
@@ -214,6 +249,7 @@ fn handle_open(
     };
     match term.term_alive(&id) {
         Some(true) => {
+            // 尺寸以 app 为准，覆盖本地 client 容器尺寸
             if let (Some(c), Some(r)) = (cols, rows) {
                 if term.term_size(&id).ok() != Some((c, r)) {
                     if let Err(e) = term.term_resize_inner(&id, c, r) {
@@ -222,6 +258,7 @@ fn handle_open(
                 }
             }
             tracing::info!(term_id = %id, "RTC 终端会话已附着");
+            emit_term_remote(app, &id, true, cols, rows);
             bridge.term_id = Some(id);
             bridge.opened = true;
             send_snapshot(rtc, term, bridge);
@@ -231,7 +268,13 @@ fn handle_open(
     }
 }
 
-fn handle_client_msg(rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge, data: &[u8]) {
+fn handle_client_msg(
+    app: &AppHandle,
+    rtc: &mut Rtc,
+    term: &TermManager,
+    bridge: &mut TermBridge,
+    data: &[u8],
+) {
     let msg = match decode_client_msg(data) {
         Ok(msg) => msg,
         Err(e) => {
@@ -245,7 +288,7 @@ fn handle_client_msg(rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge,
             cols,
             rows,
             cwd,
-        } => handle_open(rtc, term, bridge, term_id, cols, rows, cwd),
+        } => handle_open(app, rtc, term, bridge, term_id, cols, rows, cwd),
         ClientMsg::Ping => {
             send_msg(rtc, bridge, &ServerMsg::Pong);
         }
@@ -269,16 +312,21 @@ fn handle_client_msg(rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge,
             };
             if let Err(e) = term.term_resize_inner(&id, cols, rows) {
                 tracing::warn!(term_id = %id, "RTC resize 失败: {e}");
+            } else {
+                // 同步前端遮罩下的 xterm 显示尺寸，并刷新 sticky 占用
+                emit_term_remote(app, &id, true, Some(cols), Some(rows));
             }
         }
         ClientMsg::Close => {
-            bridge.term_id = None;
+            if let Some(id) = bridge.term_id.take() {
+                emit_term_remote(app, &id, false, None, None);
+            }
             send_closed(rtc, bridge, "closed by peer");
         }
     }
 }
 
-fn pump(rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge) {
+fn pump(app: &AppHandle, rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge) {
     let Some(id) = bridge.term_id.clone() else {
         return;
     };
@@ -286,10 +334,14 @@ fn pump(rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge) {
     match term.term_alive(&id) {
         Some(true) => {}
         Some(false) => {
+            emit_term_remote(app, &id, false, None, None);
+            bridge.term_id = None;
             send_closed(rtc, bridge, "终端进程已退出");
             return;
         }
         None => {
+            emit_term_remote(app, &id, false, None, None);
+            bridge.term_id = None;
             send_closed(rtc, bridge, "terminal not found");
             return;
         }
@@ -319,11 +371,16 @@ fn pump(rtc: &mut Rtc, term: &TermManager, bridge: &mut TermBridge) {
                 }
             }
         }
-        Err(e) => send_closed(rtc, bridge, e),
+        Err(e) => {
+            emit_term_remote(app, &id, false, None, None);
+            bridge.term_id = None;
+            send_closed(rtc, bridge, e);
+        }
     }
 }
 
 async fn drive(
+    app: AppHandle,
     mut rtc: Rtc,
     socket: UdpSocket,
     cand_addr: SocketAddr,
@@ -341,7 +398,7 @@ async fn drive(
 
         let now = Instant::now();
         if bridge.opened && !bridge.done && now >= next_pump {
-            pump(&mut rtc, &term, &mut bridge);
+            pump(&app, &mut rtc, &term, &mut bridge);
             next_pump = now + PUMP_TICK;
         }
         if !bridge.connected && now >= connect_deadline {
@@ -378,7 +435,7 @@ async fn drive(
                     }
                     Event::ChannelData(ChannelData { id, data, .. }) => {
                         if Some(id) == bridge.cid {
-                            handle_client_msg(&mut rtc, &term, &mut bridge, &data);
+                            handle_client_msg(&app, &mut rtc, &term, &mut bridge, &data);
                         }
                     }
                     Event::ChannelClose(id) => {
@@ -391,6 +448,10 @@ async fn drive(
                 },
                 Err(e) => {
                     tracing::warn!("RTC poll_output 失败: {e}");
+                    // 异常退出前释放占用
+                    if let Some(id) = bridge.term_id.take() {
+                        emit_term_remote(&app, &id, false, None, None);
+                    }
                     return;
                 }
             }
@@ -439,6 +500,10 @@ async fn drive(
         }
     }
 
+    // 连接结束：释放前端遮罩
+    if let Some(id) = bridge.term_id.take() {
+        emit_term_remote(&app, &id, false, None, None);
+    }
     tracing::info!(term_id = ?bridge.term_id, "RTC 驱动任务退出");
 }
 
@@ -476,10 +541,9 @@ mod tests {
         assert_eq!(b64_decode(&b64_encode(bytes)).unwrap(), bytes);
     }
 
-    #[tokio::test]
-    async fn invalid_offer_sdp_is_rejected() {
-        let term = Arc::new(TermManager::default());
-        let err = accept_offer(term, "not an sdp").await.unwrap_err();
-        assert!(err.contains("SDP"), "{err}");
+    #[test]
+    fn invalid_offer_sdp_is_rejected() {
+        // accept_offer 依赖 AppHandle；SDP 解析失败路径与之一致，直接测 from_sdp_string
+        assert!(SdpOffer::from_sdp_string("not an sdp").is_err());
     }
 }
